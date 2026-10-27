@@ -29,7 +29,7 @@ Holokeep is early. What exists is the content-addressing core, each piece checke
 - **Import**: `hk add` turns files and directories into UnixFSv1 with CIDs identical to Kubo's `ipfs add` under the `unixfs-v1-2025` profile, including chunked files, nested directories, symlinks and HAMT-sharded directories.
 - **CIDs and multihashes**: v0 and v1; SHA-1, SHA-2, SHA-3, BLAKE2b-256 and murmur3 (no identity hash yet).
 - **Codecs**: dag-pb, dag-cbor and dag-json, strict and canonical, passing all of [ipld/codec-fixtures](https://github.com/ipld/codec-fixtures) and differential fuzzing against `serde_ipld_dagcbor`/`serde_ipld_dagjson`.
-- **Storage and retrieval**: `hk add` stores into a repo where a routing store sorts blocks by structure, UnixFS nodes as rows and everything else as raw bytes, and `hk cat`/`hk get` read them back out, checked against the original files.
+- **Storage and retrieval**: `hk add` stores into a repo where a routing store sorts blocks by structure: UnixFS nodes as rows, dag-cbor and dag-json as queryable JSONB, file contents left in place with `--nocopy`, and everything else as raw bytes. `hk cat`/`hk get` read them back out, checked against the original files.
 
 Everything lives on one node so far; next are CAR import/export and indexing, see the [roadmap](#roadmap).
 
@@ -131,7 +131,7 @@ This is a more granular take on Perkeep's blob servers, leaning into Rust's trai
 |---|---|
 | `BlockIndex` | Does the store have a block, and enumerate what it has |
 | `BlockSource` | Get a block's bytes |
-| `BlockStore` | Put a block |
+| `BlockStore` | Put a block, optionally saying where its bytes came from |
 | `RefIndex` | Which blocks reference a given block (backreferences) |
 
 …and a zoo of extensions to come. A read-only archive is a `BlockSource` and `BlockIndex` without `BlockStore`; an index rebuilt from other stores is a `RefIndex` with no blocks at all.
@@ -146,16 +146,15 @@ Implemented so far (`src/store/`), all in one SQLite file:
 
 - **`Db`** owns the interned `multihashes` table every store refers to. Foreign keys stop a multihash from being deleted while anything refers to it, so an id is never reused under a reference.
 - **`RoutingStore`** offers each block to its stores in order and indexes which took it (`blocks`), along with every CID prefix the block was put under (`block_cids`). It verifies every block against its CID on the way out, can `reindex` placement from the stores, runs an import as one transaction, and is itself a `Store`, so routers nest.
+- **`OffsetStore`** keeps blocks as (file, offset, length) ranges of files on disk, so `hk add --nocopy` stores a file once, as itself. It admits only raw blocks put with a `Provenance::FileRange`, which the importer attaches to each leaf it reads; without `--nocopy` the CLI drops provenance (`Copying`) and leaves are copied as usual. Each version of a file is recorded with a fingerprint (size, mtime, inode), and a range is served only while its file still matches; a block kept in several files is served from whichever is unchanged, and when none is, reads fail as `Stale` rather than returning the wrong bytes.
 - **`UnixfsStore`** keeps UnixFS nodes as a node row and link rows, admitting only nodes it can manifest exactly: every link named and sized, no mode or mtime, Kubo's field order. A link row is the target's id plus the CID prefix it was written with, and link rows double as a `RefIndex` by multihash. Every node `hk add` makes lands here; of the 17 dag-pb blocks in codec-fixtures, the 2 in Kubo's form do.
+- **`IpldStore`** keeps dag-cbor and dag-json blocks as SQLite JSONB in dag-json form (links `{"/": "<CID>"}`, bytes `{"/": {"bytes": …}}`), so their contents can be queried in place, eg `WHERE data ->> '$.name' = …`. A block is admitted only if what SQLite hands back manifests it exactly, which excludes non-canonical encodings and the data dag-json can't express (a map whose only key is `/` with a string value). Links are also kept as rows by interned multihash, as a `RefIndex`. All 256 dag-cbor and dag-json blocks in codec-fixtures land here, and fuzzing checks that everything dag-json can express round-trips.
 - **`RawStore`** takes anything else as bytes.
 
-Representations carved out in the original prototype:
+Remaining representations from the original prototype:
 
-- **Raw blocks** kept as bytes, either in a database or a sharded directory.
-- **Offset blocks**: a file stored contiguously, its chunks indexed as (file, offset, size). With raw leaves (the `unixfs-v1-2025` default) every leaf of a file *is* a byte range of the original, so the file on disk doubles as its blocks, stored once.
-- **UnixFS rows**: canonical dag-pb UnixFS nodes (no mode/mtime, standard HAMT parameters) as a node row plus link rows. dag-pb's wire format is far too permissive to store anything else this way.
-- **IPLD rows**: dag-cbor/dag-json blocks as structured data (eg JSONB) to make them queryable.
-- **Backreferences**: (source, destination) pairs.
+- **Raw blocks in a sharded directory**, for large blobs that don't belong in a database.
+- **Backreferences** across every store, as (source, destination) pairs: `RefIndex` per store exists, a repo-wide index doesn't yet.
 
 "Small blocks" (inlining small blobs into the database instead of separate files) is probably a placement policy inside a generic store rather than its own kind. SQLite is faster than the filesystem for small blobs, so the policy is worth having, but nothing else needs to know about it.
 
@@ -164,8 +163,8 @@ The original database sketch, still roughly the plan, with `multihashes` now int
 Ideas:
 
 - *Routing store*: a composite which dispatches each put to the most specialized store that admits it, falling back to a generic one, and reads through the `blocks` index to whichever store holds a block. Specialized stores then become an optimization you can add or remove, migrating blocks between representations without changing their identity.
-- *In-place import*: with offset blocks, importing a directory needn't copy it, like Kubo's filestore (`--nocopy`), provided changes to the original are detected (size, mtime, re-hash on read). This edges towards the anchor-mounted host filesystem idea in [open questions](#open-questions).
-- *Offsets are only ever known, never searched for.* An offset store doesn't scan files for blocks; it learns offsets when they're known. On import the importer knows exactly which byte range each leaf came from, which `put(&Block)` can't express, so puts would carry a small closed provenance (`Unknown`, or `FileRange { file, offset }`) that stores are free to ignore. Migration from other stores needs no scanning either: a UnixFS file node's blocksizes give every leaf's offset, so given a path claimed to hold that file, check its size, hash each range, and move the leaves that match.
+- *Offsets are only ever known, never searched for.* The offset store doesn't scan files for blocks; it learns offsets when they're known. On import the importer knows exactly which byte range each leaf came from, which `put(&Block)` can't express, so puts carry a small closed provenance (`Unknown`, or `FileRange { path, offset }`) that other stores ignore. The provenance is trusted, since within one executable the importer has just read those bytes, and the router re-hashes everything it serves regardless. In-place import edges towards the anchor-mounted host filesystem idea in [open questions](#open-questions).
+- *Migrating into the offset store* needs no scanning either: a UnixFS file node's blocksizes give every leaf's offset, so given a path claimed to hold that file, check its size, hash each range, and move the leaves that match. It needs a way to remove blocks from the store they're leaving, which no store has yet. Until then, `hk add --nocopy` of something already copied leaves its blocks where they are.
 - *Shape metadata*: a cached classification of each block (UnixFS file leaf, HAMT shard, claim…) recomputable from its bytes, to find candidates for a new specialized store without parsing everything. IPLD codecs have no magic numbers; the CID's codec is the out-of-band equivalent, and already narrows what each store considers.
 - *Verify on read*: blocks from untrusted stores or peers are re-hashed (`Block::verify`); trusted local stores can skip it.
 
@@ -177,6 +176,7 @@ Design decisions:
 
 - **Hand-rolled codecs**, mainly for canonicity reporting (see [blockstores](#physical-blockstores)), plus control over determinism and digest types. The ecosystem implementations are used only as test oracles (dev-dependencies), so `ipld-core` and `Multihash<usize>` never reach the runtime.
 - **Strict decoding with canonicity.** Invalid input (duplicate keys, NaN, indefinite lengths, malformed CIDs) is an error; valid but non-canonical input (unsorted keys, short floats, padded integers, whitespace) decodes and is reported as non-canonical.
+- **Nesting is limited to 256 levels** (`serde::MAX_DEPTH`). Decoding recurses, so without a limit a kilobyte of nested lists overflows the stack. The limit applies to ignored values too.
 - **Integers are i128** in the data model so dag-cbor's full range, -2^64 to 2^64 - 1, survives.
 - **dag-json** follows the spec where implementations disagree: integral floats keep a `.0`, big integers stay integers, and only `{"/": string}` and `{"/": {"bytes": string}}` under a leading `/` key are reserved; `{"/": null}` is an ordinary map. Floats otherwise print like JavaScript's `Number#toString`, matching the fixtures.
 - **dag-pb** has its own strict codec (`pb.rs`) for its PBNode/PBLink framing, with UnixFS layered on top (`unixfs.rs`). It's not in the data model yet: the plan is for dag-pb to convert to and from `Ipld`, with UnixFS eventually treated as an ADL the way go-unixfsnode does, rather than baking UnixFS into the codec.
@@ -332,6 +332,7 @@ cargo build --release
 hk=target/release/hk
 $hk add <path>                      # store it, printing CIDs like `ipfs add -r`
 $hk add -n <path>                   # only print CIDs, like `ipfs add --only-hash`
+$hk add --nocopy <path>             # keep contents in place, like Kubo's filestore
 $hk cat <cid>                       # a file's contents
 $hk get <cid> -o <path>             # a file, directory or symlink
 $hk block get <cid>                 # a block's bytes

@@ -124,6 +124,15 @@ mod tests {
     use crate::model::Ipld;
 
     #[test]
+    fn limits_nesting() {
+        use crate::serde::MAX_DEPTH;
+        let nested = |depth: usize| format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(from_slice::<Ipld>(nested(MAX_DEPTH).as_bytes()).is_ok());
+        assert!(from_slice::<Ipld>(nested(MAX_DEPTH + 1).as_bytes()).is_err());
+        assert!(from_slice::<Ipld>(nested(100_000).as_bytes()).is_err());
+    }
+
+    #[test]
     fn floats_like_javascript() {
         for (value, expected) in [
             (0.5, "0.5"),

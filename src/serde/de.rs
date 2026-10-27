@@ -33,15 +33,32 @@ macro_rules! deserialize {
     )*}};
 }
 
+/// How deeply lists and maps may nest. Decoding recurses, so without a
+/// limit a small hostile block (a kilobyte of nested lists) overflows the
+/// stack. `serde_json` allows 128; `SQLite`'s JSON allows 1000.
+pub const MAX_DEPTH: usize = 256;
+
 pub struct Deserializer<D> {
     dec: D,
+    depth: usize,
 }
 impl<D> Deserializer<D> {
     pub fn new(dec: D) -> Self {
-        Self { dec }
+        Self { dec, depth: 0 }
     }
 
     pub fn into_inner(self) -> D { self.dec }
+
+    /// Descend into a container, run `f`, and come back out.
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
+        if self.depth >= MAX_DEPTH {
+            return Err(Error::custom(format_args!("nested deeper than {MAX_DEPTH}")));
+        }
+        self.depth = self.depth.saturating_add(1);
+        let result = f(self);
+        self.depth = self.depth.saturating_sub(1);
+        result
+    }
 }
 
 impl<'de, D: Decoder<'de>> de::Deserializer<'de> for &mut Deserializer<D> {
@@ -103,26 +120,28 @@ impl<'de, D: Decoder<'de>> de::Deserializer<'de> for &mut Deserializer<D> {
         }
 
         fn seq(self, v) {
-            let container = D::ListDecoder::begin(&mut self.dec)?;
-            let mut access = Accessor::new(self, container, None);
-            let value = v.visit_seq(&mut access)?;
-            access.finish_seq()?;
-            Ok(value)
+            self.nested(|de| {
+                let container = D::ListDecoder::begin(&mut de.dec)?;
+                let mut access = Accessor::new(de, container, None);
+                let value = v.visit_seq(&mut access)?;
+                access.finish_seq()?;
+                Ok(value)
+            })
         }
 
         fn map(self, v) {
-            let container = D::MapDecoder::begin(&mut self.dec)?;
-            let mut access = Accessor::new(self, container, None);
-            let value = v.visit_map(&mut access)?;
-            access.finish_map()?;
-            Ok(value)
+            self.nested(|de| {
+                let container = D::MapDecoder::begin(&mut de.dec)?;
+                let mut access = Accessor::new(de, container, None);
+                let value = v.visit_map(&mut access)?;
+                access.finish_map()?;
+                Ok(value)
+            })
         }
 
         fn identifier(self, v) { self.deserialize_str(v) }
-        fn ignored_any(self, v) {
-            self.dec.skip()?;
-            v.visit_unit()
-        }
+        // Through `any` rather than `Decoder::skip`, which recurses unchecked
+        fn ignored_any(self, v) { self.deserialize_any(v) }
     }
 
     fn deserialize_unit_struct<V>(self, _name: &'static str, v: V)
@@ -150,17 +169,19 @@ impl<'de, D: Decoder<'de>> de::Deserializer<'de> for &mut Deserializer<D> {
     fn deserialize_tuple<V>(self, len: usize, v: V)
         -> Result<V::Value, Self::Error>
     where V: Visitor<'de> {
-        let dec = D::ListDecoder::begin(&mut self.dec)?;
-        match dec.size_hint() {
-            Some(arr) if arr != len =>
-                Err(Error::invalid_length(arr, &"tuple")),
-            _ => {
-                let mut access = Accessor::new(self, dec, Some(len));
-                let value = v.visit_seq(&mut access)?;
-                access.finish_seq()?;
-                Ok(value)
-            },
-        }
+        self.nested(|de| {
+            let dec = D::ListDecoder::begin(&mut de.dec)?;
+            match dec.size_hint() {
+                Some(arr) if arr != len =>
+                    Err(Error::invalid_length(arr, &"tuple")),
+                _ => {
+                    let mut access = Accessor::new(de, dec, Some(len));
+                    let value = v.visit_seq(&mut access)?;
+                    access.finish_seq()?;
+                    Ok(value)
+                },
+            }
+        })
     }
 
     fn deserialize_tuple_struct<V>(self, _: &'static str, len: usize, v: V)
@@ -187,13 +208,13 @@ impl<'de, D: Decoder<'de>> de::Deserializer<'de> for &mut Deserializer<D> {
         // Unit variants are bare strings, the rest {variant: value}
         match self.dec.peek_kind()? {
             Kind::String => v.visit_enum(EnumAccessor { de: self, map: None }),
-            Kind::Map => {
-                let map = D::MapDecoder::begin(&mut self.dec)?;
+            Kind::Map => self.nested(|de| {
+                let map = D::MapDecoder::begin(&mut de.dec)?;
                 if map.size_hint().is_some_and(|n| n != 1) {
                     return Err(Error::custom("enum must be a map with one entry"));
                 }
-                v.visit_enum(EnumAccessor { de: self, map: Some(map) })
-            },
+                v.visit_enum(EnumAccessor { de, map: Some(map) })
+            }),
             kind => Err(Error::custom(format_args!(
                 "invalid type: {kind:?}, expected enum"
             ))),

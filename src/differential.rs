@@ -294,3 +294,43 @@ proptest! {
         }
     }
 }
+
+//-----------------//
+//-[ IPLD store ]-//
+//-----------------//
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// Whatever dag-json can express, the JSONB store keeps, and gives back
+    /// exactly. Not differential, but the same values make good fodder.
+    #[test]
+    fn ipld_store_round_trips(value in ipld(CBOR)) {
+        use crate::block::Block;
+        use crate::cid::{Cidv1Spec, DAG_CBOR_CODEC, DAG_JSON_CODEC};
+        use crate::multihash::MultihashFunc;
+        use crate::store::{BlockSource, BlockStore, Db, IpldStore, Put};
+
+        thread_local! {
+            static STORE: IpldStore = IpldStore::open(Db::memory().expect("db")).expect("store");
+        }
+        let expressible = dagjson::to_vec(&value).is_ok();
+        for codec in [DAG_CBOR_CODEC, DAG_JSON_CODEC] {
+            let Ok(bytes) = (if codec == DAG_CBOR_CODEC { dagcbor::to_vec(&value) } else { dagjson::to_vec(&value) }) else {
+                continue;
+            };
+            let block = Block::hash(Cidv1Spec::new(codec, MultihashFunc::Sha2_256), bytes.clone().into());
+            let (put, back) = STORE.with(|store| {
+                let put = store.put(&block).expect("put");
+                (put, store.get(block.cid().multihash()).expect("get"))
+            });
+            if expressible {
+                prop_assert_eq!(put, Put::Stored, "{:?}", value);
+                prop_assert_eq!(back, Some(bytes));
+            }
+            else {
+                prop_assert_eq!(put, Put::Declined, "{:?}", value);
+            }
+        }
+    }
+}

@@ -35,7 +35,7 @@ use chunker::ChunkerType;
 use dag::{BalancedLayout, BlockSink, NullSink};
 use import::Importer;
 use model::Link;
-use store::RoutingStore;
+use store::{Copying, RoutingStore};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -69,6 +69,11 @@ enum Command {
         /// Maximum links per file node
         #[arg(long, default_value_t = dag::FILE_WIDTH)]
         max_file_links: usize,
+        /// Keep files' contents where they are rather than copying them
+        /// into the repo, like Kubo's filestore. The blocks are only
+        /// readable while the files are unchanged.
+        #[arg(long, conflicts_with = "only_hash")]
+        nocopy: bool,
     },
     /// Write a file's contents to stdout, like `ipfs cat`
     Cat {
@@ -122,7 +127,7 @@ fn open_repo(repo: Option<PathBuf>) -> anyhow::Result<RoutingStore> {
 
 fn run(args: Args) -> anyhow::Result<()> {
     match args.command {
-        Command::Add { path, only_hash, hidden, quiet, chunker, max_file_links } => {
+        Command::Add { path, only_hash, hidden, quiet, chunker, max_file_links, nocopy } => {
             let Some(ChunkerType::Size(chunk_size)) = ChunkerType::parse(&chunker) else {
                 anyhow::bail!("unsupported chunker {chunker:?}, expected size-[bytes]");
             };
@@ -138,8 +143,11 @@ fn run(args: Args) -> anyhow::Result<()> {
             if only_hash {
                 add(&importer, &path, quiet, &mut NullSink)
             }
-            else {
+            else if nocopy {
                 open_repo(args.repo)?.batch(|repo| add(&importer, &path, quiet, repo))
+            }
+            else {
+                open_repo(args.repo)?.batch(|repo| add(&importer, &path, quiet, &mut Copying(repo)))
             }
         },
         Command::Cat { cid } => {

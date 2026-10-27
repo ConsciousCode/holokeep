@@ -113,4 +113,23 @@ else
 fi
 "$hk" repo stat
 
+## Keep files in place, in a separate repo, and read them back while unchanged
+export HOLOKEEP_REPO="$work/nocopy"
+nocopy="$work/nocopy-out"
+mkdir -p "$nocopy"
+for f in *; do
+    root=$("$hk" add -q -H --nocopy "$f")
+    if "$hk" get "$root" -o "$nocopy/$f" && diff -r --no-dereference "$f" "$nocopy/$f" >/dev/null; then
+        echo "ok   get --nocopy $f"
+    else
+        echo "FAIL get --nocopy $f"
+        fail=1
+    fi
+done
+"$hk" repo stat
+if "$hk" repo stat | grep -q '^raw'; then
+    echo "FAIL --nocopy copied leaves into the repo"
+    fail=1
+fi
+
 exit $fail

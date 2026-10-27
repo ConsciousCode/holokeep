@@ -16,7 +16,7 @@ use crate::chunker::{Chunker, SizeChunker};
 use crate::cid::{Cidv1Spec, RAW_CODEC};
 use crate::dag::{
     self, BalancedLayout, BlockSink, DagLink, DirLayoutBuilder, DirLayoutStrategy,
-    DynamicDirectory, FileLayoutBuilder, FileLayoutStrategy,
+    DynamicDirectory, FileLayoutBuilder, FileLayoutStrategy, Provenance,
 };
 use crate::multihash::MultihashFunc;
 
@@ -56,7 +56,7 @@ impl<F: FileLayoutStrategy, D: DirLayoutStrategy> Importer<F, D> {
     ) -> io::Result<Option<DagLink>> {
         let kind = fs::symlink_metadata(path)?.file_type();
         let link = if kind.is_file() {
-            self.add_file(File::open(path)?, sink)?
+            self.read_file(File::open(path)?, Some(path), sink)?
         }
         else if kind.is_dir() {
             self.add_dir(path, sink, report)?
@@ -73,7 +73,19 @@ impl<F: FileLayoutStrategy, D: DirLayoutStrategy> Importer<F, D> {
     }
 
     /// Import a file's contents.
-    pub fn add_file(&self, mut reader: impl Read, sink: &mut impl BlockSink) -> io::Result<DagLink> {
+    pub fn add_file(&self, reader: impl Read, sink: &mut impl BlockSink) -> io::Result<DagLink> {
+        self.read_file(reader, None, sink)
+    }
+
+    /// Import a file's contents, noting which part of `origin` each leaf
+    /// came from if it's read from one.
+    fn read_file(&self, mut reader: impl Read, origin: Option<&Path>, sink: &mut impl BlockSink) -> io::Result<DagLink> {
+        let mut offset = 0u64;
+        let mut leaf = |chunk: &[u8], sink: &mut _| {
+            let provenance = origin.map_or(Provenance::Unknown, |path| Provenance::FileRange { path, offset });
+            offset = offset.saturating_add(dag::len64(chunk));
+            leaf(chunk, provenance, sink)
+        };
         let mut chunker = SizeChunker::with_size(self.chunk_size);
         let mut layout = self.layout.builder();
         let mut chunks: Vec<Bytes> = Vec::new();
@@ -128,12 +140,12 @@ impl<F: FileLayoutStrategy, D: DirLayoutStrategy> Importer<F, D> {
 }
 
 /// Store a chunk as a raw leaf.
-fn leaf(chunk: &[u8], sink: &mut impl BlockSink) -> io::Result<DagLink> {
+fn leaf(chunk: &[u8], provenance: Provenance<'_>, sink: &mut impl BlockSink) -> io::Result<DagLink> {
     let spec = Cidv1Spec::new(RAW_CODEC, MultihashFunc::Sha2_256);
     let block: Block = Block::hash(spec, chunk.into());
     let size = dag::len64(chunk);
     let cid = block.cid().clone();
-    sink.put(block)?;
+    sink.put_from(block, provenance)?;
     Ok(DagLink { cid, tsize: size, filesize: size })
 }
 

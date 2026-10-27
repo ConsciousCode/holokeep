@@ -17,6 +17,23 @@ pub const HAMT_THRESHOLD: usize = 256 * 1024;
 /// Somewhere to put blocks as the DAG is built.
 pub trait BlockSink {
     fn put(&mut self, block: Block) -> io::Result<()>;
+
+    /// Put a block along with what's known of where its bytes came from.
+    /// Sinks which have no use for it needn't care.
+    fn put_from(&mut self, block: Block, provenance: Provenance<'_>) -> io::Result<()> {
+        let _ = provenance;
+        self.put(block)
+    }
+}
+
+/// Where a block's bytes came from, when that's known. A block's bytes
+/// can't say where else they're found, so this is the only way a store
+/// learns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance<'a> {
+    Unknown,
+    /// The block's bytes are exactly the bytes of this file at `offset`.
+    FileRange { path: &'a std::path::Path, offset: u64 },
 }
 
 /// Discard blocks, for when only the CIDs matter (`ipfs add --only-hash`).

@@ -207,6 +207,26 @@ mod tests {
         multibase::decode(format!("f{s}")).expect("hex").1
     }
 
+    #[test]
+    fn limits_nesting() {
+        use crate::serde::MAX_DEPTH;
+        #[derive(Deserialize)]
+        struct Empty {}
+        let nested = |list: u8, depth: usize| [vec![list; depth], vec![0xf6]].concat();
+        // Lists, and maps keyed by ""
+        for (list, label) in [(0x81, "lists"), (0xa1, "maps")] {
+            let unit = if list == 0x81 { vec![list] } else { vec![list, 0x60] };
+            let block = |depth: usize| [unit.repeat(depth), vec![0xf6]].concat();
+            assert!(from_slice::<Ipld>(&block(MAX_DEPTH)).is_ok(), "{label}");
+            assert!(from_slice::<Ipld>(&block(MAX_DEPTH + 1)).is_err(), "{label}");
+        }
+        // Ignored values are limited too
+        let ignored = [&[0xa1, 0x61, b'x'][..], &nested(0x81, 100_000)].concat();
+        assert!(from_slice::<Empty>(&ignored).is_err());
+        // Far past the limit, where the stack would have overflowed
+        assert!(from_slice::<Ipld>(&nested(0x81, 100_000)).is_err());
+    }
+
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     enum Variant {
         Unit,

@@ -20,19 +20,23 @@
 //! interchange format between them.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::block::Block;
 use crate::cid::{AnyCid, BaseCid, CidRef, CidVersion, Cidv1};
-use crate::dag::BlockSink;
+use crate::dag::{BlockSink, Provenance};
 use crate::multihash::{Inline, Multihash};
 
+mod ipld;
+mod offset;
 mod raw;
 mod unixfs;
 
+pub use ipld::IpldStore;
+pub use offset::OffsetStore;
 pub use raw::RawStore;
 pub use unixfs::UnixfsStore;
 
@@ -55,6 +59,10 @@ pub enum Error {
     /// The index names a store which isn't configured.
     #[error("block is in store {0:?}, which isn't configured")]
     UnknownStore(String),
+
+    /// A block is kept as part of a file which has changed or gone.
+    #[error("block is kept in {}, which has changed since it was added", .0.display())]
+    Stale(PathBuf),
 
     /// A multihash too long to keep; see `MAX_DIGEST_LEN`.
     #[error("multihash digest of {0} bytes is too long to keep")]
@@ -102,6 +110,13 @@ pub trait BlockSource {
 /// Accepts blocks, or declines them.
 pub trait BlockStore {
     fn put(&self, block: &Block) -> Result<Put>;
+
+    /// Put a block along with where its bytes came from, for stores which
+    /// can make use of it.
+    fn put_from(&self, block: &Block, provenance: Provenance<'_>) -> Result<Put> {
+        let _ = provenance;
+        self.put(block)
+    }
 }
 
 /// Knows which blocks link to a block.
@@ -268,11 +283,14 @@ impl RoutingStore {
         Self::standard(db)
     }
 
-    /// The standard stores in one database: UnixFS nodes as rows, and
-    /// everything else as raw bytes.
+    /// The standard stores in one database: ranges of files on disk when
+    /// that's where blocks came from, UnixFS nodes as rows, dag-cbor and
+    /// dag-json as JSONB, and everything else as raw bytes.
     pub fn standard(db: Db) -> Result<Self> {
         let stores: Vec<Box<dyn Store>> = vec![
+            Box::new(OffsetStore::open(db.clone())?),
             Box::new(UnixfsStore::open(db.clone())?),
+            Box::new(IpldStore::open(db.clone())?),
             Box::new(RawStore::open(db.clone())?),
         ];
         Self::new(db, stores)
@@ -345,14 +363,26 @@ impl RoutingStore {
 
     /// Put a block, returning the name of the store it's in.
     pub fn put_block(&self, block: &Block, version: CidVersion) -> Result<String> {
+        self.put_block_from(block, version, Provenance::Unknown)
+    }
+
+    /// Put a block along with where its bytes came from.
+    ///
+    /// A block already present stays where it is, but its store hears of
+    /// the provenance too: an offset store can then keep a block as part
+    /// of several files, and serve it while any of them is unchanged.
+    pub fn put_block_from(&self, block: &Block, version: CidVersion, provenance: Provenance<'_>) -> Result<String> {
         let key = block.cid().multihash();
         let prefix = cid_prefix(block.cid(), version);
         self.db.atomically(|| {
             let store = if let Some(store) = self.store_of(key)? {
+                if provenance != Provenance::Unknown {
+                    self.named(&store)?.put_from(block, provenance)?;
+                }
                 store
             }
             else {
-                let store = self.place(block)?;
+                let store = self.place(block, provenance)?;
                 self.record(self.db.intern(key)?, store)?;
                 store.to_owned()
             };
@@ -372,9 +402,9 @@ impl RoutingStore {
     }
 
     /// Offer a block to each store in turn.
-    fn place(&self, block: &Block) -> Result<&'static str> {
+    fn place(&self, block: &Block, provenance: Provenance<'_>) -> Result<&'static str> {
         for store in &self.stores {
-            if store.put(block)? == Put::Stored {
+            if store.put_from(block, provenance)? == Put::Stored {
                 return Ok(store.name());
             }
         }
@@ -445,7 +475,11 @@ impl BlockSource for RoutingStore {
 /// Routing stores compose: one can be a store within another.
 impl BlockStore for RoutingStore {
     fn put(&self, block: &Block) -> Result<Put> {
-        match self.put_block(block, CidVersion::V1) {
+        self.put_from(block, Provenance::Unknown)
+    }
+
+    fn put_from(&self, block: &Block, provenance: Provenance<'_>) -> Result<Put> {
+        match self.put_block_from(block, CidVersion::V1, provenance) {
             Ok(_) => Ok(Put::Stored),
             Err(Error::Unplaced(_)) => Ok(Put::Declined),
             Err(e) => Err(e),
@@ -456,7 +490,21 @@ impl BlockStore for RoutingStore {
 /// For the importer, which only makes CIDv1.
 impl BlockSink for RoutingStore {
     fn put(&mut self, block: Block) -> io::Result<()> {
-        self.put_block(&block, CidVersion::V1).map(drop).map_err(io::Error::other)
+        BlockSink::put_from(self, block, Provenance::Unknown)
+    }
+
+    fn put_from(&mut self, block: Block, provenance: Provenance<'_>) -> io::Result<()> {
+        self.put_block_from(&block, CidVersion::V1, provenance).map(drop).map_err(io::Error::other)
+    }
+}
+
+/// Puts blocks into a router as copies, forgetting where they came from,
+/// so nothing is kept as part of the original files.
+pub struct Copying<'a>(pub &'a mut RoutingStore);
+
+impl BlockSink for Copying<'_> {
+    fn put(&mut self, block: Block) -> io::Result<()> {
+        BlockSink::put(self.0, block)
     }
 }
 

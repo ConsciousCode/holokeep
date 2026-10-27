@@ -437,10 +437,14 @@ fn every_block_stores_and_retrieves() {
         let back = router.get_block(&AnyCid::V1(cid)).expect(&label).expect(&label);
         assert_eq!(back.data(), f.bytes, "{label}");
     }
-    // Only dag-pb in Kubo's form is UnixFS; the rest is kept as bytes
-    for (codec, store) in placed.keys() {
-        assert!(store == "raw" || codec == "dag-pb", "{codec} in {store}");
-    }
-    assert!(placed.contains_key(&("dag-pb".into(), "raw".into())), "{placed:?}");
-    println!("{placed:?}");
+    // Every fixture is canonical, and dag-pb is UnixFS only in Kubo's form
+    let expected = [
+        (("dag-cbor", "ipld"), 128),
+        (("dag-json", "ipld"), 128),
+        (("dag-pb", "raw"), 15),
+        (("dag-pb", "unixfs"), 2),
+    ];
+    let expected: std::collections::BTreeMap<_, _> =
+        expected.into_iter().map(|((codec, store), n)| ((codec.to_owned(), store.to_owned()), n)).collect();
+    assert_eq!(placed, expected);
 }

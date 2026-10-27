@@ -4,6 +4,7 @@ use crate::dag::{BalancedLayout, DynamicDirectory};
 use crate::hamt::Hamt;
 use crate::import::Importer;
 use crate::multihash::MultihashFunc;
+use crate::dag::Provenance;
 use crate::testutil::Scratch;
 use crate::unixfs;
 
@@ -368,3 +369,187 @@ fn persists() {
     let cid = AnyCid::V1(block.cid().clone());
     assert_eq!(router.get_block(&cid).expect("get"), Some(block));
 }
+
+//------------//
+//-[ Offset ]-//
+//------------//
+
+/// Import with provenance, as `hk add --nocopy` does.
+fn import_in_place(router: &mut RoutingStore, path: &std::path::Path) -> crate::dag::DagLink {
+    let importer = Importer { chunk_size: 64, ..Importer::default() };
+    importer.add_path(path, router, &mut |_, _| {}).expect("import").expect("root")
+}
+
+fn content(len: usize, seed: u8) -> Vec<u8> {
+    (0..len).map(|i| u8::try_from(i % 251).expect("byte") ^ seed).collect()
+}
+
+#[test]
+fn keeps_leaves_in_place() {
+    let scratch = Scratch::new("offset-in-place");
+    let file = scratch.path().join("file");
+    std::fs::write(&file, content(1000, 0)).expect("write");
+    let mut router = router();
+    let root = import_in_place(&mut router, &file);
+
+    // 16 leaves in the file, one node as rows, and no copies
+    let stats = router.stats().expect("stats");
+    assert_eq!(stats, [("offset".to_owned(), 16), ("unixfs".to_owned(), 1)]);
+    assert_eq!(count(&router.db, "raw_blocks"), 0);
+
+    let mut out = Vec::new();
+    crate::export::cat(&router, &AnyCid::V1(root.cid), &mut out).expect("cat");
+    assert_eq!(out, content(1000, 0));
+}
+
+#[test]
+fn changed_files_are_stale() {
+    let scratch = Scratch::new("offset-stale");
+    let file = scratch.path().join("file");
+    std::fs::write(&file, content(200, 0)).expect("write");
+    let mut router = router();
+    let root = import_in_place(&mut router, &file);
+    let cid = AnyCid::V1(root.cid);
+
+    // Same size, different bytes
+    std::fs::write(&file, content(200, 1)).expect("rewrite");
+    let mut out = Vec::new();
+    let err = crate::export::cat(&router, &cid, &mut out).expect_err("stale");
+    assert!(err.to_string().contains("changed since it was added"), "{err}");
+
+    // Importing it again keeps the new leaves, and the old ones stay stale
+    let new = import_in_place(&mut router, &file);
+    let mut out = Vec::new();
+    crate::export::cat(&router, &AnyCid::V1(new.cid), &mut out).expect("cat");
+    assert_eq!(out, content(200, 1));
+    std::fs::remove_file(&file).expect("remove");
+    assert!(crate::export::cat(&router, &cid, &mut Vec::new()).is_err());
+}
+
+#[test]
+fn blocks_are_served_from_any_unchanged_file() {
+    let scratch = Scratch::new("offset-copies");
+    let (a, b) = (scratch.path().join("a"), scratch.path().join("b"));
+    std::fs::write(&a, content(300, 0)).expect("write");
+    std::fs::write(&b, content(300, 0)).expect("write");
+    let mut router = router();
+    let root = import_in_place(&mut router, &a);
+    assert_eq!(import_in_place(&mut router, &b).cid, root.cid);
+    // Five leaves, each kept in both files
+    assert_eq!(count(&router.db, "offset_ranges"), 10);
+
+    std::fs::write(&b, content(300, 9)).expect("change b");
+    let mut out = Vec::new();
+    crate::export::cat(&router, &AnyCid::V1(root.cid.clone()), &mut out).expect("from a");
+    assert_eq!(out, content(300, 0));
+    std::fs::remove_file(&a).expect("remove a");
+    assert!(crate::export::cat(&router, &AnyCid::V1(root.cid), &mut Vec::new()).is_err());
+}
+
+#[test]
+fn offset_store_needs_provenance() {
+    let scratch = Scratch::new("offset-provenance");
+    let file = scratch.path().join("file");
+    std::fs::write(&file, b"hello world").expect("write");
+    let store = OffsetStore::open(Db::memory().expect("db")).expect("store");
+    let hello = raw(b"hello");
+    let at = |offset| Provenance::FileRange { path: &file, offset };
+
+    assert_eq!(store.put(&hello).expect("put"), Put::Declined);
+    assert_eq!(store.put_from(&hello, Provenance::Unknown).expect("put"), Put::Declined);
+    // Past the end of the file
+    assert_eq!(store.put_from(&hello, at(7)).expect("put"), Put::Declined);
+    // Not a raw block
+    assert_eq!(store.put_from(&block(DAG_PB_CODEC, b"hello"), at(0)).expect("put"), Put::Declined);
+
+    assert_eq!(store.put_from(&hello, at(0)).expect("put"), Put::Stored);
+    assert_eq!(store.get(hello.cid().multihash()).expect("get").as_deref(), Some(&b"hello"[..]));
+    // Provenance is trusted, and the router's re-hash is what catches a lie
+    let world = raw(b"world");
+    assert_eq!(store.put_from(&world, at(0)).expect("put"), Put::Stored);
+    assert_eq!(store.get(world.cid().multihash()).expect("get").as_deref(), Some(&b"hello"[..]));
+}
+
+#[test]
+fn copying_forgets_provenance() {
+    let scratch = Scratch::new("offset-copying");
+    let file = scratch.path().join("file");
+    std::fs::write(&file, content(100, 0)).expect("write");
+    let mut router = router();
+    let importer = Importer { chunk_size: 64, ..Importer::default() };
+    importer.add_path(&file, &mut Copying(&mut router), &mut |_, _| {}).expect("import");
+    assert_eq!(router.stats().expect("stats"), [("raw".to_owned(), 2), ("unixfs".to_owned(), 1)]);
+}
+
+//----------//
+//-[ IPLD ]-//
+//----------//
+
+fn ipld_block(codec: u64, value: &crate::model::Ipld) -> Block {
+    let data = match codec {
+        DAG_CBOR_CODEC => crate::dagcbor::to_vec(value).expect("encode"),
+        _ => crate::dagjson::to_vec(value).expect("encode"),
+    };
+    block(codec, &data)
+}
+
+fn sample() -> crate::model::Ipld {
+    use crate::model::Ipld;
+    let link = raw(b"hello");
+    Ipld::Map([
+        ("name".to_owned(), Ipld::String("holokeep".into())),
+        ("size".to_owned(), Ipld::Integer(-(1 << 64))),
+        ("ratio".to_owned(), Ipld::Float(1.0)),
+        ("bytes".to_owned(), Ipld::Bytes(vec![0, 1, 2])),
+        ("target".to_owned(), Ipld::Link(AnyCid::V1(link.cid().clone()))),
+        ("list".to_owned(), Ipld::List(vec![Ipld::Null, Ipld::Bool(true)])),
+    ].into_iter().collect())
+}
+
+#[test]
+fn ipld_as_jsonb() {
+    let router = router();
+    for codec in [DAG_CBOR_CODEC, crate::cid::DAG_JSON_CODEC] {
+        let block = ipld_block(codec, &sample());
+        assert_eq!(router.put_block(&block, CidVersion::V1).expect("put"), "ipld");
+        let cid = AnyCid::V1(block.cid().clone());
+        assert_eq!(router.get_block(&cid).expect("get"), Some(block));
+    }
+    // Queryable in place
+    let names: Vec<String> = router.db.conn()
+        .prepare("SELECT data ->> '$.name' FROM ipld_blocks WHERE data ->> '$.ratio' = 1.0").expect("prepare")
+        .query_map([], |r| r.get(0)).expect("query")
+        .collect::<rusqlite::Result<_>>().expect("rows");
+    assert_eq!(names, ["holokeep", "holokeep"]);
+}
+
+#[test]
+fn ipld_store_declines_what_it_cant_manifest() {
+    use crate::model::Ipld;
+    let store = IpldStore::open(Db::memory().expect("db")).expect("store");
+    // A map dag-json would read back as a link
+    let slash = Ipld::Map(std::iter::once(("/".to_owned(), Ipld::String("bafy".into()))).collect());
+    // Deeper than the decoder allows
+    let deep = [&vec![0x81; crate::serde::MAX_DEPTH + 1][..], b"\xf6"].concat();
+    for (label, block) in [
+        ("slash map", ipld_block(DAG_CBOR_CODEC, &slash)),
+        ("too deep", block(DAG_CBOR_CODEC, &deep)),
+        // A map with its keys out of order
+        ("non-canonical", block(DAG_CBOR_CODEC, b"\xa2\x61b\x01\x61a\x02")),
+        ("not dag-cbor", block(DAG_CBOR_CODEC, b"\xff")),
+        ("dag-json with whitespace", block(crate::cid::DAG_JSON_CODEC, b"{ }")),
+        ("wrong codec", block(RAW_CODEC, &crate::dagcbor::to_vec(&sample()).expect("encode"))),
+    ] {
+        assert_eq!(store.put(&block).expect("put"), Put::Declined, "{label}");
+    }
+    assert!(store.keys().expect("keys").is_empty());
+}
+
+#[test]
+fn ipld_backrefs() {
+    let store = IpldStore::open(Db::memory().expect("db")).expect("store");
+    let block = ipld_block(DAG_CBOR_CODEC, &sample());
+    store.put(&block).expect("put");
+    assert_eq!(store.backrefs(raw(b"hello").cid().multihash()).expect("backrefs"), [Multihash::from(block.cid().clone())]);
+}
+

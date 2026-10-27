@@ -9,7 +9,7 @@ mod ser;
 mod de;
 
 pub use ser::Serializer;
-pub use de::Deserializer;
+pub use de::{Deserializer, MAX_DEPTH};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
