@@ -145,6 +145,12 @@ impl<'de, D: DigestBuf> de::Visitor<'de> for DigestBufVisitor<D> {
         write!(fmt, "a valid CIDv0 in bytes")
     }
 
+    /// IPLD codecs wrap CIDs in a newtype named CID_SERDE_PRIVATE_IDENTIFIER
+    /// whose contents are the binary CID.
+    fn visit_newtype_struct<De: de::Deserializer<'de>>(self, d: De) -> Result<Self::Value, De::Error> {
+        d.deserialize_bytes(self)
+    }
+
     fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
     where E: de::Error
     {

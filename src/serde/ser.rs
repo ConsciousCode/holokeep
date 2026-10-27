@@ -12,6 +12,8 @@ impl<Enc> Serializer<Enc> {
     pub fn new(enc: Enc) -> Serializer<Enc> {
         Serializer { enc }
     }
+
+    pub fn into_inner(self) -> Enc { self.enc }
 }
 
 macro_rules! serialize_primitive {
@@ -51,7 +53,7 @@ impl<'se, Enc: Encoder> ser::Serializer for &'se mut Serializer<Enc> {
 
     serialize_primitive! {
         bool as bool(bool),
-        int as i128(i8, i16, i32, i64, u8, u16, u32, u64),
+        int as i128(i8, i16, i32, i64, i128, u8, u16, u32, u64),
         float as f64(f32, f64),
     }
 
@@ -303,7 +305,7 @@ impl<'a, E, M> ser::Serializer for &'a mut MapKeySerializer<'a, E, M>
     }
 }
 
-struct Collection<'se, E: Encoder, C> {
+pub struct Collection<'se, E: Encoder, C> {
     ser: &'se mut Serializer<E>,
     container: C,
 }
@@ -476,7 +478,7 @@ impl<'se, E, C> SerializeStructVariant for Collection<'se, E, C>
 //-[ Variant serialization ]-//
 //---------------------------//
 
-struct Variant<Inner, Outer> {
+pub struct Variant<Inner, Outer> {
     inner: Inner,
     outer: Outer,
 }

@@ -3,11 +3,16 @@
 
 use std::borrow::Cow;
 
+use crate::canon::Canon;
+
 mod ser;
 mod de;
 
+pub use ser::Serializer;
+pub use de::Deserializer;
+
 #[derive(Debug, thiserror::Error)]
-#[error("serde")]
+#[error("{0}")]
 pub struct Error(String);
 impl serde::ser::Error for Error {
     fn custom<T>(msg: T) -> Self where T: std::fmt::Display {
@@ -151,6 +156,13 @@ pub trait Decoder<'de>: Sized {
     /// Is the format human readable?
     fn is_human_readable() -> bool;
 
+    /// Called after the top-level value, to reject trailing input.
+    fn finish(&mut self) -> Result<(), Error>;
+
+    /// Whether everything decoded so far was in canonical form, ie would
+    /// re-encode to the same bytes.
+    fn is_canon(&self) -> bool;
+
     /// Decode any value without any expected type.
     fn decode_any(&mut self) -> Result<Any<'de>, Error> {
         Ok(match self.peek_kind()? {
@@ -166,28 +178,23 @@ pub trait Decoder<'de>: Sized {
             Kind::Link => Any::Link(self.decode_link()?),
             Kind::List => {
                 let mut dec = Self::ListDecoder::begin(self)?;
-                let mut ls = if let Some(len) = dec.size_hint() {
-                    Vec::with_capacity(len)
-                }
-                else {
-                    Vec::new()
-                };
-                while dec.has_next(self)? {
+                // Counted formats leave it to the size hint to stop
+                let mut remain = dec.size_hint();
+                let mut ls = Vec::with_capacity(remain.unwrap_or(0));
+                while remain != Some(0) && dec.has_next(self)? {
                     ls.push(self.decode_any()?);
+                    remain = remain.map(|r| r - 1);
                 }
                 dec.end(self)?;
                 Any::List(ls)
             },
             Kind::Map => {
                 let mut dec = Self::MapDecoder::begin(self)?;
-                let mut map = if let Some(len) = dec.size_hint() {
-                    Vec::with_capacity(len)
-                }
-                else {
-                    Vec::new()
-                };
-                while let Some(key) = dec.key(self)? {
+                let mut remain = dec.size_hint();
+                let mut map = Vec::with_capacity(remain.unwrap_or(0));
+                while remain != Some(0) && let Some(key) = dec.key(self)? {
                     map.push((key, self.decode_any()?));
+                    remain = remain.map(|r| r - 1);
                 }
                 dec.end(self)?;
                 Any::Map(map)
@@ -217,11 +224,35 @@ pub trait Decoder<'de>: Sized {
     fn decode_link(&mut self) -> Result<Cow<'de, [u8]>, Error>;
 }
 
+/// Deserialize a whole input.
 pub fn deserialize<'de, D, T>(dec: D) -> Result<T, Error>
     where
         D: Decoder<'de>,
         T: serde::Deserialize<'de>,
 {
+    deserialize_canon(dec).map(Canon::into_inner)
+}
+
+/// Deserialize a whole input, noting whether it was canonical.
+pub fn deserialize_canon<'de, D, T>(dec: D) -> Result<Canon<T>, Error>
+    where
+        D: Decoder<'de>,
+        T: serde::Deserialize<'de>,
+{
     let mut de = de::Deserializer::new(dec);
-    serde::Deserialize::deserialize(&mut de)
+    let value = serde::Deserialize::deserialize(&mut de)?;
+    let mut dec = de.into_inner();
+    dec.finish()?;
+    Ok(Canon::new(value, dec.is_canon()))
+}
+
+/// Serialize a value, returning the encoder to collect its output from.
+pub fn serialize<E, T>(enc: E, value: &T) -> Result<E, Error>
+    where
+        E: Encoder,
+        T: ?Sized + serde::Serialize,
+{
+    let mut ser = ser::Serializer::new(enc);
+    value.serialize(&mut ser)?;
+    Ok(ser.into_inner())
 }

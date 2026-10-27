@@ -40,6 +40,8 @@ impl<D> Deserializer<D> {
     pub fn new(dec: D) -> Self {
         Self { dec }
     }
+
+    pub fn into_inner(self) -> D { self.dec }
 }
 
 impl<'de, D: Decoder<'de>> de::Deserializer<'de> for &mut Deserializer<D> {
@@ -102,12 +104,18 @@ impl<'de, D: Decoder<'de>> de::Deserializer<'de> for &mut Deserializer<D> {
 
         fn seq(self, v) {
             let container = D::ListDecoder::begin(&mut self.dec)?;
-            v.visit_seq(Accessor::new(self, container, None))
+            let mut access = Accessor::new(self, container, None);
+            let value = v.visit_seq(&mut access)?;
+            access.finish_seq()?;
+            Ok(value)
         }
 
         fn map(self, v) {
             let container = D::MapDecoder::begin(&mut self.dec)?;
-            v.visit_map(Accessor::new(self, container, None))
+            let mut access = Accessor::new(self, container, None);
+            let value = v.visit_map(&mut access)?;
+            access.finish_map()?;
+            Ok(value)
         }
 
         fn identifier(self, v) { self.deserialize_str(v) }
@@ -146,7 +154,12 @@ impl<'de, D: Decoder<'de>> de::Deserializer<'de> for &mut Deserializer<D> {
         match dec.size_hint() {
             Some(arr) if arr != len =>
                 Err(Error::invalid_length(arr, &"tuple")),
-            _ => v.visit_seq(Accessor::new(self, dec, Some(len))),
+            _ => {
+                let mut access = Accessor::new(self, dec, Some(len));
+                let value = v.visit_seq(&mut access)?;
+                access.finish_seq()?;
+                Ok(value)
+            },
         }
     }
 
@@ -171,7 +184,20 @@ impl<'de, D: Decoder<'de>> de::Deserializer<'de> for &mut Deserializer<D> {
         _: &'static [&'static str],
         v: V
     ) -> Result<V::Value, Self::Error> {
-        v.visit_enum(EnumAccessor::new(self))
+        // Unit variants are bare strings, the rest {variant: value}
+        match self.dec.peek_kind()? {
+            Kind::String => v.visit_enum(EnumAccessor { de: self, map: None }),
+            Kind::Map => {
+                let map = D::MapDecoder::begin(&mut self.dec)?;
+                if map.size_hint().is_some_and(|n| n != 1) {
+                    return Err(Error::custom("enum must be a map with one entry"));
+                }
+                v.visit_enum(EnumAccessor { de: self, map: Some(map) })
+            },
+            kind => Err(Error::custom(format_args!(
+                "invalid type: {kind:?}, expected enum"
+            ))),
+        }
     }
 
     fn is_human_readable(&self) -> bool { D::is_human_readable() }
@@ -195,34 +221,20 @@ impl<'de, 'a, D: Decoder<'de>> de::Deserializer<'de> for CidDeserializer<'a, D>
         self.deserialize_bytes(v)
     }
 
+    /// The binary CID of the link.
     fn deserialize_bytes<V: de::Visitor<'de>>(self, v: V)
         -> Result<V::Value, Self::Error>
     {
-        match self.de.dec.decode_bytes()? {
+        match self.de.dec.decode_link()? {
             Cow::Borrowed(bs) => v.visit_borrowed_bytes(bs),
             Cow::Owned(bs) => v.visit_byte_buf(bs)
         }
     }
 
-    fn deserialize_newtype_struct<V>(self, name: &'static str, v: V)
-        -> Result<V::Value, Self::Error>
-    where V: de::Visitor<'de> {
-        match name {
-            CID_SERDE_PRIVATE_IDENTIFIER => match self.de.dec.decode_link()? {
-                Cow::Borrowed(bs) => v.visit_borrowed_bytes(bs),
-                Cow::Owned(bs) => v.visit_byte_buf(bs),
-            },
-            _ => Err(Error::custom([
-                "This deserializer must not be called on newtype structs other than one named `",
-                CID_SERDE_PRIVATE_IDENTIFIER,
-                "`"
-            ].concat()))
-        }
-    }
-
     serde::forward_to_deserialize_any! {
-        bool byte_buf char enum f32 f64 i8 i16 i32 i64 identifier ignored_any map option seq str
-        string struct tuple tuple_struct u8 u16 u32 u64 unit unit_struct
+        bool byte_buf char enum f32 f64 i8 i16 i32 i64 i128 u128 identifier ignored_any
+        map newtype_struct option seq str string struct tuple tuple_struct u8 u16 u32 u64
+        unit unit_struct
     }
 }
 
@@ -230,6 +242,7 @@ struct Accessor<'a, D, C> {
     de: &'a mut Deserializer<D>,
     container: C,
     remain: Option<usize>,
+    ended: bool,
 }
 impl<'de, 'a, D, C> Accessor<'a, D, C>
     where
@@ -240,9 +253,47 @@ impl<'de, 'a, D, C> Accessor<'a, D, C>
         -> Self
     {
         let remain = container.size_hint().or(size);
-        Self { de, container, remain }
+        Self { de, container, remain, ended: false }
+    }
+
+    /// Count off an entry, returning whether there could be one.
+    fn take(&mut self) -> bool {
+        match self.remain.as_mut() {
+            Some(0) => false,
+            Some(r) => {
+                *r -= 1;
+                true
+            },
+            None => true,
+        }
     }
 }
+
+impl<'de, 'a, D, C> Accessor<'a, D, C>
+    where
+        D: Decoder<'de>,
+        C: ListDecoder<'de, D>,
+{
+    fn end_seq(&mut self) -> Result<(), Error> {
+        self.ended = true;
+        self.container.end(&mut self.de.dec)
+    }
+
+    /// Make sure the list is fully consumed after the visitor is done,
+    /// which it might not be if the visitor only wanted so many elements.
+    fn finish_seq(mut self) -> Result<(), Error> {
+        if self.ended {
+            Ok(())
+        }
+        else if self.remain.unwrap_or(0) == 0 && (self.remain.is_some() || !self.container.has_next(&mut self.de.dec)?) {
+            self.end_seq()
+        }
+        else {
+            Err(Error::custom("trailing list elements"))
+        }
+    }
+}
+
 impl<'de, 'a, D, C> SeqAccess<'de> for Accessor<'a, D, C>
     where
         D: Decoder<'de>,
@@ -253,27 +304,47 @@ impl<'de, 'a, D, C> SeqAccess<'de> for Accessor<'a, D, C>
     fn next_element_seed<T: de::DeserializeSeed<'de>>(&mut self, seed: T)
         -> Result<Option<T::Value>, Self::Error>
     {
-        if let Some(r) = self.remain.as_mut() {
-            if let Some(s) = r.checked_sub(1) {
-                *r = s;
-            }
-            else {
-                return Ok(None)
-            }
+        if self.ended {
+            return Ok(None);
         }
-        Ok(if self.container.has_next(&mut self.de.dec)? {
-            Some(seed.deserialize(&mut *self.de)?)
+        if self.take() && self.container.has_next(&mut self.de.dec)? {
+            Ok(Some(seed.deserialize(&mut *self.de)?))
         }
         else {
-            self.container.end(&mut self.de.dec);
-            None
-        })
+            self.end_seq()?;
+            Ok(None)
+        }
     }
 
     fn size_hint(&self) -> Option<usize> {
         self.remain
     }
 }
+
+impl<'de, 'a, D, C> Accessor<'a, D, C>
+    where
+        D: Decoder<'de>,
+        C: MapDecoder<'de, D>,
+{
+    fn end_map(&mut self) -> Result<(), Error> {
+        self.ended = true;
+        self.container.end(&mut self.de.dec)
+    }
+
+    /// Make sure the map is fully consumed after the visitor is done.
+    fn finish_map(mut self) -> Result<(), Error> {
+        if self.ended {
+            Ok(())
+        }
+        else if self.remain.unwrap_or(0) == 0 && (self.remain.is_some() || self.container.key(&mut self.de.dec)?.is_none()) {
+            self.end_map()
+        }
+        else {
+            Err(Error::custom("trailing map entries"))
+        }
+    }
+}
+
 impl<'a, 'de, D, C> MapAccess<'de> for Accessor<'a, D, C>
     where
         D: Decoder<'de>,
@@ -284,16 +355,17 @@ impl<'a, 'de, D, C> MapAccess<'de> for Accessor<'a, D, C>
     fn next_key_seed<K: de::DeserializeSeed<'de>>(&mut self, seed: K)
         -> Result<Option<K::Value>, Self::Error>
     {
-        if let Some(r) = self.remain.as_mut() {
-            match r.checked_sub(1) {
-                Some(s) => *r = s,
-                None => return Ok(None),
-            }
+        if self.ended {
+            return Ok(None);
         }
-        Ok(match self.container.key(&mut self.de.dec)? {
-            Some(key) => Some(seed.deserialize(CowStrDeserializer::new(key))?),
-            None => { self.container.end(&mut self.de.dec); None }
-        })
+        let key = if self.take() { self.container.key(&mut self.de.dec)? } else { None };
+        match key {
+            Some(key) => Ok(Some(seed.deserialize(CowStrDeserializer::new(key))?)),
+            None => {
+                self.end_map()?;
+                Ok(None)
+            },
+        }
     }
 
     fn next_value_seed<V: de::DeserializeSeed<'de>>(&mut self, seed: V)
@@ -306,46 +378,74 @@ impl<'a, 'de, D, C> MapAccess<'de> for Accessor<'a, D, C>
     fn size_hint(&self) -> Option<usize> { self.remain }
 }
 
-struct EnumAccessor<'a, R> {
-    de: &'a mut Deserializer<R>,
+/// Unit variants are a bare string, everything else a single-entry map
+/// `{variant: value}` (`map`, already entered).
+struct EnumAccessor<'a, D, M> {
+    de: &'a mut Deserializer<D>,
+    map: Option<M>,
 }
-impl<'a, R> EnumAccessor<'a, R> {
-    fn new(de: &'a mut Deserializer<R>) -> Self {
-        Self { de }
+
+impl<'de, 'a, D: Decoder<'de>> EnumAccessor<'a, D, D::MapDecoder> {
+    /// Deserialize the variant's value, then close the map around it.
+    fn value<T>(self, f: impl FnOnce(&mut Deserializer<D>) -> Result<T, Error>) -> Result<T, Error> {
+        let Some(mut map) = self.map else {
+            return Err(Error::custom("expected {variant: value}, got a unit variant"));
+        };
+        let value = f(&mut *self.de)?;
+        if map.size_hint().is_none() && map.key(&mut self.de.dec)?.is_some() {
+            return Err(Error::custom("enum must be a map with one entry"));
+        }
+        map.end(&mut self.de.dec)?;
+        Ok(value)
     }
 }
 
-impl<'de, 'a, D: Decoder<'de>> EnumAccess<'de> for EnumAccessor<'a, D> {
+impl<'de, 'a, D: Decoder<'de>> EnumAccess<'de> for EnumAccessor<'a, D, D::MapDecoder> {
     type Error = Error;
-    type Variant = EnumAccessor<'a, D>;
+    type Variant = Self;
 
-    fn variant_seed<V: de::DeserializeSeed<'de>>(self, seed: V)
+    fn variant_seed<V: de::DeserializeSeed<'de>>(mut self, seed: V)
         -> Result<(V::Value, Self::Variant), Self::Error>
     {
-        Ok((seed.deserialize(&mut *self.de)?, self))
+        let variant = match self.map.as_mut() {
+            Some(map) => {
+                let key = map.key(&mut self.de.dec)?
+                    .ok_or_else(|| Error::custom("enum must be a map with one entry"))?;
+                seed.deserialize(CowStrDeserializer::new(key))?
+            },
+            None => seed.deserialize(&mut *self.de)?,
+        };
+        Ok((variant, self))
     }
 }
 
-impl<'de, 'a, D: Decoder<'de>> VariantAccess<'de> for EnumAccessor<'a, D> {
+impl<'de, 'a, D: Decoder<'de>> VariantAccess<'de> for EnumAccessor<'a, D, D::MapDecoder> {
     type Error = Error;
 
-    fn unit_variant(self) -> Result<(), Self::Error> { Ok(()) }
+    fn unit_variant(self) -> Result<(), Self::Error> {
+        if self.map.is_some() {
+            self.value(|de| de.dec.decode_null())
+        }
+        else {
+            Ok(())
+        }
+    }
 
     fn newtype_variant_seed<T: de::DeserializeSeed<'de>>(self, seed: T)
         -> Result<T::Value, Self::Error>
     {
-        seed.deserialize(&mut *self.de)
+        self.value(|de| seed.deserialize(de))
     }
 
     fn tuple_variant<V: Visitor<'de>>(self, len: usize, v: V)
         -> Result<V::Value, Self::Error>
     {
-        self.de.deserialize_tuple(len, v)
+        self.value(|de| de.deserialize_tuple(len, v))
     }
 
     fn struct_variant<V>(self, _: &'static [&'static str], v: V)
         -> Result<V::Value, Self::Error>
     where V: Visitor<'de> {
-        self.de.deserialize_map(v)
+        self.value(|de| de.deserialize_map(v))
     }
 }

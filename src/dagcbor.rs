@@ -41,10 +41,33 @@
 
 use num_enum::IntoPrimitive;
 
+use crate::canon::Canon;
+use crate::serde::{self as harness, Error};
+
 mod ser;
 mod de;
 
+pub use de::Deserializer;
+pub use ser::Serializer;
+
 pub const CID_TAG: u8 = 42;
+
+/// Encode a value as DAG-CBOR.
+pub fn to_vec<T: ?Sized + serde::Serialize>(value: &T) -> Result<Vec<u8>, Error> {
+    Ok(harness::serialize(Serializer::new(), value)?.into_bytes())
+}
+
+/// Decode a whole DAG-CBOR block.
+pub fn from_slice<'de, T: serde::Deserialize<'de>>(input: &'de [u8]) -> Result<T, Error> {
+    harness::deserialize(Deserializer::new(input))
+}
+
+/// Decode a whole DAG-CBOR block, noting whether it was canonical. Strict
+/// errors are still errors, this only covers forms which decode to the
+/// same data but wouldn't re-encode to the same bytes.
+pub fn from_slice_canon<'de, T: serde::Deserialize<'de>>(input: &'de [u8]) -> Result<Canon<T>, Error> {
+    harness::deserialize_canon(Deserializer::new(input))
+}
 
 #[derive(Copy, Clone)]
 enum Size {
@@ -171,3 +194,155 @@ pub mod marker {
 
 /// Get the additional information field.
 const fn ai_field(byte: u8) -> u8 { byte & marker::START }
+#[cfg(test)]
+mod tests {
+    use serde::{Deserialize, Serialize};
+    use serde_bytes::ByteBuf;
+
+    use super::*;
+    use crate::cid::{CidRef, Cidv0, Cidv1, Cidv1Spec};
+    use crate::model::Ipld;
+
+    fn hex(s: &str) -> Vec<u8> {
+        multibase::decode(format!("f{s}")).expect("hex").1
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    enum Variant {
+        Unit,
+        Newtype(u8),
+        Tuple(u8, bool),
+        Struct { x: i8 },
+    }
+
+    /// Fields deliberately declared out of DAG-CBOR order.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Thing {
+        zzz: u32,
+        a: String,
+        link: Cidv1,
+        v0: Cidv0,
+        bytes: ByteBuf,
+        none: Option<i8>,
+        some: Option<i8>,
+        list: Vec<i64>,
+        variants: Vec<Variant>,
+        big: i128,
+    }
+
+    fn thing() -> Thing {
+        Thing {
+            zzz: 70000,
+            a: "hello".into(),
+            link: Cidv1Spec::default().hash(b"hello world"),
+            v0: "QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn".parse().expect("v0"),
+            bytes: ByteBuf::from(vec![1, 2, 3]),
+            none: None,
+            some: Some(-5),
+            list: vec![i64::MIN, -1, 0, 23, 24, 255, 256, i64::MAX],
+            variants: vec![Variant::Unit, Variant::Newtype(1), Variant::Tuple(2, true), Variant::Struct { x: -3 }],
+            big: -(1 << 64),
+        }
+    }
+
+    #[test]
+    fn typed_round_trip() {
+        let bytes = to_vec(&thing()).expect("encode");
+        let decoded = from_slice_canon::<Thing>(&bytes).expect("decode");
+        assert!(decoded.is_canon());
+        assert_eq!(decoded.into_inner(), thing());
+
+        // Through the data model too, and back to the same bytes
+        let ipld: Ipld = from_slice(&bytes).expect("as ipld");
+        assert_eq!(to_vec(&ipld).expect("re-encode"), bytes);
+    }
+
+    #[test]
+    fn struct_keys_sorted_length_first() {
+        #[derive(Serialize)]
+        struct S { bb: u8, a: u8 }
+        assert_eq!(to_vec(&S { bb: 1, a: 2 }).expect("encode"), hex("a261610262626201"));
+    }
+
+    #[test]
+    fn encodings() {
+        let cases: [(Ipld, &str); 9] = [
+            (Ipld::Null, "f6"),
+            (Ipld::Bool(true), "f5"),
+            (Ipld::Integer(24), "1818"),
+            (Ipld::Integer(-1), "20"),
+            (Ipld::Integer(u64::MAX.into()), "1bffffffffffffffff"),
+            (Ipld::Integer(-(1 << 64)), "3bffffffffffffffff"),
+            // Floats are always 64 bit
+            (Ipld::Float(1.5), "fb3ff8000000000000"),
+            (Ipld::Bytes(vec![0xa1]), "41a1"),
+            (Ipld::String("a".into()), "6161"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(to_vec(&value).expect("encode"), hex(expected), "{value:?}");
+            assert_eq!(from_slice::<Ipld>(&hex(expected)).expect("decode"), value);
+        }
+
+        // Tag 42, bytes with a 0x00 prefix, then the binary CID
+        let link: Cidv1 = Cidv1Spec::default().hash(b"hello world");
+        let bytes = to_vec(&link).expect("encode");
+        assert_eq!(bytes[..4], [0xd8, 0x2a, 0x58, 0x25]);
+        assert_eq!(bytes[4], 0x00);
+        assert_eq!(bytes[5..], link.to_bytes());
+        assert_eq!(from_slice::<Cidv1>(&bytes).expect("decode"), link);
+    }
+
+    #[test]
+    fn noncanonical_forms_decode() {
+        for (label, input, value) in [
+            ("f32", "fa3fc00000", Ipld::Float(1.5)),
+            ("f16", "f93e00", Ipld::Float(1.5)),
+            ("long int", "1801", Ipld::Integer(1)),
+            ("long length", "780161", Ipld::String("a".into())),
+            ("unsorted keys", "a262626201616102", from_slice::<Ipld>(&hex("a261610262626201")).expect("map")),
+        ] {
+            let decoded = from_slice_canon::<Ipld>(&hex(&input)).expect(label);
+            assert!(!decoded.is_canon(), "{label} should be non-canonical");
+            assert_eq!(decoded.into_inner(), value, "{label}");
+        }
+    }
+
+    #[test]
+    fn strict_errors() {
+        for (label, input) in [
+            ("empty", ""),
+            ("trailing bytes", "0101"),
+            ("truncated string", "6261"),
+            ("undefined", "f7"),
+            ("indefinite list", "9fff"),
+            ("indefinite string", "7f6161ff"),
+            ("non-CID tag", "c101"),
+            ("NaN", "fb7ff8000000000000"),
+            ("infinity", "f97c00"),
+            ("CID without 0x00 prefix", "d82a4101"),
+            ("non-string key", "a10102"),
+            ("duplicate key", "a2616101616102"),
+            ("invalid utf-8", "61ff"),
+        ] {
+            assert!(from_slice::<Ipld>(&hex(input)).is_err(), "{label} should fail");
+        }
+        assert!(to_vec(&f64::NAN).is_err());
+        assert!(to_vec(&f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn typed_errors() {
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code, reason = "only deserialized")]
+        struct Pair(u8, u8);
+        // Too many and too few tuple elements
+        assert!(from_slice::<Pair>(&hex("83010203")).is_err());
+        assert!(from_slice::<Pair>(&hex("8101")).is_err());
+        // Out of range
+        assert!(from_slice::<u8>(&hex("190100")).is_err());
+        // An enum map must have exactly one entry
+        assert!(from_slice::<Variant>(&hex("a0")).is_err());
+        // A link where a CID isn't
+        assert!(from_slice::<Cidv1>(&hex("4100")).is_err());
+    }
+}

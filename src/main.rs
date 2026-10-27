@@ -12,14 +12,15 @@ mod unixfs;
 mod dag;
 mod hamt;
 mod import;
+mod model;
 #[cfg(test)]
 mod codec_fixtures;
 // Generic IPLD/serde layer, not needed by the importer yet
 //mod dagpb;
-//mod canon;
+mod canon;
 //mod ipld;
-//mod dagcbor;
-//mod serde;
+mod dagcbor;
+mod serde;
 
 use chunker::ChunkerType;
 use dag::{BalancedLayout, NullSink};

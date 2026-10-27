@@ -13,6 +13,8 @@ use multibase::Base;
 use serde_json::{Map, Value};
 
 use crate::block::Block;
+use crate::dagcbor;
+use crate::model::Ipld;
 use crate::cid::{AnyCid, BaseCid, Cid, CidRef, Cidv1, Cidv1Spec, DAG_CBOR_CODEC, DAG_JSON_CODEC, DAG_PB_CODEC};
 use crate::multihash::{Inline, MultihashFunc};
 use crate::pb::{PbLink, PbNode};
@@ -286,5 +288,53 @@ fn dagpb_encode_negative() {
                 assert_eq!(got, reason, "{}", case_name(case));
             }
         }
+    }
+}
+
+//--------------//
+//-[ dag-cbor ]-//
+//--------------//
+
+#[test]
+fn dagcbor_round_trip() {
+    let fixtures = fixtures();
+    let cbor: Vec<&Fixture> = fixtures.iter().filter(|f| f.codec == "dag-cbor").collect();
+    assert!(cbor.len() >= 128, "only found {} dag-cbor fixtures", cbor.len());
+
+    let mut failures = Vec::new();
+    for f in cbor {
+        let label = f.label();
+        let decoded = match dagcbor::from_slice_canon::<Ipld>(&f.bytes) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                failures.push(format!("{label}: decode: {e}"));
+                continue;
+            },
+        };
+        if !decoded.is_canon() {
+            failures.push(format!("{label}: decoded as non-canonical"));
+        }
+        match dagcbor::to_vec(decoded.inner()) {
+            Ok(bytes) if bytes == f.bytes => (),
+            Ok(_) => failures.push(format!("{label}: re-encodes differently")),
+            Err(e) => failures.push(format!("{label}: encode: {e}")),
+        }
+    }
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}
+
+#[test]
+fn dagcbor_decode_negative() {
+    let cases = negative("dag-cbor/decode/duplicate-keys.json");
+    assert!(!cases.is_empty());
+    for case in &cases {
+        let hex = case["hex"].as_str().expect("hex");
+        let (_, bytes) = multibase::decode(format!("f{hex}")).expect("hex");
+        assert!(
+            dagcbor::from_slice::<Ipld>(&bytes).is_err(),
+            "{} should fail: {}",
+            case_name(case),
+            case["error"]
+        );
     }
 }
