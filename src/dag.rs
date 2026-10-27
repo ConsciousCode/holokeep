@@ -24,6 +24,31 @@ pub trait BlockSink {
         let _ = provenance;
         self.put(block)
     }
+
+    /// Where the importer should read a file from, and so where its leaves'
+    /// provenance will point. By default, the file itself.
+    fn source(&mut self, path: &std::path::Path) -> io::Result<Source> {
+        let _ = path;
+        Ok(Source::InPlace)
+    }
+
+    /// A file read from a copy the sink kept (`Source::Kept`) was imported
+    /// as `root`.
+    fn kept(&mut self, copy: &std::path::Path, root: &DagLink) -> io::Result<()> {
+        let _ = (copy, root);
+        Ok(())
+    }
+}
+
+/// Where a file being imported is read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// The file itself, with its leaves' provenance pointing into it.
+    InPlace,
+    /// The file itself, but its leaves are copies with no provenance.
+    Copy,
+    /// A copy the sink made, with provenance pointing into the copy.
+    Kept(std::path::PathBuf),
 }
 
 /// Where a block's bytes came from, when that's known. A block's bytes

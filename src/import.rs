@@ -16,7 +16,7 @@ use crate::chunker::{Chunker, SizeChunker};
 use crate::cid::{Cidv1Spec, RAW_CODEC};
 use crate::dag::{
     self, BalancedLayout, BlockSink, DagLink, DirLayoutBuilder, DirLayoutStrategy,
-    DynamicDirectory, FileLayoutBuilder, FileLayoutStrategy, Provenance,
+    DynamicDirectory, FileLayoutBuilder, FileLayoutStrategy, Provenance, Source,
 };
 use crate::multihash::MultihashFunc;
 
@@ -56,7 +56,7 @@ impl<F: FileLayoutStrategy, D: DirLayoutStrategy> Importer<F, D> {
     ) -> io::Result<Option<DagLink>> {
         let kind = fs::symlink_metadata(path)?.file_type();
         let link = if kind.is_file() {
-            self.read_file(File::open(path)?, Some(path), sink)?
+            self.import_file(path, sink)?
         }
         else if kind.is_dir() {
             self.add_dir(path, sink, report)?
@@ -75,6 +75,19 @@ impl<F: FileLayoutStrategy, D: DirLayoutStrategy> Importer<F, D> {
     /// Import a file's contents.
     pub fn add_file(&self, reader: impl Read, sink: &mut impl BlockSink) -> io::Result<DagLink> {
         self.read_file(reader, None, sink)
+    }
+
+    /// Import a file from wherever the sink wants it read.
+    fn import_file(&self, path: &Path, sink: &mut impl BlockSink) -> io::Result<DagLink> {
+        match sink.source(path)? {
+            Source::InPlace => self.read_file(File::open(path)?, Some(path), sink),
+            Source::Copy => self.read_file(File::open(path)?, None, sink),
+            Source::Kept(copy) => {
+                let root = self.read_file(File::open(&copy)?, Some(&copy), sink)?;
+                sink.kept(&copy, &root)?;
+                Ok(root)
+            },
+        }
     }
 
     /// Import a file's contents, noting which part of `origin` each leaf

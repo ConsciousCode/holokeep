@@ -29,7 +29,7 @@ Holokeep is early. What exists is the content-addressing core, each piece checke
 - **Import**: `hk add` turns files and directories into UnixFSv1 with CIDs identical to Kubo's `ipfs add` under the `unixfs-v1-2025` profile, including chunked files, nested directories, symlinks and HAMT-sharded directories.
 - **CIDs and multihashes**: v0 and v1; SHA-1, SHA-2, SHA-3, BLAKE2b-256 and murmur3 (no identity hash yet).
 - **Codecs**: dag-pb, dag-cbor and dag-json, strict and canonical, passing all of [ipld/codec-fixtures](https://github.com/ipld/codec-fixtures) and differential fuzzing against `serde_ipld_dagcbor`/`serde_ipld_dagjson`.
-- **Storage and retrieval**: `hk add` stores into a repo where a routing store sorts blocks by structure: UnixFS nodes as rows, dag-cbor and dag-json as queryable JSONB, file contents left in place with `--nocopy`, and everything else as raw bytes. `hk cat`/`hk get` read them back out, checked against the original files.
+- **Storage and retrieval**: `hk add` stores into a repo where a routing store sorts blocks by structure: UnixFS nodes as rows, dag-cbor and dag-json as queryable JSONB, large files kept whole in a sharded directory (or left in place with `--nocopy`) with their leaves as ranges of them, and everything else as raw bytes. `hk cat`/`hk get` read them back out, checked against the original files.
 
 Everything lives on one node so far; next are CAR import/export and indexing, see the [roadmap](#roadmap).
 
@@ -146,14 +146,14 @@ Implemented so far (`src/store/`), all in one SQLite file:
 
 - **`Db`** owns the interned `multihashes` table every store refers to. Foreign keys stop a multihash from being deleted while anything refers to it, so an id is never reused under a reference.
 - **`RoutingStore`** offers each block to its stores in order and indexes which took it (`blocks`), along with every CID prefix the block was put under (`block_cids`). It verifies every block against its CID on the way out, can `reindex` placement from the stores, runs an import as one transaction, and is itself a `Store`, so routers nest.
-- **`OffsetStore`** keeps blocks as (file, offset, length) ranges of files on disk, so `hk add --nocopy` stores a file once, as itself. It admits only raw blocks put with a `Provenance::FileRange`, which the importer attaches to each leaf it reads; without `--nocopy` the CLI drops provenance (`Copying`) and leaves are copied as usual. Each version of a file is recorded with a fingerprint (size, mtime, inode), and a range is served only while its file still matches; a block kept in several files is served from whichever is unchanged, and when none is, reads fail as `Stale` rather than returning the wrong bytes.
+- **`OffsetStore`** keeps blocks as (source, offset, length) ranges of files on disk, so a file's contents are stored once, as itself. It admits only raw blocks put with a `Provenance::FileRange`, which the importer attaches to each leaf it reads. A source is either an external file, imported in place with `hk add --nocopy`, or a file the repo keeps in its shards. External files are the user's and may change: each version is recorded with a fingerprint (size, mtime, inode), a range is served only while its file still matches, and when none does, reads fail as `Stale` rather than returning the wrong bytes. A block kept in several sources is served from a kept file first, then whichever external file is unchanged.
+- **`Shards`** is a sharded directory of whole files, kept immutably outside the database. Plain `hk add` (`Copying`) asks the sink where to read each file from (`BlockSink::source`): files over 1 MiB are copied in, hashed on the way, and imported from the copy, so their leaves become ranges of it; smaller files are at most one default-sized leaf and are copied block by block. A kept file is named by its multihash and sharded on its digest's first byte (`ab/1220ab…`), so `sha256sum` checks the directory without the database; it's written to `tmp/`, synced, made read-only and renamed into place, and identical files are kept once. `shard_roots` records which UnixFS roots each was imported as, and a kept file none of whose leaves landed in it (they were already stored elsewhere) is let go.
 - **`UnixfsStore`** keeps UnixFS nodes as a node row and link rows, admitting only nodes it can manifest exactly: every link named and sized, no mode or mtime, Kubo's field order. A link row is the target's id plus the CID prefix it was written with, and link rows double as a `RefIndex` by multihash. Every node `hk add` makes lands here; of the 17 dag-pb blocks in codec-fixtures, the 2 in Kubo's form do.
 - **`IpldStore`** keeps dag-cbor and dag-json blocks as SQLite JSONB in dag-json form (links `{"/": "<CID>"}`, bytes `{"/": {"bytes": …}}`), so their contents can be queried in place, eg `WHERE data ->> '$.name' = …`. A block is admitted only if what SQLite hands back manifests it exactly, which excludes non-canonical encodings and the data dag-json can't express (a map whose only key is `/` with a string value). Links are also kept as rows by interned multihash, as a `RefIndex`. All 256 dag-cbor and dag-json blocks in codec-fixtures land here, and fuzzing checks that everything dag-json can express round-trips.
 - **`RawStore`** takes anything else as bytes.
 
 Remaining representations from the original prototype:
 
-- **Raw blocks in a sharded directory**, for large blobs that don't belong in a database.
 - **Backreferences** across every store, as (source, destination) pairs: `RefIndex` per store exists, a repo-wide index doesn't yet.
 
 "Small blocks" (inlining small blobs into the database instead of separate files) is probably a placement policy inside a generic store rather than its own kind. SQLite is faster than the filesystem for small blobs, so the policy is worth having, but nothing else needs to know about it.
@@ -165,6 +165,8 @@ Ideas:
 - *Routing store*: a composite which dispatches each put to the most specialized store that admits it, falling back to a generic one, and reads through the `blocks` index to whichever store holds a block. Specialized stores then become an optimization you can add or remove, migrating blocks between representations without changing their identity.
 - *Offsets are only ever known, never searched for.* The offset store doesn't scan files for blocks; it learns offsets when they're known. On import the importer knows exactly which byte range each leaf came from, which `put(&Block)` can't express, so puts carry a small closed provenance (`Unknown`, or `FileRange { path, offset }`) that other stores ignore. The provenance is trusted, since within one executable the importer has just read those bytes, and the router re-hashes everything it serves regardless. In-place import edges towards the anchor-mounted host filesystem idea in [open questions](#open-questions).
 - *Migrating into the offset store* needs no scanning either: a UnixFS file node's blocksizes give every leaf's offset, so given a path claimed to hold that file, check its size, hash each range, and move the leaves that match. It needs a way to remove blocks from the store they're leaving, which no store has yet. Until then, `hk add --nocopy` of something already copied leaves its blocks where they are.
+- *Two names for one file.* A kept file's whole-file multihash and its UnixFS root name the same bytes, which `shard_roots` records. That's a `Same` claim in all but name, and is what lets a kept file's ranges be rebuilt from its roots' blocksizes if the index is lost; without it, a kept file is an anonymous byte string. Until claims exist and blocks can be read as streams, the whole-file multihash isn't a block anyone can get: a `get` returning one 4 GiB `Vec` serves nobody.
+- *Kept files outlive failed imports.* A file is copied in before the import's transaction and isn't removed if it rolls back, so a failed import can leave a kept file nothing refers to; re-adding the file reuses it, and collection should sweep the rest. Copying then importing reads a file twice (the second from the page cache); one pass needs provenance that can point at a file before it has its name. Stdin isn't kept whole yet.
 - *Shape metadata*: a cached classification of each block (UnixFS file leaf, HAMT shard, claim…) recomputable from its bytes, to find candidates for a new specialized store without parsing everything. IPLD codecs have no magic numbers; the CID's codec is the out-of-band equivalent, and already narrows what each store considers.
 - *Verify on read*: blocks from untrusted stores or peers are re-hashed (`Block::verify`); trusted local stores can skip it.
 
@@ -250,6 +252,8 @@ Blocks are collectable if they are referenced by a tombstone or their refcount i
 
 Collection is a lazy trickle with a hard boundary on what is collectable, and always local. Objects with refcount 0 are collected first, then tombstones ordered by `when`, then tombstone targets with no `when`. This is done iteratively so refcounts are recalculated and newly collectable items join the work queue; as blocks are collected their links become eligible in turn, until the whole subgraph has had the opportunity to be collected. When a node runs low on space, it raises the collection rate in proportion to usage.
 
+Collection is also too slow for some things. A *purge* removes a block now, for infohazards (leaked secrets, abuse material, anything legally or personally dangerous to hold) that shouldn't wait for the trickle. It's complicated by user profiles and tiered permissions: who may purge a block several users refer to, whether a purge propagates to replicas and peers or only cleans the local cache, and what's left behind so it isn't simply fetched back (a tombstone naming the multihash is itself a pointer to the hazard). Kept files and in-place ranges make it concrete too: a purge has to remove every representation, including whole files whose other leaves are still wanted.
+
 Audit/repair and trickle GC are the same homeostasis with opposite signs, akin to soup convecting, weighed against the bandwidth they cost.
 
 ### Replication and transport
@@ -286,6 +290,7 @@ Checklist:
 - [ ] UnixFSv1 indexing in SQL
 - [ ] Backreference indexing
 - [ ] Tagging
+- [ ] Purging blocks immediately, across stores and permission tiers
 - [ ] Querying
 - [ ] Perkeep-style claims
 - [ ] File mutation
@@ -323,7 +328,7 @@ Checklist:
 - The audit/repair loop, and diversity weighting for replica placement.
 
 **Storage**
-- Coalesce files as large blobs, promoting their blocks to offset blocks; and chunk large blocks automatically.
+- Coalesce existing files as large blobs, promoting their blocks to offset blocks (kept files do this at import); and chunk large blocks automatically.
 
 ## Development
 

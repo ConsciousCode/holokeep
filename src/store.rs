@@ -27,17 +27,19 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::block::Block;
 use crate::cid::{AnyCid, BaseCid, CidRef, CidVersion, Cidv1};
-use crate::dag::{BlockSink, Provenance};
+use crate::dag::{BlockSink, DagLink, Provenance, Source};
 use crate::multihash::{Inline, Multihash};
 
 mod ipld;
 mod offset;
 mod raw;
+mod shards;
 mod unixfs;
 
 pub use ipld::IpldStore;
 pub use offset::OffsetStore;
 pub use raw::RawStore;
+pub use shards::Shards;
 pub use unixfs::UnixfsStore;
 
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +65,10 @@ pub enum Error {
     /// A block is kept as part of a file which has changed or gone.
     #[error("block is kept in {}, which has changed since it was added", .0.display())]
     Stale(PathBuf),
+
+    /// A block is kept as part of a file in the repo which is gone.
+    #[error("block is kept in {}, which is missing", .0.display())]
+    Missing(PathBuf),
 
     /// A multihash too long to keep; see `MAX_DIGEST_LEN`.
     #[error("multihash digest of {0} bytes is too long to keep")]
@@ -273,6 +279,8 @@ pub struct RoutingStore {
     db: Db,
     /// Most specialized first; the last should admit anything.
     stores: Vec<Box<dyn Store>>,
+    /// Where files copied in are kept whole, if anywhere.
+    shards: Option<Rc<Shards>>,
 }
 
 impl RoutingStore {
@@ -280,20 +288,30 @@ impl RoutingStore {
     pub fn open_repo(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let db = Db::open(&dir.join("blocks.db"))?;
-        Self::standard(db)
+        let shards = Shards::open(db.clone(), &dir.join("shards"))?;
+        Self::with_shards(db, Some(shards))
+    }
+
+    /// The standard stores in one database, with no shards.
+    pub fn standard(db: Db) -> Result<Self> {
+        Self::with_shards(db, None)
     }
 
     /// The standard stores in one database: ranges of files on disk when
     /// that's where blocks came from, UnixFS nodes as rows, dag-cbor and
-    /// dag-json as JSONB, and everything else as raw bytes.
-    pub fn standard(db: Db) -> Result<Self> {
+    /// dag-json as JSONB, and everything else as raw bytes. Large files
+    /// copied in are kept whole in the shards, if there are any.
+    pub fn with_shards(db: Db, shards: Option<Shards>) -> Result<Self> {
+        let shards = shards.map(Rc::new);
         let stores: Vec<Box<dyn Store>> = vec![
-            Box::new(OffsetStore::open(db.clone())?),
+            Box::new(OffsetStore::open(db.clone(), shards.clone())?),
             Box::new(UnixfsStore::open(db.clone())?),
             Box::new(IpldStore::open(db.clone())?),
             Box::new(RawStore::open(db.clone())?),
         ];
-        Self::new(db, stores)
+        let mut router = Self::new(db, stores)?;
+        router.shards = shards;
+        Ok(router)
     }
 
     pub fn new(db: Db, stores: Vec<Box<dyn Store>>) -> Result<Self> {
@@ -320,7 +338,7 @@ impl RoutingStore {
         for store in &stores {
             db.conn().execute("INSERT OR IGNORE INTO stores (name) VALUES (?1)", [store.name()])?;
         }
-        Ok(Self { db, stores })
+        Ok(Self { db, stores, shards: None })
     }
 
     /// Run `f` in one transaction, for speed and so that a failed import
@@ -498,13 +516,36 @@ impl BlockSink for RoutingStore {
     }
 }
 
-/// Puts blocks into a router as copies, forgetting where they came from,
-/// so nothing is kept as part of the original files.
+/// Puts blocks into a router as copies, so nothing is kept as part of the
+/// original files. Large files are kept whole in the router's shards, and
+/// their leaves as ranges of them; the rest are copied block by block.
 pub struct Copying<'a>(pub &'a mut RoutingStore);
 
 impl BlockSink for Copying<'_> {
     fn put(&mut self, block: Block) -> io::Result<()> {
         BlockSink::put(self.0, block)
+    }
+
+    /// Provenance only ever points into kept files: `source` reads the rest
+    /// without any.
+    fn put_from(&mut self, block: Block, provenance: Provenance<'_>) -> io::Result<()> {
+        BlockSink::put_from(self.0, block, provenance)
+    }
+
+    fn source(&mut self, path: &Path) -> io::Result<Source> {
+        match &self.0.shards {
+            Some(shards) if std::fs::metadata(path)?.len() > shards.threshold => {
+                shards.keep(path).map(Source::Kept).map_err(io::Error::other)
+            },
+            _ => Ok(Source::Copy),
+        }
+    }
+
+    fn kept(&mut self, copy: &Path, root: &DagLink) -> io::Result<()> {
+        let Some(shards) = &self.0.shards else {
+            return Ok(());
+        };
+        shards.kept(copy, root.cid.multihash()).map_err(io::Error::other)
     }
 }
 

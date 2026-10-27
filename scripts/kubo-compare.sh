@@ -113,6 +113,25 @@ else
 fi
 "$hk" repo stat
 
+## Large files are kept whole, named by their multihash, so they check
+## themselves
+kept=0
+for f in "$HOLOKEEP_REPO"/shards/[0-9a-f][0-9a-f]/*; do
+    [ -e "$f" ] || continue
+    kept=$((kept + 1))
+    name=$(basename "$f")
+    if [ "1220$(sha256sum "$f" | cut -d' ' -f1)" != "$name" ]; then
+        echo "FAIL kept file $name doesn't match its name"
+        fail=1
+    fi
+done
+if [ "$kept" -gt 0 ]; then
+    echo "ok   $kept kept files match their names"
+else
+    echo "FAIL no large files were kept whole"
+    fail=1
+fi
+
 ## Keep files in place, in a separate repo, and read them back while unchanged
 export HOLOKEEP_REPO="$work/nocopy"
 nocopy="$work/nocopy-out"
