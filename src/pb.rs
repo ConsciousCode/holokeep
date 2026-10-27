@@ -50,6 +50,9 @@ pub enum DecodeError {
 
     #[error("invalid link Hash")]
     Hash(#[from] cid::DecodeError),
+
+    #[error("invalid UnixFS data: {0}")]
+    Unixfs(&'static str),
 }
 
 impl From<varint::Error> for DecodeError {
@@ -162,8 +165,10 @@ impl<'a> PbNode<'a> {
 //-[ Protobuf primitives ]-//
 //------------------------//
 
-const VARINT: u64 = 0;
-const LEN: u64 = 2;
+pub const VARINT: u64 = 0;
+pub const FIXED64: u64 = 1;
+pub const LEN: u64 = 2;
+pub const FIXED32: u64 = 5;
 
 fn put_tag(buf: &mut Vec<u8>, field: u64, wire: u64) {
     varint::write(buf, field << 3 | wire);
@@ -181,13 +186,13 @@ pub fn put_bytes(buf: &mut Vec<u8>, field: u64, value: &[u8]) {
 }
 
 /// Read a (field, wire type) tag.
-fn read_tag(buf: &mut &[u8]) -> Result<(u64, u64), DecodeError> {
+pub fn read_tag(buf: &mut &[u8]) -> Result<(u64, u64), DecodeError> {
     let tag = varint::read(buf)?;
     Ok((tag >> 3, tag & 7))
 }
 
 /// Read a length-delimited value.
-fn read_bytes<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8], DecodeError> {
+pub fn read_bytes<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8], DecodeError> {
     let len = usize::try_from(varint::read(buf)?).map_err(|_| DecodeError::Truncated)?;
     let (value, rest) = buf.split_at_checked(len).ok_or(DecodeError::Truncated)?;
     *buf = rest;

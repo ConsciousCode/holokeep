@@ -1,7 +1,6 @@
 //! Block type representing raw data with a CID.
 //! Preserves the invariant that the cid exactly matches the data.
-
-use futures::{future::BoxFuture, stream::BoxStream};
+//! Where blocks are kept is the `store` module.
 
 use crate::cid::{BaseCid, CidRef, Cid, Cidv1, Cidv1Spec};
 use crate::multihash::{DigestBuf, Inline, Multihash, MultihashDigest, MultihashFunc, SizeError};
@@ -68,47 +67,6 @@ impl<D: DigestBuf> Block<D> {
 
     /// Consume the block and return its data
     pub fn into_data(self) -> Box<[u8]> { self.data }
-}
-
-/// An index for (back)references
-pub trait RefIndex<D: AsRef<[u8]>> {
-    /// Iterate over block multihashes which reference the given multihash.
-    fn backrefs(&self, id: Multihash<D>) -> BoxStream<'_, Multihash<D>>;
-
-    /// Iterate over zero or more backreferences.
-    fn backrefs_many(&self, ids: &[Multihash<D>]) -> Box<[BoxStream<'_, Multihash<D>>]>;
-}
-
-/// An index for blocks.
-pub trait BlockIndex<D: AsRef<[u8]>> {
-    /// Return if the index has a block with the given multihash.
-    fn has(&self, id: Multihash<D>) -> BoxFuture<'_, bool>;
-
-    /// Return if the index has blocks with the given multihashes. Returns
-    /// a boxed array of futures which may resolve in any order.
-    fn has_many(&self, ids: &[Multihash<D>]) -> Box<[BoxFuture<'_, bool>]>;
-
-    /// Iterate over all multihashes in the index.
-    fn iter(&self) -> BoxStream<'_, Multihash<D>>;
-}
-
-/// A source of blocks.
-pub trait BlockSource<D: DigestBuf> {
-    /// Get a block with the given multihash.
-    fn get(&mut self, id: Multihash<D>) -> BoxFuture<'_, Block<D>>;
-
-    /// Attempt to get zero or more blocks with the given multihashes.
-    /// Returns a boxed array of futures which may resolve in any order.
-    fn get_many(&mut self, ids: &[Multihash<D>]) -> Box<[BoxFuture<'_, Block<D>>]>;
-}
-
-/// A storage for blocks.
-pub trait BlockStore<D: DigestBuf> {
-    /// Put a new block into the store.
-    fn put(&mut self, block: Block<D>) -> BoxFuture<'_, ()>;
-
-    /// Put zero or more blocks into the store.
-    fn put_many(&mut self, block: &[Block<D>]) -> BoxFuture<'_, ()>;
 }
 
 #[cfg(test)]

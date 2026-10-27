@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Compare `hk add` against `ipfs add --only-hash` for a batch of generated
-# cases. Uses a throwaway Kubo repo initialized with the unixfs-v1-2025
-# profile, so your own ~/.ipfs is never touched.
+# cases, then store each case in a holokeep repo and check `hk get` writes
+# it back out identically. Uses throwaway Kubo and holokeep repos, so your
+# own ~/.ipfs and ~/.holokeep are never touched.
 #
 #   scripts/kubo-compare.sh          # quick cases
 #   LARGE=1 scripts/kubo-compare.sh  # also >1 GiB files (1024/1025 chunks)
@@ -13,6 +14,7 @@ trap 'rm -rf "$work"' EXIT
 
 export IPFS_PATH="$work/ipfs"
 ipfs init --profile unixfs-v1-2025 --empty-repo >/dev/null
+export HOLOKEEP_REPO="$work/holokeep"
 
 cargo build --release --quiet --manifest-path "$root/Cargo.toml"
 hk="$root/target/release/hk"
@@ -69,7 +71,7 @@ compare() {
     local label=$1; shift
     local want got
     want=$(ipfs add -n -r "$@" | sort)
-    got=$("$hk" add "$@" | sort)
+    got=$("$hk" add -n "$@" | sort)
     if [[ "$want" == "$got" ]]; then
         echo "ok   $label ($(wc -l <<<"$want") entries)"
     else
@@ -88,5 +90,27 @@ for args in "size-64 2" "size-100 3" "size-1000 7" "size-256 174"; do
     set -- $args
     compare "deep -s $1 --max-file-links $2" --chunker="$1" --max-file-links="$2" deep
 done
+
+## Store everything and read it back out
+out="$work/out"
+mkdir -p "$out"
+for f in *; do
+    root=$("$hk" add -q -H "$f")
+    if "$hk" get "$root" -o "$out/$f" && diff -r --no-dereference "$f" "$out/$f" >/dev/null; then
+        echo "ok   get $f"
+    else
+        echo "FAIL get $f"
+        diff -r --no-dereference "$f" "$out/$f" | head -10
+        fail=1
+    fi
+done
+root=$("$hk" add -q --chunker=size-64 --max-file-links=2 deep)
+if "$hk" cat "$root" | cmp -s - deep; then
+    echo "ok   cat deep -s size-64 --max-file-links 2"
+else
+    echo "FAIL cat deep -s size-64 --max-file-links 2"
+    fail=1
+fi
+"$hk" repo stat
 
 exit $fail

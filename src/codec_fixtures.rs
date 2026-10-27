@@ -415,3 +415,32 @@ fn dagjson_decode_negative() {
         );
     }
 }
+
+//-----------//
+//-[ Store ]-//
+//-----------//
+
+#[test]
+fn every_block_stores_and_retrieves() {
+    use crate::cid::CidVersion;
+    use crate::store::{Db, RoutingStore};
+
+    let router = RoutingStore::standard(Db::memory().expect("db")).expect("router");
+    let mut placed = std::collections::BTreeMap::<(String, String), usize>::new();
+    for f in fixtures() {
+        let label = f.label();
+        let cid: Cidv1 = f.cid.parse().expect(&label);
+        let block = Block::verify(cid.clone(), f.bytes.clone().into()).expect(&label);
+        let store = router.put_block(&block, CidVersion::V1).expect(&label);
+        *placed.entry((f.codec.clone(), store)).or_default() += 1;
+
+        let back = router.get_block(&AnyCid::V1(cid)).expect(&label).expect(&label);
+        assert_eq!(back.data(), f.bytes, "{label}");
+    }
+    // Only dag-pb in Kubo's form is UnixFS; the rest is kept as bytes
+    for (codec, store) in placed.keys() {
+        assert!(store == "raw" || codec == "dag-pb", "{codec} in {store}");
+    }
+    assert!(placed.contains_key(&("dag-pb".into(), "raw".into())), "{placed:?}");
+    println!("{placed:?}");
+}

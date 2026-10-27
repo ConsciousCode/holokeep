@@ -7,15 +7,16 @@
 //!
 //! <https://specs.ipfs.tech/unixfs/>
 
-use num_enum::IntoPrimitive;
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 use crate::block::Block;
 use crate::cid::{CidRef, Cidv1, Cidv1Spec, DAG_PB_CODEC};
 use crate::multihash::MultihashFunc;
-use crate::pb::{put_bytes, put_uint, PbLink, PbNode};
+use crate::pb::{self, put_bytes, put_uint, DecodeError, PbLink, PbNode};
+use crate::varint;
 
 /// UnixFSv1 `Data.Type`.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, IntoPrimitive)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, IntoPrimitive, TryFromPrimitive)]
 #[repr(u64)]
 pub enum DataType {
     Raw = 0,
@@ -93,6 +94,85 @@ impl<'a> Data<'a> {
         if let Some(fanout) = self.fanout {
             put_uint(buf, 6, fanout);
         }
+    }
+}
+
+/// An owned, decoded UnixFS `Data` message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_field_names, reason = "names mirror the spec")]
+pub struct DataBuf {
+    pub data_type: DataType,
+    pub data: Option<Vec<u8>>,
+    pub filesize: Option<u64>,
+    pub blocksizes: Vec<u64>,
+    pub hash_type: Option<u64>,
+    pub fanout: Option<u64>,
+}
+
+impl DataBuf {
+    /// Decode leniently, the way readers must: fields in any order, packed
+    /// or unpacked blocksizes, and mode, mtime and unknown fields skipped.
+    /// Whether it re-encodes to the same bytes is for the caller to check.
+    pub fn decode(mut buf: &[u8]) -> Result<Self, DecodeError> {
+        let mut data_type = None;
+        let mut data = None;
+        let mut filesize = None;
+        let mut blocksizes = Vec::new();
+        let mut hash_type = None;
+        let mut fanout = None;
+        while !buf.is_empty() {
+            match pb::read_tag(&mut buf)? {
+                (1, pb::VARINT) => {
+                    let code = varint::read(&mut buf)?;
+                    data_type = Some(DataType::try_from(code)
+                        .map_err(|_| DecodeError::Unixfs("unknown Type"))?);
+                },
+                (2, pb::LEN) => data = Some(pb::read_bytes(&mut buf)?.to_vec()),
+                (3, pb::VARINT) => filesize = Some(varint::read(&mut buf)?),
+                (4, pb::VARINT) => blocksizes.push(varint::read(&mut buf)?),
+                (4, pb::LEN) => {
+                    let mut packed = pb::read_bytes(&mut buf)?;
+                    while !packed.is_empty() {
+                        blocksizes.push(varint::read(&mut packed)?);
+                    }
+                },
+                (5, pb::VARINT) => hash_type = Some(varint::read(&mut buf)?),
+                (6, pb::VARINT) => fanout = Some(varint::read(&mut buf)?),
+                // mode, mtime and anything newer
+                (_, pb::VARINT) => drop(varint::read(&mut buf)?),
+                (_, pb::LEN) => drop(pb::read_bytes(&mut buf)?),
+                (_, pb::FIXED64) => buf = buf.get(8..).ok_or(DecodeError::Truncated)?,
+                (_, pb::FIXED32) => buf = buf.get(4..).ok_or(DecodeError::Truncated)?,
+                (field, wire) => return Err(DecodeError::Field { message: "Data", field, wire }),
+            }
+        }
+        Ok(Self {
+            data_type: data_type.ok_or(DecodeError::Unixfs("missing Type"))?,
+            data,
+            filesize,
+            blocksizes,
+            hash_type,
+            fanout,
+        })
+    }
+
+    /// Borrow it for encoding.
+    pub fn as_data(&self) -> Data<'_> {
+        Data {
+            data_type: self.data_type,
+            data: self.data.as_deref(),
+            filesize: self.filesize,
+            blocksizes: &self.blocksizes,
+            hash_type: self.hash_type,
+            fanout: self.fanout,
+        }
+    }
+
+    /// Serialize it canonically.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.as_data().encode(&mut buf);
+        buf
     }
 }
 
@@ -180,6 +260,44 @@ mod tests {
             &[0x0a, 0x02, 0x08, 0x01],
         ].concat();
         assert_eq!(node, expected);
+    }
+
+    #[test]
+    fn decode_round_trips() {
+        let bitfield = [0x01, 0xff];
+        for data in [
+            Data::directory(),
+            Data::file(10, &[4, 4, 2]),
+            Data::symlink(b"../empty"),
+            Data::hamt_shard(&bitfield, 0x22, 256),
+        ] {
+            let mut bytes = Vec::new();
+            data.encode(&mut bytes);
+            let decoded = DataBuf::decode(&bytes).expect("decode");
+            assert_eq!(decoded.encode(), bytes, "{data:?}");
+        }
+    }
+
+    #[test]
+    fn decode_leniently() {
+        // Fields out of order, packed blocksizes, a mode and an mtime
+        let bytes = [
+            0x18, 0x0a,             // filesize 10
+            0x08, 0x02,             // Type File
+            0x22, 0x03, 4, 4, 2,    // packed blocksizes
+            0x38, 0xa4, 0x03,       // mode 0o644
+            0x42, 0x02, 0x08, 0x01, // mtime {Seconds: 1}
+        ];
+        let decoded = DataBuf::decode(&bytes).expect("decode");
+        assert_eq!(decoded.data_type, DataType::File);
+        assert_eq!(decoded.filesize, Some(10));
+        assert_eq!(decoded.blocksizes, [4, 4, 2]);
+        // ...which isn't how it re-encodes
+        assert_ne!(decoded.encode(), bytes);
+
+        assert!(DataBuf::decode(&[0x18, 0x0a]).is_err(), "no Type");
+        assert!(DataBuf::decode(&[0x08, 0x09]).is_err(), "unknown Type");
+        assert!(DataBuf::decode(&[0x12, 0x05, 0x00]).is_err(), "truncated");
     }
 
     #[test]

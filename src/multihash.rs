@@ -46,7 +46,7 @@ impl From<varint::Error> for DecodeError {
 
 /// An IPLD multihash, encoding the digest along with the hash function used
 /// to generate it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Multihash<D: ?Sized=Inline<64>> {
     /// The code of the Multihash.
     code: u64,

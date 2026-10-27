@@ -29,8 +29,9 @@ Holokeep is early. What exists is the content-addressing core, each piece checke
 - **Import**: `hk add` turns files and directories into UnixFSv1 with CIDs identical to Kubo's `ipfs add` under the `unixfs-v1-2025` profile, including chunked files, nested directories, symlinks and HAMT-sharded directories.
 - **CIDs and multihashes**: v0 and v1; SHA-1, SHA-2, SHA-3, BLAKE2b-256 and murmur3 (no identity hash yet).
 - **Codecs**: dag-pb, dag-cbor and dag-json, strict and canonical, passing all of [ipld/codec-fixtures](https://github.com/ipld/codec-fixtures) and differential fuzzing against `serde_ipld_dagcbor`/`serde_ipld_dagjson`.
+- **Storage and retrieval**: `hk add` stores into a repo where a routing store sorts blocks by structure, UnixFS nodes as rows and everything else as raw bytes, and `hk cat`/`hk get` read them back out, checked against the original files.
 
-Nothing is stored yet: `hk add` computes CIDs and discards the blocks. The blockstore is next, see the [roadmap](#roadmap).
+Everything lives on one node so far; next are CAR import/export and indexing, see the [roadmap](#roadmap).
 
 ## Vision
 
@@ -132,6 +133,12 @@ This is a more granular take on Perkeep's blob servers, leaning into Rust's trai
 …and a zoo of extensions to come. A read-only archive is a `BlockSource` and `BlockIndex` without `BlockStore`; an index rebuilt from other stores is a `RefIndex` with no blocks at all.
 
 **Specialized stores must manifest exact bytes.** A store which keeps blocks as rows rather than bytes has to regenerate each block byte-for-byte, or its CID breaks. So a specialized store admits only blocks whose decoded form re-encodes identically, ie canonical blocks. Anything valid but non-canonical falls through to a generic store, which keeps raw bytes. This is why the codecs report canonicity (`dagcbor::from_slice_canon` and friends) rather than just accepting or rejecting: it's the admission test.
+
+Implemented so far (`src/store/`), all in one SQLite file:
+
+- **`RoutingStore`** offers each block to its stores in order and indexes which took it (`blocks`), along with every CID prefix the block was put under (`block_cids`). It verifies every block against its CID on the way out, can `reindex` from the stores if its index is lost, runs an import as one transaction, and is itself a `Store`, so routers nest.
+- **`UnixfsStore`** keeps UnixFS nodes as a node row and link rows, admitting only nodes it can manifest exactly: every link named and sized, no mode or mtime, Kubo's field order. Its link rows double as a `RefIndex`. Every node `hk add` makes lands here; of the 17 dag-pb blocks in codec-fixtures, the 2 in Kubo's form do.
+- **`RawStore`** takes anything else as bytes.
 
 Representations carved out in the original prototype:
 
@@ -262,8 +269,8 @@ Checklist:
   - [x] Directory
   - [x] HAMT
 - [x] dag-pb, dag-cbor and dag-json codecs
-- [ ] Blockstore that keeps what `hk add` imports
-- [ ] Retrieval (`hk cat`, `hk get`)
+- [x] Blockstore that keeps what `hk add` imports
+- [x] Retrieval (`hk cat`, `hk get`)
 - [ ] CAR import/export
 - [ ] UnixFSv1 indexing in SQL
 - [ ] Backreference indexing
@@ -311,9 +318,16 @@ Checklist:
 
 ```sh
 cargo build --release
-target/release/hk add <path>        # print CIDs, like `ipfs add --only-hash -r`
-target/release/hk add --help        # chunker, max file links, hidden files
+hk=target/release/hk
+$hk add <path>                      # store it, printing CIDs like `ipfs add -r`
+$hk add -n <path>                   # only print CIDs, like `ipfs add --only-hash`
+$hk cat <cid>                       # a file's contents
+$hk get <cid> -o <path>             # a file, directory or symlink
+$hk block get <cid>                 # a block's bytes
+$hk repo stat                       # blocks per store
 ```
+
+The repo is `~/.holokeep` unless `--repo` or `HOLOKEEP_REPO` says otherwise.
 
 Every layer is tested against an independent implementation:
 
@@ -321,16 +335,18 @@ Every layer is tested against an independent implementation:
 git submodule update --init         # ipld/codec-fixtures
 cargo test                          # unit tests, codec fixtures, quick fuzzing
 PROPTEST_CASES=1000000 cargo test --release differential   # long fuzzing
-scripts/kubo-compare.sh             # every CID vs Kubo; needs `ipfs` on PATH
+scripts/kubo-compare.sh             # every CID vs Kubo, then store and get back; needs `ipfs`
 LARGE=1 scripts/kubo-compare.sh     # adds >1 GiB files
 ```
 
 | Module | |
 |---|---|
 | `varint`, `multihash`, `cid` | Multiformats primitives |
-| `block` | Blocks, which always match their CID, and the blockstore traits |
+| `block` | Blocks, which always match their CID |
+| `store` | The blockstore traits, routing store and stores |
 | `pb`, `unixfs` | dag-pb framing and UnixFSv1 nodes |
 | `chunker`, `dag`, `hamt`, `import` | Importing files and directories |
+| `export` | Reading them back out |
 | `serde`, `model`, `dagcbor`, `dagjson` | The data model and its codecs |
 | `canon` | Tracking whether decoded data was canonical |
 | `codec_fixtures`, `differential` | Fixture and fuzz tests |

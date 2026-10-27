@@ -145,6 +145,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::dag::NullSink;
+    use crate::testutil::Scratch;
 
     const HELLO: &str = "bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e";
     const EMPTY: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
@@ -185,22 +186,6 @@ mod tests {
     fn short_reads() {
         assert_eq!(add(&small(), Dribble(b"hello world", false)), HELLO_SMALL);
         assert_eq!(add(&Importer::default(), Dribble(b"", false)), EMPTY);
-    }
-
-    /// A scratch directory removed on drop.
-    struct Scratch(PathBuf);
-    impl Scratch {
-        fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("hk-test-{}-{name}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).expect("scratch dir");
-            Self(path)
-        }
-    }
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
     }
 
     /// Build the tree Kubo's vectors were made from:
