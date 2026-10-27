@@ -229,12 +229,118 @@ fn backrefs_come_from_link_rows() {
     store.put(&one).expect("put");
     store.put(&two).expect("put");
 
-    let mut refs = store.backrefs(&file.cid().to_bytes()).expect("backrefs");
+    let mut refs = store.backrefs(file.cid().multihash()).expect("backrefs");
     refs.sort_by_key(Multihash::to_bytes);
     let mut expected = vec![Multihash::from(one.cid().clone()), Multihash::from(two.cid().clone())];
     expected.sort_by_key(Multihash::to_bytes);
     assert_eq!(refs, expected);
-    assert!(store.backrefs(&one.cid().to_bytes()).expect("backrefs").is_empty());
+    assert!(store.backrefs(one.cid().multihash()).expect("backrefs").is_empty());
+}
+
+#[test]
+fn backrefs_span_cid_versions() {
+    let store = UnixfsStore::open(Db::memory().expect("db")).expect("store");
+    let child = unixfs::node_block(&[], &unixfs::Data::directory());
+    let v0 = crate::cid::Cidv0::new(<[u8; 32]>::try_from(child.cid().digest_ref()).expect("sha2-256"));
+    let entry = |hash: Vec<u8>| crate::pb::PbLink { hash: hash.into(), name: Some(b"child"), tsize: Some(4) };
+    let by_v0 = PbNode { links: vec![entry(v0.to_bytes())], data: Some(b"\x08\x01") }.encode();
+    let by_v1 = PbNode { links: vec![entry(child.cid().to_bytes())], data: Some(b"\x08\x01") }.encode();
+    let (by_v0, by_v1) = (block(DAG_PB_CODEC, &by_v0), block(DAG_PB_CODEC, &by_v1));
+    assert_eq!(store.put(&by_v0).expect("put"), Put::Stored);
+    assert_eq!(store.put(&by_v1).expect("put"), Put::Stored);
+
+    let mut refs = store.backrefs(child.cid().multihash()).expect("backrefs");
+    refs.sort_by_key(Multihash::to_bytes);
+    let mut expected = vec![Multihash::from(by_v0.cid().clone()), Multihash::from(by_v1.cid().clone())];
+    expected.sort_by_key(Multihash::to_bytes);
+    assert_eq!(refs, expected);
+    // Each link still manifests with the CID it was written with
+    assert_eq!(store.get(by_v0.cid().multihash()).expect("get").as_deref(), Some(by_v0.data()));
+    assert_eq!(store.get(by_v1.cid().multihash()).expect("get").as_deref(), Some(by_v1.data()));
+}
+
+fn count(db: &Db, table: &str) -> usize {
+    let n: i64 = db.conn().query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0)).expect("count");
+    usize::try_from(n).expect("count")
+}
+
+#[test]
+fn interns_each_multihash_once() {
+    let mut router = router();
+    let blocks = import_everything(&mut router);
+    let distinct: std::collections::HashSet<_> = blocks.iter().map(|b| b.cid().multihash().to_bytes()).collect();
+    // Every link target is a block of the import, so nothing else is known
+    assert_eq!(count(&router.db, "multihashes"), distinct.len());
+    assert_eq!(count(&router.db, "blocks"), distinct.len());
+}
+
+#[test]
+fn links_to_absent_blocks_are_known() {
+    let router = router();
+    let absent = raw(b"never stored");
+    let link = unixfs::Link { hash: absent.cid(), name: b"absent", tsize: 12 };
+    let dir = unixfs::node_block(&[link], &unixfs::Data::directory());
+    assert_eq!(router.put_block(&dir, CidVersion::V1).expect("put"), "unixfs");
+
+    assert_eq!(count(&router.db, "multihashes"), 2);
+    assert_eq!(count(&router.db, "blocks"), 1);
+    assert!(router.db.lookup(absent.cid().multihash()).expect("lookup").is_some());
+    assert!(!router.has(absent.cid().multihash()).expect("has"));
+}
+
+#[test]
+fn referenced_multihashes_cant_be_deleted() {
+    let router = router();
+    let block = raw(b"hello");
+    router.put_block(&block, CidVersion::V1).expect("put");
+    assert!(router.db.conn().execute("DELETE FROM multihashes", []).is_err());
+    // Once nothing refers to it, it can go
+    router.db.conn().execute_batch("DELETE FROM raw_blocks; DELETE FROM blocks; DELETE FROM block_cids;").expect("clear");
+    assert_eq!(router.db.conn().execute("DELETE FROM multihashes", []).expect("delete"), 1);
+}
+
+#[test]
+fn caps_digest_length() {
+    let db = Db::memory().expect("db");
+    let identity = |len: usize| Multihash::<Vec<u8>>::new(0x00, vec![7; len]);
+    db.intern(identity(MAX_DIGEST_LEN).as_ref()).expect("128 bytes is fine");
+    assert!(matches!(db.intern(identity(MAX_DIGEST_LEN + 1).as_ref()), Err(Error::Oversized(129))));
+
+    // A node linking to an oversized identity CID isn't kept as rows
+    let store = UnixfsStore::open(db).expect("store");
+    let node = |len: usize| {
+        let cid = Cidv1::new(RAW_CODEC, identity(len)).to_bytes();
+        let link = crate::pb::PbLink { hash: cid.into(), name: Some(b"inline"), tsize: Some(1) };
+        block(DAG_PB_CODEC, &PbNode { links: vec![link], data: Some(b"\x08\x01") }.encode())
+    };
+    assert_eq!(store.put(&node(MAX_DIGEST_LEN)).expect("put"), Put::Stored);
+    assert_eq!(store.put(&node(MAX_DIGEST_LEN + 1)).expect("put"), Put::Declined);
+}
+
+#[test]
+fn splits_cids() {
+    let v1 = raw(b"hello");
+    let bytes = v1.cid().to_bytes();
+    let (prefix, key) = split_cid(&bytes).expect("v1");
+    assert_eq!(prefix, [0x01, 0x55]);
+    assert_eq!(key, v1.cid().multihash());
+
+    let dir = unixfs::node_block(&[], &unixfs::Data::directory());
+    let v0 = crate::cid::Cidv0::new(<[u8; 32]>::try_from(dir.cid().digest_ref()).expect("sha2-256")).to_bytes();
+    let (prefix, key) = split_cid(&v0).expect("v0");
+    assert!(prefix.is_empty());
+    assert_eq!(key, dir.cid().multihash());
+
+    for (label, bad) in [
+        ("empty", vec![]),
+        ("truncated", bytes[..bytes.len() - 1].to_vec()),
+        ("trailing", [&bytes[..], b"\0"].concat()),
+        ("non-minimal codec", [&[0x01, 0xd5, 0x00][..], &bytes[2..]].concat()),
+        ("v0 that isn't sha2-256", [&[0x13, 0x20][..], &[0; 32]].concat()),
+        ("version 2", [&[0x02][..], &bytes[1..]].concat()),
+    ] {
+        assert!(split_cid(&bad).is_none(), "{label}");
+    }
 }
 
 #[test]

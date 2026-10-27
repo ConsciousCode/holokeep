@@ -113,7 +113,8 @@ impl<'a> PbLink<'a> {
         }
 
         let hash = hash.ok_or(DecodeError::MissingHash)?;
-        AnyCid::<Inline<64>>::decode(hash)?;
+        // Room for identity CIDs, which IPIP-0512 caps at 128 bytes
+        AnyCid::<Inline<128>>::decode(hash)?;
         Ok(Self { hash: Cow::Borrowed(hash), name, tsize })
     }
 }

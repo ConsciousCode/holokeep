@@ -11,6 +11,13 @@
 //! can: a read-only archive has no `BlockStore`, an index has no blocks.
 //! Every store is keyed by multihash, the block's identity; the CID's
 //! version and codec are a claim about how to read it.
+//!
+//! Within one database, multihashes are interned: `multihashes` holds each
+//! one once, and every other table refers to it by integer id, whether or
+//! not the block itself is present. Ids mean nothing outside their
+//! database, so they never cross the traits, which take multihash bytes;
+//! each database pays for its own copy, and the multihash is the
+//! interchange format between them.
 
 use std::io;
 use std::path::Path;
@@ -49,6 +56,10 @@ pub enum Error {
     #[error("block is in store {0:?}, which isn't configured")]
     UnknownStore(String),
 
+    /// A multihash too long to keep; see `MAX_DIGEST_LEN`.
+    #[error("multihash digest of {0} bytes is too long to keep")]
+    Oversized(usize),
+
     /// Data in a store which can't be right.
     #[error("invalid data in store {store}: {reason}")]
     Invalid { store: &'static str, reason: String },
@@ -58,6 +69,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// What blocks are keyed by: their multihash.
 pub type Key<'a> = Multihash<&'a [u8]>;
+
+/// An interned multihash, meaningful only within its database.
+pub type Id = i64;
+
+/// The longest digest a database will intern. IPIP-0512 caps identity
+/// multihashes at 128 bytes, and no real hash function comes close.
+pub const MAX_DIGEST_LEN: usize = 128;
 
 /// What a store did with a block it was offered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,8 +106,9 @@ pub trait BlockStore {
 
 /// Knows which blocks link to a block.
 pub trait RefIndex {
-    /// The multihashes of blocks with a link to exactly this binary CID.
-    fn backrefs(&self, cid: &[u8]) -> Result<Vec<Multihash>>;
+    /// The multihashes of blocks with a link to this multihash, under any
+    /// CID.
+    fn backrefs(&self, key: Key<'_>) -> Result<Vec<Multihash>>;
 }
 
 /// A store a `RoutingStore` can place blocks in.
@@ -122,7 +141,15 @@ impl Db {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA foreign_keys = ON;",
+             PRAGMA foreign_keys = ON;
+             -- Every multihash the database knows of, present or not. The
+             -- default foreign key action (NO ACTION) means one can't be
+             -- deleted while anything refers to it, so ids are never
+             -- reused under a reference.
+             CREATE TABLE IF NOT EXISTS multihashes (
+                 id INTEGER PRIMARY KEY,
+                 multihash BLOB UNIQUE NOT NULL
+             );",
         )?;
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         Ok(Self(Rc::new(conn)))
@@ -148,6 +175,28 @@ impl Db {
             },
         }
     }
+
+    /// A multihash's id, if the database knows of it.
+    pub fn lookup(&self, key: Key<'_>) -> Result<Option<Id>> {
+        Ok(self.conn()
+            .prepare_cached("SELECT id FROM multihashes WHERE multihash = ?1")?
+            .query_row([key.to_bytes()], |row| row.get(0))
+            .optional()?)
+    }
+
+    /// A multihash's id, adding it if it's new.
+    pub fn intern(&self, key: Key<'_>) -> Result<Id> {
+        if key.len() > MAX_DIGEST_LEN {
+            return Err(Error::Oversized(key.len()));
+        }
+        if let Some(id) = self.lookup(key)? {
+            return Ok(id);
+        }
+        self.conn()
+            .prepare_cached("INSERT INTO multihashes (multihash) VALUES (?1)")?
+            .execute([key.to_bytes()])?;
+        Ok(self.conn().last_insert_rowid())
+    }
 }
 
 /// Read a multihash back out of a store.
@@ -160,6 +209,28 @@ fn query_keys(db: &Db, store: &'static str, sql: &str) -> Result<Vec<Multihash>>
     let mut stmt = db.conn().prepare(sql)?;
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
     rows.map(|bytes| decode_key(store, &bytes?)).collect()
+}
+
+/// Split a binary CID into its prefix (see `cid_prefix`) and multihash,
+/// if it's a valid CID.
+fn split_cid(cid: &[u8]) -> Option<(&[u8], Key<'_>)> {
+    let (prefix, mut rest) = match cid.split_first() {
+        Some((0x01, mut rest)) => {
+            crate::varint::read_minimal(&mut rest).ok()?;
+            cid.split_at_checked(cid.len().checked_sub(rest.len())?)?
+        },
+        _ => (&[][..], cid),
+    };
+    let code = crate::varint::read_minimal(&mut rest).ok()?;
+    let len = usize::try_from(crate::varint::read_minimal(&mut rest).ok()?).ok()?;
+    if rest.len() != len {
+        return None;
+    }
+    // CIDv0 is only ever sha2-256
+    if prefix.is_empty() && (code != 0x12 || len != 32) {
+        return None;
+    }
+    Some((prefix, Multihash::wrap(code, rest)))
 }
 
 /// The CID's version and codec, without the multihash: empty for CIDv0.
@@ -209,20 +280,28 @@ impl RoutingStore {
 
     pub fn new(db: Db, stores: Vec<Box<dyn Store>>) -> Result<Self> {
         db.conn().execute_batch(
-            "CREATE TABLE IF NOT EXISTS blocks (
-                 multihash BLOB PRIMARY KEY,
-                 store TEXT NOT NULL
-             ) WITHOUT ROWID;
+            "CREATE TABLE IF NOT EXISTS stores (
+                 id INTEGER PRIMARY KEY,
+                 name TEXT UNIQUE NOT NULL
+             );
+             -- Which store holds each block that's present.
+             CREATE TABLE IF NOT EXISTS blocks (
+                 block INTEGER PRIMARY KEY REFERENCES multihashes (id),
+                 store INTEGER NOT NULL REFERENCES stores (id)
+             );
              -- The CID prefixes (version and codec) each block was put with.
              -- Unlike `blocks` this isn't derivable from the stores, which
              -- needn't know how their bytes are meant to be read, so it
              -- survives a reindex.
              CREATE TABLE IF NOT EXISTS block_cids (
-                 multihash BLOB NOT NULL,
+                 block INTEGER NOT NULL REFERENCES multihashes (id),
                  prefix BLOB NOT NULL,
-                 PRIMARY KEY (multihash, prefix)
+                 PRIMARY KEY (block, prefix)
              ) WITHOUT ROWID;",
         )?;
+        for store in &stores {
+            db.conn().execute("INSERT OR IGNORE INTO stores (name) VALUES (?1)", [store.name()])?;
+        }
         Ok(Self { db, stores })
     }
 
@@ -246,7 +325,13 @@ impl RoutingStore {
     /// Which store holds a block.
     pub fn store_of(&self, key: Key<'_>) -> Result<Option<String>> {
         Ok(self.db.conn()
-            .query_row("SELECT store FROM blocks WHERE multihash = ?1", [key.to_bytes()], |row| row.get(0))
+            .prepare_cached(
+                "SELECT s.name FROM multihashes m
+                 JOIN blocks b ON b.block = m.id
+                 JOIN stores s ON s.id = b.store
+                 WHERE m.multihash = ?1",
+            )?
+            .query_row([key.to_bytes()], |row| row.get(0))
             .optional()?)
     }
 
@@ -260,26 +345,30 @@ impl RoutingStore {
 
     /// Put a block, returning the name of the store it's in.
     pub fn put_block(&self, block: &Block, version: CidVersion) -> Result<String> {
-        let key = block.cid().multihash().to_bytes();
+        let key = block.cid().multihash();
         let prefix = cid_prefix(block.cid(), version);
         self.db.atomically(|| {
-            let store = if let Some(store) = self.store_of(block.cid().multihash())? {
+            let store = if let Some(store) = self.store_of(key)? {
                 store
             }
             else {
                 let store = self.place(block)?;
-                self.db.conn().execute(
-                    "INSERT INTO blocks (multihash, store) VALUES (?1, ?2)",
-                    params![key, store],
-                )?;
+                self.record(self.db.intern(key)?, store)?;
                 store.to_owned()
             };
-            self.db.conn().execute(
-                "INSERT OR IGNORE INTO block_cids (multihash, prefix) VALUES (?1, ?2)",
-                params![key, prefix],
-            )?;
+            self.db.conn()
+                .prepare_cached("INSERT OR IGNORE INTO block_cids (block, prefix) VALUES (?1, ?2)")?
+                .execute(params![self.db.intern(key)?, prefix])?;
             Ok(store)
         })
+    }
+
+    /// Index a block as being in a store, returning whether it's new.
+    fn record(&self, id: Id, store: &str) -> Result<bool> {
+        let added = self.db.conn()
+            .prepare_cached("INSERT OR IGNORE INTO blocks (block, store) SELECT ?1, id FROM stores WHERE name = ?2")?
+            .execute(params![id, store])?;
+        Ok(added > 0)
     }
 
     /// Offer a block to each store in turn.
@@ -308,13 +397,12 @@ impl RoutingStore {
     pub fn reindex(&self) -> Result<usize> {
         self.db.atomically(|| {
             self.db.conn().execute("DELETE FROM blocks", [])?;
-            let mut count = 0;
+            let mut count = 0usize;
             for store in &self.stores {
                 for key in store.keys()? {
-                    count = self.db.conn().execute(
-                        "INSERT OR IGNORE INTO blocks (multihash, store) VALUES (?1, ?2)",
-                        params![key.to_bytes(), store.name()],
-                    )?.saturating_add(count);
+                    if self.record(self.db.intern(key.as_ref())?, store.name())? {
+                        count = count.saturating_add(1);
+                    }
                 }
             }
             Ok(count)
@@ -323,7 +411,9 @@ impl RoutingStore {
 
     /// How many blocks each store holds, by the index.
     pub fn stats(&self) -> Result<Vec<(String, u64)>> {
-        let mut stmt = self.db.conn().prepare("SELECT store, count(*) FROM blocks GROUP BY store ORDER BY store")?;
+        let mut stmt = self.db.conn().prepare(
+            "SELECT s.name, count(*) FROM blocks b JOIN stores s ON s.id = b.store GROUP BY s.name ORDER BY s.name",
+        )?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get::<_, i64>(1)?)))?;
         rows.map(|row| {
             let (store, count) = row?;
@@ -339,7 +429,7 @@ impl BlockIndex for RoutingStore {
     }
 
     fn keys(&self) -> Result<Vec<Multihash>> {
-        query_keys(&self.db, "router", "SELECT multihash FROM blocks")
+        query_keys(&self.db, "router", "SELECT m.multihash FROM blocks b JOIN multihashes m ON m.id = b.block")
     }
 }
 

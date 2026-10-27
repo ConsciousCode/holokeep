@@ -110,11 +110,15 @@ A block is a finite sequence of bytes. Blocks are addressed by multihashes, wher
 
 Two multihashes may, by design, refer to the same block (for example, when using different hash functions) and Holokeep makes the opinionated assertion that these constitute distinct logical objects, even if they share physical storage. Equivalence between different multihashes with the same preimage is deferred to the relational layer (`Same` claims).
 
-A CID adds a version and a codec to the multihash: a claim about how to interpret the bytes, not part of their identity. Blockstores key by multihash, as Kubo's does, and the CID prefixes a block has been seen with are indexed alongside it.
+A CID adds a version and a codec to the multihash: a claim about how to interpret the bytes, not part of their identity. Blockstores key by multihash, as Kubo's does, and the CID prefixes a block has been seen with are indexed alongside it. References are by multihash too, so a link written as CIDv0 and one written as CIDv1 are backreferences to the same block.
+
+Within a database, multihashes are **interned**: one table holds each multihash once, and everything else (placement, CID prefixes, stores' rows, link targets) refers to it by integer id. Knowing a multihash doesn't mean having its block: a link to something not yet fetched still gets an id, so "what's linked but missing" is a plain query.
 
 Design decisions:
 
 - `Multihash<D>` is generic over its digest storage (fixed arrays, inline buffers, boxed slices) rather than the ecosystem's `Multihash<usize>`, and `AnyCid` preserves a CID's version through round trips.
+- **Ids are local; multihashes are the interchange format.** An interned id means nothing outside its database, so ids never cross a trait boundary or the network, and each database pays for its own copy of the multihashes it knows. Assuming every store is a local SQLite database that could be attached to the others is what broke the original prototype: repos have to scale to distant stores.
+- Digests are capped at 128 bytes, the limit IPIP-0512 sets for identity multihashes; no real hash function comes close.
 - Varints follow two specs. Protobuf (dag-pb) varints are LEB128 up to 64 bits, read leniently. Multiformats varints (CIDs, multihashes) must be minimal and at most 9 bytes, so codes and lengths stop at 2^63 - 1; `varint::read_minimal` enforces this, as the ecosystem's `cid` crate does. A CID with a larger code can be constructed but won't decode again; no real codec comes close.
 
 ### Physical: blockstores
@@ -134,10 +138,15 @@ This is a more granular take on Perkeep's blob servers, leaning into Rust's trai
 
 **Specialized stores must manifest exact bytes.** A store which keeps blocks as rows rather than bytes has to regenerate each block byte-for-byte, or its CID breaks. So a specialized store admits only blocks whose decoded form re-encodes identically, ie canonical blocks. Anything valid but non-canonical falls through to a generic store, which keeps raw bytes. This is why the codecs report canonicity (`dagcbor::from_slice_canon` and friends) rather than just accepting or rejecting: it's the admission test.
 
+For now admission is checked by round trip: parse, re-encode, compare. That's verification where "parse, don't verify" should hold. Within one executable, a strict parser that only accepts canonical encodings proves the bytes can be rebuilt by construction, and the round trip becomes a debug assertion. Across trust boundaries (other stores, peers) blocks are verified regardless.
+
+Indexes are rebuildable in the sense that *an* index can always be built from the stores, not that every table is disposable as in Perkeep. The interned multihashes are primary data; which store holds each block is derived. If a block turns up missing under one hash function, it may be worth trying the others in common use, though with two or three likely hashes that's probably more caution than it's worth.
+
 Implemented so far (`src/store/`), all in one SQLite file:
 
-- **`RoutingStore`** offers each block to its stores in order and indexes which took it (`blocks`), along with every CID prefix the block was put under (`block_cids`). It verifies every block against its CID on the way out, can `reindex` from the stores if its index is lost, runs an import as one transaction, and is itself a `Store`, so routers nest.
-- **`UnixfsStore`** keeps UnixFS nodes as a node row and link rows, admitting only nodes it can manifest exactly: every link named and sized, no mode or mtime, Kubo's field order. Its link rows double as a `RefIndex`. Every node `hk add` makes lands here; of the 17 dag-pb blocks in codec-fixtures, the 2 in Kubo's form do.
+- **`Db`** owns the interned `multihashes` table every store refers to. Foreign keys stop a multihash from being deleted while anything refers to it, so an id is never reused under a reference.
+- **`RoutingStore`** offers each block to its stores in order and indexes which took it (`blocks`), along with every CID prefix the block was put under (`block_cids`). It verifies every block against its CID on the way out, can `reindex` placement from the stores, runs an import as one transaction, and is itself a `Store`, so routers nest.
+- **`UnixfsStore`** keeps UnixFS nodes as a node row and link rows, admitting only nodes it can manifest exactly: every link named and sized, no mode or mtime, Kubo's field order. A link row is the target's id plus the CID prefix it was written with, and link rows double as a `RefIndex` by multihash. Every node `hk add` makes lands here; of the 17 dag-pb blocks in codec-fixtures, the 2 in Kubo's form do.
 - **`RawStore`** takes anything else as bytes.
 
 Representations carved out in the original prototype:
@@ -150,12 +159,14 @@ Representations carved out in the original prototype:
 
 "Small blocks" (inlining small blobs into the database instead of separate files) is probably a placement policy inside a generic store rather than its own kind. SQLite is faster than the filesystem for small blobs, so the policy is worth having, but nothing else needs to know about it.
 
-The original database sketch, still roughly the plan: `blocks` (multihash, storage kind, cached current attribute state), `attrs` (an EAV table for the metadata system, each entry with its own CID from its dag-cbor form, plus a timestamp for ordering), `users` (public keys to identities), `refs` (backreferences), `stores` (connected blockstores) and `locs` (which blocks live in which stores).
+The original database sketch, still roughly the plan, with `multihashes` now interning identities for all of them: `blocks` (multihash, storage kind, cached current attribute state), `attrs` (an EAV table for the metadata system, each entry with its own CID from its dag-cbor form, plus a timestamp for ordering), `users` (public keys to identities), `refs` (backreferences), `stores` (connected blockstores) and `locs` (which blocks live in which stores).
 
 Ideas:
 
 - *Routing store*: a composite which dispatches each put to the most specialized store that admits it, falling back to a generic one, and reads through the `blocks` index to whichever store holds a block. Specialized stores then become an optimization you can add or remove, migrating blocks between representations without changing their identity.
 - *In-place import*: with offset blocks, importing a directory needn't copy it, like Kubo's filestore (`--nocopy`), provided changes to the original are detected (size, mtime, re-hash on read). This edges towards the anchor-mounted host filesystem idea in [open questions](#open-questions).
+- *Offsets are only ever known, never searched for.* An offset store doesn't scan files for blocks; it learns offsets when they're known. On import the importer knows exactly which byte range each leaf came from, which `put(&Block)` can't express, so puts would carry a small closed provenance (`Unknown`, or `FileRange { file, offset }`) that stores are free to ignore. Migration from other stores needs no scanning either: a UnixFS file node's blocksizes give every leaf's offset, so given a path claimed to hold that file, check its size, hash each range, and move the leaves that match.
+- *Shape metadata*: a cached classification of each block (UnixFS file leaf, HAMT shard, claim…) recomputable from its bytes, to find candidates for a new specialized store without parsing everything. IPLD codecs have no magic numbers; the CID's codec is the out-of-band equivalent, and already narrows what each store considers.
 - *Verify on read*: blocks from untrusted stores or peers are re-hashed (`Block::verify`); trusted local stores can skip it.
 
 ### Data model and codecs

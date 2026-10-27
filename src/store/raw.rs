@@ -20,8 +20,7 @@ impl RawStore {
         // A rowid table: SQLite advises against WITHOUT ROWID for large rows
         db.conn().execute_batch(
             "CREATE TABLE IF NOT EXISTS raw_blocks (
-                 id INTEGER PRIMARY KEY,
-                 multihash BLOB UNIQUE NOT NULL,
+                 block INTEGER PRIMARY KEY REFERENCES multihashes (id),
                  data BLOB NOT NULL
              );",
         )?;
@@ -36,30 +35,36 @@ impl Store for RawStore {
 impl BlockIndex for RawStore {
     fn has(&self, key: Key<'_>) -> Result<bool> {
         Ok(self.db.conn()
-            .query_row("SELECT 1 FROM raw_blocks WHERE multihash = ?1", [key.to_bytes()], |_| Ok(()))
+            .prepare_cached(
+                "SELECT 1 FROM multihashes m JOIN raw_blocks r ON r.block = m.id WHERE m.multihash = ?1",
+            )?
+            .query_row([key.to_bytes()], |_| Ok(()))
             .optional()?
             .is_some())
     }
 
     fn keys(&self) -> Result<Vec<Multihash>> {
-        query_keys(&self.db, NAME, "SELECT multihash FROM raw_blocks")
+        query_keys(&self.db, NAME, "SELECT m.multihash FROM raw_blocks r JOIN multihashes m ON m.id = r.block")
     }
 }
 
 impl BlockSource for RawStore {
     fn get(&self, key: Key<'_>) -> Result<Option<Vec<u8>>> {
         Ok(self.db.conn()
-            .query_row("SELECT data FROM raw_blocks WHERE multihash = ?1", [key.to_bytes()], |row| row.get(0))
+            .prepare_cached(
+                "SELECT r.data FROM multihashes m JOIN raw_blocks r ON r.block = m.id WHERE m.multihash = ?1",
+            )?
+            .query_row([key.to_bytes()], |row| row.get(0))
             .optional()?)
     }
 }
 
 impl BlockStore for RawStore {
     fn put(&self, block: &Block) -> Result<Put> {
-        self.db.conn().execute(
-            "INSERT OR IGNORE INTO raw_blocks (multihash, data) VALUES (?1, ?2)",
-            params![block.cid().multihash().to_bytes(), block.data()],
-        )?;
+        let id = self.db.intern(block.cid().multihash())?;
+        self.db.conn()
+            .prepare_cached("INSERT OR IGNORE INTO raw_blocks (block, data) VALUES (?1, ?2)")?
+            .execute(params![id, block.data()])?;
         Ok(Put::Stored)
     }
 }

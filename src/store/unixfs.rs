@@ -7,7 +7,9 @@
 //! mtime, canonical field order. Anything else is declined and belongs in
 //! a generic store.
 //!
-//! Since links are rows, backreferences come for free.
+//! Since links are rows, backreferences come for free. Link targets are
+//! interned multihashes, with the CID prefix each link was written with
+//! kept alongside to manifest it.
 
 use rusqlite::{OptionalExtension, params};
 
@@ -17,7 +19,7 @@ use crate::multihash::Multihash;
 use crate::pb::{PbLink, PbNode};
 use crate::unixfs::{DataBuf, DataType};
 
-use super::{BlockIndex, BlockSource, BlockStore, Db, Error, Key, Put, RefIndex, Result, Store, query_keys};
+use super::{BlockIndex, BlockSource, BlockStore, Db, Error, Key, MAX_DIGEST_LEN, Put, RefIndex, Result, Store, query_keys, split_cid};
 
 const NAME: &str = "unixfs";
 
@@ -36,8 +38,10 @@ struct Node {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Link {
-    /// Binary CID.
-    cid: Vec<u8>,
+    /// The CID's version and codec, empty for CIDv0.
+    prefix: Vec<u8>,
+    /// The CID's multihash.
+    target: Vec<u8>,
     name: Vec<u8>,
     tsize: u64,
     blocksize: Option<u64>,
@@ -58,12 +62,17 @@ impl Node {
         let links = node.links
             .iter()
             .enumerate()
-            .map(|(i, link)| Some(Link {
-                cid: link.hash.to_vec(),
-                name: link.name?.to_vec(),
-                tsize: link.tsize?,
-                blocksize: blocksizes.get(i).copied(),
-            }))
+            .map(|(i, link)| {
+                let (prefix, target) = split_cid(&link.hash)?;
+                (target.len() <= MAX_DIGEST_LEN).then_some(())?;
+                Some(Link {
+                    prefix: prefix.to_vec(),
+                    target: target.to_bytes(),
+                    name: link.name?.to_vec(),
+                    tsize: link.tsize?,
+                    blocksize: blocksizes.get(i).copied(),
+                })
+            })
             .collect::<Option<Vec<_>>>()?;
         let parsed = Self { data, links };
         // SQLite integers are signed
@@ -87,7 +96,7 @@ impl Node {
         PbNode {
             links: self.links
                 .iter()
-                .map(|l| PbLink { hash: l.cid.as_slice().into(), name: Some(&l.name), tsize: Some(l.tsize) })
+                .map(|l| PbLink { hash: [&l.prefix[..], &l.target].concat().into(), name: Some(&l.name), tsize: Some(l.tsize) })
                 .collect(),
             data: Some(&data),
         }
@@ -110,8 +119,7 @@ impl UnixfsStore {
     pub fn open(db: Db) -> Result<Self> {
         db.conn().execute_batch(
             "CREATE TABLE IF NOT EXISTS unixfs_nodes (
-                 id INTEGER PRIMARY KEY,
-                 multihash BLOB UNIQUE NOT NULL,
+                 block INTEGER PRIMARY KEY REFERENCES multihashes (id),
                  type INTEGER NOT NULL,
                  data BLOB,
                  filesize INTEGER,
@@ -119,15 +127,16 @@ impl UnixfsStore {
                  fanout INTEGER
              );
              CREATE TABLE IF NOT EXISTS unixfs_links (
-                 node INTEGER NOT NULL REFERENCES unixfs_nodes (id) ON DELETE CASCADE,
+                 node INTEGER NOT NULL REFERENCES unixfs_nodes (block) ON DELETE CASCADE,
                  idx INTEGER NOT NULL,
-                 cid BLOB NOT NULL,
+                 target INTEGER NOT NULL REFERENCES multihashes (id),
+                 prefix BLOB NOT NULL,
                  name BLOB NOT NULL,
                  tsize INTEGER NOT NULL,
                  blocksize INTEGER,
                  PRIMARY KEY (node, idx)
              ) WITHOUT ROWID;
-             CREATE INDEX IF NOT EXISTS unixfs_links_cid ON unixfs_links (cid);",
+             CREATE INDEX IF NOT EXISTS unixfs_links_target ON unixfs_links (target);",
         )?;
         Ok(Self { db })
     }
@@ -136,7 +145,8 @@ impl UnixfsStore {
         let conn = self.db.conn();
         let row = conn
             .query_row(
-                "SELECT id, type, data, filesize, hash_type, fanout FROM unixfs_nodes WHERE multihash = ?1",
+                "SELECT n.block, n.type, n.data, n.filesize, n.hash_type, n.fanout
+                 FROM multihashes m JOIN unixfs_nodes n ON n.block = m.id WHERE m.multihash = ?1",
                 [key.to_bytes()],
                 |row| Ok((
                     row.get::<_, i64>(0)?,
@@ -156,19 +166,23 @@ impl UnixfsStore {
             .ok_or_else(|| Error::Invalid { store: NAME, reason: format!("type {data_type}") })?;
 
         let mut stmt = conn.prepare_cached(
-            "SELECT cid, name, tsize, blocksize FROM unixfs_links WHERE node = ?1 ORDER BY idx",
+            "SELECT l.prefix, m.multihash, l.name, l.tsize, l.blocksize
+             FROM unixfs_links l JOIN multihashes m ON m.id = l.target
+             WHERE l.node = ?1 ORDER BY l.idx",
         )?;
         let links = stmt
             .query_map([id], |row| Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             )))?
             .map(|row| {
-                let (cid, name, tsize, blocksize) = row?;
+                let (prefix, target, name, tsize, blocksize) = row?;
                 Ok(Link {
-                    cid,
+                    prefix,
+                    target,
                     name,
                     tsize: unsigned(Some(tsize))?.unwrap_or_default(),
                     blocksize: unsigned(blocksize)?,
@@ -197,13 +211,16 @@ impl Store for UnixfsStore {
 impl BlockIndex for UnixfsStore {
     fn has(&self, key: Key<'_>) -> Result<bool> {
         Ok(self.db.conn()
-            .query_row("SELECT 1 FROM unixfs_nodes WHERE multihash = ?1", [key.to_bytes()], |_| Ok(()))
+            .prepare_cached(
+                "SELECT 1 FROM multihashes m JOIN unixfs_nodes n ON n.block = m.id WHERE m.multihash = ?1",
+            )?
+            .query_row([key.to_bytes()], |_| Ok(()))
             .optional()?
             .is_some())
     }
 
     fn keys(&self) -> Result<Vec<Multihash>> {
-        query_keys(&self.db, NAME, "SELECT multihash FROM unixfs_nodes")
+        query_keys(&self.db, NAME, "SELECT m.multihash FROM unixfs_nodes n JOIN multihashes m ON m.id = n.block")
     }
 }
 
@@ -218,17 +235,17 @@ impl BlockStore for UnixfsStore {
         let Some(node) = Node::parse(block) else {
             return Ok(Put::Declined);
         };
-        let key = block.cid().multihash().to_bytes();
         if self.has(block.cid().multihash())? {
             return Ok(Put::Stored);
         }
         self.db.atomically(|| {
             let conn = self.db.conn();
+            let id = self.db.intern(block.cid().multihash())?;
             conn.execute(
-                "INSERT INTO unixfs_nodes (multihash, type, data, filesize, hash_type, fanout)
+                "INSERT INTO unixfs_nodes (block, type, data, filesize, hash_type, fanout)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
-                    key,
+                    id,
                     u64::from(node.data.data_type).cast_signed(),
                     node.data.data,
                     signed(node.data.filesize),
@@ -236,15 +253,18 @@ impl BlockStore for UnixfsStore {
                     signed(node.data.fanout),
                 ],
             )?;
-            let id = conn.last_insert_rowid();
             let mut stmt = conn.prepare_cached(
-                "INSERT INTO unixfs_links (node, idx, cid, name, tsize, blocksize) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO unixfs_links (node, idx, target, prefix, name, tsize, blocksize)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for (idx, link) in node.links.iter().enumerate() {
+                let target = Multihash::<Box<[u8]>>::decode(&link.target)
+                    .map_err(|e| Error::Invalid { store: NAME, reason: format!("link multihash: {e}") })?;
                 stmt.execute(params![
                     id,
                     i64::try_from(idx).unwrap_or(i64::MAX),
-                    link.cid,
+                    self.db.intern(target.as_ref())?,
+                    link.prefix,
                     link.name,
                     signed(Some(link.tsize)),
                     signed(link.blocksize),
@@ -257,11 +277,14 @@ impl BlockStore for UnixfsStore {
 }
 
 impl RefIndex for UnixfsStore {
-    fn backrefs(&self, cid: &[u8]) -> Result<Vec<Multihash>> {
+    fn backrefs(&self, key: Key<'_>) -> Result<Vec<Multihash>> {
         let mut stmt = self.db.conn().prepare_cached(
-            "SELECT DISTINCT n.multihash FROM unixfs_links l JOIN unixfs_nodes n ON n.id = l.node WHERE l.cid = ?1",
+            "SELECT DISTINCT n.multihash FROM multihashes t
+             JOIN unixfs_links l ON l.target = t.id
+             JOIN multihashes n ON n.id = l.node
+             WHERE t.multihash = ?1",
         )?;
-        let rows = stmt.query_map([cid], |row| row.get::<_, Vec<u8>>(0))?;
+        let rows = stmt.query_map([key.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
         rows.map(|bytes| super::decode_key(NAME, &bytes?)).collect()
     }
 }
