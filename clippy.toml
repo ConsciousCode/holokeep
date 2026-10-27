@@ -1,0 +1,2 @@
+# Domain terms which aren't code identifiers; ".." keeps clippy's defaults
+doc-valid-idents = ["UnixFS", "UnixFSv1", "CIDv0", "CIDv1", "IPLD", ".."]
