@@ -13,7 +13,7 @@ use multibase::Base;
 use serde_json::{Map, Value};
 
 use crate::block::Block;
-use crate::dagcbor;
+use crate::{dagcbor, dagjson};
 use crate::model::Ipld;
 use crate::cid::{AnyCid, BaseCid, Cid, CidRef, Cidv1, Cidv1Spec, DAG_CBOR_CODEC, DAG_JSON_CODEC, DAG_PB_CODEC};
 use crate::multihash::{Inline, MultihashFunc};
@@ -332,6 +332,83 @@ fn dagcbor_decode_negative() {
         let (_, bytes) = multibase::decode(format!("f{hex}")).expect("hex");
         assert!(
             dagcbor::from_slice::<Ipld>(&bytes).is_err(),
+            "{} should fail: {}",
+            case_name(case),
+            case["error"]
+        );
+    }
+}
+
+//--------------//
+//-[ dag-json ]-//
+//--------------//
+
+#[test]
+fn dagjson_round_trip() {
+    let fixtures = fixtures();
+    let json: Vec<&Fixture> = fixtures.iter().filter(|f| f.codec == "dag-json").collect();
+    assert!(json.len() >= 128, "only found {} dag-json fixtures", json.len());
+
+    let mut failures = Vec::new();
+    for f in json {
+        let label = f.label();
+        let decoded = match dagjson::from_slice_canon::<Ipld>(&f.bytes) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                failures.push(format!("{label}: decode: {e}"));
+                continue;
+            },
+        };
+        if !decoded.is_canon() {
+            failures.push(format!("{label}: decoded as non-canonical"));
+        }
+        match dagjson::to_vec(decoded.inner()) {
+            Ok(bytes) if bytes == f.bytes => (),
+            Ok(bytes) => failures.push(format!("{label}: re-encodes as {}", String::from_utf8_lossy(&bytes))),
+            Err(e) => failures.push(format!("{label}: encode: {e}")),
+        }
+    }
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}
+
+#[test]
+fn cross_codec() {
+    // The same data in dag-cbor and dag-json transcodes to the other exactly
+    let fixtures = fixtures();
+    let mut failures = Vec::new();
+    let mut pairs = 0;
+    for cbor in fixtures.iter().filter(|f| f.codec == "dag-cbor") {
+        let Some(json) = fixtures.iter().find(|j| j.name == cbor.name && j.codec == "dag-json") else {
+            continue;
+        };
+        pairs += 1;
+        let from_cbor: Ipld = dagcbor::from_slice(&cbor.bytes)
+            .unwrap_or_else(|e| panic!("{}: {e}", cbor.label()));
+        let from_json: Ipld = dagjson::from_slice(&json.bytes)
+            .unwrap_or_else(|e| panic!("{}: {e}", json.label()));
+        if from_cbor != from_json {
+            failures.push(format!("{}: decodes differently from cbor and json", cbor.name));
+        }
+        if dagjson::to_vec(&from_cbor).ok().as_ref() != Some(&json.bytes) {
+            failures.push(format!("{}: cbor -> json differs", cbor.name));
+        }
+        if dagcbor::to_vec(&from_json).ok().as_ref() != Some(&cbor.bytes) {
+            failures.push(format!("{}: json -> cbor differs", cbor.name));
+        }
+    }
+    assert!(pairs >= 128, "only found {pairs} cbor/json pairs");
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}
+
+#[test]
+fn dagjson_decode_negative() {
+    let cases = negative("dag-json/decode/duplicate-keys.json");
+    assert!(!cases.is_empty());
+    for case in &cases {
+        let hex = case["hex"].as_str().expect("hex");
+        let (_, bytes) = multibase::decode(format!("f{hex}")).expect("hex");
+        assert!(
+            dagjson::from_slice::<Ipld>(&bytes).is_err(),
             "{} should fail: {}",
             case_name(case),
             case["error"]

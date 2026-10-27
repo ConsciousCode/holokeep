@@ -20,6 +20,7 @@ mod codec_fixtures;
 mod canon;
 //mod ipld;
 mod dagcbor;
+mod dagjson;
 mod serde;
 
 use chunker::ChunkerType;

@@ -23,8 +23,8 @@ pub enum Ipld {
     Float(f64),
     String(String),
     Bytes(Vec<u8>),
-    List(Vec<Ipld>),
-    Map(BTreeMap<String, Ipld>),
+    List(Vec<Self>),
+    Map(BTreeMap<String, Self>),
     Link(Link),
 }
 
@@ -103,7 +103,7 @@ impl<'de> Visitor<'de> for IpldVisitor {
         Ok(Ipld::Map(map))
     }
 
-    /// Links, by the CID_SERDE_PRIVATE_IDENTIFIER convention
+    /// Links, by the `CID_SERDE_PRIVATE_IDENTIFIER` convention
     fn visit_newtype_struct<D: Deserializer<'de>>(self, d: D) -> Result<Ipld, D::Error> {
         Link::deserialize(d).map(Ipld::Link)
     }
