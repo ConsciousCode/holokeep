@@ -1,2 +1,6 @@
 # Domain terms which aren't code identifiers; ".." keeps clippy's defaults
 doc-valid-idents = ["UnixFS", "UnixFSv1", "CIDv0", "CIDv1", "IPLD", ".."]
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

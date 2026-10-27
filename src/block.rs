@@ -125,5 +125,44 @@ mod tests {
 
         assert_eq!(block.data(), &data[..]);
         assert_eq!(block.len(), 11);
+        assert_eq!(
+            block.cid().to_string(),
+            "bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e"
+        );
+        assert_eq!(block.into_data(), data);
+    }
+
+    fn hello() -> Block {
+        Block::hash(Cidv1Spec::default(), b"hello world"[..].into())
+    }
+
+    #[test]
+    fn verify_matching() {
+        let block = hello();
+        let verified = Block::verify(block.cid().clone(), block.data().into()).expect("matches");
+        assert_eq!(verified, block);
+
+        // Any supported hash function, not just the default
+        let spec = Cidv1Spec::new(RAW_CODEC, MultihashFunc::Sha3_512);
+        let block: Block = Block::hash(spec, b"hello world"[..].into());
+        assert!(Block::verify(block.cid().clone(), block.data().into()).is_ok());
+    }
+
+    #[test]
+    fn verify_mismatch() {
+        let block = hello();
+        let err = Block::verify(block.cid().clone(), b"hello there"[..].into())
+            .expect_err("different data");
+        let VerifyError::Mismatch(expected, got) = err else { panic!("{err:?}") };
+        assert_eq!(expected, block.cid().multihash());
+        assert_ne!(expected, got);
+    }
+
+    #[test]
+    fn verify_unknown_hash() {
+        let digest = Inline::<64>::decode(&[0; 16]).expect("fits");
+        let cid = Cidv1::new(RAW_CODEC, Multihash::new(0xd5, digest));
+        let err = Block::verify(cid, Box::default()).expect_err("md5 unsupported");
+        assert!(matches!(err, VerifyError::UnknownHash(0xd5)));
     }
 }

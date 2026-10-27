@@ -177,6 +177,39 @@ mod tests {
     }
 
     #[test]
+    fn file_data() {
+        // Type File, filesize 10, unpacked blocksizes 4, 4, 2
+        let mut buf = Vec::new();
+        Data::file(10, &[4, 4, 2]).encode(&mut buf);
+        assert_eq!(buf, [0x08, 0x02, 0x18, 0x0a, 0x20, 0x04, 0x20, 0x04, 0x20, 0x02]);
+    }
+
+    #[test]
+    fn hamt_data() {
+        // Type HAMTShard, bitfield, hashType murmur3-x64-64, fanout 256
+        let mut buf = Vec::new();
+        Data::hamt_shard(&[0x01, 0xff], 0x22, 256).encode(&mut buf);
+        assert_eq!(buf, [0x08, 0x05, 0x12, 0x02, 0x01, 0xff, 0x28, 0x22, 0x30, 0x80, 0x02]);
+    }
+
+    #[test]
+    fn links_before_data() {
+        let cid: Cidv1 = Cidv1Spec::default().hash(b"hello world");
+        let link = Link { hash: &cid, name: b"a", tsize: 300 };
+        let node = encode_node(&[link.clone(), Link { name: b"", ..link }], &Data::directory());
+
+        let named = [&[0x0a, 0x24][..], &cid.to_bytes(), &[0x12, 0x01, b'a', 0x18, 0xac, 0x02]].concat();
+        // An empty name is still written
+        let unnamed = [&[0x0a, 0x24][..], &cid.to_bytes(), &[0x12, 0x00, 0x18, 0xac, 0x02]].concat();
+        let expected = [
+            &[0x12, 0x2c][..], &named,
+            &[0x12, 0x2b], &unnamed,
+            &[0x0a, 0x02, 0x08, 0x01],
+        ].concat();
+        assert_eq!(node, expected);
+    }
+
+    #[test]
     fn empty_directory_cid() {
         let block = node_block(&[], &Data::directory());
         assert_eq!(

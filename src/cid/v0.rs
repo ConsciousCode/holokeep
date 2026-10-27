@@ -81,8 +81,11 @@ impl<D: DigestBuf> Cid<D> for Cidv0<D> {
     fn decode(mut buf: &[u8]) -> Result<Self, DecodeError> {
         const CIDV0_HASH_U8: u8 = HASH_CODEC as u8;
         match buf.split_off_first() {
-            Some(&CIDV0_HASH_U8) if varint::read(&mut buf)? == 32 =>
-                Ok(Self { digest: D::decode(buf)? }),
+            Some(&CIDV0_HASH_U8) if varint::read(&mut buf)? == 32 => match buf.len() {
+                32 => Ok(Self { digest: D::decode(buf)? }),
+                0..32 => Err(DecodeError::Truncated),
+                _ => Err(DecodeError::Parse),
+            },
             Some(&CIDV0_HASH_U8) => Err(DecodeError::Parse),
             Some(_) => Err(DecodeError::Version),
             None => Err(DecodeError::Truncated),
@@ -115,14 +118,8 @@ impl<D: DigestBuf> From<Cidv0<D>> for Cidv1<D> {
 impl<D: DigestBuf> FromStr for Cidv0<D> {
     type Err = FromStrError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (base, raw) = multibase::decode(s)?;
-
-        if base == multibase::Base::Base58Btc {
-            Ok(Self::decode(&raw)?)
-        }
-        else {
-            Err(DecodeError::Version.into())
-        }
+        // CIDv0 strings are bare base58btc, without a multibase prefix
+        Ok(Self::decode(&Base::Base58Btc.decode(s)?)?)
     }
 }
 
@@ -266,5 +263,76 @@ impl<'de> de::Deserialize<'de> for Cidv0<Cow<'de, [u8]>> {
             CID_SERDE_PRIVATE_IDENTIFIER,
             CowVisitor
         )
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::multihash::MultihashDigest;
+
+    // An empty UnixFS directory, `ipfs add -r --cid-version 0`
+    const EMPTY_DIR: &[u8] = &[0x0a, 0x02, 0x08, 0x01];
+    const EMPTY_DIR_V0: &str = "QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn";
+    const EMPTY_DIR_V1: &str = "bafybeiczsscdsbs7ffqz55asqdf3smv6klcw3gofszvwlyarci47bgf354";
+
+    fn empty_dir() -> Cidv0 {
+        Cidv0::new(HASH_CODEC.digest::<[u8; 32]>(EMPTY_DIR).expect("digest").into_digest())
+    }
+
+    #[test]
+    fn display_and_parse() {
+        let cid = empty_dir();
+        assert_eq!(cid.to_string(), EMPTY_DIR_V0);
+        assert_eq!(EMPTY_DIR_V0.parse::<Cidv0>().expect("parse"), cid);
+        // CIDv0 is never multibase-prefixed, nor anything but base58btc
+        assert!(format!("z{EMPTY_DIR_V0}").parse::<Cidv0>().is_err());
+        assert!(EMPTY_DIR_V1.parse::<Cidv0>().is_err());
+    }
+
+    #[test]
+    fn bytes_round_trip() {
+        let cid = empty_dir();
+        let bytes = cid.to_bytes();
+        assert_eq!(bytes.len(), cid.size());
+        assert_eq!(bytes[..2], [0x12, 0x20]);
+        assert_eq!(bytes[2..], *cid.digest());
+        assert_eq!(Cidv0::<[u8; 32]>::decode(&bytes).expect("decode"), cid);
+        assert_eq!(Cidv0::<Vec<u8>>::decode(&bytes).expect("decode").digest_ref(), cid.digest_ref());
+    }
+
+    #[test]
+    fn decode_errors() {
+        let bytes = empty_dir().to_bytes();
+        let decode = Cidv0::<Vec<u8>>::decode;
+        assert!(matches!(decode(&[]), Err(DecodeError::Truncated)));
+        assert!(matches!(decode(&bytes[..33]), Err(DecodeError::Truncated)));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(matches!(decode(&trailing), Err(DecodeError::Parse)));
+        // Not sha2-256
+        let mut wrong = bytes.clone();
+        wrong[0] = 0x13;
+        assert!(matches!(decode(&wrong), Err(DecodeError::Version)));
+        // sha2-256, but not 32 bytes
+        let mut wrong = bytes;
+        wrong[1] = 0x10;
+        assert!(matches!(decode(&wrong), Err(DecodeError::Parse)));
+    }
+
+    #[test]
+    fn properties() {
+        let cid = empty_dir();
+        assert_eq!(cid.version(), CidVersion::V0);
+        assert_eq!(cid.codec(), DAG_PB_CODEC);
+        assert_eq!(cid.multihash().code(), 0x12);
+        assert_eq!(cid.multihash().to_bytes(), cid.to_bytes());
+        assert_eq!(Multihash::from(cid.clone()).to_bytes(), cid.to_bytes());
+        assert_eq!(cid.clone().into_multihash(), cid.multihash());
+    }
+
+    #[test]
+    fn upgrade_to_v1() {
+        let v1: Cidv1<[u8; 32]> = empty_dir().into();
+        assert_eq!(v1.to_string(), EMPTY_DIR_V1);
     }
 }

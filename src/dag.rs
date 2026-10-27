@@ -285,6 +285,113 @@ mod tests {
         assert_eq!(layout(4, 4).1, 1);
     }
 
+    /// Keep every emitted block.
+    #[derive(Default)]
+    struct Keep(Vec<Block>);
+    impl BlockSink for Keep {
+        fn put(&mut self, block: Block) -> io::Result<()> {
+            self.0.push(block);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tsize_counts_whole_dag() {
+        // Includes trees 3+ levels deep, where interior nodes are easy to miss
+        for (width, chunks) in [(2, 2), (2, 5), (2, 8), (3, 10), (4, 64), (4, 65)] {
+            let mut sink = Keep::default();
+            let mut builder = BalancedLayout { width }.builder();
+            for i in 0..chunks {
+                builder.add_chunk(leaf(i), &mut sink).expect("add");
+            }
+            let root = builder.finalize(&mut sink).expect("finalize");
+            let nodes: u64 = sink.0.iter().map(|b| len64(b.data())).sum();
+            assert_eq!(root.tsize, nodes + u64::from(chunks), "width {width}, {chunks} chunks");
+            assert_eq!(root.filesize, u64::from(chunks));
+            // Children before parents, so the root comes last
+            assert_eq!(sink.0.last().map(Block::cid), Some(&root.cid));
+        }
+    }
+
+    #[test]
+    fn balanced_depth() {
+        // Full trees don't grow an extra level: width^n leaves is n levels
+        assert_eq!(layout(2, 8).1, 4 + 2 + 1);
+        assert_eq!(layout(3, 9).1, 3 + 1);
+        assert_eq!(layout(3, 10).1, 4 + 2 + 1);
+    }
+
+    /// Kubo: a directory of files `a`..`j`, each containing its own name.
+    fn letters(strategy: DynamicDirectory, order: impl Iterator<Item = u8>) -> DagLink {
+        let mut sink = NullSink;
+        let mut dir = strategy.builder();
+        for c in order {
+            dir.add_link(vec![c], leaf(c), &mut sink).expect("add");
+        }
+        dir.finalize(&mut sink).expect("finalize")
+    }
+
+    #[test]
+    fn basic_directory_matches_kubo() {
+        let expected = "bafybeieyljareszbgtwnecod7waccwrwxc4hnkhvcfz46jjkvm6lejz6x4";
+        let dir = letters(DynamicDirectory::default(), b'a'..=b'j');
+        assert_eq!(dir.cid.to_string(), expected);
+        // Sorted by name whatever order they were added in
+        let dir = letters(DynamicDirectory::default(), (b'a'..=b'j').rev());
+        assert_eq!(dir.cid.to_string(), expected);
+    }
+
+    #[test]
+    fn hamt_directory_matches_kubo() {
+        // Import.UnixFSHAMTDirectorySizeThreshold "1B" and
+        // Import.UnixFSHAMTDirectoryMaxFanout 256 or 8
+        let sharded = |fanout| DynamicDirectory { threshold: 1, hamt: Hamt { fanout } };
+        assert_eq!(
+            letters(sharded(256), b'a'..=b'j').cid.to_string(),
+            "bafybeifigwztatb3igypxcz6gkrtfgcgjfeoheuq4xoh57akbpzt45qdoy"
+        );
+        // 10 entries in 8 buckets has to nest
+        assert_eq!(
+            letters(sharded(8), b'a'..=b'j').cid.to_string(),
+            "bafybeihjqjwxbsv5swajtldgzdqkoydmgh7yoqkw5rqsylhclnehiix45y"
+        );
+    }
+
+    #[test]
+    fn directory_tsize() {
+        let mut sink = Keep::default();
+        let mut dir = DynamicDirectory::default().builder();
+        for c in b'a'..=b'j' {
+            dir.add_link(vec![c], leaf(c), &mut sink).expect("add");
+        }
+        let root = dir.finalize(&mut sink).expect("finalize");
+        assert_eq!(sink.0.len(), 1);
+        assert_eq!(root.tsize, len64(sink.0[0].data()) + 10);
+        assert_eq!(root.filesize, 0);
+
+        // Sharded: every shard counted once, children before parents
+        let mut sink = Keep::default();
+        let hamt = Hamt { fanout: 8 };
+        let mut dir = DynamicDirectory { threshold: 1, hamt }.builder();
+        for c in b'a'..=b'j' {
+            dir.add_link(vec![c], leaf(c), &mut sink).expect("add");
+        }
+        let root = dir.finalize(&mut sink).expect("finalize");
+        assert!(sink.0.len() > 1, "nested shards");
+        let shards: u64 = sink.0.iter().map(|b| len64(b.data())).sum();
+        assert_eq!(root.tsize, shards + 10);
+        assert_eq!(sink.0.last().map(Block::cid), Some(&root.cid));
+    }
+
+    #[test]
+    fn symlink() {
+        let mut sink = Keep::default();
+        let link = symlink_node(b"hello", &mut sink).expect("symlink");
+        // From the Kubo tree in import's tests
+        assert_eq!(link.cid.to_string(), "bafybeifmeeehxnbbwguvklqabzdq4choqqi7jdygi2egmgd5kaxxudojxi");
+        assert_eq!(link.tsize, len64(sink.0[0].data()));
+    }
+
     #[test]
     fn balanced_shapes() {
         // width 2: 3 leaves = root[n(0,1), n(2)]

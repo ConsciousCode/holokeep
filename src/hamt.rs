@@ -165,6 +165,40 @@ mod tests {
     }
 
     #[test]
+    fn pad_small_fanout() {
+        assert_eq!(Hamt { fanout: 8 }.pad(), 1);
+        assert_eq!(Hamt { fanout: 2 }.pad(), 1);
+    }
+
+    #[test]
+    fn name_hash_is_go_sum64() {
+        // mmh3.hash64(name, signed=False)[0]
+        assert_eq!(name_hash(b"").ok(), Some(0));
+        assert_eq!(name_hash(b"hello").ok(), Some(0xcbd8_a7b3_41bd_9b02));
+        assert_eq!(name_hash(b"entry-1.txt").ok(), Some(0xdde3_6f58_fc15_7797));
+    }
+
+    #[test]
+    fn rejects_bad_fanout() {
+        for fanout in [0, 1, 3, 12, 512] {
+            let built = Hamt { fanout }.build(BTreeMap::new(), &mut crate::dag::NullSink);
+            assert!(built.is_err(), "fanout {fanout}");
+        }
+    }
+
+    #[test]
+    fn index_small_fanout() {
+        // 3 bits per level, from the top
+        let hamt = Hamt { fanout: 8 };
+        let hash = 0b101_011 << 58;
+        assert_eq!(bucket_index(hamt, 0, hash).ok(), Some(0b101));
+        assert_eq!(bucket_index(hamt, 1, hash).ok(), Some(0b011));
+        // 21 whole levels fit in 64 bits
+        assert!(bucket_index(hamt, 20, hash).is_ok());
+        assert!(bucket_index(hamt, 21, hash).is_err());
+    }
+
+    #[test]
     fn index_takes_high_bits_first() {
         let hamt = Hamt::default();
         let hash = 0x0123_4567_89ab_cdef;

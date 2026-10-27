@@ -136,3 +136,131 @@ fn leaf(chunk: &[u8], sink: &mut impl BlockSink) -> io::Result<DagLink> {
     sink.put(block)?;
     Ok(DagLink { cid, tsize: size, filesize: size })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
+
+    use crate::dag::NullSink;
+
+    const HELLO: &str = "bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e";
+    const EMPTY: &str = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku";
+    /// `ipfs add --chunker=size-4 --max-file-links=3` of "hello world"
+    const HELLO_SMALL: &str = "bafybeighmzuokpuzyho2ninhgybpych6atkhbn2o57c3hlyer2hntezxly";
+
+    fn small() -> Importer {
+        Importer { chunk_size: 4, layout: BalancedLayout { width: 3 }, ..Importer::default() }
+    }
+
+    fn add(importer: &Importer, reader: impl Read) -> String {
+        importer.add_file(reader, &mut NullSink).expect("add").cid.to_string()
+    }
+
+    #[test]
+    fn files_match_kubo() {
+        assert_eq!(add(&Importer::default(), &b"hello world"[..]), HELLO);
+        assert_eq!(add(&Importer::default(), &b""[..]), EMPTY);
+        assert_eq!(add(&small(), &b"hello world"[..]), HELLO_SMALL);
+    }
+
+    /// A reader which dribbles out a byte at a time, interrupted between.
+    struct Dribble<'a>(&'a [u8], bool);
+    impl Read for Dribble<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.1 = !self.1;
+            if self.1 {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let Some((first, rest)) = self.0.split_first() else { return Ok(0) };
+            buf[0] = *first;
+            self.0 = rest;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn short_reads() {
+        assert_eq!(add(&small(), Dribble(b"hello world", false)), HELLO_SMALL);
+        assert_eq!(add(&Importer::default(), Dribble(b"", false)), EMPTY);
+    }
+
+    /// A scratch directory removed on drop.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("hk-test-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("scratch dir");
+            Self(path)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Build the tree Kubo's vectors were made from:
+    /// t/hello, t/.hidden, t/sub/empty, t/sub/link -> hello
+    fn tree(scratch: &Scratch) -> PathBuf {
+        let t = scratch.0.join("t");
+        fs::create_dir_all(t.join("sub")).expect("mkdir");
+        fs::write(t.join("hello"), "hello world").expect("write");
+        fs::write(t.join(".hidden"), "secret").expect("write");
+        fs::write(t.join("sub/empty"), "").expect("write");
+        symlink("hello", t.join("sub/link")).expect("symlink");
+        t
+    }
+
+    fn add_tree(importer: &Importer, root: &Path) -> BTreeMap<PathBuf, String> {
+        let mut added = BTreeMap::new();
+        let base = root.parent().expect("parent");
+        let link = importer
+            .add_path(root, &mut NullSink, &mut |path, link| {
+                let rel = path.strip_prefix(base).expect("under root").to_path_buf();
+                added.insert(rel, link.cid.to_string());
+            })
+            .expect("add")
+            .expect("representable");
+        assert_eq!(added.get(Path::new("t")), Some(&link.cid.to_string()));
+        added
+    }
+
+    #[test]
+    fn directory_matches_kubo() {
+        let scratch = Scratch::new("tree");
+        let t = tree(&scratch);
+
+        // `ipfs add -r t`
+        let added = add_tree(&Importer::default(), &t);
+        let expected = [
+            ("t", "bafybeieln7fdrluiqxqnebxsxvajb2grwv7liien3aqu74iryolh4puri4"),
+            ("t/hello", HELLO),
+            ("t/sub", "bafybeifhwpoqs4s6hlqhnms5p5esn5jymudhmy3xpswph237qxeovkccli"),
+            ("t/sub/empty", EMPTY),
+            ("t/sub/link", "bafybeifmeeehxnbbwguvklqabzdq4choqqi7jdygi2egmgd5kaxxudojxi"),
+        ];
+        let expected: BTreeMap<PathBuf, String> =
+            expected.iter().map(|(p, c)| (PathBuf::from(p), (*c).to_owned())).collect();
+        assert_eq!(added, expected);
+
+        // `ipfs add -r -H t`
+        let hidden = Importer { hidden: true, ..Importer::default() };
+        let added = add_tree(&hidden, &t);
+        assert_eq!(
+            added.get(Path::new("t")).map(String::as_str),
+            Some("bafybeic2ctdqelmghewrn5cmqebegqlmanbutlym22tzbewrmtr5fm7k3q")
+        );
+        assert!(added.contains_key(Path::new("t/.hidden")));
+    }
+
+    #[test]
+    fn missing_path_errors() {
+        let scratch = Scratch::new("missing");
+        let result = Importer::default().add_path(&scratch.0.join("nope"), &mut NullSink, &mut |_, _| {});
+        assert!(result.is_err());
+    }
+}

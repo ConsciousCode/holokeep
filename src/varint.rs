@@ -204,23 +204,64 @@ mod tests {
         }
     }
 
-    /*
     #[test]
     fn dogfood_unsigned() {
-        for i in 0..1025 {
-            let mut buf = [0u8; 1024];
-
-            {
-                let mut writable = &mut buf[..];
-                write(&mut writable, i);
-            }
+        let boundaries = (1..64).flat_map(|bit| {
+            let n = 1u64 << bit;
+            [n - 1, n, n + 1]
+        });
+        for i in (0..1025).chain(boundaries).chain([u64::MAX]) {
+            let mut buf = Vec::new();
+            write(&mut buf, i);
+            assert_eq!(buf.len(), size(i), "size of {i}");
 
             let mut readable = &buf[..];
             let result =
                 read(&mut readable).expect("Should be able to read it back again");
             assert_eq!(i, result);
+            assert!(readable.is_empty(), "{i} left bytes behind");
         }
-    } */
+    }
+
+    // Examples from the multiformats unsigned-varint spec
+    #[test]
+    fn test_write_known() {
+        let cases: [(u64, &[u8]); 7] = [
+            (1, &[0x01]),
+            (127, &[0x7f]),
+            (128, &[0x80, 0x01]),
+            (255, &[0xff, 0x01]),
+            (300, &[0xac, 0x02]),
+            (16384, &[0x80, 0x80, 0x01]),
+            (u64::MAX, &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]),
+        ];
+        for (value, bytes) in cases {
+            let mut buf = Vec::new();
+            write(&mut buf, value);
+            assert_eq!(buf, bytes, "encoding {value}");
+        }
+    }
+
+    #[test]
+    fn test_read_empty() {
+        let mut readable = &[][..];
+        assert!(matches!(read(&mut readable), Err(Error::Truncated)));
+    }
+
+    #[test]
+    fn test_read_last_byte_limit() {
+        // The 10th byte can only carry the 64th bit
+        let mut buf = [0xff; 10];
+        buf[9] = 0x01;
+        assert_eq!(read(&mut &buf[..]).expect("u64::MAX"), u64::MAX);
+
+        buf[9] = 0x02;
+        assert!(matches!(read(&mut &buf[..]), Err(Error::Overflow)));
+
+        // Overflowing and then running out mid-varint is truncation
+        buf[9] = 0x82;
+        assert!(matches!(read(&mut &buf[..]), Err(Error::Truncated)));
+    }
 
     #[test]
     fn test_read_overflow() {

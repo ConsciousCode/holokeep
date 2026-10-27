@@ -7,7 +7,6 @@ use std::marker::PhantomData;
 use std::str::FromStr;
 
 use digest::Digest;
-use multibase::Base;
 use serde::{ser, de};
 use serde_bytes;
 
@@ -94,11 +93,11 @@ impl<D: DigestBuf> Cid<D> for AnyCid<D> {
         cid_call!(self.into_multihash())
     }
 
-    fn decode(mut buf: &[u8]) -> Result<Self, DecodeError> {
+    fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
         const HASH_CODE: u8 = v0::HASH_CODEC as u8;
 
         // Peek first byte to branch between V0 (0x12) and V1 (0x01)
-        match buf.split_off_first() {
+        match buf.first() {
             Some(&HASH_CODE) => Ok(Self::V0(Cidv0::decode(buf)?)),
             Some(0x01) => Ok(Self::V1(Cidv1::decode(buf)?)),
             Some(_) => Err(DecodeError::Version),
@@ -152,19 +151,13 @@ impl<D: DigestBuf> FromStr for AnyCid<D> {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // CIDv0 strings are always raw base58btc without multibase prefixes (Qm...)
         if s.starts_with("Qm") && s.len() == 46 {
-            let (_, raw) = multibase::decode(format!("z{s}"))?;
-            let cid = Cidv0::decode(&raw)?;
-            return Ok(Self::V0(cid));
+            return Ok(Self::V0(s.parse()?));
         }
 
-        // Multibase encoded CIDs
-        let (base, raw) = multibase::decode(s)?;
-        if base == Base::Base58Btc && raw.len() == 34 {
-            Ok(Self::V0(Cidv0::decode(&raw)?))
-        }
-        else {
-            Ok(Self::V1(Cidv1::decode(&raw)?))
-        }
+        // Anything else is a multibase CIDv1. The spec forbids multibase
+        // CIDv0, which Cidv1::decode rejects by its version byte.
+        let (_, raw) = multibase::decode(s)?;
+        Ok(Self::V1(Cidv1::decode(&raw)?))
     }
 }
 
@@ -177,7 +170,7 @@ impl<D: AsRef<[u8]>> fmt::Display for AnyCid<D> {
 
 impl<A: AsRef<[u8]>, B: AsRef<[u8]>> PartialEq<AnyCid<B>> for AnyCid<A> {
     fn eq(&self, other: &AnyCid<B>) -> bool {
-        self.codec() == other.codec() && self.multihash() == self.multihash()
+        self.codec() == other.codec() && self.multihash() == other.multihash()
     }
 }
 impl<D: AsRef<[u8]>> Eq for AnyCid<D> {}
@@ -301,5 +294,87 @@ impl<'de, D: DigestBuf> de::Deserialize<'de> for AnyCid<D> {
             CID_SERDE_PRIVATE_IDENTIFIER,
             AnyCidVisitor(PhantomData)
         )
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cid::DAG_PB_CODEC;
+    use crate::multihash::Inline;
+
+    const EMPTY_DIR: &[u8] = &[0x0a, 0x02, 0x08, 0x01];
+    const EMPTY_DIR_V0: &str = "QmUNLLsPACCz1vLxQVkXqqLX5R1X345qqfHbsf67hvA3Nn";
+    const EMPTY_DIR_V1: &str = "bafybeiczsscdsbs7ffqz55asqdf3smv6klcw3gofszvwlyarci47bgf354";
+    const HELLO: &str = "bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e";
+
+    type Any = AnyCid<Inline<64>>;
+
+    #[test]
+    fn parse_keeps_version() {
+        let v0: Any = EMPTY_DIR_V0.parse().expect("v0");
+        let v1: Any = EMPTY_DIR_V1.parse().expect("v1");
+        assert_eq!(v0.version(), CidVersion::V0);
+        assert_eq!(v1.version(), CidVersion::V1);
+        assert_eq!(v0.to_string(), EMPTY_DIR_V0);
+        assert_eq!(v1.to_string(), EMPTY_DIR_V1);
+        assert_eq!(v0.size(), 34);
+        assert_eq!(v1.size(), 36);
+        // The spec forbids multibase-encoding CIDv0
+        assert!(format!("z{EMPTY_DIR_V0}").parse::<Any>().is_err());
+    }
+
+    #[test]
+    fn decode_keeps_version() {
+        for s in [EMPTY_DIR_V0, EMPTY_DIR_V1, HELLO] {
+            let cid: Any = s.parse().expect(s);
+            let back = Any::decode(&cid.to_bytes()).expect(s);
+            assert_eq!(back.version(), cid.version(), "{s}");
+            assert_eq!(back.to_string(), s);
+        }
+        assert!(matches!(Any::decode(&[]), Err(DecodeError::Truncated)));
+        assert!(matches!(Any::decode(&[0x02, 0x55]), Err(DecodeError::Version)));
+    }
+
+    #[test]
+    fn equality_is_by_content() {
+        let v0: Any = EMPTY_DIR_V0.parse().expect("v0");
+        let v1: Any = EMPTY_DIR_V1.parse().expect("v1");
+        let hello: Any = HELLO.parse().expect("hello");
+        assert_eq!(v0, v1);
+        assert_ne!(v1, hello);
+        // Same codec, different digest
+        let other = CidSpec::<MultihashFunc>::V0.hash::<Inline<64>>(b"other");
+        assert_ne!(v0, other);
+    }
+
+    #[test]
+    fn conversions() {
+        let v1: Any = EMPTY_DIR_V1.parse().expect("v1");
+        assert_eq!(Cidv0::try_from(v1.clone()).expect("downgrade").to_string(), EMPTY_DIR_V0);
+        assert_eq!(Cidv1::from(v1).to_string(), EMPTY_DIR_V1);
+
+        let v0: Any = EMPTY_DIR_V0.parse().expect("v0");
+        assert_eq!(Cidv1::from(v0).to_string(), EMPTY_DIR_V1);
+
+        let hello: Any = HELLO.parse().expect("hello");
+        assert!(matches!(Cidv0::try_from(hello), Err(DecodeError::Version)));
+    }
+
+    #[test]
+    fn spec() {
+        use MultihashFunc::{Sha2_256, Sha2_512};
+        assert_eq!(CidSpec::new(CidVersion::V0, DAG_PB_CODEC, Sha2_256), Some(CidSpec::V0));
+        assert_eq!(CidSpec::new(CidVersion::V0, RAW_CODEC, Sha2_256), None);
+        assert_eq!(CidSpec::new(CidVersion::V0, DAG_PB_CODEC, Sha2_512), None);
+        assert_eq!(
+            CidSpec::new(CidVersion::V1, RAW_CODEC, Sha2_256),
+            Some(CidSpec::default())
+        );
+
+        assert_eq!(CidSpec::<MultihashFunc>::V0.hash::<Inline<64>>(EMPTY_DIR).to_string(), EMPTY_DIR_V0);
+        assert_eq!(CidSpec::default().hash::<Inline<64>>(b"hello world").to_string(), HELLO);
+        assert_eq!(CidSpec::<MultihashFunc>::V0.codec(), DAG_PB_CODEC);
+        assert_eq!(CidSpec::<MultihashFunc>::V0.hashcode(), 0x12);
+        assert_eq!(CidSpec::default().version(), CidVersion::V1);
     }
 }

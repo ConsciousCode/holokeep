@@ -123,14 +123,18 @@ mod rabin_const {
         table
     };
 
-    // Calculate out table for window removal
+    /// Bytes in the rolling window.
+    pub const WINDOW: usize = 64;
+
+    // Calculate out table for window removal: a byte's contribution once
+    // it has been shifted through the whole window and one more step
     pub const OUT_TABLE: [u64; 256] = {
         let mut out_table = [0u64; 256];
         let mut i = 0;
         while i < 256 {
             let mut hash = TABLE[i];
             let mut j = 0;
-            while j < 64 {
+            while j < 8 * WINDOW {
                 if hash & 1 == 1 {
                     hash = (hash >> 1) ^ POLY;
                 }
@@ -148,7 +152,7 @@ mod rabin_const {
 
 /// Rabin rolling hash window
 struct RabinWindow {
-    window: [u8; 64],
+    window: [u8; rabin_const::WINDOW],
     wpos: usize,
     hash: u64,
     mask: u64,
@@ -162,7 +166,7 @@ impl RabinWindow {
         let mask = (1u64 << bits) - 1;
 
         Self {
-            window: [0u8; 64],
+            window: [0u8; rabin_const::WINDOW],
             wpos: 0,
             hash: 0,
             mask,
@@ -170,7 +174,7 @@ impl RabinWindow {
     }
 
     fn reset(&mut self) {
-        self.window = [0u8; 64];
+        self.window = [0u8; rabin_const::WINDOW];
         self.wpos = 0;
         self.hash = 0;
     }
@@ -178,10 +182,12 @@ impl RabinWindow {
     fn slide(&mut self, byte: u8) -> u64 {
         let out = self.window[self.wpos];
         self.window[self.wpos] = byte;
-        self.wpos = (self.wpos + 1) & 63;
+        self.wpos = (self.wpos + 1) % rabin_const::WINDOW;
 
-        self.hash =
-            rabin_const::TABLE[(self.hash ^ byte as u64) as u8 as usize]
+        // Rolling CRC: shift the new byte in, cancel the one leaving, so
+        // the hash depends only on the window's contents
+        self.hash = (self.hash >> 8)
+            ^ rabin_const::TABLE[(self.hash ^ byte as u64) as u8 as usize]
             ^ rabin_const::OUT_TABLE[out as usize];
 
         self.hash
@@ -269,33 +275,38 @@ impl Default for ChunkerType {
 }
 
 impl ChunkerType {
-    /// Parse a chunker spec string (e.g., "size-262144" or "rabin-262144-524288-1048576")
+    /// Parse a chunker spec string the way Kubo does, e.g. "size-262144",
+    /// "rabin", "rabin-262144" or "rabin-[min:]131072-[avg:]262144-[max:]1048576".
     pub fn parse(s: &str) -> Option<Self> {
         if let Some(size_str) = s.strip_prefix("size-") {
-            size_str.parse().ok().map(ChunkerType::Size)
+            size_str.parse().ok().filter(|&n| n > 0).map(ChunkerType::Size)
+        }
+        else if s == "rabin" {
+            Some(Self::rabin(DEFAULT_CHUNK_SIZE))
         }
         else if let Some(params) = s.strip_prefix("rabin-") {
             let parts: Vec<&str> = params.split('-').collect();
+            let labeled = |part: &str, label: &str| -> Option<usize> {
+                part.strip_prefix(label).unwrap_or(part).parse().ok()
+            };
             match parts[..] {
                 [min, avg, max] => Some(ChunkerType::Rabin {
-                    min: min.parse().ok()?,
-                    avg: avg.parse().ok()?,
-                    max: max.parse().ok()?,
+                    min: labeled(min, "min:")?,
+                    avg: labeled(avg, "avg:")?,
+                    max: labeled(max, "max:")?,
                 }),
-                [avg] => {
-                    let avg = avg.parse().ok()?;
-                    Some(ChunkerType::Rabin {
-                        min: avg / 2,
-                        avg,
-                        max: avg * 4,
-                    })
-                },
+                [avg] => Some(Self::rabin(avg.parse().ok()?)),
                 _ => None,
             }
         }
         else {
             None
         }
+    }
+
+    /// Rabin chunking around an average size, with Kubo's derived bounds.
+    const fn rabin(avg: usize) -> Self {
+        ChunkerType::Rabin { min: avg / 3, avg, max: avg.saturating_add(avg / 2) }
     }
 }
 
@@ -405,12 +416,125 @@ mod tests {
         assert_eq!(
             ChunkerType::parse("rabin-262144"),
             Some(ChunkerType::Rabin {
-                min: 131072,
+                min: 87381,
                 avg: 262144,
-                max: 1048576
+                max: 393216
             })
         );
 
         assert!(ChunkerType::parse("invalid").is_none());
+    }
+
+    #[test]
+    fn test_chunker_type_parse_like_kubo() {
+        // boxo/chunker: rabin-<avg> means min avg/3, max avg*1.5
+        assert_eq!(
+            ChunkerType::parse("rabin"),
+            Some(ChunkerType::Rabin { min: 87381, avg: 262144, max: 393216 })
+        );
+        assert_eq!(
+            ChunkerType::parse("rabin-min:16-avg:32-max:64"),
+            Some(ChunkerType::Rabin { min: 16, avg: 32, max: 64 })
+        );
+        assert_eq!(ChunkerType::parse("size-1"), Some(ChunkerType::Size(1)));
+        for bad in ["size-0", "size-", "size--1", "size-1k", "rabin-1-2", "rabin-1-2-3-4", "rabin-x", "buzhash"] {
+            assert_eq!(ChunkerType::parse(bad), None, "{bad}");
+        }
+    }
+
+    /// Deterministic pseudo-random bytes (xorshift64).
+    fn noise(len: usize, mut seed: u64) -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed.to_le_bytes()[0]
+            })
+            .collect()
+    }
+
+    /// Run a chunker over `data`, feeding it `feed` bytes at a time.
+    fn run(chunker: &mut impl Chunker, data: &[u8], feed: usize) -> Vec<Bytes> {
+        let mut out = Vec::new();
+        for piece in data.chunks(feed) {
+            chunker.push(piece, |c| out.push(c));
+        }
+        chunker.finish(|c| out.push(c));
+        out
+    }
+
+    #[test]
+    fn test_size_chunker_feed_independent() {
+        let data = noise(1000, 1);
+        let expected: Vec<&[u8]> = data.chunks(300).collect();
+        for feed in [1, 7, 299, 300, 301, 1000] {
+            let chunks = run(&mut SizeChunker::with_size(300), &data, feed);
+            assert_eq!(chunks, expected, "feeding {feed} at a time");
+        }
+    }
+
+    #[test]
+    fn test_size_chunker_edges() {
+        // Nothing in, nothing out; the importer handles empty files
+        assert!(run(&mut SizeChunker::new(), &[], 1).is_empty());
+
+        let chunks = run(&mut SizeChunker::with_size(1), b"abc", 2);
+        assert_eq!(chunks, [&b"a"[..], b"b", b"c"]);
+
+        // Reusable after finish
+        let mut chunker = SizeChunker::with_size(2);
+        assert_eq!(run(&mut chunker, b"abc", 3), [&b"ab"[..], b"c"]);
+        assert_eq!(run(&mut chunker, b"de", 3), [&b"de"[..]]);
+        assert_eq!(chunker.chunk_size(), 2);
+    }
+
+    #[test]
+    fn test_rabin_chunker_deterministic() {
+        let data = noise(200_000, 2);
+        let expected = run(&mut RabinChunker::with_params(1024, 4096, 16384), &data, data.len());
+        assert_eq!(expected.concat(), data);
+        assert!(expected.len() > 1);
+        for chunk in &expected[..expected.len() - 1] {
+            assert!((1024..=16384).contains(&chunk.len()), "chunk of {}", chunk.len());
+        }
+        for feed in [1, 100, 4096, 65536] {
+            let mut chunker = RabinChunker::with_params(1024, 4096, 16384);
+            assert_eq!(run(&mut chunker, &data, feed), expected, "feeding {feed} at a time");
+            // and again after finish resets it
+            assert_eq!(run(&mut chunker, &data, feed), expected, "reused, feeding {feed}");
+        }
+    }
+
+    #[test]
+    fn test_rabin_window_rolls() {
+        // The hash depends only on the last WINDOW bytes, whatever came before
+        let tail = noise(rabin_const::WINDOW, 5);
+        let hash = |prefix: &[u8]| {
+            let mut window = RabinWindow::new(4096);
+            prefix.iter().chain(&tail).fold(0, |_, &b| window.slide(b))
+        };
+        let expected = hash(&[]);
+        assert_eq!(hash(&noise(1, 6)), expected);
+        assert_eq!(hash(&noise(1000, 7)), expected);
+    }
+
+    #[test]
+    fn test_rabin_chunker_resyncs() {
+        // Content-defined chunking: inserting bytes at the front should
+        // only disturb the chunks near the insertion
+        let data = noise(200_000, 3);
+        let mut shifted = noise(100, 4);
+        shifted.extend_from_slice(&data);
+
+        let params = || RabinChunker::with_params(1024, 4096, 16384);
+        let original = run(&mut params(), &data, data.len());
+        let moved = run(&mut params(), &shifted, shifted.len());
+        let shared = original.iter().filter(|c| moved.contains(c)).count();
+        assert!(
+            shared * 10 >= original.len() * 9,
+            "only {shared} of {} chunks survived a 100 byte insert",
+            original.len()
+        );
     }
 }
