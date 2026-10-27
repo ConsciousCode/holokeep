@@ -247,6 +247,7 @@ mod tests {
     use super::*;
     use crate::cid::{Cidv1Spec, RAW_CODEC};
     use crate::multihash::MultihashFunc;
+    use crate::pb::PbNode;
 
     /// Count emitted blocks.
     #[derive(Default)]
@@ -381,6 +382,31 @@ mod tests {
         let shards: u64 = sink.0.iter().map(|b| len64(b.data())).sum();
         assert_eq!(root.tsize, shards + 10);
         assert_eq!(sink.0.last().map(Block::cid), Some(&root.cid));
+    }
+
+    #[test]
+    fn emitted_nodes_are_valid_dag_pb() {
+        let mut sink = Keep::default();
+        let mut file = BalancedLayout { width: 3 }.builder();
+        for i in 0..20 {
+            file.add_chunk(leaf(i), &mut sink).expect("add");
+        }
+        file.finalize(&mut sink).expect("finalize");
+        for strategy in [DynamicDirectory::default(), DynamicDirectory { threshold: 1, hamt: Hamt { fanout: 8 } }] {
+            let mut dir = strategy.builder();
+            for c in (b'a'..=b'z').rev() {
+                dir.add_link(vec![c], leaf(c), &mut sink).expect("add");
+            }
+            dir.finalize(&mut sink).expect("finalize");
+        }
+        symlink_node(b"target", &mut sink).expect("symlink");
+
+        assert!(sink.0.len() > 10);
+        for block in &sink.0 {
+            let node = PbNode::decode(block.data()).expect("decode");
+            node.validate().expect("links sorted");
+            assert_eq!(node.encode(), block.data(), "canonical");
+        }
     }
 
     #[test]

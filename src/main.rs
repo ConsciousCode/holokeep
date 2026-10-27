@@ -7,10 +7,13 @@ mod block;
 mod chunker;
 mod varint;
 mod multihash;
+mod pb;
 mod unixfs;
 mod dag;
 mod hamt;
 mod import;
+#[cfg(test)]
+mod codec_fixtures;
 // Generic IPLD/serde layer, not needed by the importer yet
 //mod dagpb;
 //mod canon;

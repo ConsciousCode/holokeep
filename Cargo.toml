@@ -50,3 +50,6 @@ panic_in_result_fn = "deny"
 panic = "deny"
 exit = "deny"
 as_conversions = "deny"
+
+[dev-dependencies]
+serde_json = "1"

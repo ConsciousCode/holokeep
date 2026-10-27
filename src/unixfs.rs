@@ -3,7 +3,7 @@
 //! This only writes, and only the canonical form: dag-pb Links (field 2)
 //! before Data (field 1), UnixFS fields in ascending order, no mode/mtime.
 //! That's exactly what Kubo produces, so byte-identical blocks give
-//! identical CIDs. Parsing lives in the (WIP) serde-based `dagpb` module.
+//! identical CIDs. The dag-pb framing itself is in `pb`.
 //!
 //! <https://specs.ipfs.tech/unixfs/>
 
@@ -12,7 +12,7 @@ use num_enum::IntoPrimitive;
 use crate::block::Block;
 use crate::cid::{CidRef, Cidv1, Cidv1Spec, DAG_PB_CODEC};
 use crate::multihash::MultihashFunc;
-use crate::varint;
+use crate::pb::{put_bytes, put_uint, PbLink, PbNode};
 
 /// UnixFSv1 `Data.Type`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, IntoPrimitive)]
@@ -105,56 +105,29 @@ pub struct Link<'a> {
     pub tsize: u64,
 }
 
-impl Link<'_> {
-    fn encode(&self, buf: &mut Vec<u8>) {
-        put_bytes(buf, 1, &self.hash.to_bytes());
-        // Kubo always writes Name, even when empty
-        put_bytes(buf, 2, self.name);
-        put_uint(buf, 3, self.tsize);
-    }
-}
-
 /// Serialize a dag-pb node.
 pub fn encode_node(links: &[Link<'_>], data: &Data<'_>) -> Vec<u8> {
     let mut buf = Vec::new();
-    let mut scratch = Vec::new();
-    for link in links {
-        scratch.clear();
-        link.encode(&mut scratch);
-        put_bytes(&mut buf, 2, &scratch);
+    data.encode(&mut buf);
+    PbNode {
+        // Kubo always writes Name and Tsize, even when empty or zero
+        links: links
+            .iter()
+            .map(|link| PbLink {
+                hash: link.hash.to_bytes().into(),
+                name: Some(link.name),
+                tsize: Some(link.tsize),
+            })
+            .collect(),
+        data: Some(&buf),
     }
-    scratch.clear();
-    data.encode(&mut scratch);
-    put_bytes(&mut buf, 1, &scratch);
-    buf
+    .encode()
 }
 
 /// Serialize a dag-pb node and wrap it in a block with a CIDv1.
 pub fn node_block(links: &[Link<'_>], data: &Data<'_>) -> Block {
     let spec = Cidv1Spec::new(DAG_PB_CODEC, MultihashFunc::Sha2_256);
     Block::hash(spec, encode_node(links, data).into_boxed_slice())
-}
-
-//------------------------//
-//-[ Protobuf primitives ]-//
-//------------------------//
-
-const VARINT: u64 = 0;
-const LEN: u64 = 2;
-
-fn put_tag(buf: &mut Vec<u8>, field: u64, wire: u64) {
-    varint::write(buf, field << 3 | wire);
-}
-
-fn put_uint(buf: &mut Vec<u8>, field: u64, value: u64) {
-    put_tag(buf, field, VARINT);
-    varint::write(buf, value);
-}
-
-fn put_bytes(buf: &mut Vec<u8>, field: u64, value: &[u8]) {
-    put_tag(buf, field, LEN);
-    varint::write(buf, u64::try_from(value.len()).unwrap_or(u64::MAX));
-    buf.extend_from_slice(value);
 }
 
 #[cfg(test)]
