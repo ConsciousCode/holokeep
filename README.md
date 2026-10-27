@@ -1,229 +1,176 @@
-# Data Soup
-## Principles
-- Objects "live" in multiple possibly remote locations but can be accessed from anywhere within the mesh without the user knowing where they are.
-- Objects are automatically stochastically replicated so they are never lost.
-- Scales automatically with however many (or few) servers you add.
-- Integrates nicely with the existing IPFS/IPLD ecosystem - the public DHT is a subset of the repository.
-- Non-hierarchical/relational by default with support for hierarchy as-needed.
-- Privacy needs exactly one of permissioned or cryptographic security.
-- Private and user-owned by default.
-- It can take any data you throw at it and sort the mess later.
-- Consume the universe, import everything.
-
-## Architecture
-- Physical - "Blockstores" supervised by one or more gateways map CIDs to actual blocks. They do not have any concept of users, ownership, or authentication except as needed to provide their service.
-- Access - Users authenticated by public key have logical views of the underlying unauthenticated blockstores.
-- Logical - Backreferences, attributes, and joint queries which also implement mutation.
-- Transport - P2P communication between gateways to coordinate replication and DHT resolution.
-- Social - Contact between separate private DHTs including mutually storing encrypted blocks and sharing access.
-
-## Database
-So the tables I can think of:
-- `blocks` - mapping CID to any block storage metadata
-	- `type` - enumeration of `raw`, `cbor`, `json`, `anchor`
-	- `current` - cache of the current state of the block's attributes to avoid recalculating them every time
-- `attrs` - an EAV table for the metadata system - each entry has its own CID calculated by converting it to `dag-cbor`. There needs to be some magic for determining that an object is an attribute (relation?) to rebuild the index from exported blocks. Also need a timestamp to order them.
-- `users` - mapping public keys to user identities
-- `refs` - for backreference indexing
-- `stores` - the blockstores to connect to
-- `locs` - one to many mapping of blocks to their blockstores.
-
-## Join blocks
-This is the core of the Nayuki-style tagging system and what I believe can take IPFS from a dead archive to a living local ecosystem. The concept hoists mutability into backref indexes so "what refers to this" is a valid query. The use-cases:
-- Tags
-  - Primarily for search and discovery
-  - Simple tags associated with a name
-  - Could link to a complex tag like a globally recognized anchor with extensible metadata associated with it
-- Attributes
-  - When was this photo taken?
-  - What year is this album?
-  - Who is pictured?
-  - Who did I get this from?
-  - How many times have I viewed it?
-- Anchors
-  - Compare to Perkeep permanodes
-  - Empty objects where state is attached by the presence of blocks which reference them in the repo
-  - Core of mutability, define a stable identity decoupled from content
-- Claims
-  - Signed trustful state claims
-  - "This is a snapshot of this URI at this time" - import claim?
-  - Anchor mutations
-  - "This metadata can be extracted from this file"
-  - Could be less trustful: "hash X is an alias of hash Y" - still requires trust as rehashing could be an expensive operation
-- ADL/content-typed views
-  - Instead of magic or mime xattrs, files can have view objects that link to them providing a hint about what content types are valid
-  - Using ADLs could make opaque blobs traversable
-- Administrative
-  - Keep claims
-  - Pin claims
-    - Distinct from Kubo, "pin to this particular node"
-    - May work better out-of-band. Keep claims make sense just as a matter of signaling "this is an object you probably don't want garbage-collected" which can be imported from another repo, but it doesn't make sense to transport claims about where an object would live.
-  - Arguably mutations could fall under this. I want to put more thought into CRDT and live shared editing eventually, but the priority by a longshot is repo curation.
-  - Tombstones
-
-What if I had something anchor-shaped that signalled a kind of mutable mount into a host filesystem? Then it could be referred to in CAS but rather than traversal going through ordered claims, it defers to some handler. This would allow much better interoperability and even allow me to navigate the filesystems of my different computers completely abstracted from where they are.
-
-This might also be the key for mutable files. One major problem MFS has is every single mutation has to rehash up to the root; delaying risks data loss and doesn't play nicely with my private DHT aim. What if instead, you mount one singular file like this and it hooks into some CRDT scheme so changes propagate at the speed they need to and eventually it can be recommitted to immutability?
-
-```ipld
-type ComplexTag struct {
-	name String
-}
-type Tag union {
-	| String simple
-  | ComplexTag complex
-} representation kinded;
-
-type Attrs struct {
-	attrs map
-}
-
-type Holokeep union {
-	| [Link] "keeps"
-	| [Link] "tombs"
-	| [Tag] "tags"
-} representation keyed
-```
-
-Note that this kind of block tends to be content first, address second. That is, because it's defined by *what* it references the hash can be elided except during transport when it's manifested. Optionally you might want to keep the hash around "just in case" someone references it, but when would that happen? Hnnn... it might if the hash exists elsewhere in the DHT and they want to talk about it. But, it could just ask for the block then match it to the object...
-
-The problem I'm trying to avoid here is I want these to be ultra-lightweight and very numerous. Essentially they represent compact rows in a table, for each one of thousands or millions to have its own hash "just in case" seems absurd especially since the hash is likely to be bigger than the object itself. But, if I do truly get to millions then that's just a few dozen megabytes. Also if it's bigger I can just use the `id` hashfunc.
-
-## Phases
-1. Private DHT for replicating file archives
-2. Limited distributed mutability and local indexing (Perkeep parity)
-3. Social networking (shares, encrypted puts with friends, subsumption of website databases for per-user data pods, BAT/delegated distributed access control including website databases on your user, DIDs necessary)
-4. Abstract transport (mount to anchors (permanodes) for arbitrary RPC and plan9-esque file access, proxying across the network)
-
-## Checklist
-- [ ] Kubo hash compatibility for imported files
-  - [ ] Small file with raw codec
-  - [ ] Multi-block file
-  - [ ] Directory
-  - [ ] HAMT
-- [ ] UnixFSv1 indexing in SQL
-- [ ] Backreference indexing
-- [ ] Tagging
-- [ ] Querying
-- [ ] Perkeep-style claims
-- [ ] File mutation
-- [ ] FUSE
-- [ ] P2P private DHT
-- [ ] Public Amino DHT
-- [ ] Bittorrent bridging
-- [ ] User ownership model
-- [ ] Peergos BAT with friends
-
-## Optimizations
-- Coalesce files as large blobs and promote blocks to offset-blocks. Also, chunk large blocks automatically.
-
----
-
-Attempt to re-frame this project:
-
-## Naming and intuition
-The high-level idea is "data soup" which anchors intuition to a view of data as a fluid which flows to fill the shape of its container with data (particles) being roughly fungible at a high-level view. Soup also contains larger chunks which are files and objects, the soup has no identifiable location for anything.
-
-My particular project is "Holokeep", a particular implementation of data soup as a concept.
-
-## Prior art
-Perkeep: archival object focus, importing, abstractions, permanodes (anchors)
-IPFS/IPLD: Protocols, formats, CIDs, libp2p plumbing
-Nayuki RelFS: Backreference indexing, tagging as a core organizational principle, tables as a compact representation of object classes
-Peergos: BAT for hierarchical access control via semi-trusted nodes
-
-## Principles
-- Objects "live" in multiple possibly remote locations but can be accessed from anywhere within the mesh without the user knowing where they are.
-- Objects are automatically stochastically replicated so they are never lost.
-- Scales automatically with however many (or few) servers you add.
-- Integrates nicely with the existing IPFS/IPLD ecosystem - the public DHT is a subset of the repository.
-- Non-hierarchical/relational by default with support for hierarchy as-needed.
-- Privacy needs exactly one of permissioned or cryptographic security.
-- Private and user-owned by default.
-- It can take any data you throw at it and sort the mess later.
-- Consume the universe, import everything.
-
-## Layers
-- Physical - Each node may have one or more blockstores. These are dumb by design and do not track user ownership. All blocks can be serialized to raw bytes, but blockstores can specialize in storing specific types of blocks. For instance, objects with common properties may instead be stored as rows in a database indexed by multihash. Like Perkeep, indexes should generally be derivable from data, but not to its level of paranoia. It should be possible *in principle* but not something done lightly, akin to fsck.
-- Logical - Nodes keep track of user block ownership in their repository ("repo") and make a best effort to restrict access to the blocks users actually control. Users are coordinated by DID and their documents.
-- Linking - Within a user's repo, indexes keep track of which blocks reference other blocks which forms the basis of mutable anchoring, tagging, and collections. At any given moment these indexes might be incomplete, spread across multiple nodes, but a node should try to aggregate the totality of any given block's indexes within its blockstores.
-- Transport
-  - Private - Nodes join a private DHT to stochastically replicate files. These are assumed to be owned by the same entity and are fully permissioned/trusted. Replication is aware of blockstores which are indexed by private-DHT-local UUID because nodes are not assumed to have total ownership of their store. This allows eg multiple nodes having access to shared cloud storage without double-counting replications.
-  - Protected - Private DHTs can connect between each other at the periphery to semi-trusted nodes (eg owned by friends) which are trusted to provide and maintain access control of encrypted blocks for mutual replication. Negotiation of providing blocks is out of scope, but I could see this also being used for paid nodes rather than simply friends.
-  - Public - Amino DHT for public block access. Blocks that users import are assumed private by default and participation in bitswap occurs only when blocks are shared or that block is provided by bitswap in the first place to avoid leaking information.
-
-## Use cases
-- Personal archive
-- Stochastic replication
-- Social data sharing
-- Distributed application hosting
-- General transport via anchor mounts. Basically mount arbitrary RPC servers on anchors to be serviced by nodes ala 9P. This could let you access a node's local filesystem and facilities through the DAG.
-
-## Vision
-- Short-term: I want to treat my data like a tiny data lake without having to know "where" anything is and without ever having to configure replication or redundancy. From any node in the network, all files are accessible even if they don't "live" with that node. I just add 5 computers to my network and they automatically figure out which hard drives get which blobs to maintain a default 3x replication. It needs to be robust to changing network topologies so I can keep my laptop as part of it even as it connects and disconnects. Compare this to other distributed filesystems like ceph where nodes are expected to be always-on and NFS where data lives in one server.
-- Mid-term: Imports act as a local cache of external data repositories and applications to eventually support the long-term vision where those applications provide the blocks directly without needing an import step.
-- Long-term: Re-imagine the internet as one enormous global filesystem that everyone is a part of. Personal files are invisible to everyone unless shared, and there's a shift in applications from storing user data in proprietary servers to storing data with the user's own data sectors with BAT-style permissions. Compare this to DNS/HTTP where the authority itself is decentralized.
-
----
-
-Trust is an optimization
-
-Lampshade:
-- Encryption vs deduplication
-- Pin "privacy needs exactly one of permissioned or cryptographic" to the layers: private is permissioned, protected is cryptographic, public is neither
-- Need a story for node eviction in case a computer is stolen. Key rotation etc
-- A partitioned node is indistinguishable from a dead one thus every mutable structure must be merge-shaped
-- Read-your-writes on the local node, eventual everywhere else, convergence via anti-entropy.
-- Threat model for each tier
-- Non-goals: not a blockchain, not Byzantine-fault-tolerant against malicious mesh members, not a POSIX filesystem, not low-latency block storage, no availability guarantee during total partition.
-- Hardware now is like a hermit crab shell; discard the old, move into the new, renovate, and grow into it. Data soup reframes the relationship to adding a machine to a mesh and it becomes yours, receives of your identity
-- Derivation graphs as a generalization of claims/tags/indexes
-- Homeostasis as a goal weighed against the bandwidth costs
-- Dedup reveals structure, could be useful user-facing
-- Metadata is more sensitive than data
-- Stochastic placement presents safe-harbor questions
-- AP system vis a vis CAP theorem
-- Protected tier is a commons/mutual aid, sharing as infrastructure instead of sharing through a platform. Accounting should be legible enough for trust but not so financialized it becomes a market
-- Apps are pure function over soup - VLAD?
-- Data soup decentralizes authority over state as opposed to DNS which decentralizes authority over names
-- Anchor mounts are named ports, simple transport with no assumed protocol
-- Audit/repair and trickl-GC are the same homeostasis with different signs akin to soup convecting
-- Primordial soup, beautiful soup
-
-Split principles into invariants, defaults, and design stances
-
-Identity
-  Multihash identity
-Claims
-  Carry retention implications
-
-Retention
-  Lazy trickle GC - hard boundary on what is collectable, priority collection. Always local. Mention that merkle DAG cannot contain loops by construction and thus refcounting is sound
-Replication
-  Audit/repair immune loop
-  Diversity weighting
-Tiers
-
----
+# Holokeep
 
 Conventional filesystems are incredibly useful. They provide a unified interface for coordinating impossibly heterogeneous data in the form of "files" across multiple systems. However, the cost of this utility is the tyranny of *location*. A file must always "live" somewhere under a rigid ontology communicated by hierarchical directories. Does the album name or the year it was released come first? Where do you put a "School" folder? They must have a unique name even when that name would be meaningless - "Cat.jpg", "Cat (1).jpg", "Cat (1)-backup.jpg", "Cat (1) (1).jpg". Placing a file entails a decision about which drive it exists within, tying its lifetime to the health of the drive itself. There is no formal way to tie a backup to its file, particularly when that file is edited. Given long enough, any filesystem succumbs to entropy and the only choices are to give up or continue pushing the boulder against the gravity of decay.
 
 What if files didn't have a location? They could be pure objects identified by their content found by their intrinsic attributes. They could exist on any of your drives, computers, or even your friends' computers without worry that anything had changed. They could be in multiple locations at once so you don't have to worry about drive failure.
 
-This is "data soup", a content-addressable storage model where location is not tied to an object's identity or meaning. Objects are identified by their content and organized through relationships, not paths or hosts. The medium is homeostatic through anti-entropy replication and stochastic garbage collection acting in tension to return to a steady state. Semantics are contextual and relational; applications interpret objects in terms of the local graph of links and descriptors that surround them.
+This is **data soup**, a content-addressable storage model where location is not tied to an object's identity or meaning. The name anchors intuition to data as a fluid which flows to fill the shape of its container, its particles roughly fungible at a high level, with larger chunks (files and objects) suspended in it and no identifiable location for anything. Objects are identified by their content and organized through relationships, not paths or hosts. The medium is homeostatic through anti-entropy replication and stochastic garbage collection acting in tension to return to a steady state. Semantics are contextual and relational; applications interpret objects in terms of the local graph of links and descriptors that surround them.
 
-Holokeep is a particular implementation of this storage model.
+**Holokeep** is a particular implementation of this storage model.
 
-## Identity
-A block is a finite sequence of bytes. Blocks are addressed by multihashes, where each multihash encodes a choice of hash function and a digest of the block's bytes. For any fixed hash function, the system treats the hash as injective over all blocks it will store so that, operationally, each multihash acts as its primary key and hash collisions are treated as impossible for all practical purposes. Two multihashes may, by design, refer to the same block (for example, when using different hash functions) and Holokeep makes the opinionated assertion that these constitute distinct logical objects, even if they share physical storage. Equivalence relations between different multihashes with the same preimage are deferred to the relational layer.
+- [Status](#status)
+- [Vision](#vision)
+- [Principles](#principles)
+- [Architecture](#architecture)
+  - [Identity](#identity)
+  - [Physical: blockstores](#physical-blockstores)
+  - [Data model and codecs](#data-model-and-codecs)
+  - [Linking: claims](#linking-claims)
+  - [Retention](#retention)
+  - [Replication and transport](#replication-and-transport)
+- [Roadmap](#roadmap)
+- [Open questions](#open-questions)
+- [Development](#development)
 
-## Relational
-Under strict IPLD semantics, blocks are related to each other by directed CID links. In Holokeep, this is augmented by backreferences within the local repository. **Claims** are sidecar blocks representing information about their targets not necessarily present in the content itself such as metadata or derived information such as headers. Unlike ordinary blocks they do not typically have a CID. The process of having a CID assigned to a claim is called "**precipitation**". This is necessary for transport and whenever another block (such as another claim) needs to refer to it. The opposite action, a block being indexed without its CID, is called "**dissolution**".
+## Status
 
-- Tomb - Mark a block as collectable.
-- Tag - General category associated with the block.
-- Same - Given multihashes refer to the same bytes.
-- Attr - General attribute association. Use for names, titles, descriptions, dates, provenance, etc.
+Holokeep is early. What exists is the content-addressing core, each piece checked against an independent implementation:
+
+- **Import**: `hk add` turns files and directories into UnixFSv1 with CIDs identical to Kubo's `ipfs add` under the `unixfs-v1-2025` profile, including chunked files, nested directories, symlinks and HAMT-sharded directories.
+- **CIDs and multihashes**: v0 and v1; SHA-1, SHA-2, SHA-3, BLAKE2b-256 and murmur3 (no identity hash yet).
+- **Codecs**: dag-pb, dag-cbor and dag-json, strict and canonical, passing all of [ipld/codec-fixtures](https://github.com/ipld/codec-fixtures) and differential fuzzing against `serde_ipld_dagcbor`/`serde_ipld_dagjson`.
+
+Nothing is stored yet: `hk add` computes CIDs and discards the blocks. The blockstore is next, see the [roadmap](#roadmap).
+
+## Vision
+
+- **Short-term**: Treat my data like a tiny data lake without having to know "where" anything is and without ever having to configure replication or redundancy. From any node in the network, all files are accessible even if they don't "live" with that node. I just add 5 computers to my network and they automatically figure out which hard drives get which blobs to maintain a default 3x replication. It needs to be robust to changing network topologies so I can keep my laptop as part of it even as it connects and disconnects. Compare this to other distributed filesystems like Ceph where nodes are expected to be always-on and NFS where data lives in one server.
+- **Mid-term**: Imports act as a local cache of external data repositories and applications to eventually support the long-term vision where those applications provide the blocks directly without needing an import step.
+- **Long-term**: Re-imagine the internet as one enormous global filesystem that everyone is a part of. Personal files are invisible to everyone unless shared, and there's a shift in applications from storing user data in proprietary servers to storing data within the user's own data sectors with BAT-style permissions. Compare this to DNS/HTTP: DNS decentralizes authority over *names*, data soup decentralizes authority over *state*.
+
+Hardware becomes like a hermit crab's shell: discard the old, move into the new, renovate, and grow into it. Adding a machine to a mesh makes it yours; it receives your identity.
+
+### Use cases
+
+- Personal archive
+- Stochastic replication
+- Social data sharing
+- Distributed application hosting
+- General transport via anchor mounts: mount arbitrary RPC servers on anchors to be serviced by nodes, à la 9P. This could let you access a node's local filesystem and facilities through the DAG.
+
+### Prior art
+
+- **[Perkeep](https://perkeep.org/doc/)**: archival object focus, importing, blob server abstractions, permanodes (anchors).
+- **[IPFS/IPLD](https://ipld.io/docs/)**: protocols, formats, CIDs, libp2p plumbing.
+- **[Nayuki's tag-based file organization](https://www.nayuki.io/page/designing-better-file-organization-around-tags-not-hierarchies)**: backreference indexing, tagging as the core organizational principle, tables as a compact representation of object classes.
+- **[Peergos](https://book.peergos.org/)**: BATs for hierarchical access control via semi-trusted nodes.
+
+More reading is collected in [RESEARCH.md](RESEARCH.md).
+
+## Principles
+
+### Invariants
+
+What Holokeep guarantees, whatever the configuration.
+
+- **Identity is content.** A block is named by the hash of its bytes, nothing else. Location, ownership and meaning are never part of identity.
+- **Immutability.** Blocks never change; mutability is layered on top through claims.
+- **No silent loss.** A block is only collected under the [retention](#retention) rules, never because of where it happens to be stored.
+- **Round-trip fidelity.** Whatever bytes go in come back out exactly, however a blockstore chooses to represent them.
+- **Ecosystem compatibility.** Holokeep produces and accepts standard CIDs and IPLD blocks; the public IPFS network is a subset of the repository.
+
+### Defaults
+
+What happens unless configured otherwise.
+
+- **Private and user-owned.** Imported blocks are private and never announced publicly unless shared.
+- **Replicated.** Objects are stochastically replicated within the private mesh, 3x by default.
+- **Scales either way.** Works with however many, or few, nodes you add.
+- **Kubo-compatible import.** Files import with Kubo's `unixfs-v1-2025` profile, so the same file gets the same CID in Holokeep and in IPFS.
+
+### Design stances
+
+The opinions which shape the design.
+
+- **Location-free.** Objects "live" in multiple possibly remote locations but can be accessed from anywhere within the mesh without the user knowing where they are.
+- **Relational, not hierarchical.** Organization is through tags, attributes and backreferences; hierarchy is available where it's actually wanted.
+- **Consume the universe, import everything.** It can take any data you throw at it and sort the mess later.
+- **Privacy needs exactly one of permissioned or cryptographic security.** The private tier is permissioned, the protected tier is cryptographic, the public tier is neither.
+- **Trust is an optimization.** Trusted peers skip work (verification, encryption) that untrusted ones require.
+- **AP, not CP.** A partitioned node is indistinguishable from a dead one, so every mutable structure must be merge-shaped: read-your-writes on the local node, eventual consistency everywhere else, convergence via anti-entropy.
+- **Waste no bytes.** Storage is shaped by what blocks *are*: a tag is a row, not a file in a sharded directory.
+
+### Non-goals
+
+Not a blockchain. Not Byzantine-fault-tolerant against malicious mesh members. Not a POSIX filesystem. Not low-latency block storage. No availability guarantee during total partition.
+
+## Architecture
+
+The system is layered:
+
+- **Physical**: Each node has one or more blockstores mapping multihashes to blocks. These are dumb by design and do not track user ownership.
+- **Logical**: Nodes track which blocks each user owns in their repository ("repo") and make a best effort to restrict access to the blocks users actually control. Users are coordinated by DID and their documents, authenticated by public key.
+- **Linking**: Within a user's repo, indexes track which blocks reference which, the basis of mutable anchoring, tagging and collections. At any given moment these indexes might be incomplete or spread across multiple nodes, but a node tries to aggregate the totality of any given block's indexes within its blockstores.
+- **Transport**: Private, protected and public tiers of peer-to-peer replication; see [replication and transport](#replication-and-transport).
+
+### Identity
+
+A block is a finite sequence of bytes. Blocks are addressed by multihashes, where each multihash encodes a choice of hash function and a digest of the block's bytes. For any fixed hash function, the system treats the hash as injective over all blocks it will store so that, operationally, each multihash acts as its primary key and hash collisions are treated as impossible for all practical purposes.
+
+Two multihashes may, by design, refer to the same block (for example, when using different hash functions) and Holokeep makes the opinionated assertion that these constitute distinct logical objects, even if they share physical storage. Equivalence between different multihashes with the same preimage is deferred to the relational layer (`Same` claims).
+
+A CID adds a version and a codec to the multihash: a claim about how to interpret the bytes, not part of their identity. Blockstores key by multihash, as Kubo's does, and the CID prefixes a block has been seen with are indexed alongside it.
+
+Design decisions:
+
+- `Multihash<D>` is generic over its digest storage (fixed arrays, inline buffers, boxed slices) rather than the ecosystem's `Multihash<usize>`, and `AnyCid` preserves a CID's version through round trips.
+- Varints follow two specs. Protobuf (dag-pb) varints are LEB128 up to 64 bits, read leniently. Multiformats varints (CIDs, multihashes) must be minimal and at most 9 bytes, so codes and lengths stop at 2^63 - 1; `varint::read_minimal` enforces this, as the ecosystem's `cid` crate does. A CID with a larger code can be constructed but won't decode again; no real codec comes close.
+
+### Physical: blockstores
+
+Following Nayuki's "externalized relational database", where *a file corresponds to a database row and its schema to which table the row belongs in*, blockstores are **specialized**: each may restrict which blocks it accepts and represent them however suits their structure. A generic store accepts arbitrary bytes; a tag store accepts only tag claims and keeps them as literal rows in a table, rather than blobs in a sharded directory with ad-hoc indexing on top.
+
+This is a more granular take on Perkeep's blob servers, leaning into Rust's trait-oriented style. Rather than one blob server interface, capabilities are separate traits, and a store implements whichever it can:
+
+| Trait | Capability |
+|---|---|
+| `BlockIndex` | Does the store have a block, and enumerate what it has |
+| `BlockSource` | Get a block's bytes |
+| `BlockStore` | Put a block |
+| `RefIndex` | Which blocks reference a given block (backreferences) |
+
+…and a zoo of extensions to come. A read-only archive is a `BlockSource` and `BlockIndex` without `BlockStore`; an index rebuilt from other stores is a `RefIndex` with no blocks at all.
+
+**Specialized stores must manifest exact bytes.** A store which keeps blocks as rows rather than bytes has to regenerate each block byte-for-byte, or its CID breaks. So a specialized store admits only blocks whose decoded form re-encodes identically, ie canonical blocks. Anything valid but non-canonical falls through to a generic store, which keeps raw bytes. This is why the codecs report canonicity (`dagcbor::from_slice_canon` and friends) rather than just accepting or rejecting: it's the admission test.
+
+Representations carved out in the original prototype:
+
+- **Raw blocks** kept as bytes, either in a database or a sharded directory.
+- **Offset blocks**: a file stored contiguously, its chunks indexed as (file, offset, size). With raw leaves (the `unixfs-v1-2025` default) every leaf of a file *is* a byte range of the original, so the file on disk doubles as its blocks, stored once.
+- **UnixFS rows**: canonical dag-pb UnixFS nodes (no mode/mtime, standard HAMT parameters) as a node row plus link rows. dag-pb's wire format is far too permissive to store anything else this way.
+- **IPLD rows**: dag-cbor/dag-json blocks as structured data (eg JSONB) to make them queryable.
+- **Backreferences**: (source, destination) pairs.
+
+"Small blocks" (inlining small blobs into the database instead of separate files) is probably a placement policy inside a generic store rather than its own kind. SQLite is faster than the filesystem for small blobs, so the policy is worth having, but nothing else needs to know about it.
+
+The original database sketch, still roughly the plan: `blocks` (multihash, storage kind, cached current attribute state), `attrs` (an EAV table for the metadata system, each entry with its own CID from its dag-cbor form, plus a timestamp for ordering), `users` (public keys to identities), `refs` (backreferences), `stores` (connected blockstores) and `locs` (which blocks live in which stores).
+
+Ideas:
+
+- *Routing store*: a composite which dispatches each put to the most specialized store that admits it, falling back to a generic one, and reads through the `blocks` index to whichever store holds a block. Specialized stores then become an optimization you can add or remove, migrating blocks between representations without changing their identity.
+- *In-place import*: with offset blocks, importing a directory needn't copy it, like Kubo's filestore (`--nocopy`), provided changes to the original are detected (size, mtime, re-hash on read). This edges towards the anchor-mounted host filesystem idea in [open questions](#open-questions).
+- *Verify on read*: blocks from untrusted stores or peers are re-hashed (`Block::verify`); trusted local stores can skip it.
+
+### Data model and codecs
+
+Every codec round-trips through one canonical IPLD data model (`model::Ipld`: null, bool, integer, float, string, bytes, list, map, link). The serde layer (`src/serde/`) reduces each codec to a small `Encoder`/`Decoder` trait pair, so dag-cbor and dag-json are a few hundred lines each and any `Serialize` type can be encoded directly. CIDs pass through serde as a newtype named `$__private__serde__identifier__for__cid`, the same convention as the ecosystem's `cid` crate.
+
+Design decisions:
+
+- **Hand-rolled codecs**, mainly for canonicity reporting (see [blockstores](#physical-blockstores)), plus control over determinism and digest types. The ecosystem implementations are used only as test oracles (dev-dependencies), so `ipld-core` and `Multihash<usize>` never reach the runtime.
+- **Strict decoding with canonicity.** Invalid input (duplicate keys, NaN, indefinite lengths, malformed CIDs) is an error; valid but non-canonical input (unsorted keys, short floats, padded integers, whitespace) decodes and is reported as non-canonical.
+- **Integers are i128** in the data model so dag-cbor's full range, -2^64 to 2^64 - 1, survives.
+- **dag-json** follows the spec where implementations disagree: integral floats keep a `.0`, big integers stay integers, and only `{"/": string}` and `{"/": {"bytes": string}}` under a leading `/` key are reserved; `{"/": null}` is an ordinary map. Floats otherwise print like JavaScript's `Number#toString`, matching the fixtures.
+- **dag-pb** has its own strict codec (`pb.rs`) for its PBNode/PBLink framing, with UnixFS layered on top (`unixfs.rs`). It's not in the data model yet: the plan is for dag-pb to convert to and from `Ipld`, with UnixFS eventually treated as an ADL the way go-unixfsnode does, rather than baking UnixFS into the codec.
+- **Import layouts are pluggable**: file layouts (balanced, later trickle) and directory layouts (basic, HAMT, dynamic) are strategy traits.
+
+### Linking: claims
+
+Under strict IPLD semantics, blocks are related to each other by directed CID links. In Holokeep, this is augmented by backreferences within the local repository, which hoist mutability into indexes so that "what refers to this?" is a valid query. This is the core of the Nayuki-style tagging system and what I believe can take IPFS from a dead archive to a living local ecosystem.
+
+**Claims** are sidecar blocks representing information about their targets not necessarily present in the content itself, such as metadata or derived information like headers. Unlike ordinary blocks they do not typically have a CID. The process of having a CID assigned to a claim is called **precipitation**; this is necessary for transport and whenever another block (such as another claim) needs to refer to it. The opposite, a block being indexed without its CID, is **dissolution**.
+
+The point is to keep claims ultra-lightweight and very numerous: compact rows in a table, for thousands or millions of them. Their hashes would often be bigger than the claims themselves, so they're elided except during transport, when the claim is manifested; a tiny claim can also use the `identity` hash function. Precipitation only works if a dissolved claim always manifests to the same bytes, which is exactly what the canonical dag-cbor encoder guarantees.
 
 ```ipldsch
 type iso8601 string
@@ -264,30 +211,127 @@ type Claim union {
 }
 ```
 
-For all claim types, `target` represents an unordered set. This is translated into IPLD by ordering the array lexicographically by CID bytes.
+For all claim types, `target` represents an unordered set. This is translated into IPLD by ordering the array lexicographically by CID bytes. Each claim type has CRDT semantics when claims coexist within a repo; `Tomb`, `Group` and `Same` combine their `target`s.
 
-`Attr` 
+What claims are for:
 
-## Retention
-Blocks are reference-counted. Because a DAG is acyclic by construction, reference-counting garbage collection is complete. The `refcount` of a block is the number of *non-claim* blocks in the local repo which refer to a block. Note that a block may have a refcount *after* it is collected which indicates that there are still dangling references to it. This is to allow old or unwanted data to be collected even if references would otherwise keep them alive. Garbage collection is best conceived as purging the *cache* of a platonic, immutable object and not the deletion of an object from the universe. Thus, a repo might have a nonzero refcount for an unknown block which a peer is able to provide.
+- **Tags** (`Group`): primarily search and discovery. A simple tag is a name (an `identity` CID), or a link to a complex tag such as a globally recognized anchor with extensible metadata.
+- **Attributes** (`Attr`): When was this photo taken? What year is this album? Who is pictured? Who did I get this from? How many times have I viewed it? `prev` links form an attribute's history.
+- **Anchors**: compare Perkeep's permanodes. Empty objects whose state is attached by the claims which reference them; the core of mutability, a stable identity decoupled from content.
+- **Signed claims**: trustful state claims such as "this is a snapshot of this URI at this time" (an import claim) or anchor mutations.
+- **Derivations** (`Derive`): "this metadata can be extracted from this file", "this file is this ZIP's member". Claims, tags and indexes may all be special cases of a derivation graph.
+- **Views**: instead of magic numbers or mime xattrs, files can have view objects linking to them that hint which content types are valid. Using ADLs could make opaque blobs traversable.
+- **Equivalence** (`Same`): "hash X is an alias of hash Y". This still requires trust, since checking means rehashing.
+- **Administration** (`Tomb`): tombstones, and see the keep and pin claims in [open questions](#open-questions).
 
-Blocks are collectable if they are referenced by a tombstone or their refcount is 0. Claims are collectable if they are referenced by a tombstone or if all of their *targets* are collected and have a refcount of 0. Blocks are never garbage collected except under these conditions. Claim targets keep both the claim and target alive by design. During operation, objects with refcount = 0 are collected with highest priority, then tombstones ordered by `when`, then tombstone targets with no `when` field. This is done iteratively to allow the system to recalculate refcounts and add new collectable items to the work queue. As blocks are collected, their links become eligible for collection until the entire subgraph has the opportunity to be collected. When a node runs low on memory, it increases the GC rate proportional to the amount of used memory to collect more quickly.
+### Retention
 
-Each claim type has CRDT semantics with its own type when they coexist within a repo.
-- Tomb, Group, and Same claims combine `target`.
+Blocks are reference-counted. Because a DAG is acyclic by construction, reference-counting garbage collection is complete. The `refcount` of a block is the number of *non-claim* blocks in the local repo which refer to it. A block may have a refcount *after* it is collected, which indicates that there are still dangling references to it; this allows old or unwanted data to be collected even if references would otherwise keep it alive. Garbage collection is best conceived as purging the *cache* of a platonic, immutable object, not deleting an object from the universe. Thus a repo might have a nonzero refcount for an unknown block which a peer is able to provide.
 
-## Replication
-Nodes within a mesh use anti-entropy protocols to maintain a well-replicated DHT of blocks. This is mediated by a set reconciliation algorithm
+Blocks are collectable if they are referenced by a tombstone or their refcount is 0. Claims are collectable if they are referenced by a tombstone or if all of their *targets* are collected and have a refcount of 0. Blocks are never garbage collected except under these conditions. Claim targets keep both the claim and target alive by design.
 
-When a new node joins, all peers share lists of multihashes they believe are under-replicated. Each node aggregates these and responds with a bloom filter containing every block they host.
+Collection is a lazy trickle with a hard boundary on what is collectable, and always local. Objects with refcount 0 are collected first, then tombstones ordered by `when`, then tombstone targets with no `when`. This is done iteratively so refcounts are recalculated and newly collectable items join the work queue; as blocks are collected their links become eligible in turn, until the whole subgraph has had the opportunity to be collected. When a node runs low on space, it raises the collection rate in proportion to usage.
 
-When a new file is added to an access point (AP), 
+Audit/repair and trickle GC are the same homeostasis with opposite signs, akin to soup convecting, weighed against the bandwidth they cost.
 
-Audit, repair 
+### Replication and transport
 
-## Misc ideas
-- Coordinate proximity for deduplication via distance metics wrt sets of tags representing risk categories, eg {living-room, home, new-mexico, us} is very far from {bangkok, data-center} and very close to {living-room, raid-3, home, new-mexico, us}
-  - Failure-aware domain placement
-  - Possibly use Ceph CRUSH?
-  - Latency-aware? AI-enabled relationships between risk categories?
-  - Claude's idea from early 2026
+- **Private**: Nodes join a private DHT to stochastically replicate files. These are assumed to be owned by the same entity and are fully permissioned and trusted. Replication is aware of blockstores, which are identified by private-DHT-local UUIDs because nodes are not assumed to own their stores outright. This allows, eg, multiple nodes sharing access to cloud storage without double-counting replicas.
+- **Protected**: Private DHTs can connect at the periphery to semi-trusted nodes (eg owned by friends) which are trusted to provide and maintain access control for encrypted blocks, for mutual replication. Negotiating who provides what is out of scope, but this could also serve paid nodes. The protected tier is a commons, mutual aid: sharing as infrastructure instead of sharing through a platform. Its accounting should be legible enough for trust, but not so financialized it becomes a market.
+- **Public**: The Amino DHT, for public block access. Imported blocks are private by default, and bitswap participation happens only for blocks that are shared or were obtained from bitswap in the first place, to avoid leaking information.
+
+Nodes within a mesh use anti-entropy to maintain a well-replicated set of blocks, mediated by set reconciliation. When a new node joins, all peers share lists of multihashes they believe are under-replicated; each node aggregates these and responds with a Bloom filter of every block it hosts.
+
+Ideas:
+
+- *Failure-domain placement*: describe each blockstore's risk with a set of tags, eg `{living-room, home, new-mexico, us}` is very far from `{bangkok, data-center}` and very close to `{living-room, raid-3, home, new-mexico, us}`, and place replicas to maximize the distance between them. Possibly with Ceph's CRUSH; possibly latency-aware.
+- *CAR files* as the interchange format for importing and exporting between repos, Kubo included, before any networking exists.
+
+## Roadmap
+
+1. **Private DHT for replicating file archives**
+2. **Limited distributed mutability and local indexing** (Perkeep parity)
+3. **Social networking**: shares, encrypted puts with friends, subsuming website databases for per-user data pods, BAT/delegated distributed access control (DIDs necessary)
+4. **Abstract transport**: mounts to anchors for arbitrary RPC and Plan 9-esque file access, proxying across the network
+
+Checklist:
+
+- [x] Kubo hash compatibility for imported files
+  - [x] Small file with raw codec
+  - [x] Multi-block file
+  - [x] Directory
+  - [x] HAMT
+- [x] dag-pb, dag-cbor and dag-json codecs
+- [ ] Blockstore that keeps what `hk add` imports
+- [ ] Retrieval (`hk cat`, `hk get`)
+- [ ] CAR import/export
+- [ ] UnixFSv1 indexing in SQL
+- [ ] Backreference indexing
+- [ ] Tagging
+- [ ] Querying
+- [ ] Perkeep-style claims
+- [ ] File mutation
+- [ ] FUSE
+- [ ] P2P private DHT
+- [ ] Public Amino DHT
+- [ ] BitTorrent bridging
+- [ ] User ownership model
+- [ ] Peergos BAT with friends
+
+## Open questions
+
+**Privacy and trust**
+- Encryption vs deduplication: encrypting blocks defeats deduplicating them.
+- Dedup reveals structure, which could be useful user-facing, and is a leak otherwise.
+- Metadata is more sensitive than data.
+- A threat model for each tier.
+- Node eviction if a computer is stolen: key rotation, etc.
+- Stochastic placement raises safe-harbor questions: whose drive is holding what?
+
+**Claims**
+- Keep claims: signal "this is an object you probably don't want garbage-collected", importable from another repo. Is that a claim type, or covered by refcounts?
+- Pin claims: distinct from Kubo's pins, "pin to this particular node". These may work better out of band, since it doesn't make sense to transport claims about where an object should live.
+- Should mutations be administrative claims too? CRDTs and live shared editing eventually, but by a long shot the priority is repo curation.
+- Do claims need their hashes "just in case"? Only if something references them, which happens if the claim exists elsewhere in the DHT and someone wants to talk about it; but then they could ask for the block and match it to the object. At a few dozen bytes each, even millions of claims are only tens of megabytes.
+
+**Mounts and mutability**
+- What if something anchor-shaped signalled a mutable mount into a host filesystem? It could be referred to in CAS, but rather than traversal going through ordered claims, it defers to some handler. This would allow much better interoperability, and even navigating the filesystems of my different computers completely abstracted from where they are.
+- This might also be the key for mutable files. A major problem with IPFS's MFS is that every mutation has to rehash up to the root, and delaying risks data loss and doesn't play nicely with a private DHT. What if instead you mount a single file like this, hooked into a CRDT scheme so changes propagate at the speed they need to, and eventually recommit it to immutability?
+- Anchor mounts are named ports: simple transport with no assumed protocol.
+- Apps as pure functions over the soup? See VLAD in [RESEARCH.md](RESEARCH.md).
+
+**Replication**
+- The write path: what happens when a new file is added at an access point, before it's replicated?
+- The audit/repair loop, and diversity weighting for replica placement.
+
+**Storage**
+- Coalesce files as large blobs, promoting their blocks to offset blocks; and chunk large blocks automatically.
+
+## Development
+
+```sh
+cargo build --release
+target/release/hk add <path>        # print CIDs, like `ipfs add --only-hash -r`
+target/release/hk add --help        # chunker, max file links, hidden files
+```
+
+Every layer is tested against an independent implementation:
+
+```sh
+git submodule update --init         # ipld/codec-fixtures
+cargo test                          # unit tests, codec fixtures, quick fuzzing
+PROPTEST_CASES=1000000 cargo test --release differential   # long fuzzing
+scripts/kubo-compare.sh             # every CID vs Kubo; needs `ipfs` on PATH
+LARGE=1 scripts/kubo-compare.sh     # adds >1 GiB files
+```
+
+| Module | |
+|---|---|
+| `varint`, `multihash`, `cid` | Multiformats primitives |
+| `block` | Blocks, which always match their CID, and the blockstore traits |
+| `pb`, `unixfs` | dag-pb framing and UnixFSv1 nodes |
+| `chunker`, `dag`, `hamt`, `import` | Importing files and directories |
+| `serde`, `model`, `dagcbor`, `dagjson` | The data model and its codecs |
+| `canon` | Tracking whether decoded data was canonical |
+| `codec_fixtures`, `differential` | Fixture and fuzz tests |
+| `dagpb`, `ipld` | Earlier experiments, not compiled |
