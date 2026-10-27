@@ -15,6 +15,8 @@ mod import;
 mod model;
 #[cfg(test)]
 mod codec_fixtures;
+#[cfg(test)]
+mod differential;
 // Generic IPLD/serde layer, not needed by the importer yet
 //mod dagpb;
 mod canon;

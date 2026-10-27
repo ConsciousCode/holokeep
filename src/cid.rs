@@ -56,7 +56,7 @@ impl From<varint::Error> for DecodeError {
     fn from(value: varint::Error) -> Self {
         match value {
             varint::Error::Truncated => Self::Truncated,
-            varint::Error::Overflow => Self::Parse,
+            varint::Error::Overflow | varint::Error::NonMinimal => Self::Parse,
         }
     }
 }

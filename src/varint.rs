@@ -55,6 +55,9 @@ pub enum Error {
     /// The number being read is larger than can be represented.
     #[error("leb128 overflow")]
     Overflow,
+    /// The number wasn't encoded in as few bytes as possible.
+    #[error("non-minimal varint")]
+    NonMinimal,
 }
 
 pub const fn size(value: u64) -> usize {
@@ -102,6 +105,25 @@ pub fn read(buf: &mut &[u8]) -> Result<u64, Error> {
         }
 
         shift += 7;
+    }
+}
+
+/// Read a varint the way multiformats requires: minimally encoded and at
+/// most 9 bytes, so at most 2^63 - 1.
+///
+/// <https://github.com/multiformats/unsigned-varint>
+pub fn read_minimal(buf: &mut &[u8]) -> Result<u64, Error> {
+    let start = buf.len();
+    let value = read(buf)?;
+    let len = start.saturating_sub(buf.len());
+    if len > 9 {
+        Err(Error::Overflow)
+    }
+    else if len != size(value) {
+        Err(Error::NonMinimal)
+    }
+    else {
+        Ok(value)
     }
 }
 
@@ -348,6 +370,26 @@ mod tests {
             read(&mut readable).expect("Should succeed with correct value"),
             45156
         );
+    }
+
+    #[test]
+    fn test_read_minimal() {
+        assert_eq!(read_minimal(&mut &[0x00][..]).ok(), Some(0));
+        assert_eq!(read_minimal(&mut &[0x80, 0x01][..]).ok(), Some(128));
+        // Padded with continuation bytes
+        assert!(matches!(read_minimal(&mut &[0x80, 0x00][..]), Err(Error::NonMinimal)));
+        assert!(matches!(read_minimal(&mut &[0x81, 0x80, 0x00][..]), Err(Error::NonMinimal)));
+        // 2^63 - 1 is the most 9 bytes hold, and all multiformats allows
+        let mut max = vec![0xff; 8];
+        max.push(0x7f);
+        assert_eq!(read_minimal(&mut &max[..]).ok(), Some(i64::MAX as u64));
+        let mut over = Vec::new();
+        write(&mut over, 1 << 63);
+        assert!(matches!(read_minimal(&mut &over[..]), Err(Error::Overflow)));
+        // Leaves the rest
+        let mut buf = &[0x01, 0x02][..];
+        assert_eq!(read_minimal(&mut buf).ok(), Some(1));
+        assert_eq!(buf, [0x02]);
     }
 
     #[test]

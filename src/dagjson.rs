@@ -248,6 +248,43 @@ mod tests {
     }
 
     #[test]
+    fn reserved_slash_key() {
+        // Straight from the spec: a "/" value that isn't a string is an
+        // ordinary map, as is one where a key sorts before "/"
+        for valid in [
+            "{\"/\":true,\"bar\":\"baz\"}",
+            "{\"/\":null}",
+            "{\"/\":{\"bytes\":1}}",
+            "{\"/\":{\"bytes\":\"oQ\",\"x\":1}}",
+            "{\"!\":1,\"/\":\"not a cid\"}",
+        ] {
+            let decoded = from_slice_canon::<Ipld>(valid.as_bytes()).expect(valid);
+            assert!(decoded.is_canon(), "{valid}");
+            assert!(matches!(decoded.inner(), Ipld::Map(_)), "{valid} is a map");
+            assert_eq!(to_vec(decoded.inner()).expect(valid), valid.as_bytes());
+        }
+        // ...but a first key of "/" with a string or bytes form is a link
+        // or bytes, which can't have other keys
+        for invalid in [
+            "{\"/\":\"bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e\",\"a\":1}",
+            "{\"/\":{\"bytes\":\"oQ\"},\"a\":1}",
+            "{\"/\":\"\"}",
+        ] {
+            assert!(from_slice::<Ipld>(invalid.as_bytes()).is_err(), "{invalid} should fail");
+        }
+        // and encoders mustn't produce those
+        let link_shaped = |rest: Vec<(&str, Ipld)>| {
+            let mut map: std::collections::BTreeMap<String, Ipld> =
+                rest.into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
+            map.insert("/".into(), Ipld::String("x".into()));
+            Ipld::Map(map)
+        };
+        assert!(to_vec(&link_shaped(vec![])).is_err());
+        assert!(to_vec(&link_shaped(vec![("a", Ipld::Null)])).is_err());
+        assert!(to_vec(&link_shaped(vec![("!", Ipld::Null)])).is_ok());
+    }
+
+    #[test]
     fn strict_errors() {
         for input in [
             "", "nul", "[1,]", "[1 2]", "{\"a\":1,}", "{\"a\" 1}", "{\"a\":1,\"a\":2}",
@@ -258,8 +295,5 @@ mod tests {
             assert!(from_slice::<Ipld>(input.as_bytes()).is_err(), "{input:?} should fail");
         }
         assert!(to_vec(&f64::NAN).is_err());
-        // A map which would read back as a link
-        let reserved = Ipld::Map([("/".to_owned(), Ipld::String("x".into()))].into());
-        assert!(to_vec(&reserved).is_err());
     }
 }

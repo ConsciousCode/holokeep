@@ -261,7 +261,12 @@ impl<'de> Decoder<'de> for Deserializer<'de> {
                 "invalid type: {}, expected float", tag_name(byte)
             ))),
         };
-        if value.is_finite() {
+        if value == 0.0 && value.is_sign_negative() {
+            // Negative zero is encoded as zero
+            self.noncanonical();
+            Ok(0.0)
+        }
+        else if value.is_finite() {
             Ok(value)
         }
         else {

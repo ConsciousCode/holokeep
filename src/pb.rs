@@ -56,7 +56,8 @@ impl From<varint::Error> for DecodeError {
     fn from(value: varint::Error) -> Self {
         match value {
             varint::Error::Truncated => Self::Truncated,
-            varint::Error::Overflow => Self::Overflow,
+            // Protobuf doesn't require minimal varints
+            varint::Error::Overflow | varint::Error::NonMinimal => Self::Overflow,
         }
     }
 }

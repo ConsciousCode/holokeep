@@ -2,6 +2,7 @@ use multibase::Base;
 use serde::ser::Error as _;
 
 use crate::cid::{AnyCid, Cid};
+use crate::model::Ipld;
 use crate::multihash::Inline;
 use crate::serde::{Encoder, Error, ListEncoder, MapEncoder};
 
@@ -142,8 +143,10 @@ impl MapEncoder<Serializer> for Map {
         if let Some([(key, _), _]) = entries.windows(2).find(|w| matches!(w, [(a, _), (b, _)] if a == b)) {
             return Err(Error::custom(format_args!("duplicate map key {key:?}")));
         }
-        if let [(key, _)] = entries.as_slice() && key == "/" {
-            return Err(Error::custom("a map with only a \"/\" key is reserved for links and bytes"));
+        // A first key of "/" with a link- or bytes-shaped value is either
+        // a link or bytes, or (with other keys) invalid DAG-JSON
+        if let Some((key, value)) = entries.first() && key == "/" && reads_as_reserved(value) {
+            return Err(Error::custom("a \"/\" key with this value is reserved for links and bytes"));
         }
 
         enc.write(b"{")?;
@@ -156,5 +159,15 @@ impl MapEncoder<Serializer> for Map {
             enc.write(value)?;
         }
         enc.write(b"}")
+    }
+}
+
+/// Whether a map's sole "/" value has the shape of a link (a string) or
+/// bytes (`{"bytes": string}`).
+fn reads_as_reserved(value: &[u8]) -> bool {
+    match super::from_slice::<Ipld>(value) {
+        Ok(Ipld::String(_)) => true,
+        Ok(Ipld::Map(map)) => map.len() == 1 && matches!(map.get("bytes"), Some(Ipld::String(_))),
+        _ => false,
     }
 }

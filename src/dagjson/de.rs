@@ -143,8 +143,10 @@ impl<'de> Deserializer<'de> {
         Ok(value)
     }
 
-    /// Consume `{"/":` and return what kind of reserved form follows, or
-    /// None (consuming nothing) for an ordinary map.
+    /// Look ahead for the reserved forms, consuming nothing. A map whose
+    /// first key is "/" is a link if its value is a string, or bytes if
+    /// it's `{"bytes": string}`; both must then be the map's only entry,
+    /// which decoding them enforces. Any other "/" value is an ordinary map.
     fn reserved(&self) -> Result<Option<Kind>, Error> {
         let mut ahead = self.clone();
         ahead.expect(b"{")?;
@@ -152,11 +154,21 @@ impl<'de> Deserializer<'de> {
             return Ok(None);
         }
         ahead.expect(b":")?;
-        match ahead.peek()? {
-            b'"' => Ok(Some(Kind::Link)),
-            b'{' => Ok(Some(Kind::Bytes)),
-            _ => Err(Error::custom("invalid value for the reserved \"/\" key")),
-        }
+        Ok(match ahead.peek()? {
+            b'"' => Some(Kind::Link),
+            b'{' => {
+                let mut bytes = || -> Option<()> {
+                    ahead.expect(b"{").ok()?;
+                    (ahead.string().ok()? == "bytes").then_some(())?;
+                    ahead.expect(b":").ok()?;
+                    (ahead.peek().ok()? == b'"').then_some(())?;
+                    ahead.string().ok()?;
+                    ahead.expect(b"}").ok()
+                };
+                bytes().map(|()| Kind::Bytes)
+            },
+            _ => None,
+        })
     }
 
     /// Consume the `{"/":` opening a link or bytes.
@@ -298,7 +310,8 @@ impl<'de> Decoder<'de> for Deserializer<'de> {
         if format_float(value) != token {
             self.noncanonical();
         }
-        Ok(value)
+        // Negative zero is encoded as zero
+        Ok(if value == 0.0 { 0.0 } else { value })
     }
 
     fn decode_string(&mut self) -> Result<Cow<'de, str>, Error> {

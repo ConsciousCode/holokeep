@@ -81,7 +81,7 @@ impl<D: DigestBuf> Cid<D> for Cidv0<D> {
     fn decode(mut buf: &[u8]) -> Result<Self, DecodeError> {
         const CIDV0_HASH_U8: u8 = HASH_CODEC as u8;
         match buf.split_off_first() {
-            Some(&CIDV0_HASH_U8) if varint::read(&mut buf)? == 32 => match buf.len() {
+            Some(&CIDV0_HASH_U8) if varint::read_minimal(&mut buf)? == 32 => match buf.len() {
                 32 => Ok(Self { digest: D::decode(buf)? }),
                 0..32 => Err(DecodeError::Truncated),
                 _ => Err(DecodeError::Parse),

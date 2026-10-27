@@ -126,7 +126,9 @@ impl Encoder for Serializer {
         if !value.is_finite() {
             return Err(Error::custom("DAG-CBOR forbids NaN and infinities"));
         }
-        // Always 64 bit, even when a shorter float would be exact
+        // Always 64 bit, even when a shorter float would be exact, and
+        // never negative zero
+        let value = if value == 0.0 { 0.0 } else { value };
         self.write_u8(marker::F64);
         Ok(self.write_slice(&value.to_be_bytes()))
     }

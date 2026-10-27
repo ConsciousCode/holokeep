@@ -39,7 +39,7 @@ impl From<varint::Error> for DecodeError {
     fn from(value: varint::Error) -> Self {
         match value {
             varint::Error::Truncated => Self::Truncated,
-            varint::Error::Overflow => Self::Parse,
+            varint::Error::Overflow | varint::Error::NonMinimal => Self::Parse,
         }
     }
 }
@@ -122,8 +122,8 @@ impl<D: DigestBuf> Multihash<D> {
 
     /// Reads a multihash from a byte stream that contains a full multihash (code, size and the digest)
     pub fn decode(mut buf: &[u8]) -> Result<Self, DecodeError> {
-        let code = varint::read(&mut buf)?;
-        let len = usize::try_from(varint::read(&mut buf)?)
+        let code = varint::read_minimal(&mut buf)?;
+        let len = usize::try_from(varint::read_minimal(&mut buf)?)
             .map_err(|_| SizeError::Overflow)?;
         if len > D::MAX_LEN {
             return Err(SizeError::Overflow.into());

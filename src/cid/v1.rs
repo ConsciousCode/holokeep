@@ -77,7 +77,7 @@ impl<D: DigestBuf> Cid<D> for Cidv1<D> {
     fn decode(mut bytes: &[u8]) -> Result<Cidv1<D>, DecodeError> {
         match bytes.split_off_first() {
             Some(&0x01) => {
-                let codec = varint::read(&mut bytes)?;
+                let codec = varint::read_minimal(&mut bytes)?;
                 let hash = Multihash::decode(&mut bytes)?;
                 Ok(Self { codec, hash })
             },
