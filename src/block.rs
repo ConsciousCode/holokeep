@@ -3,7 +3,7 @@
 //! Where blocks are kept is the `store` module.
 
 use crate::cid::{BaseCid, CidRef, Cid, Cidv1, Cidv1Spec};
-use crate::multihash::{DigestBuf, Inline, Multihash, MultihashDigest, MultihashFunc, SizeError};
+use crate::multihash::{DefaultDigest, DigestBuf, Multihash, MultihashDigest, MultihashFunc, SizeError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError<D: DigestBuf> {
@@ -28,7 +28,7 @@ pub enum VerifyError<D: DigestBuf> {
 /// 
 /// This maintains the invariant that the cid corresponds to the block.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Block<D: DigestBuf=Inline<64>> {
+pub struct Block<D: DigestBuf=DefaultDigest> {
     /// The content identifier for this block
     cid: Cidv1<D>,
     /// The raw data
@@ -72,6 +72,7 @@ impl<D: DigestBuf> Block<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::multihash::Inline;
     use crate::multihash::MultihashFunc;
     use crate::cid::RAW_CODEC;
 

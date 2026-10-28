@@ -6,7 +6,7 @@ use multibase::Base;
 use serde::de::Error as _;
 
 use crate::cid::{AnyCid, CidRef};
-use crate::multihash::Inline;
+use crate::multihash::DefaultDigest;
 use crate::serde::{Decoder, Error, Kind, ListDecoder, MapDecoder, SizeHint};
 
 use super::{format_float, write_string};
@@ -340,7 +340,7 @@ impl<'de> Decoder<'de> for Deserializer<'de> {
         self.open_reserved()?;
         let encoded = self.string()?;
         self.expect(b"}")?;
-        let cid: AnyCid<Inline<64>> = encoded.parse()
+        let cid: AnyCid<DefaultDigest> = encoded.parse()
             .map_err(|e| Error::custom(format_args!("invalid CID: {e}")))?;
         // Only CIDv0's base58btc and CIDv1's base32 are canonical
         if cid.to_string() != encoded {

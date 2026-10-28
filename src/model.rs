@@ -9,10 +9,10 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 
 use crate::cid::AnyCid;
-use crate::multihash::Inline;
+use crate::multihash::DefaultDigest;
 
 /// A link, preserving its CID version.
-pub type Link = AnyCid<Inline<64>>;
+pub type Link = AnyCid<DefaultDigest>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ipld {
@@ -112,5 +112,18 @@ impl<'de> Visitor<'de> for IpldVisitor {
 impl<'de> Deserialize<'de> for Ipld {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         d.deserialize_any(IpldVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn links_dont_bloat_values() {
+        // A sha2-256 link inline, so every value isn't paying for the rare
+        // long identity digest
+        assert!(std::mem::size_of::<Link>() <= 64, "{}", std::mem::size_of::<Link>());
+        assert!(std::mem::size_of::<Ipld>() <= 64, "{}", std::mem::size_of::<Ipld>());
     }
 }

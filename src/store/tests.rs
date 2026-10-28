@@ -1,5 +1,5 @@
 use super::*;
-use crate::cid::{Cidv1Spec, DAG_CBOR_CODEC, DAG_PB_CODEC, RAW_CODEC};
+use crate::cid::{AnyCid, Cidv1Spec, DAG_CBOR_CODEC, DAG_PB_CODEC, RAW_CODEC};
 use crate::dag::{BalancedLayout, DynamicDirectory};
 use crate::hamt::Hamt;
 use crate::import::Importer;

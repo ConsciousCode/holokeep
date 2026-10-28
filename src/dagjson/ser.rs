@@ -3,7 +3,7 @@ use serde::ser::Error as _;
 
 use crate::cid::{AnyCid, Cid};
 use crate::model::Ipld;
-use crate::multihash::Inline;
+use crate::multihash::DefaultDigest;
 use crate::serde::{Encoder, Error, ListEncoder, MapEncoder};
 
 use super::{format_float, write_string};
@@ -84,7 +84,7 @@ impl Encoder for Serializer {
     }
 
     fn encode_link(&mut self, value: &[u8]) -> Result<(), Error> {
-        let cid = AnyCid::<Inline<64>>::decode(value)
+        let cid = AnyCid::<DefaultDigest>::decode(value)
             .map_err(|e| Error::custom(format_args!("invalid CID: {e}")))?;
         self.write(b"{\"/\":\"")?;
         self.write(cid.to_string().as_bytes())?;

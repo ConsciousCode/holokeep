@@ -11,7 +11,7 @@
 use std::borrow::Cow;
 
 use crate::cid::{self, AnyCid, Cid};
-use crate::multihash::Inline;
+use crate::multihash::{DefaultDigest, Inline};
 use crate::varint;
 
 /// A dag-pb `PBLink`.
@@ -74,7 +74,7 @@ pub enum FormError {
 
 impl<'a> PbLink<'a> {
     /// Parse the link's Hash, which decoding has already validated.
-    pub fn cid(&self) -> Result<AnyCid<Inline<64>>, cid::DecodeError> {
+    pub fn cid(&self) -> Result<AnyCid<DefaultDigest>, cid::DecodeError> {
         AnyCid::decode(&self.hash)
     }
 

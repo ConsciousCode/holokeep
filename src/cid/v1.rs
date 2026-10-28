@@ -9,14 +9,14 @@ use serde::{ser, de};
 use serde_bytes;
 
 use crate::cid::BaseCid;
-use crate::multihash::{DigestBuf, Inline, Multihash, MultihashDigest, MultihashFunc};
+use crate::multihash::{DefaultDigest, DigestBuf, Multihash, MultihashDigest, MultihashFunc};
 use crate::varint;
 
 use super::{v0, AnyCid, DecodeError, CidVersion, CidRef, Cid, Cidv0, FromStrError, RAW_CODEC, DAG_PB_CODEC, CID_SERDE_PRIVATE_IDENTIFIER};
 
 /// A concrete IPLD CIDv1 implementation.
 #[derive(Clone, Debug)]
-pub struct Cidv1<D=Inline<64>> {
+pub struct Cidv1<D=DefaultDigest> {
     codec: u64,
     hash: Multihash<D>,
 }
@@ -243,6 +243,7 @@ impl<'de, D: DigestBuf> de::Deserialize<'de> for Cidv1<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::multihash::Inline;
     use serde::de::{Deserialize, value::{BytesDeserializer, Error as ValueError}};
 
     // `printf 'hello world' | ipfs add -n` and `ipfs cid format -b ...`

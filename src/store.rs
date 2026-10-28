@@ -26,10 +26,10 @@ use std::rc::Rc;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::block::Block;
-use crate::cid::{AnyCid, BaseCid, Cid, CidRef, CidVersion, Cidv1};
+use crate::cid::{BaseCid, Cid, CidRef, CidVersion, Cidv1};
 use crate::dag::{BlockSink, DagLink, Provenance};
 use crate::model::Link;
-use crate::multihash::{Inline, Multihash};
+use crate::multihash::Multihash;
 
 mod claims;
 mod ipld;
@@ -509,7 +509,7 @@ impl RoutingStore {
     }
 
     /// Get a block, verifying its bytes against its CID.
-    pub fn get_block(&self, cid: &AnyCid<Inline<64>>) -> Result<Option<Block>> {
+    pub fn get_block(&self, cid: &Link) -> Result<Option<Block>> {
         let Some(data) = self.get(cid.multihash())? else {
             return Ok(None);
         };

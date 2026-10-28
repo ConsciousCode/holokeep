@@ -465,7 +465,7 @@ fn fixtures_car_imports() {
     assert!(blocks > 0);
     for f in fixtures() {
         let label = f.label();
-        let cid: AnyCid<Inline<64>> = f.cid.parse().expect(&label);
+        let cid: crate::model::Link = f.cid.parse().expect(&label);
         let back = router.get_block(&cid).expect(&label).expect(&label);
         assert_eq!(back.data(), f.bytes, "{label}");
     }

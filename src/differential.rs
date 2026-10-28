@@ -17,7 +17,7 @@ use proptest::collection::{btree_map, vec};
 use proptest::prelude::*;
 
 use crate::cid::{AnyCid, CidRef, Cidv0, Cidv1};
-use crate::multihash::{DigestBuf, Inline, Multihash};
+use crate::multihash::{DefaultDigest, DigestBuf, Multihash};
 use crate::model::{Ipld, Link};
 use crate::{dagcbor, dagjson};
 
@@ -25,8 +25,8 @@ use crate::{dagcbor, dagjson};
 //-[ Generators ]-//
 //-----------------//
 
-fn digest(len: std::ops::RangeInclusive<usize>) -> impl Strategy<Value = Inline<64>> {
-    vec(any::<u8>(), len).prop_map(|d| Inline::decode(&d).expect("at most 64 bytes"))
+fn digest(len: std::ops::RangeInclusive<usize>) -> impl Strategy<Value = DefaultDigest> {
+    vec(any::<u8>(), len).prop_map(|d| DefaultDigest::decode(&d).expect("at most 128 bytes"))
 }
 
 fn link() -> impl Strategy<Value = Link> {
@@ -38,7 +38,9 @@ fn link() -> impl Strategy<Value = Link> {
     ];
     let hash = prop_oneof![Just(0x12u64), Just(0x00), code()];
     prop_oneof![
-        vec(any::<u8>(), 32).prop_map(|d| AnyCid::V0(Cidv0::new(Inline::decode(&d).expect("32 bytes")))),
+        vec(any::<u8>(), 32).prop_map(|d| AnyCid::V0(Cidv0::new(DefaultDigest::decode(&d).expect("32 bytes")))),
+        // The reference `cid` crate keeps at most 64 bytes; longer digests
+        // are tested against our own round trips instead
         (codec, hash, digest(0..=64))
             .prop_map(|(codec, hash, digest)| AnyCid::V1(Cidv1::new(codec, Multihash::new(hash, digest)))),
     ]

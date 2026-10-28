@@ -5,7 +5,7 @@ use crate::varint;
 
 mod digest;
 mod codec;
-pub use digest::{DigestBuf, Inline};
+pub use digest::{DefaultDigest, DigestBuf, Inline};
 pub use codec::{MultihashCodec, MultihashDigest, MultihashFunc};
 
 #[derive(Debug, thiserror::Error)]
@@ -47,7 +47,7 @@ impl From<varint::Error> for DecodeError {
 /// An IPLD multihash, encoding the digest along with the hash function used
 /// to generate it.
 #[derive(Clone, Copy, Debug)]
-pub struct Multihash<D: ?Sized=Inline<64>> {
+pub struct Multihash<D: ?Sized=DefaultDigest> {
     /// The code of the Multihash.
     code: u64,
     /// The digest.

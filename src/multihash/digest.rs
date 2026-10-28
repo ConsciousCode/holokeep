@@ -95,3 +95,82 @@ impl<const S: usize> DigestBuf for Inline<S> {
         }
     }
 }
+/// A digest kept inline up to `S` bytes, and on the heap beyond, so the
+/// common case (32-byte digests) never allocates while identity digests can
+/// still be as long as IPIP-0512 allows. A digest is only ever on the heap
+/// when it's longer than `S`, but equality, ordering and hashing go by the
+/// bytes regardless.
+#[derive(Clone, Debug)]
+pub enum Spill<const S: usize> {
+    Inline(Inline<S>),
+    Heap(Box<[u8]>),
+}
+
+impl<const S: usize> AsRef<[u8]> for Spill<S> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Inline(digest) => digest.as_ref(),
+            Self::Heap(digest) => digest,
+        }
+    }
+}
+
+impl<const S: usize> DigestBuf for Spill<S> {
+    fn decode(digest: &[u8]) -> Result<Self, SizeError> {
+        if digest.len() > Self::MAX_LEN {
+            Err(SizeError::Overflow)
+        }
+        else if digest.len() > S {
+            Ok(Self::Heap(digest.into()))
+        }
+        else {
+            Inline::decode(digest).map(Self::Inline)
+        }
+    }
+}
+
+impl<const S: usize> PartialEq for Spill<S> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+impl<const S: usize> Eq for Spill<S> {}
+
+impl<const S: usize> PartialOrd for Spill<S> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<const S: usize> Ord for Spill<S> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_ref().cmp(other.as_ref())
+    }
+}
+
+impl<const S: usize> std::hash::Hash for Spill<S> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_ref().hash(state);
+    }
+}
+
+/// The digest CIDs keep by default: sha2-256 and its kin inline.
+pub type DefaultDigest = Spill<32>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spills_only_past_its_inline_size() {
+        let short = Spill::<32>::decode(&[7; 32]).expect("short");
+        let long = Spill::<32>::decode(&[7; 33]).expect("long");
+        assert!(matches!(short, Spill::Inline(_)));
+        assert!(matches!(long, Spill::Heap(_)));
+        assert_eq!(long.as_ref(), &[7; 33]);
+        assert!(Spill::<32>::decode(&[7; 128]).is_ok());
+        assert!(Spill::<32>::decode(&[7; 129]).is_err());
+        // By the bytes, wherever they're kept
+        assert_eq!(Spill::<32>::Heap(vec![7; 32].into()), short);
+        assert!(std::mem::size_of::<Spill<32>>() <= 40);
+    }
+}

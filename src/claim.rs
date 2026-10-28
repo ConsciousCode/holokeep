@@ -16,9 +16,8 @@ use crate::multihash::{Multihash, MultihashFunc};
 /// The multihash code of `identity`, whose digest is the content itself.
 const IDENTITY: u64 = 0x00;
 
-/// The longest tag name, as much as a `Link` keeps inline. IPIP-0512
-/// allows identity digests of up to 128 bytes.
-pub const MAX_NAME: usize = 64;
+/// The longest tag name: IPIP-0512's limit on identity digests.
+pub const MAX_NAME: usize = 128;
 
 /// "Targets belong to the given group." With an identity CID for `into`,
 /// a simple tag: the targets are tagged with its name.

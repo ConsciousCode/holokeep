@@ -208,6 +208,20 @@ mod tests {
     }
 
     #[test]
+    fn links_with_long_digests() {
+        use crate::model::Link;
+        use crate::multihash::{DigestBuf, Multihash};
+        // Up to IPIP-0512's 128 bytes, spilling past what's kept inline
+        for len in [0, 32, 33, 64, 65, 128] {
+            let digest = crate::multihash::DefaultDigest::decode(&vec![0xab; len]).expect("digest");
+            let link: Link = crate::cid::AnyCid::V1(Cidv1::new(0x55, Multihash::new(0x00, digest)));
+            let value = Ipld::List(vec![Ipld::Link(link)]);
+            let bytes = to_vec(&value).expect("encode");
+            assert_eq!(from_slice::<Ipld>(&bytes).expect("decode"), value, "{len}");
+        }
+    }
+
+    #[test]
     fn limits_nesting() {
         use crate::serde::MAX_DEPTH;
         #[derive(Deserialize)]
