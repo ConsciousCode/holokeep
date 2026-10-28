@@ -16,7 +16,7 @@ use crate::chunker::{Chunker, SizeChunker};
 use crate::cid::{Cidv1Spec, RAW_CODEC};
 use crate::dag::{
     self, BalancedLayout, BlockSink, DagLink, DirLayoutBuilder, DirLayoutStrategy,
-    DynamicDirectory, FileLayoutBuilder, FileLayoutStrategy, Provenance, Source,
+    DynamicDirectory, FileLayoutBuilder, FileLayoutStrategy, Provenance,
 };
 use crate::multihash::MultihashFunc;
 
@@ -77,17 +77,12 @@ impl<F: FileLayoutStrategy, D: DirLayoutStrategy> Importer<F, D> {
         self.read_file(reader, None, sink)
     }
 
-    /// Import a file from wherever the sink wants it read.
+    /// Import a file, telling the sink where each leaf came from.
     fn import_file(&self, path: &Path, sink: &mut impl BlockSink) -> io::Result<DagLink> {
-        match sink.source(path)? {
-            Source::InPlace => self.read_file(File::open(path)?, Some(path), sink),
-            Source::Copy => self.read_file(File::open(path)?, None, sink),
-            Source::Kept(copy) => {
-                let root = self.read_file(File::open(&copy)?, Some(&copy), sink)?;
-                sink.kept(&copy, &root)?;
-                Ok(root)
-            },
-        }
+        sink.begin_file(path)?;
+        let root = self.read_file(File::open(path)?, Some(path), sink)?;
+        sink.end_file(path, &root)?;
+        Ok(root)
     }
 
     /// Import a file's contents, noting which part of `origin` each leaf

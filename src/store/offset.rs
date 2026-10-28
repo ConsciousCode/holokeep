@@ -1,49 +1,56 @@
-//! A store specialized for blocks which are byte ranges of files on disk,
+//! A store specialized for blocks which are byte ranges of larger files,
 //! so a file's contents are stored once: as itself.
 //!
-//! A range is of a source, which is either an external file, imported in
-//! place, or a file kept whole in the repo's shards (see `Shards`).
+//! A range is of a blob, a whole file named by its multihash (sha2-256 of
+//! its bytes), which may be found in the repo's shards (see `ShardStore`)
+//! or at external paths imported in place. The blob's multihash is the
+//! range's identity, so a block is served from any copy of its blob.
 //!
 //! Offsets are never searched for. A block's bytes can't say where else
 //! they're found, so this store only admits blocks put with a
 //! `Provenance::FileRange`, which the importer gives each leaf as it reads
 //! it. That provenance is trusted: within one executable, the importer has
-//! just read those bytes from that range.
+//! just read those bytes from that range. A file's multihash isn't known
+//! until all of it has been read, so its ranges are pending until the
+//! sink importing it `settle`s them.
 //!
 //! External files belong to the user and may change. Each is recorded with
-//! a fingerprint (size, mtime, inode) taken when it's first seen, and a
-//! range is only served while its file's fingerprint still matches; the
-//! router re-hashes what it serves regardless. Kept files are the repo's
-//! own and never change. A block may be kept in several sources, and is
-//! served from a kept file first, then whichever external file is still
-//! unchanged.
+//! a fingerprint (size, mtime, inode) taken as it's imported, and a range
+//! is only served while its file's fingerprint still matches; the router
+//! re-hashes what it serves regardless. Kept files are the repo's own and
+//! never change. A block is served from a kept file first, then whichever
+//! external file is still unchanged.
 
 use std::fs::{self, File};
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use rusqlite::{OptionalExtension, params};
+use sha2::{Digest, Sha256};
 
 use crate::block::Block;
 use crate::cid::{BaseCid, CidRef, RAW_CODEC};
 use crate::dag::Provenance;
 use crate::multihash::Multihash;
 
-use super::{BlockIndex, BlockSource, BlockStore, Db, Error, Id, Key, Put, Result, Shards, Store, query_keys};
+use super::{BlockIndex, BlockSource, BlockStore, Db, Error, Key, Put, Result, ShardStore, Store, query_keys};
 
 const NAME: &str = "offset";
 
-/// Keeps blocks as (source, offset, length).
+const SHA2_256: u64 = 0x12;
+
+/// Keeps blocks as (blob, offset, length).
 pub struct OffsetStore {
     db: Db,
-    shards: Option<Rc<Shards>>,
+    shards: Option<Rc<ShardStore>>,
 }
 
 /// What identifies a version of a file, short of hashing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Fingerprint {
+pub struct Fingerprint {
     size: i64,
     /// Nanoseconds since the epoch.
     mtime: i64,
@@ -61,44 +68,75 @@ impl Fingerprint {
         })
     }
 
-    fn read(path: &Path) -> Option<Self> {
+    pub fn read(path: &Path) -> Option<Self> {
         fs::metadata(path).ok().as_ref().and_then(Self::of)
     }
 }
 
-/// Where a range's bytes are.
+/// A file's multihash, from its leaves as they arrive in order.
+pub struct Whole {
+    hasher: Sha256,
+    len: u64,
+}
+
+impl Default for Whole {
+    fn default() -> Self {
+        Self { hasher: Sha256::new(), len: 0 }
+    }
+}
+
+impl Whole {
+    /// Add the leaf at `offset`, which must follow the last.
+    pub fn push(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
+        if offset != self.len {
+            return Err(io::Error::other(format!("leaf at {offset} doesn't follow the {} bytes before it", self.len)));
+        }
+        self.hasher.update(data);
+        self.len = self.len.saturating_add(crate::dag::len64(data));
+        Ok(())
+    }
+
+    pub const fn len(&self) -> u64 { self.len }
+
+    pub fn finish(self) -> Multihash<[u8; 32]> {
+        Multihash::new(SHA2_256, self.hasher.finalize().into())
+    }
+}
+
+/// Where a blob whose ranges are being settled is.
+pub enum Location<'a> {
+    /// At a path outside the repo, as of a fingerprint.
+    External { path: &'a Path, fingerprint: Fingerprint },
+    /// In the repo's shards.
+    Kept,
+}
+
+/// Where a range's bytes may be read.
 enum Place {
     External { path: PathBuf, fingerprint: Fingerprint },
     Kept(PathBuf),
 }
 
-/// Where a block is kept.
-struct Range {
-    place: Place,
-    offset: u64,
-    len: usize,
-}
-
-impl Range {
-    /// The range's bytes, or the error to give if there are none to be had:
-    /// its external file has changed, or its kept file is gone.
-    fn read(&self) -> Result<std::result::Result<Vec<u8>, Error>> {
-        let path = match &self.place {
-            Place::External { path, fingerprint } => {
+impl Place {
+    /// The bytes, or the error to give if there are none to be had: an
+    /// external file has changed, or a kept one is gone.
+    fn read(&self, offset: u64, len: usize) -> Result<std::result::Result<Vec<u8>, Error>> {
+        let path = match self {
+            Self::External { path, fingerprint } => {
                 if Fingerprint::read(path) != Some(*fingerprint) {
                     return Ok(Err(Error::Stale(path.clone())));
                 }
                 path
             },
-            Place::Kept(path) => {
-                if !path.exists() {
-                    return Ok(Err(Error::Missing(path.clone())));
-                }
-                path
-            },
+            Self::Kept(path) => path,
         };
-        let mut data = vec![0; self.len];
-        File::open(path)?.read_exact_at(&mut data, self.offset)?;
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Err(Error::Missing(path.clone()))),
+            Err(e) => return Err(e.into()),
+        };
+        let mut data = vec![0; len];
+        file.read_exact_at(&mut data, offset)?;
         Ok(Ok(data))
     }
 }
@@ -107,143 +145,144 @@ fn path_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_bytes()
 }
 
-/// Create the offset tables, which `Shards` shares.
+/// Create the tables for offsets and the shards they index into.
 pub(super) fn schema(db: &Db) -> Result<()> {
-    db.atomically(|| {
-        let conn = db.conn();
-        // Before sources, ranges were of external files only
-        let v1 = conn
-            .prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'offset_files'")?
-            .exists([])?;
-        if v1 {
-            conn.execute_batch("ALTER TABLE offset_ranges RENAME TO offset_ranges_v1")?;
-        }
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS offset_sources (id INTEGER PRIMARY KEY);
-             -- Each version of an external file seen, so ranges of a version
-             -- which has since changed are never served from the new one.
-             CREATE TABLE IF NOT EXISTS external_files (
-                 source INTEGER PRIMARY KEY REFERENCES offset_sources (id) ON DELETE CASCADE,
-                 path BLOB NOT NULL,
-                 size INTEGER NOT NULL,
-                 mtime INTEGER NOT NULL,
-                 inode INTEGER NOT NULL,
-                 UNIQUE (path, size, mtime, inode)
-             );
-             -- Files kept whole in the shards, by their whole-file multihash.
-             CREATE TABLE IF NOT EXISTS shard_files (
-                 source INTEGER PRIMARY KEY REFERENCES offset_sources (id) ON DELETE CASCADE,
-                 blob INTEGER UNIQUE NOT NULL REFERENCES multihashes (id),
-                 size INTEGER NOT NULL
-             );
-             -- Which UnixFS roots each kept file was imported as.
-             CREATE TABLE IF NOT EXISTS shard_roots (
-                 blob INTEGER NOT NULL REFERENCES multihashes (id),
-                 root INTEGER NOT NULL REFERENCES multihashes (id),
-                 PRIMARY KEY (blob, root)
-             ) WITHOUT ROWID;
-             CREATE TABLE IF NOT EXISTS offset_ranges (
-                 block INTEGER NOT NULL REFERENCES multihashes (id),
-                 source INTEGER NOT NULL REFERENCES offset_sources (id) ON DELETE CASCADE,
-                 offset INTEGER NOT NULL,
-                 len INTEGER NOT NULL,
-                 PRIMARY KEY (block, source)
-             ) WITHOUT ROWID;",
-        )?;
-        if v1 {
-            conn.execute_batch(
-                "INSERT INTO offset_sources (id) SELECT id FROM offset_files;
-                 INSERT INTO external_files (source, path, size, mtime, inode)
-                     SELECT id, path, size, mtime, inode FROM offset_files;
-                 INSERT INTO offset_ranges (block, source, offset, len)
-                     SELECT block, file, offset, len FROM offset_ranges_v1;
-                 DROP TABLE offset_ranges_v1;
-                 DROP TABLE offset_files;",
-            )?;
-        }
-        Ok(())
-    })
+    db.conn().execute_batch(
+        "-- Ranges of blobs, by the blob's multihash.
+         CREATE TABLE IF NOT EXISTS offset_ranges (
+             block INTEGER NOT NULL REFERENCES multihashes (id),
+             blob INTEGER NOT NULL REFERENCES multihashes (id),
+             offset INTEGER NOT NULL,
+             len INTEGER NOT NULL,
+             PRIMARY KEY (block, blob)
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS offset_ranges_blob ON offset_ranges (blob);
+         -- Paths outside the repo a blob was imported from, as of when.
+         CREATE TABLE IF NOT EXISTS external_files (
+             blob INTEGER NOT NULL REFERENCES multihashes (id),
+             path BLOB NOT NULL,
+             size INTEGER NOT NULL,
+             mtime INTEGER NOT NULL,
+             inode INTEGER NOT NULL,
+             PRIMARY KEY (blob, path)
+         ) WITHOUT ROWID;
+         -- What's in the shards, so finding a blob needn't touch the
+         -- filesystem. Rebuilt from the directory by a rescan.
+         CREATE TABLE IF NOT EXISTS shard_files (
+             blob INTEGER PRIMARY KEY REFERENCES multihashes (id),
+             size INTEGER NOT NULL
+         );
+         -- Which UnixFS roots each kept file was imported as.
+         CREATE TABLE IF NOT EXISTS shard_roots (
+             blob INTEGER NOT NULL REFERENCES multihashes (id),
+             root INTEGER NOT NULL REFERENCES multihashes (id),
+             PRIMARY KEY (blob, root)
+         ) WITHOUT ROWID;
+         -- Ranges of a file whose multihash isn't known yet, by the path
+         -- it's being imported from. Private to the connection.
+         CREATE TEMP TABLE IF NOT EXISTS pending_ranges (
+             path BLOB NOT NULL,
+             offset INTEGER NOT NULL,
+             block INTEGER NOT NULL,
+             len INTEGER NOT NULL,
+             PRIMARY KEY (path, offset)
+         ) WITHOUT ROWID;",
+    )?;
+    Ok(())
 }
 
 impl OffsetStore {
     /// An offset store for external files, and kept ones if there are
     /// shards to keep them in.
-    pub fn open(db: Db, shards: Option<Rc<Shards>>) -> Result<Self> {
+    pub fn open(db: Db, shards: Option<Rc<ShardStore>>) -> Result<Self> {
         schema(&db)?;
         Ok(Self { db, shards })
     }
 
-    /// The source for an external file's current version, recording it if
-    /// it's new, and the file's size.
-    fn external(&self, path: &Path) -> Result<Option<(Id, i64)>> {
-        let path = fs::canonicalize(path)?;
-        let Some(fp) = Fingerprint::read(&path) else {
-            return Ok(None);
-        };
+    /// The file imported from `path` has multihash `blob` and is `len`
+    /// bytes long: its pending ranges are of that blob, which is at
+    /// `location`. Returns how many ranges the blob has in all.
+    pub fn settle(&self, path: &Path, blob: Key<'_>, len: u64, location: &Location<'_>) -> Result<u64> {
+        let len = i64::try_from(len).map_err(|_| Error::Invalid { store: NAME, reason: "file too large".into() })?;
         let conn = self.db.conn();
-        let existing = conn
-            .prepare_cached(
-                "SELECT source FROM external_files WHERE path = ?1 AND size = ?2 AND mtime = ?3 AND inode = ?4",
+        let beyond = conn
+            .prepare_cached("SELECT 1 FROM temp.pending_ranges WHERE path = ?1 AND offset + len > ?2")?
+            .exists(params![path_bytes(path), len])?;
+        if beyond {
+            // Discarded, so they can't be settled as part of anything else
+            conn.prepare_cached("DELETE FROM temp.pending_ranges WHERE path = ?1")?.execute([path_bytes(path)])?;
+            return Err(Error::Invalid { store: NAME, reason: format!("ranges beyond the end of {}", path.display()) });
+        }
+        self.db.atomically(|| {
+            let blob_id = self.db.intern(blob)?;
+            conn.prepare_cached(
+                "INSERT OR IGNORE INTO offset_ranges (block, blob, offset, len)
+                 SELECT block, ?2, offset, len FROM temp.pending_ranges WHERE path = ?1",
             )?
-            .query_row(params![path_bytes(&path), fp.size, fp.mtime, fp.inode], |row| row.get(0))
-            .optional()?;
-        if let Some(source) = existing {
-            return Ok(Some((source, fp.size)));
-        }
-        conn.prepare_cached("INSERT INTO offset_sources DEFAULT VALUES")?.execute([])?;
-        let source = conn.last_insert_rowid();
-        conn.prepare_cached("INSERT INTO external_files (source, path, size, mtime, inode) VALUES (?1, ?2, ?3, ?4, ?5)")?
-            .execute(params![source, path_bytes(&path), fp.size, fp.mtime, fp.inode])?;
-        Ok(Some((source, fp.size)))
+            .execute(params![path_bytes(path), blob_id])?;
+            conn.prepare_cached("DELETE FROM temp.pending_ranges WHERE path = ?1")?.execute([path_bytes(path)])?;
+            if let Location::External { path, fingerprint: fp } = *location {
+                let path = fs::canonicalize(path)?;
+                conn.prepare_cached(
+                    "INSERT INTO external_files (blob, path, size, mtime, inode) VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT (blob, path) DO UPDATE SET size = ?3, mtime = ?4, inode = ?5",
+                )?
+                .execute(params![blob_id, path_bytes(&path), fp.size, fp.mtime, fp.inode])?;
+            }
+            let ranges: i64 = conn
+                .prepare_cached("SELECT count(*) FROM offset_ranges WHERE blob = ?1")?
+                .query_row([blob_id], |row| row.get(0))?;
+            Ok(u64::try_from(ranges).unwrap_or_default())
+        })
     }
 
-    /// The source for a path, kept or external, and its size.
-    fn source(&self, path: &Path) -> Result<Option<(Id, i64)>> {
-        match self.shards.as_ref().and_then(|shards| Some((shards, shards.blob(path)?))) {
-            Some((shards, blob)) => shards.source(blob.as_ref()).map(Some),
-            None => self.external(path),
+    /// Everywhere a blob may be read, kept first.
+    fn places(&self, blob: Key<'_>, kept: bool) -> Result<Vec<Place>> {
+        let mut places = Vec::new();
+        if kept && let Some(shards) = &self.shards {
+            places.push(Place::Kept(shards.path(blob)));
         }
-    }
-
-    /// Every range a block is kept in, kept files first, then newest
-    /// external file first.
-    fn ranges(&self, key: Key<'_>) -> Result<Vec<Range>> {
         let mut stmt = self.db.conn().prepare_cached(
-            "SELECT r.offset, r.len, e.path, e.size, e.mtime, e.inode, b.multihash
+            "SELECT e.path, e.size, e.mtime, e.inode FROM multihashes m
+             JOIN external_files e ON e.blob = m.id WHERE m.multihash = ?1",
+        )?;
+        let rows = stmt.query_map([blob.to_bytes()], |row| Ok(Place::External {
+            path: PathBuf::from(std::ffi::OsStr::from_bytes(&row.get::<_, Vec<u8>>(0)?)),
+            fingerprint: Fingerprint { size: row.get(1)?, mtime: row.get(2)?, inode: row.get(3)? },
+        }))?;
+        for place in rows {
+            places.push(place?);
+        }
+        Ok(places)
+    }
+
+    /// Every range a block is kept as: the blob, whether it's kept, the
+    /// offset and the length. Kept blobs come first.
+    fn ranges(&self, key: Key<'_>) -> Result<Vec<(Multihash, bool, u64, usize)>> {
+        let mut stmt = self.db.conn().prepare_cached(
+            "SELECT b.multihash, s.blob IS NOT NULL, r.offset, r.len
              FROM multihashes m
              JOIN offset_ranges r ON r.block = m.id
-             LEFT JOIN external_files e ON e.source = r.source
-             LEFT JOIN shard_files s ON s.source = r.source
-             LEFT JOIN multihashes b ON b.id = s.blob
+             JOIN multihashes b ON b.id = r.blob
+             LEFT JOIN shard_files s ON s.blob = r.blob
              WHERE m.multihash = ?1
-             ORDER BY s.source IS NULL, r.source DESC",
+             ORDER BY s.blob IS NULL",
         )?;
         let rows = stmt.query_map([key.to_bytes()], |row| Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, Option<Vec<u8>>>(2)?,
-            (row.get::<_, Option<i64>>(3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, Option<i64>>(5)?),
-            row.get::<_, Option<Vec<u8>>>(6)?,
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, bool>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
         )))?;
-        let invalid = |reason: &str| Error::Invalid { store: NAME, reason: reason.into() };
+        let invalid = |what| Error::Invalid { store: NAME, reason: format!("negative {what}") };
         rows.map(|row| {
-            let (offset, len, path, (size, mtime, inode), blob) = row?;
-            let place = match (path, size, mtime, inode, blob) {
-                (Some(path), Some(size), Some(mtime), Some(inode), None) => Place::External {
-                    path: PathBuf::from(std::ffi::OsStr::from_bytes(&path)),
-                    fingerprint: Fingerprint { size, mtime, inode },
-                },
-                (None, .., Some(blob)) => {
-                    let shards = self.shards.as_ref().ok_or_else(|| invalid("a kept file, but no shards"))?;
-                    Place::Kept(shards.path(super::decode_key(NAME, &blob)?.as_ref()))
-                },
-                _ => return Err(invalid("a range of no one source")),
-            };
-            Ok(Range {
-                place,
-                offset: u64::try_from(offset).map_err(|_| invalid("negative offset"))?,
-                len: usize::try_from(len).map_err(|_| invalid("negative length"))?,
-            })
+            let (blob, kept, offset, len) = row?;
+            Ok((
+                super::decode_key(NAME, &blob)?,
+                kept,
+                u64::try_from(offset).map_err(|_| invalid("offset"))?,
+                usize::try_from(len).map_err(|_| invalid("length"))?,
+            ))
         })
         .collect()
     }
@@ -276,14 +315,16 @@ impl BlockIndex for OffsetStore {
 }
 
 impl BlockSource for OffsetStore {
-    /// The block from whichever of its sources is readable, or why the
-    /// first can't be read if none are.
+    /// The block from whichever of its blobs' copies is readable, or why
+    /// the first can't be read if none are.
     fn get(&self, key: Key<'_>) -> Result<Option<Vec<u8>>> {
         let mut first = None;
-        for range in self.ranges(key)? {
-            match range.read()? {
-                Ok(data) => return Ok(Some(data)),
-                Err(e) => { first.get_or_insert(e); },
+        for (blob, kept, offset, len) in self.ranges(key)? {
+            for place in self.places(blob.as_ref(), kept)? {
+                match place.read(offset, len)? {
+                    Ok(data) => return Ok(Some(data)),
+                    Err(e) => { first.get_or_insert(e); },
+                }
             }
         }
         first.map_or(Ok(None), Err)
@@ -296,6 +337,7 @@ impl BlockStore for OffsetStore {
         Ok(Put::Declined)
     }
 
+    /// Admitted as pending, until the sink importing its file settles it.
     fn put_from(&self, block: &Block, provenance: Provenance<'_>) -> Result<Put> {
         let Provenance::FileRange { path, offset } = provenance else {
             return Ok(Put::Declined);
@@ -305,21 +347,13 @@ impl BlockStore for OffsetStore {
             return Ok(Put::Declined);
         }
         let len = crate::dag::len64(block.data());
-        let (Ok(offset_sql), Ok(len_sql)) = (i64::try_from(offset), i64::try_from(len)) else {
+        let (Ok(offset), Ok(len)) = (i64::try_from(offset), i64::try_from(len)) else {
             return Ok(Put::Declined);
         };
-        self.db.atomically(|| {
-            let Some((source, size)) = self.source(path)? else {
-                return Ok(Put::Declined);
-            };
-            if offset_sql.checked_add(len_sql).is_none_or(|end| end > size) {
-                return Ok(Put::Declined);
-            }
-            let id = self.db.intern(block.cid().multihash())?;
-            self.db.conn()
-                .prepare_cached("INSERT OR IGNORE INTO offset_ranges (block, source, offset, len) VALUES (?1, ?2, ?3, ?4)")?
-                .execute(params![id, source, offset_sql, len_sql])?;
-            Ok(Put::Stored)
-        })
+        let id = self.db.intern(block.cid().multihash())?;
+        self.db.conn()
+            .prepare_cached("INSERT OR REPLACE INTO temp.pending_ranges (path, offset, block, len) VALUES (?1, ?2, ?3, ?4)")?
+            .execute(params![path_bytes(path), offset, id, len])?;
+        Ok(Put::Stored)
     }
 }

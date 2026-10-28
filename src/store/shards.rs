@@ -1,169 +1,202 @@
-//! A sharded directory of whole files, copied in so their contents are kept
-//! contiguously, and immutably, outside the database. The offset store
-//! keeps their leaves as ranges of them.
+//! A sharded directory for blobs too large to be worth keeping in `SQLite`:
+//! blocks over `THRESHOLD`, and whole files kept so their leaves are
+//! contiguous, which the offset store indexes into.
 //!
-//! Each file is named by its multihash (sha2-256 of its bytes) and sharded
-//! on the digest's first byte: `ab/1220ab…`, so the directory checks itself
-//! without the database. A file's whole-file multihash is a second name for
-//! the content its UnixFS root names; `shard_roots` records which roots
-//! each file was imported as, which is what lets its ranges be rebuilt from
-//! the roots' `blocksizes`. That's a `Same` claim in all but name, and will
-//! become one; until then the whole-file multihash isn't a block anyone can
-//! get.
+//! The layout is Kubo's flatfs: each blob is named by its multihash in
+//! base32upper with no multibase prefix, sharded `next-to-last/2`, so a
+//! blob's name checks its bytes without the database. `shard_files` caches
+//! what's there, so reads needn't touch the filesystem to find a blob, and
+//! a rescan rebuilds it.
+//!
+//! A kept file's multihash is a second name for the content its UnixFS
+//! root names. `shard_roots` records which roots each kept file was
+//! imported as, which is what lets its ranges be rebuilt from the roots'
+//! `blocksizes`. That's a `Same` claim in all but name, and will become
+//! one; until then a kept file isn't a block anyone can get.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
+use multibase::Base;
 use rusqlite::{OptionalExtension, params};
-use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 
+use crate::block::Block;
+use crate::cid::CidRef;
 use crate::multihash::Multihash;
 
-use super::{Db, Error, Id, Key, Result};
+use super::{BlockIndex, BlockSource, BlockStore, Db, Error, Key, Put, Result, Store, query_keys};
 
-/// Files larger than this are kept whole when copied in. Smaller ones are
-/// cheaper as rows: they're at most one leaf at the default chunk size.
-pub const THRESHOLD: u64 = 1024 * 1024;
+const NAME: &str = "shards";
 
-const SHA2_256: u64 = 0x12;
+/// Blobs larger than this are kept here rather than in `SQLite`, which is
+/// faster for smaller ones at its default 4 KiB pages
+/// (<https://sqlite.org/intern-v-extern-blob.html>).
+pub const THRESHOLD: usize = 64 * 1024;
 
-/// Names temporary files uniquely within a process.
-static NEXT: AtomicU64 = AtomicU64::new(0);
+/// What flatfs writes to say how a directory is sharded.
+const SHARDING: &str = "/repo/flatfs/shard/v1/next-to-last/2\n";
 
-pub struct Shards {
+/// Admits blocks larger than its threshold, keeping each as a file.
+pub struct ShardStore {
     dir: PathBuf,
     db: Db,
-    /// Files larger than this are kept whole; see `THRESHOLD`.
-    pub threshold: u64,
+    /// Blobs larger than this are kept here; see `THRESHOLD`.
+    pub threshold: usize,
 }
 
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::with_capacity(bytes.len().saturating_mul(2)), |mut out, b| {
-        let _ = write!(out, "{b:02x}");
-        out
-    })
+/// A blob's name in the directory.
+fn key(blob: Key<'_>) -> String {
+    Base::Base32Upper.encode(blob.to_bytes())
 }
 
-impl Shards {
+impl ShardStore {
     pub fn open(db: Db, dir: &Path) -> Result<Self> {
-        fs::create_dir_all(dir.join("tmp"))?;
+        fs::create_dir_all(dir.join(".temp"))?;
+        let sharding = dir.join("SHARDING");
+        if !sharding.exists() {
+            fs::write(sharding, SHARDING)?;
+        }
         super::offset::schema(&db)?;
         Ok(Self { dir: fs::canonicalize(dir)?, db, threshold: THRESHOLD })
     }
 
-    /// Where the file with this multihash is kept.
-    pub(super) fn path(&self, blob: Key<'_>) -> PathBuf {
-        let first = blob.digest_ref().first().copied().unwrap_or_default();
-        self.dir.join(hex(&[first])).join(hex(&blob.to_bytes()))
+    /// Where the blob with this multihash is kept.
+    pub fn path(&self, blob: Key<'_>) -> PathBuf {
+        let key = key(blob);
+        let shard = key.len().checked_sub(3).and_then(|start| key.get(start..start.saturating_add(2)));
+        self.dir.join(shard.unwrap_or("_")).join(format!("{key}.data"))
     }
 
-    /// The multihash of a file, if the path is one of ours.
-    pub fn blob(&self, path: &Path) -> Option<Multihash> {
-        let name = path.file_name()?.to_str()?;
-        let bytes = (0..name.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(name.get(i..i.checked_add(2)?)?, 16).ok())
-            .collect::<Option<Vec<u8>>>()?;
-        let blob = Multihash::decode(&bytes).ok()?;
-        (self.path(blob.as_ref()) == path).then_some(blob)
+    /// A temporary file in the directory, to become a blob.
+    pub fn temp(&self) -> Result<NamedTempFile> {
+        Ok(tempfile::Builder::new().prefix("put-").tempfile_in(self.dir.join(".temp"))?)
     }
 
-    /// Copy a file in, returning where it's kept. A file which is already
-    /// here is kept once.
-    pub fn keep(&self, path: &Path) -> Result<PathBuf> {
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let tmp = self.dir.join("tmp").join(format!("{}-{n}", std::process::id()));
-        let result = self.copy(path, &tmp);
-        if result.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        result
-    }
-
-    fn copy(&self, path: &Path, tmp: &Path) -> Result<PathBuf> {
-        let mut from = File::open(path)?;
-        let mut to = File::create_new(tmp)?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0; 64 * 1024];
-        loop {
-            let n = match from.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
-            };
-            let chunk = buf.get(..n).unwrap_or_default();
-            hasher.update(chunk);
-            to.write_all(chunk)?;
-        }
-        to.set_permissions(fs::Permissions::from_mode(0o444))?;
-        to.sync_all()?;
-        drop(to);
-
-        let digest = hasher.finalize();
-        let dest = self.path(Multihash::wrap(SHA2_256, &digest));
-        if dest.exists() {
-            fs::remove_file(tmp)?;
-            return Ok(dest);
-        }
+    /// Make a temporary file the blob with this multihash, unless it's
+    /// already here.
+    pub fn persist(&self, file: NamedTempFile, blob: Key<'_>) -> Result<()> {
+        let size = file.as_file().metadata()?.len();
+        file.as_file().set_permissions(fs::Permissions::from_mode(0o444))?;
+        file.as_file().sync_all()?;
+        let dest = self.path(blob);
         let shard = dest.parent().unwrap_or(&self.dir);
         fs::create_dir_all(shard)?;
-        fs::rename(tmp, &dest)?;
-        File::open(shard)?.sync_all()?;
-        Ok(dest)
+        match file.persist_noclobber(&dest) {
+            Ok(_) => File::open(shard)?.sync_all()?,
+            // The temporary file is removed as it's dropped
+            Err(e) if e.error.kind() == io::ErrorKind::AlreadyExists => {},
+            Err(e) => return Err(e.error.into()),
+        }
+        self.cache(blob, size)
     }
 
-    /// The offset source for a kept file, recording it if it's new, and the
-    /// file's size.
-    pub(super) fn source(&self, blob: Key<'_>) -> Result<(Id, i64)> {
-        let blob_id = self.db.intern(blob)?;
-        let conn = self.db.conn();
-        let existing = conn
-            .prepare_cached("SELECT source, size FROM shard_files WHERE blob = ?1")?
-            .query_row([blob_id], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()?;
-        if let Some(found) = existing {
-            return Ok(found);
-        }
-        let size = i64::try_from(fs::metadata(self.path(blob))?.len())
-            .map_err(|_| Error::Invalid { store: "shards", reason: "file too large".into() })?;
-        conn.prepare_cached("INSERT INTO offset_sources DEFAULT VALUES")?.execute([])?;
-        let source = conn.last_insert_rowid();
-        conn.prepare_cached("INSERT INTO shard_files (source, blob, size) VALUES (?1, ?2, ?3)")?
-            .execute(params![source, blob_id, size])?;
-        Ok((source, size))
+    fn cache(&self, blob: Key<'_>, size: u64) -> Result<()> {
+        let size = i64::try_from(size).map_err(|_| Error::Invalid { store: NAME, reason: "blob too large".into() })?;
+        self.db.conn()
+            .prepare_cached("INSERT OR REPLACE INTO shard_files (blob, size) VALUES (?1, ?2)")?
+            .execute(params![self.db.intern(blob)?, size])?;
+        Ok(())
     }
 
-    /// A kept file was imported as `root`. If none of its ranges were kept
-    /// (its leaves were already stored elsewhere) it's let go.
-    pub fn kept(&self, copy: &Path, root: Key<'_>) -> Result<()> {
-        let Some(blob) = self.blob(copy) else {
-            return Ok(());
-        };
-        let blob_id = self.db.intern(blob.as_ref())?;
-        let used = self.db.conn()
-            .prepare_cached(
-                "SELECT 1 FROM shard_files f JOIN offset_ranges r ON r.source = f.source WHERE f.blob = ?1 LIMIT 1",
-            )?
-            .query_row([blob_id], |_| Ok(()))
-            .optional()?
-            .is_some();
-        if !used {
-            self.db.conn()
-                .prepare_cached(
-                    "DELETE FROM offset_sources WHERE id IN (SELECT source FROM shard_files WHERE blob = ?1)",
-                )?
-                .execute([blob_id])?;
-            fs::remove_file(copy)?;
-            return Ok(());
-        }
+    /// A kept file was imported as `root`.
+    pub fn record_root(&self, blob: Key<'_>, root: Key<'_>) -> Result<()> {
         self.db.conn()
             .prepare_cached("INSERT OR IGNORE INTO shard_roots (blob, root) VALUES (?1, ?2)")?
-            .execute(params![blob_id, self.db.intern(root)?])?;
+            .execute(params![self.db.intern(blob)?, self.db.intern(root)?])?;
         Ok(())
+    }
+
+    /// Let a blob go.
+    pub fn forget(&self, blob: Key<'_>) -> Result<()> {
+        if let Some(id) = self.db.lookup(blob)? {
+            self.db.conn().prepare_cached("DELETE FROM shard_files WHERE blob = ?1")?.execute([id])?;
+        }
+        match fs::remove_file(self.path(blob)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Rebuild the cache of what's here from the directory.
+    pub fn rescan(&self) -> Result<()> {
+        self.db.atomically(|| {
+            self.db.conn().execute("DELETE FROM shard_files", [])?;
+            for shard in fs::read_dir(&self.dir)? {
+                let shard = shard?;
+                if !shard.file_type()?.is_dir() || shard.file_name() == ".temp" {
+                    continue;
+                }
+                for entry in fs::read_dir(shard.path())? {
+                    let path = entry?.path();
+                    let blob = path.file_name()
+                        .and_then(|name| name.to_str()?.strip_suffix(".data"))
+                        .and_then(|key| Base::Base32Upper.decode(key).ok())
+                        .and_then(|bytes| Multihash::<Box<[u8]>>::decode(&bytes).ok());
+                    // Anything else isn't ours
+                    if let Some(blob) = blob && self.path(blob.as_ref()) == path {
+                        self.cache(blob.as_ref(), fs::metadata(&path)?.len())?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+impl Store for ShardStore {
+    fn name(&self) -> &'static str { NAME }
+}
+
+impl BlockIndex for ShardStore {
+    fn has(&self, key: Key<'_>) -> Result<bool> {
+        Ok(self.db.conn()
+            .prepare_cached(
+                "SELECT 1 FROM multihashes m JOIN shard_files s ON s.blob = m.id WHERE m.multihash = ?1",
+            )?
+            .query_row([key.to_bytes()], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// Every blob but kept files, which aren't blocks.
+    fn keys(&self) -> Result<Vec<Multihash>> {
+        query_keys(
+            &self.db,
+            NAME,
+            "SELECT m.multihash FROM shard_files s JOIN multihashes m ON m.id = s.blob
+             WHERE s.blob NOT IN (SELECT blob FROM shard_roots)",
+        )
+    }
+}
+
+impl BlockSource for ShardStore {
+    fn get(&self, key: Key<'_>) -> Result<Option<Vec<u8>>> {
+        if !self.has(key)? {
+            return Ok(None);
+        }
+        let path = self.path(key);
+        match fs::read(&path) {
+            Ok(data) => Ok(Some(data)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Error::Missing(path)),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl BlockStore for ShardStore {
+    fn put(&self, block: &Block) -> Result<Put> {
+        if block.data().len() <= self.threshold {
+            return Ok(Put::Declined);
+        }
+        let blob = block.cid().multihash();
+        if !self.has(blob)? {
+            let mut file = self.temp()?;
+            io::Write::write_all(&mut file, block.data())?;
+            self.persist(file, blob)?;
+        }
+        Ok(Put::Stored)
     }
 }

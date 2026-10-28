@@ -5,7 +5,6 @@ use crate::hamt::Hamt;
 use crate::import::Importer;
 use crate::multihash::MultihashFunc;
 use crate::dag::Provenance;
-use std::os::unix::fs::MetadataExt;
 use crate::testutil::Scratch;
 use crate::unixfs;
 
@@ -378,7 +377,7 @@ fn persists() {
 /// Import with provenance, as `hk add --nocopy` does.
 fn import_in_place(router: &mut RoutingStore, path: &std::path::Path) -> crate::dag::DagLink {
     let importer = Importer { chunk_size: 64, ..Importer::default() };
-    importer.add_path(path, router, &mut |_, _| {}).expect("import").expect("root")
+    importer.add_path(path, &mut InPlace::new(router), &mut |_, _| {}).expect("import").expect("root")
 }
 
 fn content(len: usize, seed: u8) -> Vec<u8> {
@@ -436,8 +435,8 @@ fn blocks_are_served_from_any_unchanged_file() {
     let mut router = router();
     let root = import_in_place(&mut router, &a);
     assert_eq!(import_in_place(&mut router, &b).cid, root.cid);
-    // Five leaves, each kept in both files
-    assert_eq!(count(&router.db, "offset_ranges"), 10);
+    // Five leaves, each a range of one blob found at both paths
+    assert_eq!((count(&router.db, "offset_ranges"), count(&router.db, "external_files")), (5, 2));
 
     std::fs::write(&b, content(300, 9)).expect("change b");
     let mut out = Vec::new();
@@ -452,23 +451,41 @@ fn offset_store_needs_provenance() {
     let scratch = Scratch::new("offset-provenance");
     let file = scratch.path().join("file");
     std::fs::write(&file, b"hello world").expect("write");
+    let fingerprint = Fingerprint::read(&file).expect("fingerprint");
     let store = OffsetStore::open(Db::memory().expect("db"), None).expect("store");
     let hello = raw(b"hello");
     let at = |offset| Provenance::FileRange { path: &file, offset };
+    let blob = raw(b"hello world");
+    let settle = |len| store.settle(&file, blob.cid().multihash(), len, &Location::External { path: &file, fingerprint });
 
     assert_eq!(store.put(&hello).expect("put"), Put::Declined);
     assert_eq!(store.put_from(&hello, Provenance::Unknown).expect("put"), Put::Declined);
-    // Past the end of the file
-    assert_eq!(store.put_from(&hello, at(7)).expect("put"), Put::Declined);
     // Not a raw block
     assert_eq!(store.put_from(&block(DAG_PB_CODEC, b"hello"), at(0)).expect("put"), Put::Declined);
 
+    // Pending until settled, and past the end of the file it won't settle
+    assert_eq!(store.put_from(&hello, at(7)).expect("put"), Put::Stored);
+    assert!(settle(11).is_err());
+    assert_eq!(store.get(hello.cid().multihash()).expect("get"), None);
     assert_eq!(store.put_from(&hello, at(0)).expect("put"), Put::Stored);
+    assert_eq!(settle(11).expect("settle"), 1);
     assert_eq!(store.get(hello.cid().multihash()).expect("get").as_deref(), Some(&b"hello"[..]));
+
     // Provenance is trusted, and the router's re-hash is what catches a lie
     let world = raw(b"world");
     assert_eq!(store.put_from(&world, at(0)).expect("put"), Put::Stored);
+    assert_eq!(settle(11).expect("settle"), 2);
     assert_eq!(store.get(world.cid().multihash()).expect("get").as_deref(), Some(&b"hello"[..]));
+}
+
+#[test]
+fn leaves_must_be_the_whole_file_in_order() {
+    let mut whole = Whole::default();
+    whole.push(0, b"hello ").expect("first");
+    assert!(whole.push(0, b"world").is_err());
+    assert!(whole.push(7, b"world").is_err());
+    whole.push(6, b"world").expect("next");
+    assert_eq!(whole.finish(), Multihash::from(raw(b"hello world").cid().clone()));
 }
 
 #[test]
@@ -478,42 +495,8 @@ fn copying_forgets_provenance() {
     std::fs::write(&file, content(100, 0)).expect("write");
     let mut router = router();
     let importer = Importer { chunk_size: 64, ..Importer::default() };
-    importer.add_path(&file, &mut Copying(&mut router), &mut |_, _| {}).expect("import");
+    importer.add_path(&file, &mut Copying::new(&mut router), &mut |_, _| {}).expect("import");
     assert_eq!(router.stats().expect("stats"), [("raw".to_owned(), 2), ("unixfs".to_owned(), 1)]);
-}
-
-#[test]
-fn migrates_external_files_to_sources() {
-    let scratch = Scratch::new("offset-migrate");
-    let file = scratch.path().join("file");
-    std::fs::write(&file, b"hello world").expect("write");
-    let path = std::fs::canonicalize(&file).expect("canonical");
-    let meta = std::fs::metadata(&path).expect("metadata");
-    let db = Db::memory().expect("db");
-    let hello = raw(b"hello");
-    // The schema before sources
-    db.conn().execute_batch(
-        "CREATE TABLE offset_files (id INTEGER PRIMARY KEY, path BLOB NOT NULL, size INTEGER NOT NULL,
-             mtime INTEGER NOT NULL, inode INTEGER NOT NULL, UNIQUE (path, size, mtime, inode));
-         CREATE TABLE offset_ranges (block INTEGER NOT NULL REFERENCES multihashes (id),
-             file INTEGER NOT NULL REFERENCES offset_files (id), offset INTEGER NOT NULL,
-             len INTEGER NOT NULL, PRIMARY KEY (block, file)) WITHOUT ROWID;",
-    ).expect("old schema");
-    let id = db.intern(hello.cid().multihash()).expect("intern");
-    let mtime = meta.mtime() * 1_000_000_000 + meta.mtime_nsec();
-    db.conn().execute(
-        "INSERT INTO offset_files VALUES (7, ?1, ?2, ?3, ?4)",
-        params![path.as_os_str().as_encoded_bytes(), 11, mtime, meta.ino().cast_signed()],
-    ).expect("file");
-    db.conn().execute("INSERT INTO offset_ranges VALUES (?1, 7, 0, 5)", [id]).expect("range");
-
-    let store = OffsetStore::open(db.clone(), None).expect("migrate");
-    assert_eq!(store.get(hello.cid().multihash()).expect("get").as_deref(), Some(&b"hello"[..]));
-    assert_eq!((count(&db, "external_files"), count(&db, "offset_ranges")), (1, 1));
-    let old: i64 = db.conn()
-        .query_row("SELECT count(*) FROM sqlite_schema WHERE name IN ('offset_files', 'offset_ranges_v1')", [], |r| r.get(0))
-        .expect("schema");
-    assert_eq!(old, 0);
 }
 
 //------------//
@@ -523,7 +506,7 @@ fn migrates_external_files_to_sources() {
 /// A router whose shards keep files over 100 bytes.
 fn sharded(scratch: &Scratch) -> RoutingStore {
     let db = Db::memory().expect("db");
-    let mut shards = Shards::open(db.clone(), &scratch.path().join("shards")).expect("shards");
+    let mut shards = ShardStore::open(db.clone(), &scratch.path().join("shards")).expect("shards");
     shards.threshold = 100;
     RoutingStore::with_shards(db, Some(shards)).expect("router")
 }
@@ -531,18 +514,25 @@ fn sharded(scratch: &Scratch) -> RoutingStore {
 /// Import as `hk add` does, copying.
 fn import_copying(router: &mut RoutingStore, path: &std::path::Path) -> crate::dag::DagLink {
     let importer = Importer { chunk_size: 64, ..Importer::default() };
-    importer.add_path(path, &mut Copying(router), &mut |_, _| {}).expect("import").expect("root")
+    importer.add_path(path, &mut Copying::new(router), &mut |_, _| {}).expect("import").expect("root")
 }
 
 /// Every file kept in the shards.
 fn kept_files(scratch: &Scratch) -> Vec<std::path::PathBuf> {
     let mut files: Vec<_> = std::fs::read_dir(scratch.path().join("shards")).expect("shards")
         .map(|entry| entry.expect("entry").path())
-        .filter(|dir| dir.file_name() != Some("tmp".as_ref()))
+        .filter(|dir| dir.is_dir() && dir.file_name() != Some(".temp".as_ref()))
         .flat_map(|dir| std::fs::read_dir(dir).expect("shard").map(|entry| entry.expect("entry").path()))
         .collect();
     files.sort();
     files
+}
+
+/// Where flatfs would keep a blob: base32upper, next-to-last/2.
+fn shard_path(scratch: &Scratch, data: &[u8]) -> std::path::PathBuf {
+    let key = multibase::Base::Base32Upper.encode(raw(data).cid().multihash().to_bytes());
+    let shard = key.get(key.len().saturating_sub(3)..key.len().saturating_sub(1)).expect("shard");
+    scratch.path().join("shards").canonicalize().expect("dir").join(shard).join(format!("{key}.data"))
 }
 
 #[test]
@@ -558,11 +548,9 @@ fn keeps_large_files_whole() {
     assert_eq!(count(&router.db, "raw_blocks"), 0);
     assert_eq!(count(&router.db, "shard_roots"), 1);
 
-    // Named by its multihash, sharded on the digest, and read-only
+    // Named by its multihash as flatfs would, and read-only
     let kept = kept_files(&scratch);
-    let digest: Multihash<[u8; 32]> = crate::multihash::MultihashDigest::digest(&MultihashFunc::Sha2_256, &content(1000, 0)).expect("digest");
-    let hex: String = digest.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    assert_eq!(kept, [scratch.path().join("shards").canonicalize().expect("dir").join(&hex[4..6]).join(&hex)]);
+    assert_eq!(kept, [shard_path(&scratch, &content(1000, 0))]);
     assert!(std::fs::metadata(&kept[0]).expect("metadata").permissions().readonly());
     assert_eq!(std::fs::read(&kept[0]).expect("read"), content(1000, 0));
 
@@ -595,6 +583,40 @@ fn identical_files_are_kept_once() {
     assert_eq!(import_copying(&mut router, &b).cid, root.cid);
     assert_eq!(kept_files(&scratch).len(), 1);
     assert_eq!((count(&router.db, "offset_ranges"), count(&router.db, "shard_files")), (5, 1));
+    assert_eq!(count(&router.db, "shard_roots"), 1);
+}
+
+#[test]
+fn kept_files_arent_blocks() {
+    let scratch = Scratch::new("shards-not-blocks");
+    let file = scratch.path().join("file");
+    std::fs::write(&file, content(300, 0)).expect("write");
+    let mut router = sharded(&scratch);
+    import_copying(&mut router, &file);
+    let whole = raw(&content(300, 0));
+    let before = router.stats().expect("stats");
+    assert!(!router.has(whole.cid().multihash()).expect("has"));
+    router.reindex().expect("reindex");
+    assert!(!router.has(whole.cid().multihash()).expect("has"));
+    assert_eq!(router.stats().expect("stats"), before);
+}
+
+#[test]
+fn large_blocks_are_kept_as_files() {
+    let scratch = Scratch::new("shards-blocks");
+    let router = sharded(&scratch);
+    let (small, large) = (raw(&content(100, 0)), raw(&content(101, 0)));
+    assert_eq!(router.put_block(&small, CidVersion::V1).expect("put"), "raw");
+    assert_eq!(router.put_block(&large, CidVersion::V1).expect("put"), "shards");
+    assert_eq!(kept_files(&scratch), [shard_path(&scratch, &content(101, 0))]);
+    assert_eq!(router.get_block(&AnyCid::V1(large.cid().clone())).expect("get"), Some(large.clone()));
+
+    // The cache is rebuilt from the directory, ignoring what isn't a blob
+    std::fs::write(scratch.path().join("shards").join("stray"), b"").expect("stray");
+    router.db.conn().execute("DELETE FROM shard_files", []).expect("forget");
+    router.reindex().expect("reindex");
+    assert_eq!(router.store_of(large.cid().multihash()).expect("store"), Some("shards".to_owned()));
+    assert_eq!(count(&router.db, "shard_files"), 1);
 }
 
 #[test]
@@ -625,22 +647,6 @@ fn missing_kept_files_are_reported() {
     }
     let err = crate::export::cat(&router, &AnyCid::V1(root.cid), &mut Vec::new()).expect_err("missing");
     assert!(err.to_string().contains("which is missing"), "{err}");
-}
-
-#[test]
-fn shards_only_claim_their_own_files() {
-    let scratch = Scratch::new("shards-blob");
-    let shards = Shards::open(Db::memory().expect("db"), &scratch.path().join("shards")).expect("shards");
-    let file = scratch.path().join("file");
-    std::fs::write(&file, b"hello").expect("write");
-    let kept = shards.keep(&file).expect("keep");
-    let blob = shards.blob(&kept).expect("ours");
-    assert_eq!(blob.code(), 0x12);
-    // The same name elsewhere, or under the wrong shard, isn't
-    let name = kept.file_name().expect("name");
-    assert_eq!(shards.blob(&scratch.path().join(name)), None);
-    assert_eq!(shards.blob(&kept.parent().expect("shard").with_file_name("00").join(name)), None);
-    assert_eq!(shards.blob(&file), None);
 }
 
 //----------//

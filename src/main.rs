@@ -35,7 +35,7 @@ use chunker::ChunkerType;
 use dag::{BalancedLayout, BlockSink, NullSink};
 use import::Importer;
 use model::Link;
-use store::{Copying, RoutingStore};
+use store::{Copying, InPlace, RoutingStore};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -144,10 +144,10 @@ fn run(args: Args) -> anyhow::Result<()> {
                 add(&importer, &path, quiet, &mut NullSink)
             }
             else if nocopy {
-                open_repo(args.repo)?.batch(|repo| add(&importer, &path, quiet, repo))
+                open_repo(args.repo)?.batch(|repo| add(&importer, &path, quiet, &mut InPlace::new(repo)))
             }
             else {
-                open_repo(args.repo)?.batch(|repo| add(&importer, &path, quiet, &mut Copying(repo)))
+                open_repo(args.repo)?.batch(|repo| add(&importer, &path, quiet, &mut Copying::new(repo)))
             }
         },
         Command::Cat { cid } => {

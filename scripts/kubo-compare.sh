@@ -113,22 +113,22 @@ else
 fi
 "$hk" repo stat
 
-## Large files are kept whole, named by their multihash, so they check
-## themselves
+## Large blocks and files are kept whole, named as flatfs would (base32upper
+## multihash, next-to-last/2), so they check themselves
 kept=0
-for f in "$HOLOKEEP_REPO"/shards/[0-9a-f][0-9a-f]/*; do
+for f in "$HOLOKEEP_REPO"/shards/??/*.data; do
     [ -e "$f" ] || continue
     kept=$((kept + 1))
-    name=$(basename "$f")
-    if [ "1220$(sha256sum "$f" | cut -d' ' -f1)" != "$name" ]; then
-        echo "FAIL kept file $name doesn't match its name"
+    key=$(printf '1220%s' "$(sha256sum "$f" | cut -d' ' -f1)" | xxd -r -p | base32 -w0 | tr -d =)
+    if [ "$(basename "$f")" != "$key.data" ] || [ "$(basename "$(dirname "$f")")" != "${key: -3:2}" ]; then
+        echo "FAIL kept file $f doesn't match its name"
         fail=1
     fi
 done
 if [ "$kept" -gt 0 ]; then
     echo "ok   $kept kept files match their names"
 else
-    echo "FAIL no large files were kept whole"
+    echo "FAIL nothing was kept whole"
     fail=1
 fi
 

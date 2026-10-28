@@ -847,6 +847,7 @@ dependencies = [
  "sha1",
  "sha2 0.11.0",
  "sha3 0.12.0",
+ "tempfile",
  "thiserror",
  "typed_floats",
  "typenum",

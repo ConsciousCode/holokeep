@@ -27,7 +27,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::block::Block;
 use crate::cid::{AnyCid, BaseCid, CidRef, CidVersion, Cidv1};
-use crate::dag::{BlockSink, DagLink, Provenance, Source};
+use crate::dag::{BlockSink, DagLink, Provenance};
 use crate::multihash::{Inline, Multihash};
 
 mod ipld;
@@ -38,8 +38,9 @@ mod unixfs;
 
 pub use ipld::IpldStore;
 pub use offset::OffsetStore;
+use offset::{Fingerprint, Location, Whole};
 pub use raw::RawStore;
-pub use shards::Shards;
+pub use shards::ShardStore;
 pub use unixfs::UnixfsStore;
 
 #[derive(Debug, thiserror::Error)]
@@ -279,8 +280,11 @@ pub struct RoutingStore {
     db: Db,
     /// Most specialized first; the last should admit anything.
     stores: Vec<Box<dyn Store>>,
-    /// Where files copied in are kept whole, if anywhere.
-    shards: Option<Rc<Shards>>,
+    /// The offset store, for sinks to settle the ranges of files they
+    /// import.
+    offsets: Option<Rc<OffsetStore>>,
+    /// Where large blocks and whole files are kept, if anywhere.
+    shards: Option<Rc<ShardStore>>,
 }
 
 impl RoutingStore {
@@ -288,7 +292,7 @@ impl RoutingStore {
     pub fn open_repo(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let db = Db::open(&dir.join("blocks.db"))?;
-        let shards = Shards::open(db.clone(), &dir.join("shards"))?;
+        let shards = ShardStore::open(db.clone(), &dir.join("shards"))?;
         Self::with_shards(db, Some(shards))
     }
 
@@ -297,19 +301,24 @@ impl RoutingStore {
         Self::with_shards(db, None)
     }
 
-    /// The standard stores in one database: ranges of files on disk when
-    /// that's where blocks came from, UnixFS nodes as rows, dag-cbor and
-    /// dag-json as JSONB, and everything else as raw bytes. Large files
-    /// copied in are kept whole in the shards, if there are any.
-    pub fn with_shards(db: Db, shards: Option<Shards>) -> Result<Self> {
+    /// The standard stores in one database: ranges of files when that's
+    /// where blocks came from, UnixFS nodes as rows, dag-cbor and dag-json
+    /// as JSONB, large blocks in the shards if there are any, and
+    /// everything else as raw bytes.
+    pub fn with_shards(db: Db, shards: Option<ShardStore>) -> Result<Self> {
         let shards = shards.map(Rc::new);
-        let stores: Vec<Box<dyn Store>> = vec![
-            Box::new(OffsetStore::open(db.clone(), shards.clone())?),
+        let offsets = Rc::new(OffsetStore::open(db.clone(), shards.clone())?);
+        let mut stores: Vec<Box<dyn Store>> = vec![
+            Box::new(Rc::clone(&offsets)),
             Box::new(UnixfsStore::open(db.clone())?),
             Box::new(IpldStore::open(db.clone())?),
-            Box::new(RawStore::open(db.clone())?),
         ];
+        if let Some(shards) = &shards {
+            stores.push(Box::new(Rc::clone(shards)));
+        }
+        stores.push(Box::new(RawStore::open(db.clone())?));
         let mut router = Self::new(db, stores)?;
+        router.offsets = Some(offsets);
         router.shards = shards;
         Ok(router)
     }
@@ -338,7 +347,7 @@ impl RoutingStore {
         for store in &stores {
             db.conn().execute("INSERT OR IGNORE INTO stores (name) VALUES (?1)", [store.name()])?;
         }
-        Ok(Self { db, stores, shards: None })
+        Ok(Self { db, stores, offsets: None, shards: None })
     }
 
     /// Run `f` in one transaction, for speed and so that a failed import
@@ -444,6 +453,9 @@ impl RoutingStore {
     /// found. Earlier stores win if more than one has a block.
     pub fn reindex(&self) -> Result<usize> {
         self.db.atomically(|| {
+            if let Some(shards) = &self.shards {
+                shards.rescan()?;
+            }
             self.db.conn().execute("DELETE FROM blocks", [])?;
             let mut count = 0usize;
             for store in &self.stores {
@@ -505,47 +517,168 @@ impl BlockStore for RoutingStore {
     }
 }
 
-/// For the importer, which only makes CIDv1.
+/// For the importer, which only makes CIDv1. Blocks are copied in as
+/// they come; see `Copying` and `InPlace` for sinks which keep files whole.
 impl BlockSink for RoutingStore {
     fn put(&mut self, block: Block) -> io::Result<()> {
-        BlockSink::put_from(self, block, Provenance::Unknown)
-    }
-
-    fn put_from(&mut self, block: Block, provenance: Provenance<'_>) -> io::Result<()> {
-        self.put_block_from(&block, CidVersion::V1, provenance).map(drop).map_err(io::Error::other)
+        self.put_block(&block, CidVersion::V1).map(drop).map_err(io::Error::other)
     }
 }
 
-/// Puts blocks into a router as copies, so nothing is kept as part of the
-/// original files. Large files are kept whole in the router's shards, and
-/// their leaves as ranges of them; the rest are copied block by block.
-pub struct Copying<'a>(pub &'a mut RoutingStore);
+/// Stores of a router may be shared with it.
+impl<T: Store + ?Sized> Store for Rc<T> {
+    fn name(&self) -> &'static str { (**self).name() }
+}
+
+impl<T: BlockIndex + ?Sized> BlockIndex for Rc<T> {
+    fn has(&self, key: Key<'_>) -> Result<bool> { (**self).has(key) }
+    fn keys(&self) -> Result<Vec<Multihash>> { (**self).keys() }
+}
+
+impl<T: BlockSource + ?Sized> BlockSource for Rc<T> {
+    fn get(&self, key: Key<'_>) -> Result<Option<Vec<u8>>> { (**self).get(key) }
+}
+
+impl<T: BlockStore + ?Sized> BlockStore for Rc<T> {
+    fn put(&self, block: &Block) -> Result<Put> { (**self).put(block) }
+    fn put_from(&self, block: &Block, provenance: Provenance<'_>) -> Result<Put> {
+        (**self).put_from(block, provenance)
+    }
+}
+
+fn io_error(e: Error) -> io::Error {
+    io::Error::other(e)
+}
+
+/// Imports files in place, keeping their leaves as ranges of the files
+/// themselves (`hk add --nocopy`). Each file is hashed whole as its leaves
+/// go by, and must be unchanged by the end.
+pub struct InPlace<'a> {
+    router: &'a mut RoutingStore,
+    file: Option<(Fingerprint, Whole)>,
+}
+
+impl<'a> InPlace<'a> {
+    pub const fn new(router: &'a mut RoutingStore) -> Self {
+        Self { router, file: None }
+    }
+}
+
+impl BlockSink for InPlace<'_> {
+    fn put(&mut self, block: Block) -> io::Result<()> {
+        BlockSink::put(self.router, block)
+    }
+
+    fn put_from(&mut self, block: Block, provenance: Provenance<'_>) -> io::Result<()> {
+        if let (Some((_, whole)), Provenance::FileRange { offset, .. }) = (&mut self.file, provenance) {
+            whole.push(offset, block.data())?;
+        }
+        self.router.put_block_from(&block, CidVersion::V1, provenance).map(drop).map_err(io_error)
+    }
+
+    fn begin_file(&mut self, path: &Path) -> io::Result<()> {
+        let fingerprint = Fingerprint::read(path)
+            .ok_or_else(|| io::Error::other(format!("can't fingerprint {}", path.display())))?;
+        self.file = Some((fingerprint, Whole::default()));
+        Ok(())
+    }
+
+    fn end_file(&mut self, path: &Path, _root: &DagLink) -> io::Result<()> {
+        let (Some((fingerprint, whole)), Some(offsets)) = (self.file.take(), &self.router.offsets) else {
+            return Ok(());
+        };
+        if Fingerprint::read(path) != Some(fingerprint) {
+            return Err(io::Error::other(format!("{} changed while it was being imported", path.display())));
+        }
+        let len = whole.len();
+        let blob = whole.finish();
+        offsets.settle(path, blob.as_ref(), len, &Location::External { path, fingerprint }).map(drop).map_err(io_error)
+    }
+}
+
+/// Imports files as copies, so nothing is kept as part of the originals.
+/// A file of more than one leaf and more than the shards' threshold is
+/// kept whole in the shards, written as its leaves go by, and its leaves
+/// become ranges of it; the rest are copied block by block.
+pub struct Copying<'a> {
+    router: &'a mut RoutingStore,
+    file: Option<Keeping>,
+}
+
+/// A file being imported which may be kept whole.
+struct Keeping {
+    whole: Whole,
+    /// Leaves held back until the file is known to be worth keeping, and
+    /// their offsets.
+    held: Vec<(Block, u64)>,
+    /// The file being written, once it's worth keeping.
+    temp: Option<tempfile::NamedTempFile>,
+}
+
+impl<'a> Copying<'a> {
+    pub const fn new(router: &'a mut RoutingStore) -> Self {
+        Self { router, file: None }
+    }
+}
 
 impl BlockSink for Copying<'_> {
     fn put(&mut self, block: Block) -> io::Result<()> {
-        BlockSink::put(self.0, block)
+        BlockSink::put(self.router, block)
     }
 
-    /// Provenance only ever points into kept files: `source` reads the rest
-    /// without any.
     fn put_from(&mut self, block: Block, provenance: Provenance<'_>) -> io::Result<()> {
-        BlockSink::put_from(self.0, block, provenance)
-    }
-
-    fn source(&mut self, path: &Path) -> io::Result<Source> {
-        match &self.0.shards {
-            Some(shards) if std::fs::metadata(path)?.len() > shards.threshold => {
-                shards.keep(path).map(Source::Kept).map_err(io::Error::other)
-            },
-            _ => Ok(Source::Copy),
+        let (Some(file), Some(shards), Provenance::FileRange { path, offset }) =
+            (&mut self.file, &self.router.shards, provenance)
+        else {
+            return BlockSink::put(self.router, block);
+        };
+        file.whole.push(offset, block.data())?;
+        if let Some(temp) = &mut file.temp {
+            io::Write::write_all(temp, block.data())?;
+            return self.router.put_block_from(&block, CidVersion::V1, provenance).map(drop).map_err(io_error);
         }
+        file.held.push((block, offset));
+        let threshold = u64::try_from(shards.threshold).unwrap_or(u64::MAX);
+        if file.held.len() < 2 || file.whole.len() <= threshold {
+            return Ok(());
+        }
+        let mut temp = shards.temp().map_err(io_error)?;
+        for (leaf, offset) in std::mem::take(&mut file.held) {
+            io::Write::write_all(&mut temp, leaf.data())?;
+            self.router.put_block_from(&leaf, CidVersion::V1, Provenance::FileRange { path, offset }).map_err(io_error)?;
+        }
+        file.temp = Some(temp);
+        Ok(())
     }
 
-    fn kept(&mut self, copy: &Path, root: &DagLink) -> io::Result<()> {
-        let Some(shards) = &self.0.shards else {
+    fn begin_file(&mut self, _path: &Path) -> io::Result<()> {
+        self.file = Some(Keeping { whole: Whole::default(), held: Vec::new(), temp: None });
+        Ok(())
+    }
+
+    fn end_file(&mut self, path: &Path, root: &DagLink) -> io::Result<()> {
+        let Some(file) = self.file.take() else {
             return Ok(());
         };
-        shards.kept(copy, root.cid.multihash()).map_err(io::Error::other)
+        let (Some(temp), Some(shards), Some(offsets)) = (file.temp, &self.router.shards, &self.router.offsets) else {
+            // Not worth keeping whole
+            for (leaf, _) in file.held {
+                BlockSink::put(self.router, leaf)?;
+            }
+            return Ok(());
+        };
+        let len = file.whole.len();
+        let blob = file.whole.finish();
+        let keep = || {
+            shards.persist(temp, blob.as_ref())?;
+            let ranges = offsets.settle(path, blob.as_ref(), len, &Location::Kept)?;
+            // Every leaf was already stored some other way
+            if ranges == 0 && self.router.store_of(blob.as_ref())?.is_none() {
+                return shards.forget(blob.as_ref());
+            }
+            shards.record_root(blob.as_ref(), root.cid.multihash())
+        };
+        keep().map_err(io_error)
     }
 }
 
