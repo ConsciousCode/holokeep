@@ -26,8 +26,9 @@ use std::rc::Rc;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::block::Block;
-use crate::cid::{AnyCid, BaseCid, CidRef, CidVersion, Cidv1};
+use crate::cid::{AnyCid, BaseCid, Cid, CidRef, CidVersion, Cidv1};
 use crate::dag::{BlockSink, DagLink, Provenance};
+use crate::model::Link;
 use crate::multihash::{Inline, Multihash};
 
 mod ipld;
@@ -137,6 +138,12 @@ pub trait RefIndex {
 pub trait Store: BlockIndex + BlockSource + BlockStore {
     /// A stable name, recorded in the router's index.
     fn name(&self) -> &'static str;
+
+    /// The store's own index of its blocks' links, if it keeps one. A
+    /// router indexes the links of blocks in stores which don't.
+    fn refs(&self) -> Option<&dyn RefIndex> {
+        None
+    }
 }
 
 //--------------//
@@ -318,6 +325,14 @@ impl RoutingStore {
         }
         stores.push(Box::new(RawStore::open(db.clone())?));
         let mut router = Self::new(db, stores)?;
+        router.db.conn().execute_batch(
+            "-- Every link in the repo, by the multihashes of the block it's in
+             -- and the block it's to.
+             CREATE VIEW IF NOT EXISTS links (source, target) AS
+                 SELECT node, target FROM unixfs_links
+                 UNION SELECT block, target FROM ipld_links
+                 UNION SELECT source, target FROM refs;",
+        )?;
         router.offsets = Some(offsets);
         router.shards = shards;
         Ok(router)
@@ -342,7 +357,16 @@ impl RoutingStore {
                  block INTEGER NOT NULL REFERENCES multihashes (id),
                  prefix BLOB NOT NULL,
                  PRIMARY KEY (block, prefix)
-             ) WITHOUT ROWID;",
+             ) WITHOUT ROWID;
+             -- The links of blocks in stores which don't index their own,
+             -- read from their bytes by codec. With the stores' own link
+             -- tables, every link in the repo, for backreferences.
+             CREATE TABLE IF NOT EXISTS refs (
+                 source INTEGER NOT NULL REFERENCES multihashes (id),
+                 target INTEGER NOT NULL REFERENCES multihashes (id),
+                 PRIMARY KEY (source, target)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS refs_target ON refs (target);",
         )?;
         for store in &stores {
             db.conn().execute("INSERT OR IGNORE INTO stores (name) VALUES (?1)", [store.name()])?;
@@ -402,6 +426,7 @@ impl RoutingStore {
         let key = block.cid().multihash();
         let prefix = cid_prefix(block.cid(), version);
         self.db.atomically(|| {
+            let id = self.db.intern(key)?;
             let store = if let Some(store) = self.store_of(key)? {
                 if provenance != Provenance::Unknown {
                     self.named(&store)?.put_from(block, provenance)?;
@@ -410,14 +435,45 @@ impl RoutingStore {
             }
             else {
                 let store = self.place(block, provenance)?;
-                self.record(self.db.intern(key)?, store)?;
+                self.record(id, store)?;
                 store.to_owned()
             };
-            self.db.conn()
+            let new_cid = self.db.conn()
                 .prepare_cached("INSERT OR IGNORE INTO block_cids (block, prefix) VALUES (?1, ?2)")?
-                .execute(params![self.db.intern(key)?, prefix])?;
+                .execute(params![id, prefix])? > 0;
+            // Read under each codec it's put with, since that's what says
+            // where its links are
+            if new_cid && self.named(&store)?.refs().is_none() {
+                self.index_links(id, block.cid().codec(), block.data())?;
+            }
             Ok(store)
         })
+    }
+
+    /// Index the links of a block in a store which doesn't. A block that
+    /// can't be read under its codec has none.
+    fn index_links(&self, id: Id, codec: u64, data: &[u8]) -> Result<()> {
+        let Ok(links) = crate::links::links(codec, data) else {
+            return Ok(());
+        };
+        let mut stmt = self.db.conn().prepare_cached("INSERT OR IGNORE INTO refs (source, target) VALUES (?1, ?2)")?;
+        for link in links {
+            stmt.execute(params![id, self.db.intern(link.multihash())?])?;
+        }
+        Ok(())
+    }
+
+    /// Every CID a block was put under.
+    pub fn cids(&self, key: Key<'_>) -> Result<Vec<Link>> {
+        let mut stmt = self.db.conn().prepare_cached(
+            "SELECT c.prefix FROM multihashes m JOIN block_cids c ON c.block = m.id WHERE m.multihash = ?1 ORDER BY c.prefix",
+        )?;
+        let rows = stmt.query_map([key.to_bytes()], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|prefix| {
+            let cid = [prefix?, key.to_bytes()].concat();
+            Link::decode(&cid).map_err(|e| Error::Invalid { store: "router", reason: format!("CID: {e:?}") })
+        })
+        .collect()
     }
 
     /// Index a block as being in a store, returning whether it's new.
@@ -456,17 +512,39 @@ impl RoutingStore {
             if let Some(shards) = &self.shards {
                 shards.rescan()?;
             }
-            self.db.conn().execute("DELETE FROM blocks", [])?;
+            self.db.conn().execute_batch("DELETE FROM blocks; DELETE FROM refs;")?;
             let mut count = 0usize;
             for store in &self.stores {
                 for key in store.keys()? {
-                    if self.record(self.db.intern(key.as_ref())?, store.name())? {
-                        count = count.saturating_add(1);
+                    let id = self.db.intern(key.as_ref())?;
+                    if !self.record(id, store.name())? {
+                        continue;
+                    }
+                    count = count.saturating_add(1);
+                    if store.refs().is_none() {
+                        self.reindex_links(store.as_ref(), id, key.as_ref())?;
                     }
                 }
             }
             Ok(count)
         })
+    }
+
+    /// Index a block's links again, under every codec it was put with.
+    /// Raw blocks have none, so they're never read, which matters for
+    /// offset blocks whose files may be gone.
+    fn reindex_links(&self, store: &dyn Store, id: Id, key: Key<'_>) -> Result<()> {
+        let codecs: Vec<u64> = self.cids(key)?.iter().map(BaseCid::codec).filter(|&c| c != crate::cid::RAW_CODEC).collect();
+        if codecs.is_empty() {
+            return Ok(());
+        }
+        let Some(data) = store.get(key)? else {
+            return Ok(());
+        };
+        for codec in codecs {
+            self.index_links(id, codec, &data)?;
+        }
+        Ok(())
     }
 
     /// How many blocks each store holds, by the index.
@@ -502,6 +580,30 @@ impl BlockSource for RoutingStore {
     }
 }
 
+/// Every block in the repo with a link to a multihash, whichever store
+/// holds it.
+impl RefIndex for RoutingStore {
+    fn backrefs(&self, key: Key<'_>) -> Result<Vec<Multihash>> {
+        let mut found = std::collections::BTreeMap::new();
+        for store in &self.stores {
+            if let Some(refs) = store.refs() {
+                found.extend(refs.backrefs(key)?.into_iter().map(|mh| (mh.to_bytes(), mh)));
+            }
+        }
+        let mut stmt = self.db.conn().prepare_cached(
+            "SELECT s.multihash FROM multihashes t
+             JOIN refs r ON r.target = t.id
+             JOIN multihashes s ON s.id = r.source
+             WHERE t.multihash = ?1",
+        )?;
+        for bytes in stmt.query_map([key.to_bytes()], |row| row.get::<_, Vec<u8>>(0))? {
+            let mh = decode_key("router", &bytes?)?;
+            found.insert(mh.to_bytes(), mh);
+        }
+        Ok(found.into_values().collect())
+    }
+}
+
 /// Routing stores compose: one can be a store within another.
 impl BlockStore for RoutingStore {
     fn put(&self, block: &Block) -> Result<Put> {
@@ -528,6 +630,7 @@ impl BlockSink for RoutingStore {
 /// Stores of a router may be shared with it.
 impl<T: Store + ?Sized> Store for Rc<T> {
     fn name(&self) -> &'static str { (**self).name() }
+    fn refs(&self) -> Option<&dyn RefIndex> { (**self).refs() }
 }
 
 impl<T: BlockIndex + ?Sized> BlockIndex for Rc<T> {

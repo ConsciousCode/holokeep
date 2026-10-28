@@ -16,11 +16,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Read, Write};
 
 use crate::block::Block;
-use crate::cid::{BaseCid, Cid, CidRef, CidVersion, DAG_CBOR_CODEC, DAG_JSON_CODEC, DAG_PB_CODEC, RAW_CODEC};
+use crate::cid::{BaseCid, Cid, CidRef, CidVersion};
+use crate::dagcbor;
 use crate::export::Fetch;
 use crate::model::{Ipld, Link};
-use crate::pb::PbNode;
-use crate::{dagcbor, dagjson};
 
 /// go-car's limits: no header or section is larger than these.
 const MAX_HEADER: u64 = 32 << 20;
@@ -32,9 +31,6 @@ const V2_PRAGMA: [u8; 11] = [0x0a, 0xa1, 0x67, b'v', b'e', b'r', b's', b'i', b'o
 /// The size of a `CARv2`'s header after its pragma: characteristics, then
 /// the data's offset and size and the index's offset, little-endian.
 const V2_HEADER: usize = 40;
-
-/// The CIDv1 codec of `libp2p-key`, which links to nothing.
-const LIBP2P_KEY_CODEC: u64 = 0x72;
 
 fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
@@ -158,33 +154,6 @@ impl<R: Read> CarReader<R> {
     }
 }
 
-/// Every link in a block, in order, or an error if its codec can't be
-/// read.
-pub fn links(cid: &Link, data: &[u8]) -> io::Result<Vec<Link>> {
-    fn walk(value: Ipld, out: &mut Vec<Link>) {
-        match value {
-            Ipld::Link(link) => out.push(link),
-            Ipld::List(items) => items.into_iter().for_each(|item| walk(item, out)),
-            Ipld::Map(map) => map.into_values().for_each(|item| walk(item, out)),
-            _ => {},
-        }
-    }
-    let bad = |e: &dyn std::fmt::Display| invalid(format!("{cid}: {e}"));
-    let mut out = Vec::new();
-    match cid.codec() {
-        RAW_CODEC | LIBP2P_KEY_CODEC => {},
-        DAG_PB_CODEC => {
-            for link in PbNode::decode(data).map_err(|e| bad(&e))?.links {
-                out.push(link.cid().map_err(|e| bad(&format!("{e:?}")))?);
-            }
-        },
-        DAG_CBOR_CODEC => walk(dagcbor::from_slice(data).map_err(|e| bad(&e))?, &mut out),
-        DAG_JSON_CODEC => walk(dagjson::from_slice(data).map_err(|e| bad(&e))?, &mut out),
-        codec => return Err(invalid(format!("{cid}: can't follow links in codec 0x{codec:x}"))),
-    }
-    Ok(out)
-}
-
 /// Write a `CARv1` header.
 fn write_header(out: &mut impl Write, roots: &[Link]) -> io::Result<()> {
     let header = Ipld::Map(BTreeMap::from([
@@ -222,7 +191,8 @@ pub fn export(src: &impl Fetch, root: &Link, out: &mut impl Write) -> io::Result
         let data = src.fetch(&cid)?;
         write_section(out, &cid, &data)?;
         count = count.saturating_add(1);
-        stack.extend(links(&cid, &data)?.into_iter().rev());
+        let links = crate::links::links(cid.codec(), &data).map_err(|e| invalid(format!("{cid}: {e}")))?;
+        stack.extend(links.into_iter().rev());
     }
     Ok(count)
 }

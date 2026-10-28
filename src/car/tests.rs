@@ -1,5 +1,5 @@
 use super::*;
-use crate::cid::{Cidv1Spec, CidVersion};
+use crate::cid::{Cidv1Spec, CidVersion, DAG_CBOR_CODEC, DAG_PB_CODEC};
 use crate::dag::{BalancedLayout, DynamicDirectory};
 use crate::hamt::Hamt;
 use crate::import::Importer;
@@ -157,13 +157,4 @@ fn rejects_what_it_cant_trust() {
     ] {
         assert!(import_bytes(car, &mut router()).is_err(), "{label}");
     }
-}
-
-#[test]
-fn follows_links_in_known_codecs_only() {
-    let cid = |codec| AnyCid::V1(Block::<crate::multihash::Inline<64>>::hash(Cidv1Spec::new(codec, crate::multihash::MultihashFunc::Sha2_256), b"".as_slice().into()).cid().clone());
-    assert!(links(&cid(RAW_CODEC), b"anything").expect("raw").is_empty());
-    assert_eq!(links(&cid(DAG_JSON_CODEC), br#"[{"/":"bafkqaaa"}]"#).expect("json").len(), 1);
-    assert!(links(&cid(DAG_CBOR_CODEC), b"\xff").is_err());
-    assert!(links(&cid(0x78), b"").is_err());
 }

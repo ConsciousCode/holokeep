@@ -272,6 +272,7 @@ impl UnixfsStore {
 
 impl Store for UnixfsStore {
     fn name(&self) -> &'static str { NAME }
+    fn refs(&self) -> Option<&dyn RefIndex> { Some(self) }
 }
 
 impl BlockIndex for UnixfsStore {

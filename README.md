@@ -152,10 +152,10 @@ Implemented so far (`src/store/`), all in one SQLite file:
 - **`UnixfsStore`** keeps UnixFS nodes as a node row and link rows, admitting only nodes it can manifest exactly: every link named and sized, no mode or mtime, Kubo's field order. A link row is the target's id plus the CID prefix it was written with, and link rows double as a `RefIndex` by multihash. A HAMT shard's link names are split into the bucket and the entry's name, so entries are named the same whether their directory is sharded or not, and the `unixfs_entries` view lists every directory's entries alike, descending through sub-shards: `SELECT directory FROM unixfs_entries WHERE name = CAST('notes.txt' AS BLOB)` finds a file in any directory. Every node `hk add` makes lands here; of the 17 dag-pb blocks in codec-fixtures, the 2 in Kubo's form do.
 - **`IpldStore`** keeps dag-cbor and dag-json blocks as SQLite JSONB in dag-json form (links `{"/": "<CID>"}`, bytes `{"/": {"bytes": …}}`), so their contents can be queried in place, eg `WHERE data ->> '$.name' = …`. A block is admitted only if what SQLite hands back manifests it exactly, which excludes non-canonical encodings and the data dag-json can't express (a map whose only key is `/` with a string value). Links are also kept as rows by interned multihash, as a `RefIndex`. All 256 dag-cbor and dag-json blocks in codec-fixtures land here, and fuzzing checks that everything dag-json can express round-trips.
 - **`RawStore`** takes anything else as bytes.
+- **Backreferences** span every store without storing a link twice. A store which keeps its own link rows says so (`Store::refs`); for blocks in any other store, the router reads their links by codec as they're put and keeps them in `refs`, under every codec a block is put with, since that's what says where its links are. The `RoutingStore`'s `RefIndex` is the union, and the `links (source, target)` view is the same in SQL. Reindexing rebuilds `refs`, reading only blocks with a codec that can link, so offset blocks whose files are gone aren't needed. `hk refs <cid>` lists a block's links as `ipfs refs` does, and `hk refs --back <cid>` every block linking to it, under each CID it was put with.
 
 Remaining representations from the original prototype:
 
-- **Backreferences** across every store, as (source, destination) pairs: `RefIndex` per store exists, a repo-wide index doesn't yet.
 
 "Small blocks" (inlining small blobs into the database instead of separate files) turned out to be placement order rather than its own kind: the shard store declines anything at or under its threshold, which falls through to the raw store.
 
@@ -289,7 +289,7 @@ Checklist:
 - [x] Retrieval (`hk cat`, `hk get`)
 - [x] CAR import/export
 - [x] UnixFSv1 indexing in SQL
-- [ ] Backreference indexing
+- [x] Backreference indexing
 - [ ] Tagging
 - [ ] Purging blocks immediately, across stores and permission tiers
 - [ ] Querying
@@ -342,6 +342,7 @@ $hk add --nocopy <path>             # keep contents in place, like Kubo's filest
 $hk cat <cid>                       # a file's contents
 $hk get <cid> -o <path>             # a file, directory or symlink
 $hk block get <cid>                 # a block's bytes
+$hk refs [--back] <cid>             # a block's links, or what links to it
 $hk dag export <cid> -o <file.car>  # a DAG as a CARv1, like `ipfs dag export`
 $hk dag import <file.car>...        # CARv1 or v2 files, like `ipfs dag import`
 $hk repo stat                       # blocks per store

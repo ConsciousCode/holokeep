@@ -146,6 +146,15 @@ for f in *; do
     i=$((i + 1))
 done
 
+## `hk refs` lists each root's links as `ipfs refs` does
+for root in "${roots[@]}"; do
+    if [ "$(ipfs refs "$root")" != "$("$hk" refs "$root")" ]; then
+        echo "FAIL refs $root"
+        fail=1
+    fi
+done
+echo "ok   refs of ${#roots[@]} roots"
+
 ## A legacy DAG (CIDv0, dag-pb leaves) round-trips through hk unchanged
 legacy=$(ipfs add -Q -r --cid-version=0 --raw-leaves=false --chunker=size-1000 deep)
 for root in $(ipfs add -Q -r --cid-version=0 --raw-leaves=false tree) "$legacy"; do

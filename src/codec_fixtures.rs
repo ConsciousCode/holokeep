@@ -470,3 +470,25 @@ fn fixtures_car_imports() {
         assert_eq!(back.data(), f.bytes, "{label}");
     }
 }
+
+/// Every link in every fixture is a backref, whichever store took it.
+#[test]
+fn every_link_is_a_backref() {
+    use crate::cid::CidVersion;
+    use crate::store::{Db, RefIndex, RoutingStore};
+
+    let router = RoutingStore::standard(Db::memory().expect("db")).expect("router");
+    let mut checked = 0;
+    for f in fixtures() {
+        let label = f.label();
+        let cid: Cidv1 = f.cid.parse().expect(&label);
+        let block = Block::verify(cid.clone(), f.bytes.clone().into()).expect(&label);
+        router.put_block(&block, CidVersion::V1).expect(&label);
+        let source = crate::multihash::Multihash::from(cid.clone());
+        for link in crate::links::links(cid.codec(), &f.bytes).expect(&label) {
+            assert!(router.backrefs(link.multihash()).expect(&label).contains(&source), "{label} -> {link}");
+            checked += 1;
+        }
+    }
+    assert!(checked > 50, "only {checked} links");
+}

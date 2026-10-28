@@ -15,6 +15,7 @@ mod unixfs;
 mod dag;
 mod hamt;
 mod import;
+mod links;
 mod export;
 mod model;
 mod store;
@@ -36,7 +37,8 @@ use chunker::ChunkerType;
 use dag::{BalancedLayout, BlockSink, NullSink};
 use import::Importer;
 use model::Link;
-use store::{Copying, InPlace, RoutingStore};
+use cid::{BaseCid, CidRef};
+use store::{Copying, InPlace, RefIndex, RoutingStore};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -86,6 +88,14 @@ enum Command {
         /// Where to write it [default: the CID]
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+    /// List the CIDs a block links to, like `ipfs refs`, or with --back,
+    /// the CIDs of every block in the repo which links to it
+    Refs {
+        cid: Link,
+        /// Blocks linking to this one, rather than those it links to
+        #[arg(long)]
+        back: bool,
     },
     /// Work with raw blocks
     #[command(subcommand)]
@@ -182,46 +192,12 @@ fn run(args: Args) -> anyhow::Result<()> {
             let dest = output.unwrap_or_else(|| PathBuf::from(cid.to_string()));
             export::get(&repo, &cid, &dest).with_context(|| format!("writing {}", dest.display()))
         },
+        Command::Refs { cid, back } => refs(&open_repo(args.repo)?, &cid, back),
+        Command::Dag(command) => dag(open_repo(args.repo)?, command),
         Command::Block(BlockCommand::Get { cid }) => {
             let repo = open_repo(args.repo)?;
             let block = repo.get_block(&cid)?.with_context(|| format!("block {cid} not found"))?;
             Ok(io::stdout().lock().write_all(block.data())?)
-        },
-        Command::Dag(DagCommand::Import { paths }) => {
-            open_repo(args.repo)?.batch(|repo| {
-                for path in paths {
-                    let reader: Box<dyn io::Read> = if path == Path::new("-") {
-                        Box::new(io::stdin())
-                    }
-                    else {
-                        Box::new(std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?)
-                    };
-                    let (roots, blocks) = car::import(io::BufReader::new(reader), repo)
-                        .with_context(|| format!("importing {}", path.display()))?;
-                    for root in roots {
-                        let present = if repo.get_block(&root)?.is_some() { "" } else { " (not in the CAR)" };
-                        println!("root {root}{present}");
-                    }
-                    eprintln!("imported {blocks} blocks from {}", path.display());
-                }
-                Ok(())
-            })
-        },
-        Command::Dag(DagCommand::Export { cid, output }) => {
-            let repo = open_repo(args.repo)?;
-            if let Some(path) = output {
-                // Written aside and renamed, so a failed export leaves nothing
-                let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-                let mut file = io::BufWriter::new(tempfile::NamedTempFile::new_in(dir)?);
-                car::export(&repo, &cid, &mut file)?;
-                file.into_inner().map_err(io::IntoInnerError::into_error)?.persist(&path)?;
-            }
-            else {
-                let mut out = io::BufWriter::new(io::stdout().lock());
-                car::export(&repo, &cid, &mut out)?;
-                out.flush()?;
-            }
-            Ok(())
         },
         Command::Repo(RepoCommand::Stat) => {
             for (store, blocks) in open_repo(args.repo)?.stats()? {
@@ -259,4 +235,66 @@ fn add(importer: &Importer, path: &Path, quiet: bool, sink: &mut impl BlockSink)
         println!("{}", root.cid);
     }
     Ok(())
+}
+
+/// A block's links, or the blocks linking to it.
+fn refs(repo: &RoutingStore, cid: &Link, back: bool) -> anyhow::Result<()> {
+    if back {
+        let mut out = io::BufWriter::new(io::stdout().lock());
+        for source in repo.backrefs(cid.multihash())? {
+            for cid in repo.cids(source.as_ref())? {
+                writeln!(out, "{cid}")?;
+            }
+        }
+        Ok(out.flush()?)
+    }
+    else {
+        let block = repo.get_block(cid)?.with_context(|| format!("block {cid} not found"))?;
+        let mut out = io::BufWriter::new(io::stdout().lock());
+        for link in links::links(cid.codec(), block.data())? {
+            writeln!(out, "{link}")?;
+        }
+        Ok(out.flush()?)
+    }
+}
+
+/// Import or export CAR files.
+fn dag(mut repo: RoutingStore, command: DagCommand) -> anyhow::Result<()> {
+    match command {
+        DagCommand::Import { paths } => {
+            repo.batch(|repo| {
+                for path in paths {
+                    let reader: Box<dyn io::Read> = if path == Path::new("-") {
+                        Box::new(io::stdin())
+                    }
+                    else {
+                        Box::new(std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?)
+                    };
+                    let (roots, blocks) = car::import(io::BufReader::new(reader), repo)
+                        .with_context(|| format!("importing {}", path.display()))?;
+                    for root in roots {
+                        let present = if repo.get_block(&root)?.is_some() { "" } else { " (not in the CAR)" };
+                        println!("root {root}{present}");
+                    }
+                    eprintln!("imported {blocks} blocks from {}", path.display());
+                }
+                Ok(())
+            })
+        },
+        DagCommand::Export { cid, output } => {
+            if let Some(path) = output {
+                // Written aside and renamed, so a failed export leaves nothing
+                let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+                let mut file = io::BufWriter::new(tempfile::NamedTempFile::new_in(dir)?);
+                car::export(&repo, &cid, &mut file)?;
+                file.into_inner().map_err(io::IntoInnerError::into_error)?.persist(&path)?;
+            }
+            else {
+                let mut out = io::BufWriter::new(io::stdout().lock());
+                car::export(&repo, &cid, &mut out)?;
+                out.flush()?;
+            }
+            Ok(())
+        },
+    }
 }

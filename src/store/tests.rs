@@ -424,6 +424,85 @@ fn persists() {
     assert_eq!(router.get_block(&cid).expect("get"), Some(block));
 }
 
+//--------------//
+//-[ Backrefs ]-//
+//--------------//
+
+fn sorted(mut keys: Vec<Multihash>) -> Vec<Multihash> {
+    keys.sort_by_key(Multihash::to_bytes);
+    keys
+}
+
+fn mh(block: &Block) -> Multihash {
+    Multihash::from(block.cid().clone())
+}
+
+#[test]
+fn backrefs_span_every_store() {
+    use crate::model::Ipld;
+    let router = router();
+    let target = raw(b"hello");
+    let link = Ipld::Link(AnyCid::V1(target.cid().clone()));
+    // UnixFS rows, JSONB, and raw bytes for what neither will take
+    let dir = unixfs::node_block(&[unixfs::Link { hash: target.cid(), name: b"hello", tsize: 5 }], &unixfs::Data::directory());
+    let cbor = ipld_block(DAG_CBOR_CODEC, &Ipld::List(vec![link.clone()]));
+    let noncanonical = block(DAG_PB_CODEC, &PbNode {
+        links: vec![crate::pb::PbLink { hash: target.cid().to_bytes().into(), name: None, tsize: None }],
+        data: None,
+    }.encode());
+    let slash = Ipld::Map([("/".to_owned(), Ipld::String("x".into())), ("to".to_owned(), link)].into_iter().collect());
+    let slashy = ipld_block(DAG_CBOR_CODEC, &Ipld::Map(std::iter::once(("/".to_owned(), slash)).collect()));
+    for (block, store) in [(&dir, "unixfs"), (&cbor, "ipld"), (&noncanonical, "raw"), (&slashy, "raw")] {
+        assert_eq!(router.put_block(block, CidVersion::V1).expect("put"), store, "{}", block.cid());
+    }
+
+    let expected = sorted(vec![mh(&dir), mh(&cbor), mh(&noncanonical), mh(&slashy)]);
+    assert_eq!(sorted(router.backrefs(target.cid().multihash()).expect("backrefs")), expected);
+    // Only what no store indexes itself is in refs
+    assert_eq!(count(&router.db, "refs"), 2);
+    let linked: i64 = router.db.conn()
+        .query_row("SELECT count(*) FROM links l JOIN multihashes t ON t.id = l.target WHERE t.multihash = ?1",
+            [target.cid().multihash().to_bytes()], |r| r.get(0))
+        .expect("links");
+    assert_eq!(linked, 4);
+    // And sources come back under the CIDs they were put with
+    assert_eq!(router.cids(noncanonical.cid().multihash()).expect("cids"), [AnyCid::V1(noncanonical.cid().clone())]);
+}
+
+#[test]
+fn links_are_read_under_each_codec() {
+    let router = router();
+    let target = raw(b"hello");
+    let json = format!(r#"[{{"/":"{}"}}]"#, target.cid());
+    // The same bytes, as raw and then as dag-json
+    let as_raw = block(RAW_CODEC, json.as_bytes());
+    let as_json = block(crate::cid::DAG_JSON_CODEC, json.as_bytes());
+    assert_eq!(router.put_block(&as_raw, CidVersion::V1).expect("put"), "raw");
+    assert!(router.backrefs(target.cid().multihash()).expect("backrefs").is_empty());
+    assert_eq!(router.put_block(&as_json, CidVersion::V1).expect("put"), "raw");
+    assert_eq!(router.backrefs(target.cid().multihash()).expect("backrefs"), [mh(&as_raw)]);
+    assert_eq!(router.cids(as_raw.cid().multihash()).expect("cids").len(), 2);
+}
+
+#[test]
+fn reindex_rebuilds_refs() {
+    let mut router = router();
+    let blocks = import_everything(&mut router);
+    let raw_pb = block(DAG_PB_CODEC, &PbNode {
+        links: vec![crate::pb::PbLink { hash: blocks[0].cid().to_bytes().into(), name: None, tsize: None }],
+        data: None,
+    }.encode());
+    router.put_block(&raw_pb, CidVersion::V1).expect("put");
+    let before: Vec<_> = blocks.iter().map(|b| sorted(router.backrefs(b.cid().multihash()).expect("backrefs"))).collect();
+    assert!(before.iter().filter(|refs| !refs.is_empty()).count() > 10);
+
+    router.db.conn().execute("DELETE FROM refs", []).expect("forget");
+    router.reindex().expect("reindex");
+    let after: Vec<_> = blocks.iter().map(|b| sorted(router.backrefs(b.cid().multihash()).expect("backrefs"))).collect();
+    assert_eq!(after, before);
+    assert_eq!(count(&router.db, "refs"), 1);
+}
+
 //------------//
 //-[ Offset ]-//
 //------------//

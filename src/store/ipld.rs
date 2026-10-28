@@ -98,6 +98,7 @@ impl IpldStore {
 
 impl Store for IpldStore {
     fn name(&self) -> &'static str { NAME }
+    fn refs(&self) -> Option<&dyn RefIndex> { Some(self) }
 }
 
 impl BlockIndex for IpldStore {
