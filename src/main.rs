@@ -5,6 +5,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 mod cid;
+mod car;
 mod block;
 mod chunker;
 mod varint;
@@ -89,6 +90,9 @@ enum Command {
     /// Work with raw blocks
     #[command(subcommand)]
     Block(BlockCommand),
+    /// Work with whole DAGs
+    #[command(subcommand)]
+    Dag(DagCommand),
     /// Work with the repo itself
     #[command(subcommand)]
     Repo(RepoCommand),
@@ -99,6 +103,23 @@ enum BlockCommand {
     /// Write a block's bytes to stdout, like `ipfs block get`
     Get {
         cid: Link,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DagCommand {
+    /// Import the blocks of CAR files (v1 or v2), like `ipfs dag import`.
+    /// Use "-" for stdin.
+    Import {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// Write the DAG under a CID to a `CARv1`, like `ipfs dag export`
+    Export {
+        cid: Link,
+        /// Where to write it [default: stdout]
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -165,6 +186,42 @@ fn run(args: Args) -> anyhow::Result<()> {
             let repo = open_repo(args.repo)?;
             let block = repo.get_block(&cid)?.with_context(|| format!("block {cid} not found"))?;
             Ok(io::stdout().lock().write_all(block.data())?)
+        },
+        Command::Dag(DagCommand::Import { paths }) => {
+            open_repo(args.repo)?.batch(|repo| {
+                for path in paths {
+                    let reader: Box<dyn io::Read> = if path == Path::new("-") {
+                        Box::new(io::stdin())
+                    }
+                    else {
+                        Box::new(std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?)
+                    };
+                    let (roots, blocks) = car::import(io::BufReader::new(reader), repo)
+                        .with_context(|| format!("importing {}", path.display()))?;
+                    for root in roots {
+                        let present = if repo.get_block(&root)?.is_some() { "" } else { " (not in the CAR)" };
+                        println!("root {root}{present}");
+                    }
+                    eprintln!("imported {blocks} blocks from {}", path.display());
+                }
+                Ok(())
+            })
+        },
+        Command::Dag(DagCommand::Export { cid, output }) => {
+            let repo = open_repo(args.repo)?;
+            if let Some(path) = output {
+                // Written aside and renamed, so a failed export leaves nothing
+                let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+                let mut file = io::BufWriter::new(tempfile::NamedTempFile::new_in(dir)?);
+                car::export(&repo, &cid, &mut file)?;
+                file.into_inner().map_err(io::IntoInnerError::into_error)?.persist(&path)?;
+            }
+            else {
+                let mut out = io::BufWriter::new(io::stdout().lock());
+                car::export(&repo, &cid, &mut out)?;
+                out.flush()?;
+            }
+            Ok(())
         },
         Command::Repo(RepoCommand::Stat) => {
             for (store, blocks) in open_repo(args.repo)?.stats()? {

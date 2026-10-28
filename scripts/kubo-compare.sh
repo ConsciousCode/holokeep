@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compare `hk add` against `ipfs add --only-hash` for a batch of generated
 # cases, then store each case in a holokeep repo and check `hk get` writes
-# it back out identically. Uses throwaway Kubo and holokeep repos, so your
+# it back out identically, and that CARs match Kubo's both ways. Uses throwaway Kubo and holokeep repos, so your
 # own ~/.ipfs and ~/.holokeep are never touched.
 #
 #   scripts/kubo-compare.sh          # quick cases
@@ -112,6 +112,54 @@ else
     fail=1
 fi
 "$hk" repo stat
+
+## CARs: hk's export is byte-for-byte Kubo's, and Kubo's imports into a
+## fresh repo and reads back out
+cars="$work/cars"
+mkdir -p "$cars"
+roots=()
+for f in *; do
+    root=$(ipfs add -Q -r -H "$f")
+    roots+=("$root")
+    ipfs dag export "$root" > "$cars/$f.kubo.car" 2>/dev/null
+    "$hk" dag export "$root" -o "$cars/$f.hk.car"
+    if cmp -s "$cars/$f.kubo.car" "$cars/$f.hk.car"; then
+        echo "ok   dag export $f"
+    else
+        echo "FAIL dag export $f differs from Kubo's"
+        cmp "$cars/$f.kubo.car" "$cars/$f.hk.car" | head -1 || true
+        fail=1
+    fi
+done
+fromcar="$work/fromcar-out"
+mkdir -p "$fromcar"
+i=0
+for f in *; do
+    HOLOKEEP_REPO="$work/fromcar" "$hk" dag import "$cars/$f.kubo.car" >/dev/null 2>&1
+    if HOLOKEEP_REPO="$work/fromcar" "$hk" get "${roots[$i]}" -o "$fromcar/$f" \
+        && diff -r --no-dereference "$f" "$fromcar/$f" >/dev/null; then
+        echo "ok   dag import $f"
+    else
+        echo "FAIL dag import $f"
+        fail=1
+    fi
+    i=$((i + 1))
+done
+
+## A legacy DAG (CIDv0, dag-pb leaves) round-trips through hk unchanged
+legacy=$(ipfs add -Q -r --cid-version=0 --raw-leaves=false --chunker=size-1000 deep)
+for root in $(ipfs add -Q -r --cid-version=0 --raw-leaves=false tree) "$legacy"; do
+    ipfs dag export "$root" > "$cars/legacy.kubo.car" 2>/dev/null
+    HOLOKEEP_REPO="$work/legacy" "$hk" dag import "$cars/legacy.kubo.car" >/dev/null 2>&1
+    HOLOKEEP_REPO="$work/legacy" "$hk" dag export "$root" -o "$cars/legacy.hk.car"
+    if cmp -s "$cars/legacy.kubo.car" "$cars/legacy.hk.car"; then
+        echo "ok   dag import/export legacy $root"
+    else
+        echo "FAIL dag import/export legacy $root"
+        fail=1
+    fi
+done
+HOLOKEEP_REPO="$work/legacy" "$hk" repo stat
 
 ## Large blocks and files are kept whole, named as flatfs would (base32upper
 ## multihash, next-to-last/2), so they check themselves

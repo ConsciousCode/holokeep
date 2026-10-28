@@ -448,3 +448,25 @@ fn every_block_stores_and_retrieves() {
         expected.into_iter().map(|((codec, store), n)| ((codec.to_owned(), store.to_owned()), n)).collect();
     assert_eq!(placed, expected);
 }
+
+//---------//
+//-[ CAR ]-//
+//---------//
+
+/// The fixtures' own CAR holds every fixture block, and they verify.
+#[test]
+fn fixtures_car_imports() {
+    use crate::store::{Db, RoutingStore};
+
+    let mut router = RoutingStore::standard(Db::memory().expect("db")).expect("router");
+    let car = fs::File::open(root().join("fixtures.car")).expect("fixtures.car");
+    let (roots, blocks) = crate::car::import(std::io::BufReader::new(car), &mut router).expect("import");
+    assert!(roots.is_empty());
+    assert!(blocks > 0);
+    for f in fixtures() {
+        let label = f.label();
+        let cid: AnyCid<Inline<64>> = f.cid.parse().expect(&label);
+        let back = router.get_block(&cid).expect(&label).expect(&label);
+        assert_eq!(back.data(), f.bytes, "{label}");
+    }
+}

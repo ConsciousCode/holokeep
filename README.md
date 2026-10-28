@@ -30,8 +30,9 @@ Holokeep is early. What exists is the content-addressing core, each piece checke
 - **CIDs and multihashes**: v0 and v1; SHA-1, SHA-2, SHA-3, BLAKE2b-256 and murmur3 (no identity hash yet).
 - **Codecs**: dag-pb, dag-cbor and dag-json, strict and canonical, passing all of [ipld/codec-fixtures](https://github.com/ipld/codec-fixtures) and differential fuzzing against `serde_ipld_dagcbor`/`serde_ipld_dagjson`.
 - **Storage and retrieval**: `hk add` stores into a repo where a routing store sorts blocks by structure: UnixFS nodes as rows, dag-cbor and dag-json as queryable JSONB, large blocks and whole files in a flatfs-style sharded directory, file leaves as ranges of whole files kept there (or left in place with `--nocopy`), and everything else as raw bytes. `hk cat`/`hk get` read them back out, checked against the original files.
+- **Interchange**: `hk dag export` writes a DAG as a CARv1 byte-for-byte identical to `ipfs dag export`, and `hk dag import` reads CARv1 and CARv2 files, Kubo's included, verifying every block. Legacy CIDv0 DAGs round-trip unchanged.
 
-Everything lives on one node so far; next are CAR import/export and indexing, see the [roadmap](#roadmap).
+Everything lives on one node so far; next is indexing, see the [roadmap](#roadmap).
 
 ## Vision
 
@@ -267,7 +268,7 @@ Nodes within a mesh use anti-entropy to maintain a well-replicated set of blocks
 Ideas:
 
 - *Failure-domain placement*: describe each blockstore's risk with a set of tags, eg `{living-room, home, new-mexico, us}` is very far from `{bangkok, data-center}` and very close to `{living-room, raid-3, home, new-mexico, us}`, and place replicas to maximize the distance between them. Possibly with Ceph's CRUSH; possibly latency-aware.
-- *CAR files* as the interchange format for importing and exporting between repos, Kubo included, before any networking exists.
+- *CAR files* are the interchange format between repos, Kubo included, before any networking exists. Export walks the DAG depth first, writing each block the first time it's reached, which is Kubo's order. Import trusts nothing: every block is verified, sections are bounded as go-car's are (8 MiB, headers 32 MiB), and a CARv2's index is ignored, since the repo indexes for itself. Blocks are placed by structure like any others; importing into the offset store would need provenance into the CAR, which isn't a whole file of anything.
 
 ## Roadmap
 
@@ -286,7 +287,7 @@ Checklist:
 - [x] dag-pb, dag-cbor and dag-json codecs
 - [x] Blockstore that keeps what `hk add` imports
 - [x] Retrieval (`hk cat`, `hk get`)
-- [ ] CAR import/export
+- [x] CAR import/export
 - [ ] UnixFSv1 indexing in SQL
 - [ ] Backreference indexing
 - [ ] Tagging
@@ -341,6 +342,8 @@ $hk add --nocopy <path>             # keep contents in place, like Kubo's filest
 $hk cat <cid>                       # a file's contents
 $hk get <cid> -o <path>             # a file, directory or symlink
 $hk block get <cid>                 # a block's bytes
+$hk dag export <cid> -o <file.car>  # a DAG as a CARv1, like `ipfs dag export`
+$hk dag import <file.car>...        # CARv1 or v2 files, like `ipfs dag import`
 $hk repo stat                       # blocks per store
 ```
 
