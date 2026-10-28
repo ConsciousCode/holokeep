@@ -60,6 +60,60 @@ fn import_everything(router: &mut RoutingStore) -> Vec<Block> {
 }
 
 #[test]
+fn lists_directory_entries_sharded_or_not() {
+    let mut router = router();
+    import_everything(&mut router);
+    let conn = router.db.conn();
+    let names = |dir: i64| -> Vec<String> {
+        conn.prepare("SELECT name FROM unixfs_entries WHERE directory = ?1 ORDER BY name").expect("prepare")
+            .query_map([dir], |r| r.get::<_, Vec<u8>>(0)).expect("query")
+            .map(|name| String::from_utf8(name.expect("row")).expect("utf-8"))
+            .collect()
+    };
+    let entries_named = |name: &str| -> Vec<(i64, i64)> {
+        conn.prepare("SELECT directory, target FROM unixfs_entries WHERE name = ?1").expect("prepare")
+            .query_map([name.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?))).expect("query")
+            .collect::<rusqlite::Result<_>>().expect("rows")
+    };
+
+    let [(top, shard)] = entries_named("shard")[..] else { panic!("one entry named shard") };
+    assert_eq!(names(top), ["big", "empty", "link", "shard", "small"]);
+    // The HAMT's entries, through its sub-shards, with their buckets split off
+    assert_eq!(names(shard), ('a'..='z').map(String::from).collect::<Vec<_>>());
+    let subshards: i64 = conn
+        .query_row("SELECT count(*) FROM unixfs_links WHERE bucket IS NOT NULL AND name = x''", [], |r| r.get(0))
+        .expect("count");
+    assert!(subshards > 0, "no nested shards to descend through");
+    // So finding an entry by name is the same either way
+    assert_eq!(entries_named("q").iter().map(|&(dir, _)| dir).collect::<Vec<_>>(), [shard]);
+    assert_eq!(entries_named("small").iter().map(|&(dir, _)| dir).collect::<Vec<_>>(), [top]);
+}
+
+#[test]
+fn hamt_names_must_be_canonical_to_split() {
+    use crate::pb::{PbLink, PbNode};
+    let target = raw(b"hello").cid().to_bytes();
+    let shard = |name: &[u8]| {
+        let data = unixfs::DataBuf {
+            data_type: unixfs::DataType::HAMTShard,
+            data: Some(vec![0x01]),
+            filesize: None,
+            blocksizes: Vec::new(),
+            hash_type: Some(0x22),
+            fanout: Some(256),
+        }.encode();
+        let node = PbNode { links: vec![PbLink { hash: target.as_slice().into(), name: Some(name), tsize: Some(5) }], data: Some(&data) };
+        block(DAG_PB_CODEC, &node.encode())
+    };
+    let store = UnixfsStore::open(Db::memory().expect("db")).expect("store");
+    assert_eq!(store.put(&shard(b"0Ahello")).expect("put"), Put::Stored);
+    // Lowercase, too short, or not hex at all
+    for name in [&b"0ahello"[..], b"A", b"ZZhello"] {
+        assert_eq!(store.put(&shard(name)).expect("put"), Put::Declined, "{}", String::from_utf8_lossy(name));
+    }
+}
+
+#[test]
 fn sorts_blocks_by_structure() {
     let mut router = router();
     let blocks = import_everything(&mut router);
