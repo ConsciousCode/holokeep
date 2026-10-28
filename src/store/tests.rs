@@ -504,6 +504,83 @@ fn reindex_rebuilds_refs() {
 }
 
 //------------//
+//-[ Claims ]-//
+//------------//
+
+fn link(block: &Block) -> crate::model::Link {
+    AnyCid::V1(block.cid().clone())
+}
+
+fn tagging(name: &str, targets: &[&Block]) -> Block {
+    let tag = crate::claim::tag(name).expect("tag");
+    crate::claim::Group::new(targets.iter().map(|b| link(b)), tag).expect("group").block()
+}
+
+#[test]
+fn tags_are_rows() {
+    let router = router();
+    let (a, b, c) = (raw(b"a"), raw(b"b"), raw(b"c"));
+    let claims = [tagging("music", &[&a, &b]), tagging("music", &[&c]), tagging("jazz", &[&b])];
+    for claim in &claims {
+        assert_eq!(router.put_block(claim, CidVersion::V1).expect("put"), "claims");
+        // Manifested from rows exactly
+        assert_eq!(router.get_block(&link(claim)).expect("get").as_ref(), Some(claim));
+    }
+    assert_eq!(count(&router.db, "ipld_blocks"), 0);
+
+    // Claims with the same tag combine their targets
+    let store = router.claims().expect("claims");
+    let tagged = |name| store.tagged(crate::claim::tag(name).expect("tag").multihash()).expect("tagged");
+    let mut music = vec![link(&a), link(&b), link(&c)];
+    music.sort_by_key(|cid| cid.multihash().to_bytes());
+    assert_eq!(tagged("music"), music);
+    assert_eq!(tagged("jazz"), [link(&b)]);
+    assert!(tagged("unheard").is_empty());
+    let names: Vec<_> = store.tags(b.cid().multihash()).expect("tags").iter()
+        .map(|tag| crate::claim::tag_name(tag).expect("simple").to_owned())
+        .collect();
+    assert_eq!(names, ["jazz", "music"]);
+
+    // And in SQL, by name
+    let names: Vec<String> = router.db.conn()
+        .prepare("SELECT DISTINCT name FROM tags ORDER BY name").expect("prepare")
+        .query_map([], |r| r.get(0)).expect("query")
+        .collect::<rusqlite::Result<_>>().expect("rows");
+    assert_eq!(names, ["jazz", "music"]);
+
+    // Claims are backrefs of what they tag and what they tag it with
+    assert_eq!(sorted(router.backrefs(b.cid().multihash()).expect("backrefs")), sorted(vec![mh(&claims[0]), mh(&claims[2])]));
+    let music_tag = crate::claim::tag("music").expect("tag");
+    assert_eq!(sorted(router.backrefs(music_tag.multihash()).expect("backrefs")), sorted(vec![mh(&claims[0]), mh(&claims[1])]));
+}
+
+#[test]
+fn tags_keep_target_cids() {
+    let router = router();
+    let dir = unixfs::node_block(&[], &unixfs::Data::directory());
+    let v0 = crate::model::Link::decode(&dir.cid().multihash().to_bytes()).expect("cidv0");
+    let claim = crate::claim::Group::new([v0.clone(), link(&dir)], crate::claim::tag("empty").expect("tag")).expect("group").block();
+    router.put_block(&claim, CidVersion::V1).expect("put");
+    assert_eq!(router.get_block(&link(&claim)).expect("get"), Some(claim));
+    let tagged = router.claims().expect("claims").tagged(crate::claim::tag("empty").expect("tag").multihash()).expect("tagged");
+    assert_eq!(tagged.len(), 2);
+    assert!(tagged.contains(&v0));
+}
+
+#[test]
+fn claims_store_declines_what_isnt_a_claim() {
+    use crate::model::Ipld;
+    let store = ClaimStore::open(Db::memory().expect("db")).expect("store");
+    let claim = tagging("t", &[&raw(b"a")]);
+    // The same bytes under another codec, and dag-cbor that isn't a claim
+    assert_eq!(store.put(&block(RAW_CODEC, claim.data())).expect("put"), Put::Declined);
+    assert_eq!(store.put(&ipld_block(DAG_CBOR_CODEC, &sample())).expect("put"), Put::Declined);
+    let other = Ipld::Map(std::iter::once(("claim".to_owned(), Ipld::String("same".into()))).collect());
+    assert_eq!(store.put(&ipld_block(DAG_CBOR_CODEC, &other)).expect("put"), Put::Declined);
+    assert_eq!(store.put(&claim).expect("put"), Put::Stored);
+}
+
+//------------//
 //-[ Offset ]-//
 //------------//
 

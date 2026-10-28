@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 
 mod cid;
 mod car;
+mod claim;
 mod block;
 mod chunker;
 mod varint;
@@ -97,6 +98,9 @@ enum Command {
         #[arg(long)]
         back: bool,
     },
+    /// Tag blocks, and find them by their tags
+    #[command(subcommand)]
+    Tag(TagCommand),
     /// Work with raw blocks
     #[command(subcommand)]
     Block(BlockCommand),
@@ -113,6 +117,24 @@ enum BlockCommand {
     /// Write a block's bytes to stdout, like `ipfs block get`
     Get {
         cid: Link,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TagCommand {
+    /// Tag blocks with a name, printing the claim that does it
+    Add {
+        name: String,
+        #[arg(required = true)]
+        cids: Vec<Link>,
+    },
+    /// List a block's tags
+    Ls {
+        cid: Link,
+    },
+    /// List the blocks with a tag
+    Find {
+        name: String,
     },
 }
 
@@ -194,6 +216,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         },
         Command::Refs { cid, back } => refs(&open_repo(args.repo)?, &cid, back),
         Command::Dag(command) => dag(open_repo(args.repo)?, command),
+        Command::Tag(command) => tag(open_repo(args.repo)?, command),
         Command::Block(BlockCommand::Get { cid }) => {
             let repo = open_repo(args.repo)?;
             let block = repo.get_block(&cid)?.with_context(|| format!("block {cid} not found"))?;
@@ -297,4 +320,37 @@ fn dag(mut repo: RoutingStore, command: DagCommand) -> anyhow::Result<()> {
             Ok(())
         },
     }
+}
+
+fn tag_cid(name: &str) -> anyhow::Result<Link> {
+    claim::tag(name).with_context(|| format!("a tag name must be 1 to {} bytes", claim::MAX_NAME))
+}
+
+/// Tag blocks or find them by tag.
+fn tag(mut repo: RoutingStore, command: TagCommand) -> anyhow::Result<()> {
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    match command {
+        TagCommand::Add { name, cids } => {
+            let group = claim::Group::new(cids, tag_cid(&name)?).context("nothing to tag")?;
+            let block = group.block();
+            repo.batch(|repo| repo.put_block(&block, cid::CidVersion::V1).map_err(anyhow::Error::from))?;
+            writeln!(out, "{}", block.cid())?;
+        },
+        TagCommand::Ls { cid } => {
+            let claims = repo.claims().context("this repo keeps no claims")?;
+            for tag in claims.tags(cid.multihash())? {
+                match claim::tag_name(&tag) {
+                    Some(name) => writeln!(out, "{name}")?,
+                    None => writeln!(out, "{tag}")?,
+                }
+            }
+        },
+        TagCommand::Find { name } => {
+            let claims = repo.claims().context("this repo keeps no claims")?;
+            for cid in claims.tagged(tag_cid(&name)?.multihash())? {
+                writeln!(out, "{cid}")?;
+            }
+        },
+    }
+    Ok(out.flush()?)
 }

@@ -31,12 +31,14 @@ use crate::dag::{BlockSink, DagLink, Provenance};
 use crate::model::Link;
 use crate::multihash::{Inline, Multihash};
 
+mod claims;
 mod ipld;
 mod offset;
 mod raw;
 mod shards;
 mod unixfs;
 
+pub use claims::ClaimStore;
 pub use ipld::IpldStore;
 pub use offset::OffsetStore;
 use offset::{Fingerprint, Location, Whole};
@@ -292,6 +294,8 @@ pub struct RoutingStore {
     offsets: Option<Rc<OffsetStore>>,
     /// Where large blocks and whole files are kept, if anywhere.
     shards: Option<Rc<ShardStore>>,
+    /// The claim store, for its index of tags.
+    claims: Option<Rc<ClaimStore>>,
 }
 
 impl RoutingStore {
@@ -315,9 +319,11 @@ impl RoutingStore {
     pub fn with_shards(db: Db, shards: Option<ShardStore>) -> Result<Self> {
         let shards = shards.map(Rc::new);
         let offsets = Rc::new(OffsetStore::open(db.clone(), shards.clone())?);
+        let claims = Rc::new(ClaimStore::open(db.clone())?);
         let mut stores: Vec<Box<dyn Store>> = vec![
             Box::new(Rc::clone(&offsets)),
             Box::new(UnixfsStore::open(db.clone())?),
+            Box::new(Rc::clone(&claims)),
             Box::new(IpldStore::open(db.clone())?),
         ];
         if let Some(shards) = &shards {
@@ -331,9 +337,12 @@ impl RoutingStore {
              CREATE VIEW IF NOT EXISTS links (source, target) AS
                  SELECT node, target FROM unixfs_links
                  UNION SELECT block, target FROM ipld_links
+                 UNION SELECT claim, target FROM group_targets
+                 UNION SELECT claim, into_ FROM group_claims
                  UNION SELECT source, target FROM refs;",
         )?;
         router.offsets = Some(offsets);
+        router.claims = Some(claims);
         router.shards = shards;
         Ok(router)
     }
@@ -371,7 +380,7 @@ impl RoutingStore {
         for store in &stores {
             db.conn().execute("INSERT OR IGNORE INTO stores (name) VALUES (?1)", [store.name()])?;
         }
-        Ok(Self { db, stores, offsets: None, shards: None })
+        Ok(Self { db, stores, offsets: None, shards: None, claims: None })
     }
 
     /// Run `f` in one transaction, for speed and so that a failed import
@@ -389,6 +398,11 @@ impl RoutingStore {
                 Err(e)
             },
         }
+    }
+
+    /// The claim store, if there is one.
+    pub fn claims(&self) -> Option<&ClaimStore> {
+        self.claims.as_deref()
     }
 
     /// Which store holds a block.
