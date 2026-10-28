@@ -507,13 +507,32 @@ fn reindex_rebuilds_refs() {
 //-[ Claims ]-//
 //------------//
 
+use crate::claim::{Claim, Group, Tomb};
+
 fn link(block: &Block) -> crate::model::Link {
     AnyCid::V1(block.cid().clone())
 }
 
+fn tag(name: &str) -> crate::model::Link {
+    crate::claim::tag(name).expect("tag")
+}
+
+/// A claim tagging blocks: dissolved for one, hashed for more.
 fn tagging(name: &str, targets: &[&Block]) -> Block {
-    let tag = crate::claim::tag(name).expect("tag");
-    crate::claim::Group::new(targets.iter().map(|b| link(b)), tag).expect("group").block()
+    Claim::Group(Group::new(targets.iter().map(|b| link(b)), tag(name)).expect("group")).block()
+}
+
+fn tomb(claim: &Block) -> Block {
+    Claim::Tomb(Tomb::new([link(claim)]).expect("tomb")).block()
+}
+
+fn tagged(router: &RoutingStore, name: &str) -> Vec<crate::model::Link> {
+    router.claims().expect("claims").tagged(tag(name).multihash()).expect("tagged")
+}
+
+fn by_multihash(mut links: Vec<crate::model::Link>) -> Vec<crate::model::Link> {
+    links.sort_by_key(|cid| cid.multihash().to_bytes());
+    links
 }
 
 #[test]
@@ -523,20 +542,20 @@ fn tags_are_rows() {
     let claims = [tagging("music", &[&a, &b]), tagging("music", &[&c]), tagging("jazz", &[&b])];
     for claim in &claims {
         assert_eq!(router.put_block(claim, CidVersion::V1).expect("put"), "claims");
-        // Manifested from rows exactly
+        assert!(router.has(claim.cid().multihash()).expect("has"));
+        // Manifested from rows exactly, or the CID itself
         assert_eq!(router.get_block(&link(claim)).expect("get").as_ref(), Some(claim));
     }
     assert_eq!(count(&router.db, "ipld_blocks"), 0);
+    // Only the pair was hashed: the dissolved claims have no multihash
+    assert_eq!(claims.iter().filter(|c| c.cid().hashcode() == 0x12).count(), 1);
+    assert_eq!(count(&router.db, "multihashes"), 3 + 2 + 1);
 
     // Claims with the same tag combine their targets
-    let store = router.claims().expect("claims");
-    let tagged = |name| store.tagged(crate::claim::tag(name).expect("tag").multihash()).expect("tagged");
-    let mut music = vec![link(&a), link(&b), link(&c)];
-    music.sort_by_key(|cid| cid.multihash().to_bytes());
-    assert_eq!(tagged("music"), music);
-    assert_eq!(tagged("jazz"), [link(&b)]);
-    assert!(tagged("unheard").is_empty());
-    let names: Vec<_> = store.tags(b.cid().multihash()).expect("tags").iter()
+    assert_eq!(tagged(&router, "music"), by_multihash(vec![link(&a), link(&b), link(&c)]));
+    assert_eq!(tagged(&router, "jazz"), [link(&b)]);
+    assert!(tagged(&router, "unheard").is_empty());
+    let names: Vec<_> = router.claims().expect("claims").tags(b.cid().multihash()).expect("tags").iter()
         .map(|tag| crate::claim::tag_name(tag).expect("simple").to_owned())
         .collect();
     assert_eq!(names, ["jazz", "music"]);
@@ -548,10 +567,73 @@ fn tags_are_rows() {
         .collect::<rusqlite::Result<_>>().expect("rows");
     assert_eq!(names, ["jazz", "music"]);
 
-    // Claims are backrefs of what they tag and what they tag it with
+    // Claims are backrefs of what they tag and what they tag it with,
+    // dissolved ones under their identity CIDs
     assert_eq!(sorted(router.backrefs(b.cid().multihash()).expect("backrefs")), sorted(vec![mh(&claims[0]), mh(&claims[2])]));
-    let music_tag = crate::claim::tag("music").expect("tag");
-    assert_eq!(sorted(router.backrefs(music_tag.multihash()).expect("backrefs")), sorted(vec![mh(&claims[0]), mh(&claims[1])]));
+    assert_eq!(sorted(router.backrefs(tag("music").multihash()).expect("backrefs")), sorted(vec![mh(&claims[0]), mh(&claims[1])]));
+    assert_eq!(router.cids(claims[1].cid().multihash()).expect("cids"), [link(&claims[1])]);
+}
+
+#[test]
+fn long_tag_names_fit() {
+    let router = router();
+    let name = "x".repeat(crate::claim::MAX_NAME);
+    let a = raw(b"a");
+    let claim = tagging(&name, &[&a]);
+    // Too big to dissolve, so hashed
+    assert_eq!(claim.cid().hashcode(), 0x12);
+    router.put_block(&claim, CidVersion::V1).expect("put");
+    assert_eq!(tagged(&router, &name), [link(&a)]);
+    let names: Vec<String> = router.db.conn()
+        .prepare("SELECT name FROM tags").expect("prepare")
+        .query_map([], |r| r.get(0)).expect("query")
+        .collect::<rusqlite::Result<_>>().expect("rows");
+    assert_eq!(names, [name]);
+}
+
+#[test]
+fn tombs_retract_claims() {
+    let router = router();
+    let (a, b, c) = (raw(b"a"), raw(b"b"), raw(b"c"));
+    let single = tagging("music", &[&a]);
+    let pair = tagging("music", &[&b, &c]);
+    for claim in [&single, &pair] {
+        router.put_block(claim, CidVersion::V1).expect("put");
+    }
+    assert_eq!(tagged(&router, "music").len(), 3);
+
+    // A dissolved claim is gone at once, and stays gone
+    let buried = tomb(&single);
+    assert_eq!(buried.cid().hashcode(), 0x00, "a tomb for a dissolved claim dissolves");
+    assert_eq!(router.put_block(&buried, CidVersion::V1).expect("put"), "claims");
+    assert_eq!(tagged(&router, "music"), by_multihash(vec![link(&b), link(&c)]));
+    router.put_block(&single, CidVersion::V1).expect("put again");
+    assert_eq!(tagged(&router, "music"), by_multihash(vec![link(&b), link(&c)]));
+    assert_eq!(router.backrefs(single.cid().multihash()).expect("backrefs"), [mh(&buried)]);
+
+    // A hashed one stops counting, all of it, but is still a block
+    router.put_block(&tomb(&pair), CidVersion::V1).expect("put");
+    assert!(tagged(&router, "music").is_empty());
+    assert_eq!(router.get_block(&link(&pair)).expect("get").as_ref(), Some(&pair));
+    let names: i64 = router.db.conn().query_row("SELECT count(*) FROM tags", [], |r| r.get(0)).expect("count");
+    assert_eq!(names, 0);
+}
+
+#[test]
+fn untagging_retags_the_rest() {
+    let router = router();
+    let (a, b, c) = (raw(b"a"), raw(b"b"), raw(b"c"));
+    // Tagged by one claim, as if imported, and by one of its own
+    router.put_block(&tagging("music", &[&a, &b, &c]), CidVersion::V1).expect("put");
+    router.tag(&link(&a), &tag("music")).expect("tag");
+
+    let tombs = router.untag(&link(&a), &tag("music")).expect("untag");
+    assert_eq!(tombs.len(), 2);
+    assert_eq!(tagged(&router, "music"), by_multihash(vec![link(&b), link(&c)]));
+    // The others are tagged on their own now, so untagging one leaves the other
+    router.untag(&link(&b), &tag("music")).expect("untag");
+    assert_eq!(tagged(&router, "music"), [link(&c)]);
+    assert!(router.untag(&link(&b), &tag("music")).expect("untag").is_empty());
 }
 
 #[test]
@@ -559,10 +641,10 @@ fn tags_keep_target_cids() {
     let router = router();
     let dir = unixfs::node_block(&[], &unixfs::Data::directory());
     let v0 = crate::model::Link::decode(&dir.cid().multihash().to_bytes()).expect("cidv0");
-    let claim = crate::claim::Group::new([v0.clone(), link(&dir)], crate::claim::tag("empty").expect("tag")).expect("group").block();
+    let claim = Claim::Group(Group::new([v0.clone(), link(&dir)], tag("empty")).expect("group")).block();
     router.put_block(&claim, CidVersion::V1).expect("put");
     assert_eq!(router.get_block(&link(&claim)).expect("get"), Some(claim));
-    let tagged = router.claims().expect("claims").tagged(crate::claim::tag("empty").expect("tag").multihash()).expect("tagged");
+    let tagged = tagged(&router, "empty");
     assert_eq!(tagged.len(), 2);
     assert!(tagged.contains(&v0));
 }
@@ -577,7 +659,21 @@ fn claims_store_declines_what_isnt_a_claim() {
     assert_eq!(store.put(&ipld_block(DAG_CBOR_CODEC, &sample())).expect("put"), Put::Declined);
     let other = Ipld::Map(std::iter::once(("claim".to_owned(), Ipld::String("same".into()))).collect());
     assert_eq!(store.put(&ipld_block(DAG_CBOR_CODEC, &other)).expect("put"), Put::Declined);
+    // An identity CID for a claim that should be hashed
+    let pair = tagging("t", &[&raw(b"a"), &raw(b"b")]);
+    let identity: Block = Block::identity(DAG_CBOR_CODEC, pair.data().into()).expect("fits");
+    assert_eq!(store.put(&identity).expect("put"), Put::Declined);
     assert_eq!(store.put(&claim).expect("put"), Put::Stored);
+}
+
+#[test]
+fn identity_blocks_are_never_kept() {
+    let router = router();
+    let block: Block = Block::identity(RAW_CODEC, b"hello"[..].into()).expect("fits");
+    assert_eq!(router.put_block(&block, CidVersion::V1).expect("put"), "identity");
+    assert!(router.has(block.cid().multihash()).expect("has"));
+    assert_eq!(router.get_block(&link(&block)).expect("get"), Some(block));
+    assert_eq!(count(&router.db, "multihashes"), 0);
 }
 
 //------------//

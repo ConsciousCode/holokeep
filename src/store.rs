@@ -25,7 +25,8 @@ use std::rc::Rc;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::block::Block;
+use crate::block::{Block, IDENTITY};
+use crate::claim::{Claim, Group, Tomb};
 use crate::cid::{BaseCid, Cid, CidRef, CidVersion, Cidv1};
 use crate::dag::{BlockSink, DagLink, Provenance};
 use crate::model::Link;
@@ -73,6 +74,10 @@ pub enum Error {
     /// A block is kept as part of a file in the repo which is gone.
     #[error("block is kept in {}, which is missing", .0.display())]
     Missing(PathBuf),
+
+    /// Claims were asked for of a router with no claim store.
+    #[error("this repo keeps no claims")]
+    NoClaims,
 
     /// A multihash too long to keep; see `MAX_DIGEST_LEN`.
     #[error("multihash digest of {0} bytes is too long to keep")]
@@ -337,8 +342,11 @@ impl RoutingStore {
              CREATE VIEW IF NOT EXISTS links (source, target) AS
                  SELECT node, target FROM unixfs_links
                  UNION SELECT block, target FROM ipld_links
-                 UNION SELECT claim, target FROM group_targets
-                 UNION SELECT claim, into_ FROM group_claims
+                 UNION SELECT g.claim, t.target FROM group_targets t JOIN group_claims g ON g.id = t.group_
+                     WHERE g.claim IS NOT NULL
+                 UNION SELECT claim, into_ FROM group_claims WHERE claim IS NOT NULL
+                 UNION SELECT b.claim, t.target FROM tomb_targets t JOIN tombs b ON b.id = t.tomb
+                     WHERE b.claim IS NOT NULL
                  UNION SELECT source, target FROM refs;",
         )?;
         router.offsets = Some(offsets);
@@ -405,6 +413,31 @@ impl RoutingStore {
         self.claims.as_deref()
     }
 
+    /// Tag a block, with a claim of its own so it can be retracted alone.
+    /// Returns the claim's CID.
+    pub fn tag(&self, target: &Link, tag: &Link) -> Result<Link> {
+        let claim = Claim::Group(Group::new([target.clone()], tag.clone()).ok_or(Error::NoClaims)?);
+        self.put_block(&claim.block(), CidVersion::V1)?;
+        Ok(claim.cid())
+    }
+
+    /// Untag a block, tombing every claim tagging it with the tag. A claim
+    /// is retracted whole, so whatever else one tagged is tagged again on
+    /// its own. Returns the tombs' CIDs.
+    pub fn untag(&self, target: &Link, tag: &Link) -> Result<Vec<Link>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let mut tombs = Vec::new();
+        for (claim, group) in claims.tagging(target.multihash(), tag.multihash())? {
+            let tomb = Claim::Tomb(Tomb::new([claim]).ok_or(Error::NoClaims)?);
+            self.put_block(&tomb.block(), CidVersion::V1)?;
+            tombs.push(tomb.cid());
+            for other in group.target().iter().filter(|other| other.multihash() != target.multihash()) {
+                self.tag(other, tag)?;
+            }
+        }
+        Ok(tombs)
+    }
+
     /// Which store holds a block.
     pub fn store_of(&self, key: Key<'_>) -> Result<Option<String>> {
         Ok(self.db.conn()
@@ -438,6 +471,16 @@ impl RoutingStore {
     /// of several files, and serve it while any of them is unchanged.
     pub fn put_block_from(&self, block: &Block, version: CidVersion, provenance: Provenance<'_>) -> Result<String> {
         let key = block.cid().multihash();
+        // An identity block is its CID, so there's nothing to keep, unless
+        // it's a dissolved claim, which the claim store keeps as rows
+        if key.code() == IDENTITY {
+            if let Some(claims) = &self.claims
+                && claims.put(block)? == Put::Stored
+            {
+                return Ok(claims.name().to_owned());
+            }
+            return Ok("identity".to_owned());
+        }
         let prefix = cid_prefix(block.cid(), version);
         self.db.atomically(|| {
             let id = self.db.intern(key)?;
@@ -479,6 +522,14 @@ impl RoutingStore {
 
     /// Every CID a block was put under.
     pub fn cids(&self, key: Key<'_>) -> Result<Vec<Link>> {
+        // An identity multihash with no codec on record: a dissolved claim,
+        // if it's one
+        if key.code() == IDENTITY {
+            return Ok(crate::claim::dissolved_cid(key.digest_ref())
+                .filter(|cid| crate::claim::dissolved(cid).is_some())
+                .into_iter()
+                .collect());
+        }
         let mut stmt = self.db.conn().prepare_cached(
             "SELECT c.prefix FROM multihashes m JOIN block_cids c ON c.block = m.id WHERE m.multihash = ?1 ORDER BY c.prefix",
         )?;
@@ -576,8 +627,9 @@ impl RoutingStore {
 }
 
 impl BlockIndex for RoutingStore {
+    /// Identity blocks are always had: they're their CIDs.
     fn has(&self, key: Key<'_>) -> Result<bool> {
-        Ok(self.store_of(key)?.is_some())
+        Ok(key.code() == IDENTITY || self.store_of(key)?.is_some())
     }
 
     fn keys(&self) -> Result<Vec<Multihash>> {
@@ -587,6 +639,9 @@ impl BlockIndex for RoutingStore {
 
 impl BlockSource for RoutingStore {
     fn get(&self, key: Key<'_>) -> Result<Option<Vec<u8>>> {
+        if key.code() == IDENTITY {
+            return Ok(Some(key.digest_ref().to_vec()));
+        }
         match self.store_of(key)? {
             Some(store) => self.named(&store)?.get(key),
             None => Ok(None),

@@ -1,23 +1,25 @@
 //! Claims: sidecar blocks about their targets, which the README describes.
-//! So far only `Group`, which is what a tag is.
+//! So far `Group`, which is what a tag is, and `Tomb`, which retracts.
 //!
 //! A claim is dag-cbor with its type inline, under the key `claim`. Its
 //! `target` is a set, written as an array sorted by CID bytes, so equal
 //! claims are equal blocks.
+//!
+//! A claim with one target which encodes to no more than an identity
+//! digest allows is *dissolved*: its CID is its own bytes, so it's named
+//! without being hashed, and a store keeps it as rows without a multihash.
+//! Anything bigger is precipitated, an ordinary sha2-256 block.
 
 use std::collections::BTreeMap;
 
-use crate::block::Block;
+use crate::block::{Block, IDENTITY, IDENTITY_MAX};
 use crate::cid::{AnyCid, BaseCid, CidRef, Cidv1, Cidv1Spec, DAG_CBOR_CODEC, RAW_CODEC};
 use crate::dagcbor;
 use crate::model::{Ipld, Link};
 use crate::multihash::{Multihash, MultihashFunc};
 
-/// The multihash code of `identity`, whose digest is the content itself.
-const IDENTITY: u64 = 0x00;
-
 /// The longest tag name: IPIP-0512's limit on identity digests.
-pub const MAX_NAME: usize = 128;
+pub const MAX_NAME: usize = IDENTITY_MAX;
 
 /// "Targets belong to the given group." With an identity CID for `into`,
 /// a simple tag: the targets are tagged with its name.
@@ -28,10 +30,29 @@ pub struct Group {
     into: Link,
 }
 
+/// "Mark a block as collectable." Locally a claim it targets is retracted
+/// at once; the tomb itself outlives it so the claim isn't brought back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tomb {
+    /// Sorted by CID bytes and distinct.
+    target: Vec<Link>,
+}
+
+/// Any claim this understands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    Group(Group),
+    Tomb(Tomb),
+}
+
 /// Sort links by their bytes and drop repeats, making them a set.
 fn set(links: impl IntoIterator<Item = Link>) -> Vec<Link> {
     let set: BTreeMap<Vec<u8>, Link> = links.into_iter().map(|link| (link.to_bytes(), link)).collect();
     set.into_values().collect()
+}
+
+fn links(links: &[Link]) -> Ipld {
+    Ipld::List(links.iter().cloned().map(Ipld::Link).collect())
 }
 
 impl Group {
@@ -45,31 +66,70 @@ impl Group {
 
     /// What the targets belong to: the schema's `into`.
     pub const fn group(&self) -> &Link { &self.into }
+}
 
-    fn to_ipld(&self) -> Ipld {
-        Ipld::Map(BTreeMap::from([
-            ("claim".to_owned(), Ipld::String("group".to_owned())),
-            ("target".to_owned(), Ipld::List(self.target.iter().cloned().map(Ipld::Link).collect())),
-            ("into".to_owned(), Ipld::Link(self.into.clone())),
-        ]))
+impl Tomb {
+    /// A tomb for the targets, if there are any.
+    pub fn new(target: impl IntoIterator<Item = Link>) -> Option<Self> {
+        let target = set(target);
+        (!target.is_empty()).then_some(Self { target })
     }
 
-    /// The claim as a dag-cbor block.
+    pub fn target(&self) -> &[Link] { &self.target }
+}
+
+impl Claim {
+    pub fn target(&self) -> &[Link] {
+        match self {
+            Self::Group(group) => group.target(),
+            Self::Tomb(tomb) => tomb.target(),
+        }
+    }
+
+    fn to_ipld(&self) -> Ipld {
+        let (kind, mut map) = match self {
+            Self::Group(group) => ("group", BTreeMap::from([("into".to_owned(), Ipld::Link(group.into.clone()))])),
+            Self::Tomb(_) => ("tomb", BTreeMap::new()),
+        };
+        map.insert("claim".to_owned(), Ipld::String(kind.to_owned()));
+        map.insert("target".to_owned(), links(self.target()));
+        Ipld::Map(map)
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        dagcbor::to_vec(&self.to_ipld()).unwrap_or_default()
+    }
+
+    /// Whether the claim is dissolved: one target, and small enough to be
+    /// its own CID.
+    pub fn dissolves(&self) -> bool {
+        self.target().len() == 1 && self.encode().len() <= IDENTITY_MAX
+    }
+
+    /// The claim as a dag-cbor block: an identity block if it dissolves,
+    /// otherwise hashed.
     pub fn block(&self) -> Block {
-        let data = dagcbor::to_vec(&self.to_ipld()).unwrap_or_default();
+        let data = self.encode();
+        if self.dissolves()
+            && let Some(block) = Block::identity(DAG_CBOR_CODEC, data.clone().into())
+        {
+            return block;
+        }
         Block::hash(Cidv1Spec::new(DAG_CBOR_CODEC, MultihashFunc::Sha2_256), data.into())
     }
 
-    /// The group claim a dag-cbor block's bytes are, if they're exactly
-    /// one: canonical, with a set of targets and nothing else.
+    /// The claim's CID, as `block` would make it.
+    pub fn cid(&self) -> Link {
+        AnyCid::V1(self.block().cid().clone())
+    }
+
+    /// The claim a dag-cbor block's bytes are, if they're exactly one:
+    /// canonical, with a set of targets and nothing else.
     pub fn parse(data: &[u8]) -> Option<Self> {
         let Ipld::Map(mut map) = dagcbor::from_slice(data).ok()? else {
             return None;
         };
-        if map.remove("claim")? != Ipld::String("group".to_owned()) {
-            return None;
-        }
-        let Ipld::Link(into) = map.remove("into")? else {
+        let Ipld::String(kind) = map.remove("claim")? else {
             return None;
         };
         let Ipld::List(target) = map.remove("target")? else {
@@ -82,26 +142,43 @@ impl Group {
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()?;
-        if !map.is_empty() {
-            return None;
-        }
-        let group = Self::new(target.clone(), into)?;
-        // Sorted and distinct already, and canonical dag-cbor
-        (group.target == target && dagcbor::to_vec(&group.to_ipld()).ok()? == data).then_some(group)
+        let claim = match kind.as_str() {
+            "group" => {
+                let Ipld::Link(into) = map.remove("into")? else {
+                    return None;
+                };
+                Self::Group(Group::new(target.clone(), into)?)
+            },
+            "tomb" => Self::Tomb(Tomb::new(target.clone())?),
+            _ => return None,
+        };
+        // Nothing else, sorted and distinct already, and canonical dag-cbor
+        (map.is_empty() && claim.target() == target && claim.encode() == data).then_some(claim)
     }
 }
 
 /// The CID of a simple tag: its name, as a raw identity CID.
 pub fn tag(name: &str) -> Option<Link> {
-    (!name.is_empty() && name.len() <= MAX_NAME).then_some(())?;
-    let hash = Multihash::try_wrap(IDENTITY, name.as_bytes()).ok()?;
-    Some(AnyCid::V1(Cidv1::new(RAW_CODEC, hash)))
+    (!name.is_empty()).then_some(())?;
+    Block::identity(RAW_CODEC, name.as_bytes().into()).map(|block| AnyCid::V1(block.cid().clone()))
 }
 
 /// A simple tag's name, if the CID is one.
 pub fn tag_name(cid: &Link) -> Option<&str> {
     (cid.codec() == RAW_CODEC && cid.hashcode() == IDENTITY).then_some(())?;
     std::str::from_utf8(cid.digest_ref()).ok()
+}
+
+/// The claim an identity CID is, if it's a dissolved one.
+pub fn dissolved(cid: &Link) -> Option<Claim> {
+    (cid.codec() == DAG_CBOR_CODEC && cid.hashcode() == IDENTITY).then_some(())?;
+    Claim::parse(cid.digest_ref()).filter(Claim::dissolves)
+}
+
+/// A dissolved claim's CID from its bytes.
+pub fn dissolved_cid(data: &[u8]) -> Option<Link> {
+    let hash = Multihash::try_wrap(IDENTITY, data).ok()?;
+    Some(AnyCid::V1(Cidv1::new(DAG_CBOR_CODEC, hash)))
 }
 
 #[cfg(test)]
@@ -112,6 +189,10 @@ mod tests {
         AnyCid::V1(Block::hash(Cidv1Spec::default(), data.into()).cid().clone())
     }
 
+    fn group(target: &[Link], name: &str) -> Claim {
+        Claim::Group(Group::new(target.iter().cloned(), tag(name).expect("tag")).expect("group"))
+    }
+
     #[test]
     fn tags_are_identity_cids() {
         let music = tag("music").expect("tag");
@@ -119,6 +200,7 @@ mod tests {
         // As Kubo inlines it: `ipfs add --inline --raw-leaves`
         assert_eq!(music.to_string(), "bafkqablnovzwsyy");
         assert_eq!(tag(""), None);
+        assert!(tag(&"x".repeat(MAX_NAME)).is_some());
         assert_eq!(tag(&"x".repeat(MAX_NAME + 1)), None);
         assert_eq!(tag_name(&cid(b"music")), None);
     }
@@ -126,35 +208,57 @@ mod tests {
     #[test]
     fn targets_are_a_set() {
         let (a, b) = (cid(b"a"), cid(b"b"));
-        let into = tag("t").expect("tag");
-        let one = Group::new([b.clone(), a.clone(), b.clone()], into.clone()).expect("group");
-        let other = Group::new([a, b], into.clone()).expect("group");
+        let one = group(&[b.clone(), a.clone(), b.clone()], "t");
+        let other = group(&[a, b], "t");
         assert_eq!(one.block(), other.block());
         assert_eq!(one.target().len(), 2);
-        assert_eq!(Group::new([], into), None);
+        assert_eq!(Group::new([], tag("t").expect("tag")), None);
+        assert_eq!(Tomb::new([]), None);
     }
 
     #[test]
-    fn parses_only_canonical_groups() {
-        let group = Group::new([cid(b"a"), cid(b"b")], tag("t").expect("tag")).expect("group");
-        let block = group.block();
-        assert_eq!(Group::parse(block.data()), Some(group.clone()));
+    fn small_claims_dissolve() {
+        let single = group(&[cid(b"a")], "music");
+        assert!(single.dissolves());
+        let block = single.block();
+        assert_eq!(block.cid().hashcode(), IDENTITY);
+        assert_eq!(dissolved(&single.cid()), Some(single.clone()));
+        // A tomb for it still fits, though it holds the whole claim
+        let tomb = Claim::Tomb(Tomb::new([single.cid()]).expect("tomb"));
+        assert!(tomb.dissolves(), "{} bytes", tomb.encode().len());
+        assert_eq!(dissolved(&tomb.cid()), Some(tomb));
+
+        // Two targets, or a name too long to fit, are hashed
+        let pair = group(&[cid(b"a"), cid(b"b")], "music");
+        assert!(!pair.dissolves());
+        assert_eq!(pair.block().cid().hashcode(), 0x12);
+        let long = group(&[cid(b"a")], &"x".repeat(100));
+        assert!(!long.dissolves());
+        assert_eq!(dissolved(&long.cid()), None);
+    }
+
+    #[test]
+    fn parses_only_canonical_claims() {
+        let claim = group(&[cid(b"a"), cid(b"b")], "t");
+        assert_eq!(Claim::parse(claim.block().data()), Some(claim.clone()));
+        let tomb = Claim::Tomb(Tomb::new([cid(b"a")]).expect("tomb"));
+        assert_eq!(Claim::parse(tomb.block().data()), Some(tomb));
 
         let with = |key: &str, value: Ipld| {
-            let Ipld::Map(mut map) = group.to_ipld() else { panic!("a group is a map") };
+            let Ipld::Map(mut map) = claim.to_ipld() else { panic!("a claim is a map") };
             map.insert(key.to_owned(), value);
             dagcbor::to_vec(&Ipld::Map(map)).expect("encode")
         };
-        let links = |links: Vec<Link>| Ipld::List(links.into_iter().map(Ipld::Link).collect());
         for (label, data) in [
-            ("unsorted", with("target", links(group.target().iter().rev().cloned().collect()))),
-            ("repeated", with("target", links(vec![cid(b"a"), cid(b"a")]))),
-            ("empty", with("target", links(vec![]))),
-            ("another claim", with("claim", Ipld::String("same".into()))),
+            ("unsorted", with("target", links(&claim.target().iter().rev().cloned().collect::<Vec<_>>()))),
+            ("repeated", with("target", links(&[cid(b"a"), cid(b"a")]))),
+            ("empty", with("target", links(&[]))),
+            ("unknown claim", with("claim", Ipld::String("same".into()))),
             ("an extra key", with("when", Ipld::String("now".into()))),
             ("not a link", with("into", Ipld::String("t".into()))),
+            ("a tomb with into", with("claim", Ipld::String("tomb".into()))),
         ] {
-            assert_eq!(Group::parse(&data), None, "{label}");
+            assert_eq!(Claim::parse(&data), None, "{label}");
         }
     }
 }

@@ -5,6 +5,12 @@
 use crate::cid::{BaseCid, CidRef, Cid, Cidv1, Cidv1Spec};
 use crate::multihash::{DefaultDigest, DigestBuf, Multihash, MultihashDigest, MultihashFunc, SizeError};
 
+/// The multihash code of `identity`, whose digest is the data itself.
+pub const IDENTITY: u64 = 0x00;
+
+/// IPIP-0512's limit on identity digests.
+pub const IDENTITY_MAX: usize = 128;
+
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError<D: DigestBuf> {
     /// Could not convert a hash code to a known hash codec
@@ -41,9 +47,26 @@ impl<D: DigestBuf> Block<D> {
         Self { cid: spec.hash(&data), data }
     }
 
+    /// A block named by its own bytes, with an `identity` CID, if they're
+    /// no longer than IPIP-0512 allows.
+    pub fn identity(codec: u64, data: Box<[u8]>) -> Option<Self> {
+        let digest = D::decode(&data).ok().filter(|_| data.len() <= IDENTITY_MAX)?;
+        Some(Self { cid: Cidv1::new(codec, Multihash::new(IDENTITY, digest)), data })
+    }
+
     /// Verify that a CID matches data, returning a new block.
     pub fn verify(cid: Cidv1<D>, data: Box<[u8]>) -> Result<Self, VerifyError<D>> {
         let hashcode = cid.hashcode();
+        // The digest is the data itself
+        if hashcode == IDENTITY {
+            return if cid.digest_ref() == &*data && data.len() <= IDENTITY_MAX {
+                Ok(Self { cid, data })
+            }
+            else {
+                let digest = Multihash::new(IDENTITY, D::decode(&data)?);
+                Err(VerifyError::Mismatch(cid.into_multihash(), digest))
+            };
+        }
         let spec: MultihashFunc = hashcode
             .try_into()
             .map_err(|_| VerifyError::UnknownHash(hashcode))?;
@@ -105,6 +128,16 @@ mod tests {
         let spec = Cidv1Spec::new(RAW_CODEC, MultihashFunc::Sha3_512);
         let block: Block = Block::hash(spec, b"hello world"[..].into());
         assert!(Block::verify(block.cid().clone(), block.data().into()).is_ok());
+    }
+
+    #[test]
+    fn identity_blocks_are_their_cids() {
+        let block: Block = Block::identity(RAW_CODEC, b"music"[..].into()).expect("fits");
+        assert_eq!(block.cid().to_string(), "bafkqablnovzwsyy");
+        assert_eq!(Block::verify(block.cid().clone(), b"music"[..].into()).expect("verifies"), block);
+        assert!(Block::verify(block.cid().clone(), b"jazz"[..].into()).is_err());
+        assert!(Block::<DefaultDigest>::identity(RAW_CODEC, vec![0; IDENTITY_MAX].into()).is_some());
+        assert!(Block::<DefaultDigest>::identity(RAW_CODEC, vec![0; IDENTITY_MAX + 1].into()).is_none());
     }
 
     #[test]

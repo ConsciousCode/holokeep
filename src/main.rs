@@ -122,8 +122,14 @@ enum BlockCommand {
 
 #[derive(Subcommand, Debug)]
 enum TagCommand {
-    /// Tag blocks with a name, printing the claim that does it
+    /// Tag blocks with a name, printing the claim tagging each
     Add {
+        name: String,
+        #[arg(required = true)]
+        cids: Vec<Link>,
+    },
+    /// Untag blocks, printing the tombs which retract their claims
+    Rm {
         name: String,
         #[arg(required = true)]
         cids: Vec<Link>,
@@ -331,10 +337,24 @@ fn tag(mut repo: RoutingStore, command: TagCommand) -> anyhow::Result<()> {
     let mut out = io::BufWriter::new(io::stdout().lock());
     match command {
         TagCommand::Add { name, cids } => {
-            let group = claim::Group::new(cids, tag_cid(&name)?).context("nothing to tag")?;
-            let block = group.block();
-            repo.batch(|repo| repo.put_block(&block, cid::CidVersion::V1).map_err(anyhow::Error::from))?;
-            writeln!(out, "{}", block.cid())?;
+            let tag = tag_cid(&name)?;
+            repo.batch(|repo| {
+                for cid in cids {
+                    writeln!(out, "{}", repo.tag(&cid, &tag)?)?;
+                }
+                anyhow::Ok(())
+            })?;
+        },
+        TagCommand::Rm { name, cids } => {
+            let tag = tag_cid(&name)?;
+            repo.batch(|repo| {
+                for cid in cids {
+                    for tomb in repo.untag(&cid, &tag)? {
+                        writeln!(out, "{tomb}")?;
+                    }
+                }
+                anyhow::Ok(())
+            })?;
         },
         TagCommand::Ls { cid } => {
             let claims = repo.claims().context("this repo keeps no claims")?;
