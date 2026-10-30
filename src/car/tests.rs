@@ -3,15 +3,15 @@ use crate::cid::{Cidv1Spec, CidVersion, DAG_CBOR_CODEC, DAG_PB_CODEC};
 use crate::dag::{BalancedLayout, DynamicDirectory};
 use crate::hamt::Hamt;
 use crate::import::Importer;
-use crate::store::{BlockIndex, Db, RoutingStore};
+use crate::store::{BlockIndex, Db, Catalog};
 use crate::testutil::Scratch;
 
-fn router() -> RoutingStore {
-    RoutingStore::standard(Db::memory().expect("db")).expect("router")
+fn router() -> Catalog {
+    Catalog::standard(Db::memory().expect("db")).expect("router")
 }
 
 /// A tree with chunked files, a HAMT directory and a symlink, imported.
-fn tree(router: &mut RoutingStore) -> Link {
+fn tree(router: &mut Catalog) -> Link {
     let scratch = Scratch::new("car-tree");
     let t = scratch.path().join("t");
     std::fs::create_dir_all(t.join("hamt")).expect("dirs");
@@ -32,13 +32,13 @@ fn tree(router: &mut RoutingStore) -> Link {
     AnyCid::V1(root.cid)
 }
 
-fn export_bytes(router: &RoutingStore, root: &Link) -> Vec<u8> {
+fn export_bytes(router: &Catalog, root: &Link) -> Vec<u8> {
     let mut car = Vec::new();
     export(router, root, &mut car).expect("export");
     car
 }
 
-fn import_bytes(car: Vec<u8>, router: &mut RoutingStore) -> io::Result<(Vec<Link>, u64)> {
+fn import_bytes(car: Vec<u8>, router: &mut Catalog) -> io::Result<(Vec<Link>, u64)> {
     import(io::Cursor::new(car), router)
 }
 

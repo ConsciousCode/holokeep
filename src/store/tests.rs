@@ -8,8 +8,18 @@ use crate::dag::Provenance;
 use crate::testutil::Scratch;
 use crate::unixfs;
 
-fn router() -> RoutingStore {
-    RoutingStore::standard(Db::memory().expect("db")).expect("router")
+fn router() -> Catalog {
+    Catalog::standard(Db::memory().expect("db")).expect("router")
+}
+
+/// How many blocks are in each form, whichever volume.
+fn forms(router: &Catalog) -> Vec<(String, u64)> {
+    let mut forms = std::collections::BTreeMap::new();
+    for (_, form, n) in router.stats().expect("stats") {
+        let total: &mut u64 = forms.entry(form).or_default();
+        *total = total.saturating_add(n);
+    }
+    forms.into_iter().collect()
 }
 
 fn raw(data: &[u8]) -> Block {
@@ -22,7 +32,7 @@ fn block(codec: u64, data: &[u8]) -> Block {
 
 /// Put blocks into a router while keeping a copy of each.
 struct Tee<'a> {
-    router: &'a mut RoutingStore,
+    router: &'a mut Catalog,
     blocks: Vec<Block>,
 }
 
@@ -35,7 +45,7 @@ impl BlockSink for Tee<'_> {
 
 /// Import a tree with every kind of UnixFS node: chunked files at several
 /// depths, a basic and a HAMT directory, a symlink and an empty file.
-fn import_everything(router: &mut RoutingStore) -> Vec<Block> {
+fn import_everything(router: &mut Catalog) -> Vec<Block> {
     let scratch = Scratch::new("store-import");
     let t = scratch.path().join("t");
     let shard = t.join("shard");
@@ -128,7 +138,7 @@ fn sorts_blocks_by_structure() {
         let cid = AnyCid::V1(block.cid().clone());
         assert_eq!(router.get_block(&cid).expect("get").as_ref(), Some(block));
     }
-    let stats = router.stats().expect("stats");
+    let stats = forms(&router);
     assert!(stats.iter().any(|(store, n)| store == "unixfs" && *n > 10), "{stats:?}");
 }
 
@@ -194,7 +204,7 @@ fn declined_blocks_fall_through() {
 fn unplaced_blocks_are_declined() {
     let db = Db::memory().expect("db");
     let unixfs_only: Vec<Box<dyn Store>> = vec![Box::new(UnixfsStore::open(db.clone()).expect("store"))];
-    let router = RoutingStore::new(db, unixfs_only).expect("router");
+    let router = Catalog::new(db, unixfs_only).expect("router");
     let block = raw(b"hello");
     assert!(matches!(router.put_block(&block, CidVersion::V1), Err(Error::Unplaced(_))));
     assert_eq!(BlockStore::put(&router, &block).expect("put"), Put::Declined);
@@ -202,7 +212,7 @@ fn unplaced_blocks_are_declined() {
 }
 
 /// A router is itself a store, so routers nest.
-struct Nested(RoutingStore);
+struct Nested(Catalog);
 impl Store for Nested {
     fn name(&self) -> &'static str { "nested" }
 }
@@ -221,7 +231,7 @@ impl BlockStore for Nested {
 fn routers_compose() {
     let inner = router();
     let db = Db::memory().expect("db");
-    let outer = RoutingStore::new(db, vec![Box::new(Nested(inner))]).expect("router");
+    let outer = Catalog::new(db, vec![Box::new(Nested(inner))]).expect("router");
     let block = raw(b"hello");
     assert_eq!(outer.put_block(&block, CidVersion::V1).expect("put"), "nested");
     let cid = AnyCid::V1(block.cid().clone());
@@ -416,10 +426,10 @@ fn persists() {
     let scratch = Scratch::new("store-persist");
     let block = raw(b"hello");
     {
-        let router = RoutingStore::open_repo(scratch.path()).expect("open");
+        let router = Catalog::open_repo(scratch.path()).expect("open");
         router.put_block(&block, CidVersion::V1).expect("put");
     }
-    let router = RoutingStore::open_repo(scratch.path()).expect("reopen");
+    let router = Catalog::open_repo(scratch.path()).expect("reopen");
     let cid = AnyCid::V1(block.cid().clone());
     assert_eq!(router.get_block(&cid).expect("get"), Some(block));
 }
@@ -526,7 +536,7 @@ fn tomb(claim: &Block) -> Block {
     Claim::Tomb(Tomb::new([link(claim)]).expect("tomb")).block()
 }
 
-fn tagged(router: &RoutingStore, name: &str) -> Vec<crate::model::Link> {
+fn tagged(router: &Catalog, name: &str) -> Vec<crate::model::Link> {
     router.claims().expect("claims").tagged(tag(name).multihash()).expect("tagged")
 }
 
@@ -681,7 +691,7 @@ fn identity_blocks_are_never_kept() {
 //------------//
 
 /// Import with provenance, as `hk add --nocopy` does.
-fn import_in_place(router: &mut RoutingStore, path: &std::path::Path) -> crate::dag::DagLink {
+fn import_in_place(router: &mut Catalog, path: &std::path::Path) -> crate::dag::DagLink {
     let importer = Importer { chunk_size: 64, ..Importer::default() };
     importer.add_path(path, &mut InPlace::new(router), &mut |_, _| {}).expect("import").expect("root")
 }
@@ -699,8 +709,7 @@ fn keeps_leaves_in_place() {
     let root = import_in_place(&mut router, &file);
 
     // 16 leaves in the file, one node as rows, and no copies
-    let stats = router.stats().expect("stats");
-    assert_eq!(stats, [("offset".to_owned(), 16), ("unixfs".to_owned(), 1)]);
+    assert_eq!(forms(&router), [("offset".to_owned(), 16), ("unixfs".to_owned(), 1)]);
     assert_eq!(count(&router.db, "raw_blocks"), 0);
 
     let mut out = Vec::new();
@@ -802,7 +811,7 @@ fn copying_forgets_provenance() {
     let mut router = router();
     let importer = Importer { chunk_size: 64, ..Importer::default() };
     importer.add_path(&file, &mut Copying::new(&mut router), &mut |_, _| {}).expect("import");
-    assert_eq!(router.stats().expect("stats"), [("raw".to_owned(), 2), ("unixfs".to_owned(), 1)]);
+    assert_eq!(forms(&router), [("raw".to_owned(), 2), ("unixfs".to_owned(), 1)]);
 }
 
 //------------//
@@ -810,15 +819,15 @@ fn copying_forgets_provenance() {
 //------------//
 
 /// A router whose shards keep files over 100 bytes.
-fn sharded(scratch: &Scratch) -> RoutingStore {
+fn sharded(scratch: &Scratch) -> Catalog {
     let db = Db::memory().expect("db");
     let mut shards = ShardStore::open(db.clone(), &scratch.path().join("shards")).expect("shards");
     shards.threshold = 100;
-    RoutingStore::with_shards(db, Some(shards)).expect("router")
+    Catalog::with_shards(db, Some(shards)).expect("router")
 }
 
 /// Import as `hk add` does, copying.
-fn import_copying(router: &mut RoutingStore, path: &std::path::Path) -> crate::dag::DagLink {
+fn import_copying(router: &mut Catalog, path: &std::path::Path) -> crate::dag::DagLink {
     let importer = Importer { chunk_size: 64, ..Importer::default() };
     importer.add_path(path, &mut Copying::new(router), &mut |_, _| {}).expect("import").expect("root")
 }
@@ -850,7 +859,7 @@ fn keeps_large_files_whole() {
     let root = import_copying(&mut router, &file);
 
     // Leaves as ranges of the kept file, the node as rows, and no copies
-    assert_eq!(router.stats().expect("stats"), [("offset".to_owned(), 16), ("unixfs".to_owned(), 1)]);
+    assert_eq!(forms(&router), [("offset".to_owned(), 16), ("unixfs".to_owned(), 1)]);
     assert_eq!(count(&router.db, "raw_blocks"), 0);
     assert_eq!(count(&router.db, "shard_roots"), 1);
 
@@ -874,7 +883,7 @@ fn small_files_are_copied_as_blocks() {
     std::fs::write(&file, content(100, 0)).expect("write");
     let mut router = sharded(&scratch);
     import_copying(&mut router, &file);
-    assert_eq!(router.stats().expect("stats"), [("raw".to_owned(), 2), ("unixfs".to_owned(), 1)]);
+    assert_eq!(forms(&router), [("raw".to_owned(), 2), ("unixfs".to_owned(), 1)]);
     assert!(kept_files(&scratch).is_empty());
 }
 
@@ -913,7 +922,7 @@ fn large_blocks_are_kept_as_files() {
     let router = sharded(&scratch);
     let (small, large) = (raw(&content(100, 0)), raw(&content(101, 0)));
     assert_eq!(router.put_block(&small, CidVersion::V1).expect("put"), "raw");
-    assert_eq!(router.put_block(&large, CidVersion::V1).expect("put"), "shards");
+    assert_eq!(router.put_block(&large, CidVersion::V1).expect("put"), "flatfs");
     assert_eq!(kept_files(&scratch), [shard_path(&scratch, &content(101, 0))]);
     assert_eq!(router.get_block(&AnyCid::V1(large.cid().clone())).expect("get"), Some(large.clone()));
 
@@ -921,7 +930,7 @@ fn large_blocks_are_kept_as_files() {
     std::fs::write(scratch.path().join("shards").join("stray"), b"").expect("stray");
     router.db.conn().execute("DELETE FROM shard_files", []).expect("forget");
     router.reindex().expect("reindex");
-    assert_eq!(router.store_of(large.cid().multihash()).expect("store"), Some("shards".to_owned()));
+    assert_eq!(router.store_of(large.cid().multihash()).expect("store"), Some("flatfs".to_owned()));
     assert_eq!(count(&router.db, "shard_files"), 1);
 }
 
@@ -1027,3 +1036,72 @@ fn ipld_backrefs() {
     assert_eq!(store.backrefs(raw(b"hello").cid().multihash()).expect("backrefs"), [Multihash::from(block.cid().clone())]);
 }
 
+
+//-------------//
+//-[ Volumes ]-//
+//-------------//
+
+fn labels(router: &Catalog) -> Vec<volume::Label> {
+    router.volumes.iter().map(Volume::label).collect()
+}
+
+#[test]
+fn volumes_keep_their_labels() {
+    let scratch = Scratch::new("volumes-labels");
+    let first = labels(&Catalog::open_repo(scratch.path()).expect("open"));
+    assert_eq!(first.len(), 2);
+    assert_ne!(first.first(), first.get(1));
+    assert!(scratch.path().join("shards").join("VOLUME").exists());
+    assert_eq!(labels(&Catalog::open_repo(scratch.path()).expect("reopen")), first);
+
+    // A label is the volume's, wherever it's opened from
+    let shards = ShardStore::open(Db::memory().expect("db"), &scratch.path().join("shards")).expect("shards");
+    assert_eq!(shards.label(), *first.get(1).expect("shards"));
+}
+
+#[test]
+fn any_copy_serves_a_block() {
+    let scratch = Scratch::new("volumes-copies");
+    let router = sharded(&scratch);
+    let large = raw(&content(101, 0));
+    router.put_block(&large, CidVersion::V1).expect("put");
+    // A second copy, in the database's raw store
+    let db = router.volumes.first().expect("db");
+    db.form("raw").expect("raw").put(&large).expect("copy");
+    router.reindex().expect("reindex");
+    assert_eq!(router.placements(large.cid().multihash()).expect("placements").len(), 2);
+
+    // One copy lost, the other serves it
+    std::fs::remove_file(shard_path(&scratch, &content(101, 0))).expect("lose");
+    let cid = AnyCid::V1(large.cid().clone());
+    assert_eq!(router.get_block(&cid).expect("get"), Some(large));
+}
+
+#[test]
+fn blocks_on_detached_volumes_are_known() {
+    let scratch = Scratch::new("volumes-detached");
+    let db = Db::open(&scratch.path().join("blocks.db")).expect("db");
+    let (large, parent) = {
+        let mut shards = ShardStore::open(db.clone(), &scratch.path().join("shards")).expect("shards");
+        shards.threshold = 100;
+        let router = Catalog::with_shards(db.clone(), Some(shards)).expect("router");
+        let large = raw(&content(101, 0));
+        let parent = ipld_block(DAG_CBOR_CODEC, &crate::model::Ipld::Link(link(&large)));
+        router.put_block(&large, CidVersion::V1).expect("put");
+        router.put_block(&parent, CidVersion::V1).expect("put");
+        (large, parent)
+    };
+
+    // Without the shards, the block is still in the repo, and linked to,
+    // and a reindex doesn't forget it
+    let router = Catalog::standard(db).expect("router");
+    router.reindex().expect("reindex");
+    let key = large.cid().multihash();
+    assert!(router.has(key).expect("has"));
+    assert_eq!(router.backrefs(key).expect("backrefs"), [mh(&parent)]);
+    assert!(matches!(router.get(key), Err(Error::Unattached(_))));
+    assert_eq!(router.stats().expect("stats"), [
+        ("db".to_owned(), "ipld".to_owned(), 1),
+        ("shards".to_owned(), "flatfs".to_owned(), 1),
+    ]);
+}

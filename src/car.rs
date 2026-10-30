@@ -202,7 +202,7 @@ pub trait Import {
     fn import(&mut self, block: &Block, version: CidVersion) -> io::Result<()>;
 }
 
-impl Import for crate::store::RoutingStore {
+impl Import for crate::store::Catalog {
     fn import(&mut self, block: &Block, version: CidVersion) -> io::Result<()> {
         self.put_block(block, version).map(drop).map_err(io::Error::other)
     }

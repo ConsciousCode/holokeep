@@ -4,7 +4,7 @@
 //! represent them however suits their structure, so long as it can
 //! manifest every block it admits byte-for-byte. A generic store accepts
 //! anything; a specialized one declines what it can't represent. The
-//! `RoutingStore` offers each block to its stores from most to least
+//! `Catalog` offers each block to its stores from most to least
 //! specialized and remembers which one took it.
 //!
 //! Capabilities are separate traits so a store implements only what it
@@ -38,6 +38,7 @@ mod offset;
 mod raw;
 mod shards;
 mod unixfs;
+mod volume;
 
 pub use claims::ClaimStore;
 pub use ipld::IpldStore;
@@ -46,6 +47,7 @@ use offset::{Fingerprint, Location, Whole};
 pub use raw::RawStore;
 pub use shards::ShardStore;
 pub use unixfs::UnixfsStore;
+pub use volume::Volume;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -74,6 +76,10 @@ pub enum Error {
     /// A block is kept as part of a file in the repo which is gone.
     #[error("block is kept in {}, which is missing", .0.display())]
     Missing(PathBuf),
+
+    /// A block is only on volumes which aren't attached.
+    #[error("block {0} is only on volumes which aren't attached")]
+    Unattached(String),
 
     /// Claims were asked for of a router with no claim store.
     #[error("this repo keeps no claims")]
@@ -141,7 +147,7 @@ pub trait RefIndex {
     fn backrefs(&self, key: Key<'_>) -> Result<Vec<Multihash>>;
 }
 
-/// A store a `RoutingStore` can place blocks in.
+/// A store a `Catalog` can place blocks in.
 pub trait Store: BlockIndex + BlockSource + BlockStore {
     /// A stable name, recorded in the router's index.
     fn name(&self) -> &'static str;
@@ -285,15 +291,28 @@ fn cid_prefix(cid: &Cidv1, version: CidVersion) -> Vec<u8> {
 //-[ Router ]-//
 //-----------//
 
-/// Places each block in the most specialized store which admits it, and
-/// indexes where everything went.
+/// Indexes a repo's volumes: places each block in the most specialized
+/// store of any volume which admits it, and remembers where everything
+/// went, so a block is found without asking every volume.
 ///
-/// The index is derived data: if it's lost or out of date, `reindex`
-/// rebuilds it from the stores themselves.
-pub struct RoutingStore {
+/// The catalog's database is a volume too, which holds the structure:
+/// UnixFS nodes, claims and IPLD, small and what's queried. Other volumes
+/// mostly hold bulk, raw leaves and whole files. A block may be in more
+/// than one volume, and the catalog knows of volumes which aren't
+/// attached: it knows a block is in the repo, and what links to it, while
+/// its bytes are somewhere else.
+///
+/// Placement is derived data: if it's lost or out of date, `reindex`
+/// rebuilds it from the attached volumes.
+pub struct Catalog {
     db: Db,
-    /// Most specialized first; the last should admit anything.
-    stores: Vec<Box<dyn Store>>,
+    /// Attached volumes, the catalog's own first.
+    volumes: Vec<Volume>,
+    /// Each attached volume's id in `volumes`.
+    ids: Vec<Id>,
+    /// The order blocks are offered to stores in, as (volume, store)
+    /// indices; the last should admit anything.
+    placement: Vec<(usize, usize)>,
     /// The offset store, for sinks to settle the ranges of files they
     /// import.
     offsets: Option<Rc<OffsetStore>>,
@@ -303,7 +322,10 @@ pub struct RoutingStore {
     claims: Option<Rc<ClaimStore>>,
 }
 
-impl RoutingStore {
+/// Where a block is: an attached volume, by index, and the form it's in.
+type Placement = (usize, String);
+
+impl Catalog {
     /// Open a repo directory with the standard stores.
     pub fn open_repo(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
@@ -317,26 +339,31 @@ impl RoutingStore {
         Self::with_shards(db, None)
     }
 
-    /// The standard stores in one database: ranges of files when that's
-    /// where blocks came from, UnixFS nodes as rows, dag-cbor and dag-json
-    /// as JSONB, large blocks in the shards if there are any, and
-    /// everything else as raw bytes.
+    /// The standard stores: in the catalog's database, ranges of files
+    /// when that's where blocks came from, UnixFS nodes as rows, claims as
+    /// rows, dag-cbor and dag-json as JSONB; large blocks in the shards if
+    /// there are any; and everything else as raw bytes in the database.
     pub fn with_shards(db: Db, shards: Option<ShardStore>) -> Result<Self> {
         let shards = shards.map(Rc::new);
         let offsets = Rc::new(OffsetStore::open(db.clone(), shards.clone())?);
         let claims = Rc::new(ClaimStore::open(db.clone())?);
-        let mut stores: Vec<Box<dyn Store>> = vec![
+        let stores: Vec<Box<dyn Store>> = vec![
             Box::new(Rc::clone(&offsets)),
             Box::new(UnixfsStore::open(db.clone())?),
             Box::new(Rc::clone(&claims)),
             Box::new(IpldStore::open(db.clone())?),
+            Box::new(RawStore::open(db.clone())?),
         ];
+        let raw = stores.len().saturating_sub(1);
+        let mut volumes = vec![Volume::new("db", volume::db_label(&db)?, stores)];
+        let mut placement: Vec<_> = (0..raw).map(|store| (0, store)).collect();
         if let Some(shards) = &shards {
-            stores.push(Box::new(Rc::clone(shards)));
+            volumes.push(Volume::new("shards", shards.label(), vec![Box::new(Rc::clone(shards))]));
+            placement.push((1, 0));
         }
-        stores.push(Box::new(RawStore::open(db.clone())?));
-        let mut router = Self::new(db, stores)?;
-        router.db.conn().execute_batch(
+        placement.push((0, raw));
+        let mut catalog = Self::with_volumes(db, volumes, placement)?;
+        catalog.db.conn().execute_batch(
             "-- Every link in the repo, by the multihashes of the block it's in
              -- and the block it's to.
              CREATE VIEW IF NOT EXISTS links (source, target) AS
@@ -348,23 +375,43 @@ impl RoutingStore {
                      WHERE c.claim IS NOT NULL
                  UNION SELECT source, target FROM refs;",
         )?;
-        router.offsets = Some(offsets);
-        router.claims = Some(claims);
-        router.shards = shards;
-        Ok(router)
+        catalog.offsets = Some(offsets);
+        catalog.claims = Some(claims);
+        catalog.shards = shards;
+        Ok(catalog)
     }
 
+    /// A catalog whose only volume is its own database, holding these
+    /// stores, offered blocks in order.
     pub fn new(db: Db, stores: Vec<Box<dyn Store>>) -> Result<Self> {
+        let placement = (0..stores.len()).map(|store| (0, store)).collect();
+        let volume = Volume::new("db", volume::db_label(&db)?, stores);
+        Self::with_volumes(db, vec![volume], placement)
+    }
+
+    /// A catalog of volumes, offering blocks to their stores in the order
+    /// given.
+    pub fn with_volumes(db: Db, volumes: Vec<Volume>, placement: Vec<(usize, usize)>) -> Result<Self> {
         db.conn().execute_batch(
-            "CREATE TABLE IF NOT EXISTS stores (
+            "-- Every volume the catalog knows of, attached or not, by the
+             -- label it carries.
+             CREATE TABLE IF NOT EXISTS volumes (
+                 id INTEGER PRIMARY KEY,
+                 label BLOB UNIQUE NOT NULL,
+                 name TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS forms (
                  id INTEGER PRIMARY KEY,
                  name TEXT UNIQUE NOT NULL
              );
-             -- Which store holds each block that's present.
+             -- Where each block that's present is: which volumes, and in
+             -- which form in each.
              CREATE TABLE IF NOT EXISTS blocks (
-                 block INTEGER PRIMARY KEY REFERENCES multihashes (id),
-                 store INTEGER NOT NULL REFERENCES stores (id)
-             );
+                 block INTEGER NOT NULL REFERENCES multihashes (id),
+                 volume INTEGER NOT NULL REFERENCES volumes (id),
+                 form INTEGER NOT NULL REFERENCES forms (id),
+                 PRIMARY KEY (block, volume)
+             ) WITHOUT ROWID;
              -- The CID prefixes (version and codec) each block was put with.
              -- Unlike `blocks` this isn't derivable from the stores, which
              -- needn't know how their bytes are meant to be read, so it
@@ -384,10 +431,22 @@ impl RoutingStore {
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS refs_target ON refs (target);",
         )?;
-        for store in &stores {
-            db.conn().execute("INSERT OR IGNORE INTO stores (name) VALUES (?1)", [store.name()])?;
+        let mut ids = Vec::with_capacity(volumes.len());
+        for volume in &volumes {
+            ids.push(db.conn()
+                .prepare_cached(
+                    "INSERT INTO volumes (label, name) VALUES (?1, ?2)
+                     ON CONFLICT (label) DO UPDATE SET name = excluded.name RETURNING id",
+                )?
+                .query_row(params![volume.label().as_slice(), volume.name], |row| row.get(0))?);
+            for store in volume.stores() {
+                db.conn().execute("INSERT OR IGNORE INTO forms (name) VALUES (?1)", [store.name()])?;
+            }
         }
-        Ok(Self { db, stores, offsets: None, shards: None, claims: None })
+        if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
+            return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
+        }
+        Ok(Self { db, volumes, ids, placement, offsets: None, shards: None, claims: None })
     }
 
     /// Run `f` in one transaction, for speed and so that a failed import
@@ -437,25 +496,36 @@ impl RoutingStore {
         Ok(tombs)
     }
 
-    /// Which store holds a block.
-    pub fn store_of(&self, key: Key<'_>) -> Result<Option<String>> {
-        Ok(self.db.conn()
-            .prepare_cached(
-                "SELECT s.name FROM multihashes m
-                 JOIN blocks b ON b.block = m.id
-                 JOIN stores s ON s.id = b.store
-                 WHERE m.multihash = ?1",
-            )?
-            .query_row([key.to_bytes()], |row| row.get(0))
-            .optional()?)
+    /// Where a block is, in attached volumes, in volume order.
+    pub fn placements(&self, key: Key<'_>) -> Result<Vec<Placement>> {
+        let mut stmt = self.db.conn().prepare_cached(
+            "SELECT b.volume, f.name FROM multihashes m
+             JOIN blocks b ON b.block = m.id
+             JOIN forms f ON f.id = b.form
+             WHERE m.multihash = ?1",
+        )?;
+        let rows = stmt.query_map([key.to_bytes()], |row| Ok((row.get::<_, Id>(0)?, row.get::<_, String>(1)?)))?;
+        let mut found = Vec::new();
+        for row in rows {
+            let (id, form) = row?;
+            if let Some(volume) = self.ids.iter().position(|&attached| attached == id) {
+                found.push((volume, form));
+            }
+        }
+        found.sort();
+        Ok(found)
     }
 
-    fn named(&self, name: &str) -> Result<&dyn Store> {
-        self.stores
-            .iter()
-            .find(|store| store.name() == name)
-            .map(AsRef::as_ref)
-            .ok_or_else(|| Error::UnknownStore(name.to_owned()))
+    /// Which form a block is in, in the first attached volume that has it.
+    pub fn store_of(&self, key: Key<'_>) -> Result<Option<String>> {
+        Ok(self.placements(key)?.into_iter().next().map(|(_, form)| form))
+    }
+
+    fn named(&self, (volume, form): &Placement) -> Result<&dyn Store> {
+        self.volumes
+            .get(*volume)
+            .and_then(|v| v.form(form))
+            .ok_or_else(|| Error::UnknownStore(form.clone()))
     }
 
     /// Put a block, returning the name of the store it's in.
@@ -483,26 +553,26 @@ impl RoutingStore {
         let prefix = cid_prefix(block.cid(), version);
         self.db.atomically(|| {
             let id = self.db.intern(key)?;
-            let store = if let Some(store) = self.store_of(key)? {
+            let placed = if let Some(placed) = self.placements(key)?.into_iter().next() {
                 if provenance != Provenance::Unknown {
-                    self.named(&store)?.put_from(block, provenance)?;
+                    self.named(&placed)?.put_from(block, provenance)?;
                 }
-                store
+                placed
             }
             else {
-                let store = self.place(block, provenance)?;
-                self.record(id, store)?;
-                store.to_owned()
+                let placed = self.place(block, provenance)?;
+                self.record(id, &placed)?;
+                placed
             };
             let new_cid = self.db.conn()
                 .prepare_cached("INSERT OR IGNORE INTO block_cids (block, prefix) VALUES (?1, ?2)")?
                 .execute(params![id, prefix])? > 0;
             // Read under each codec it's put with, since that's what says
             // where its links are
-            if new_cid && self.named(&store)?.refs().is_none() {
+            if new_cid && self.named(&placed)?.refs().is_none() {
                 self.index_links(id, block.cid().codec(), block.data())?;
             }
-            Ok(store)
+            Ok(placed.1)
         })
     }
 
@@ -540,19 +610,24 @@ impl RoutingStore {
         .collect()
     }
 
-    /// Index a block as being in a store, returning whether it's new.
-    fn record(&self, id: Id, store: &str) -> Result<bool> {
+    /// Index a block as being in a volume, returning whether it's new
+    /// there.
+    fn record(&self, id: Id, (volume, form): &Placement) -> Result<bool> {
+        let volume = self.ids.get(*volume).ok_or_else(|| Error::UnknownStore(form.clone()))?;
         let added = self.db.conn()
-            .prepare_cached("INSERT OR IGNORE INTO blocks (block, store) SELECT ?1, id FROM stores WHERE name = ?2")?
-            .execute(params![id, store])?;
+            .prepare_cached("INSERT OR IGNORE INTO blocks (block, volume, form) SELECT ?1, ?2, id FROM forms WHERE name = ?3")?
+            .execute(params![id, volume, form])?;
         Ok(added > 0)
     }
 
     /// Offer a block to each store in turn.
-    fn place(&self, block: &Block, provenance: Provenance<'_>) -> Result<&'static str> {
-        for store in &self.stores {
+    fn place(&self, block: &Block, provenance: Provenance<'_>) -> Result<Placement> {
+        for &(volume, store) in &self.placement {
+            let Some(store) = self.volumes.get(volume).and_then(|v| v.stores().get(store)) else {
+                continue;
+            };
             if store.put_from(block, provenance)? == Put::Stored {
-                return Ok(store.name());
+                return Ok((volume, store.name().to_owned()));
             }
         }
         Err(Error::Unplaced(block.cid().to_string()))
@@ -569,24 +644,34 @@ impl RoutingStore {
             .map_err(|_| Error::Corrupt(cid.to_string()))
     }
 
-    /// Rebuild the index from the stores, returning how many blocks it
-    /// found. Earlier stores win if more than one has a block.
+    /// Rebuild placement from the attached volumes, returning how many
+    /// placements it found. Within a volume, earlier stores win if more
+    /// than one has a block. What's known of volumes which aren't attached
+    /// is kept.
     pub fn reindex(&self) -> Result<usize> {
         self.db.atomically(|| {
             if let Some(shards) = &self.shards {
                 shards.rescan()?;
             }
-            self.db.conn().execute_batch("DELETE FROM blocks; DELETE FROM refs;")?;
+            let conn = self.db.conn();
+            let mut forget = conn.prepare_cached("DELETE FROM blocks WHERE volume = ?1")?;
+            for id in &self.ids {
+                forget.execute([id])?;
+            }
+            // Links read from blocks only elsewhere can't be read again
+            conn.execute_batch("DELETE FROM refs WHERE source NOT IN (SELECT block FROM blocks);")?;
             let mut count = 0usize;
-            for store in &self.stores {
-                for key in store.keys()? {
-                    let id = self.db.intern(key.as_ref())?;
-                    if !self.record(id, store.name())? {
-                        continue;
-                    }
-                    count = count.saturating_add(1);
-                    if store.refs().is_none() {
-                        self.reindex_links(store.as_ref(), id, key.as_ref())?;
+            for (v, volume) in self.volumes.iter().enumerate() {
+                for store in volume.stores() {
+                    for key in store.keys()? {
+                        let id = self.db.intern(key.as_ref())?;
+                        if !self.record(id, &(v, store.name().to_owned()))? {
+                            continue;
+                        }
+                        count = count.saturating_add(1);
+                        if store.refs().is_none() {
+                            self.reindex_links(store.as_ref(), id, key.as_ref())?;
+                        }
                     }
                 }
             }
@@ -611,49 +696,64 @@ impl RoutingStore {
         Ok(())
     }
 
-    /// How many blocks each store holds, by the index.
-    pub fn stats(&self) -> Result<Vec<(String, u64)>> {
+    /// How many blocks each volume holds in each form, by the index,
+    /// attached or not.
+    pub fn stats(&self) -> Result<Vec<(String, String, u64)>> {
         let mut stmt = self.db.conn().prepare(
-            "SELECT s.name, count(*) FROM blocks b JOIN stores s ON s.id = b.store GROUP BY s.name ORDER BY s.name",
+            "SELECT v.name, f.name, count(*) FROM blocks b
+             JOIN volumes v ON v.id = b.volume JOIN forms f ON f.id = b.form
+             GROUP BY v.id, f.id ORDER BY v.name, f.name",
         )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get::<_, i64>(1)?)))?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)?)))?;
         rows.map(|row| {
-            let (store, count) = row?;
-            Ok((store, u64::try_from(count).unwrap_or_default()))
+            let (volume, form, count) = row?;
+            Ok((volume, form, u64::try_from(count).unwrap_or_default()))
         })
         .collect()
     }
 }
 
-impl BlockIndex for RoutingStore {
+impl BlockIndex for Catalog {
     /// Identity blocks are always had: they're their CIDs.
     fn has(&self, key: Key<'_>) -> Result<bool> {
-        Ok(key.code() == IDENTITY || self.store_of(key)?.is_some())
+        Ok(key.code() == IDENTITY || self.db.conn()
+            .prepare_cached("SELECT 1 FROM multihashes m JOIN blocks b ON b.block = m.id WHERE m.multihash = ?1")?
+            .exists([key.to_bytes()])?)
     }
 
     fn keys(&self) -> Result<Vec<Multihash>> {
-        query_keys(&self.db, "router", "SELECT m.multihash FROM blocks b JOIN multihashes m ON m.id = b.block")
+        query_keys(&self.db, "router", "SELECT m.multihash FROM multihashes m WHERE m.id IN (SELECT block FROM blocks)")
     }
 }
 
-impl BlockSource for RoutingStore {
+impl BlockSource for Catalog {
     fn get(&self, key: Key<'_>) -> Result<Option<Vec<u8>>> {
         if key.code() == IDENTITY {
             return Ok(Some(key.digest_ref().to_vec()));
         }
-        match self.store_of(key)? {
-            Some(store) => self.named(&store)?.get(key),
-            None => Ok(None),
+        let placements = self.placements(key)?;
+        if placements.is_empty() && self.has(key)? {
+            return Err(Error::Unattached(format!("{key:?}")));
         }
+        // Any copy will do; a failure is reported only if none can be read
+        let mut failure = None;
+        for placed in &placements {
+            match self.named(placed)?.get(key) {
+                Ok(Some(data)) => return Ok(Some(data)),
+                Ok(None) => {},
+                Err(e) => { failure.get_or_insert(e); },
+            }
+        }
+        failure.map_or(Ok(None), Err)
     }
 }
 
 /// Every block in the repo with a link to a multihash, whichever store
 /// holds it.
-impl RefIndex for RoutingStore {
+impl RefIndex for Catalog {
     fn backrefs(&self, key: Key<'_>) -> Result<Vec<Multihash>> {
         let mut found = std::collections::BTreeMap::new();
-        for store in &self.stores {
+        for store in self.volumes.iter().flat_map(Volume::stores) {
             if let Some(refs) = store.refs() {
                 found.extend(refs.backrefs(key)?.into_iter().map(|mh| (mh.to_bytes(), mh)));
             }
@@ -673,7 +773,7 @@ impl RefIndex for RoutingStore {
 }
 
 /// Routing stores compose: one can be a store within another.
-impl BlockStore for RoutingStore {
+impl BlockStore for Catalog {
     fn put(&self, block: &Block) -> Result<Put> {
         self.put_from(block, Provenance::Unknown)
     }
@@ -689,7 +789,7 @@ impl BlockStore for RoutingStore {
 
 /// For the importer, which only makes CIDv1. Blocks are copied in as
 /// they come; see `Copying` and `InPlace` for sinks which keep files whole.
-impl BlockSink for RoutingStore {
+impl BlockSink for Catalog {
     fn put(&mut self, block: Block) -> io::Result<()> {
         self.put_block(&block, CidVersion::V1).map(drop).map_err(io::Error::other)
     }
@@ -725,12 +825,12 @@ fn io_error(e: Error) -> io::Error {
 /// themselves (`hk add --nocopy`). Each file is hashed whole as its leaves
 /// go by, and must be unchanged by the end.
 pub struct InPlace<'a> {
-    router: &'a mut RoutingStore,
+    router: &'a mut Catalog,
     file: Option<(Fingerprint, Whole)>,
 }
 
 impl<'a> InPlace<'a> {
-    pub const fn new(router: &'a mut RoutingStore) -> Self {
+    pub const fn new(router: &'a mut Catalog) -> Self {
         Self { router, file: None }
     }
 }
@@ -772,7 +872,7 @@ impl BlockSink for InPlace<'_> {
 /// kept whole in the shards, written as its leaves go by, and its leaves
 /// become ranges of it; the rest are copied block by block.
 pub struct Copying<'a> {
-    router: &'a mut RoutingStore,
+    router: &'a mut Catalog,
     file: Option<Keeping>,
 }
 
@@ -787,7 +887,7 @@ struct Keeping {
 }
 
 impl<'a> Copying<'a> {
-    pub const fn new(router: &'a mut RoutingStore) -> Self {
+    pub const fn new(router: &'a mut Catalog) -> Self {
         Self { router, file: None }
     }
 }

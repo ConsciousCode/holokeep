@@ -39,7 +39,7 @@ use dag::{BalancedLayout, BlockSink, NullSink};
 use import::Importer;
 use model::Link;
 use cid::{BaseCid, CidRef};
-use store::{Copying, InPlace, RefIndex, RoutingStore};
+use store::{Copying, InPlace, RefIndex, Catalog};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -176,12 +176,12 @@ fn main() {
     }
 }
 
-fn open_repo(repo: Option<PathBuf>) -> anyhow::Result<RoutingStore> {
+fn open_repo(repo: Option<PathBuf>) -> anyhow::Result<Catalog> {
     let dir = match repo {
         Some(dir) => dir,
         None => PathBuf::from(std::env::var_os("HOME").context("no HOME, so use --repo")?).join(".holokeep"),
     };
-    RoutingStore::open_repo(&dir).with_context(|| format!("opening repo {}", dir.display()))
+    Catalog::open_repo(&dir).with_context(|| format!("opening repo {}", dir.display()))
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
@@ -229,8 +229,8 @@ fn run(args: Args) -> anyhow::Result<()> {
             Ok(io::stdout().lock().write_all(block.data())?)
         },
         Command::Repo(RepoCommand::Stat) => {
-            for (store, blocks) in open_repo(args.repo)?.stats()? {
-                println!("{store}\t{blocks}");
+            for (volume, form, blocks) in open_repo(args.repo)?.stats()? {
+                println!("{volume}\t{form}\t{blocks}");
             }
             Ok(())
         },
@@ -267,7 +267,7 @@ fn add(importer: &Importer, path: &Path, quiet: bool, sink: &mut impl BlockSink)
 }
 
 /// A block's links, or the blocks linking to it.
-fn refs(repo: &RoutingStore, cid: &Link, back: bool) -> anyhow::Result<()> {
+fn refs(repo: &Catalog, cid: &Link, back: bool) -> anyhow::Result<()> {
     if back {
         let mut out = io::BufWriter::new(io::stdout().lock());
         for source in repo.backrefs(cid.multihash())? {
@@ -288,7 +288,7 @@ fn refs(repo: &RoutingStore, cid: &Link, back: bool) -> anyhow::Result<()> {
 }
 
 /// Import or export CAR files.
-fn dag(mut repo: RoutingStore, command: DagCommand) -> anyhow::Result<()> {
+fn dag(mut repo: Catalog, command: DagCommand) -> anyhow::Result<()> {
     match command {
         DagCommand::Import { paths } => {
             repo.batch(|repo| {
@@ -333,7 +333,7 @@ fn tag_cid(name: &str) -> anyhow::Result<Link> {
 }
 
 /// Tag blocks or find them by tag.
-fn tag(mut repo: RoutingStore, command: TagCommand) -> anyhow::Result<()> {
+fn tag(mut repo: Catalog, command: TagCommand) -> anyhow::Result<()> {
     let mut out = io::BufWriter::new(io::stdout().lock());
     match command {
         TagCommand::Add { name, cids } => {

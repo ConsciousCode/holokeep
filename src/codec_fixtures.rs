@@ -423,9 +423,9 @@ fn dagjson_decode_negative() {
 #[test]
 fn every_block_stores_and_retrieves() {
     use crate::cid::CidVersion;
-    use crate::store::{Db, RoutingStore};
+    use crate::store::{Db, Catalog};
 
-    let router = RoutingStore::standard(Db::memory().expect("db")).expect("router");
+    let router = Catalog::standard(Db::memory().expect("db")).expect("router");
     let mut placed = std::collections::BTreeMap::<(String, String), usize>::new();
     for f in fixtures() {
         let label = f.label();
@@ -456,9 +456,9 @@ fn every_block_stores_and_retrieves() {
 /// The fixtures' own CAR holds every fixture block, and they verify.
 #[test]
 fn fixtures_car_imports() {
-    use crate::store::{Db, RoutingStore};
+    use crate::store::{Db, Catalog};
 
-    let mut router = RoutingStore::standard(Db::memory().expect("db")).expect("router");
+    let mut router = Catalog::standard(Db::memory().expect("db")).expect("router");
     let car = fs::File::open(root().join("fixtures.car")).expect("fixtures.car");
     let (roots, blocks) = crate::car::import(std::io::BufReader::new(car), &mut router).expect("import");
     assert!(roots.is_empty());
@@ -475,9 +475,9 @@ fn fixtures_car_imports() {
 #[test]
 fn every_link_is_a_backref() {
     use crate::cid::CidVersion;
-    use crate::store::{Db, RefIndex, RoutingStore};
+    use crate::store::{Db, RefIndex, Catalog};
 
-    let router = RoutingStore::standard(Db::memory().expect("db")).expect("router");
+    let router = Catalog::standard(Db::memory().expect("db")).expect("router");
     let mut checked = 0;
     for f in fixtures() {
         let label = f.label();

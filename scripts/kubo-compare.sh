@@ -203,7 +203,7 @@ for f in *; do
     fi
 done
 "$hk" repo stat
-if "$hk" repo stat | grep -q '^raw'; then
+if "$hk" repo stat | grep -q $'^[^\t]*\traw\t'; then
     echo "FAIL --nocopy copied leaves into the repo"
     fail=1
 fi

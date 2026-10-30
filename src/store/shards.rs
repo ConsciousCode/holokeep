@@ -8,6 +8,8 @@
 //! what's there, so reads needn't touch the filesystem to find a blob, and
 //! a rescan rebuilds it.
 //!
+//! The directory is a volume of its own, labelled by its `VOLUME` file.
+//!
 //! A kept file's multihash is a second name for the content its UnixFS
 //! root names. `shard_roots` records which roots each kept file was
 //! imported as, which is what lets its ranges be rebuilt from the roots'
@@ -27,9 +29,10 @@ use crate::block::Block;
 use crate::cid::CidRef;
 use crate::multihash::Multihash;
 
+use super::volume::{Label, dir_label};
 use super::{BlockIndex, BlockSource, BlockStore, Db, Error, Key, Put, Result, Store, query_keys};
 
-const NAME: &str = "shards";
+const NAME: &str = "flatfs";
 
 /// Blobs larger than this are kept here rather than in `SQLite`, which is
 /// faster for smaller ones at its default 4 KiB pages
@@ -42,6 +45,7 @@ const SHARDING: &str = "/repo/flatfs/shard/v1/next-to-last/2\n";
 /// Admits blocks larger than its threshold, keeping each as a file.
 pub struct ShardStore {
     dir: PathBuf,
+    label: Label,
     db: Db,
     /// Blobs larger than this are kept here; see `THRESHOLD`.
     pub threshold: usize,
@@ -60,8 +64,11 @@ impl ShardStore {
             fs::write(sharding, SHARDING)?;
         }
         super::offset::schema(&db)?;
-        Ok(Self { dir: fs::canonicalize(dir)?, db, threshold: THRESHOLD })
+        Ok(Self { dir: fs::canonicalize(dir)?, label: dir_label(dir)?, db, threshold: THRESHOLD })
     }
+
+    /// The directory's identity as a volume.
+    pub const fn label(&self) -> Label { self.label }
 
     /// Where the blob with this multihash is kept.
     pub fn path(&self, blob: Key<'_>) -> PathBuf {

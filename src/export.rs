@@ -13,7 +13,7 @@ use std::path::Path;
 use crate::cid::{BaseCid, DAG_PB_CODEC, RAW_CODEC};
 use crate::model::Link;
 use crate::pb::PbNode;
-use crate::store::RoutingStore;
+use crate::store::Catalog;
 use crate::unixfs::{DataBuf, DataType};
 
 /// Deeper than any sane DAG, shallow enough not to overflow the stack.
@@ -25,7 +25,7 @@ pub trait Fetch {
     fn fetch(&self, cid: &Link) -> io::Result<Vec<u8>>;
 }
 
-impl Fetch for RoutingStore {
+impl Fetch for Catalog {
     fn fetch(&self, cid: &Link) -> io::Result<Vec<u8>> {
         match self.get_block(cid) {
             Ok(Some(block)) => Ok(block.into_data().into_vec()),
@@ -187,12 +187,12 @@ mod tests {
     use crate::dag::{BalancedLayout, DynamicDirectory};
     use crate::hamt::Hamt;
     use crate::import::Importer;
-    use crate::store::{Db, RoutingStore};
+    use crate::store::{Db, Catalog};
     use crate::testutil::Scratch;
     use crate::unixfs;
 
-    fn router() -> RoutingStore {
-        RoutingStore::standard(Db::memory().expect("db")).expect("router")
+    fn router() -> Catalog {
+        Catalog::standard(Db::memory().expect("db")).expect("router")
     }
 
     /// Small chunks, links and shards so little data makes deep DAGs.
@@ -205,12 +205,12 @@ mod tests {
         }
     }
 
-    fn add(router: &mut RoutingStore, path: &Path) -> Link {
+    fn add(router: &mut Catalog, path: &Path) -> Link {
         let root = importer().add_path(path, router, &mut |_, _| {}).expect("import").expect("root");
         AnyCid::V1(root.cid)
     }
 
-    fn put(router: &RoutingStore, block: &Block) -> Link {
+    fn put(router: &Catalog, block: &Block) -> Link {
         router.put_block(block, CidVersion::V1).expect("put");
         AnyCid::V1(block.cid().clone())
     }

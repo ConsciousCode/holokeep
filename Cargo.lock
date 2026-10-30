@@ -827,6 +827,7 @@ dependencies = [
  "clap",
  "digest 0.11.3",
  "futures",
+ "getrandom 0.2.17",
  "hex-macro",
  "ipld-core",
  "leb128",
