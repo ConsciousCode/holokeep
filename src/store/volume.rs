@@ -12,11 +12,13 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use rusqlite::OptionalExtension;
 
-use super::{Db, Result, Store};
+use super::{Db, Result, ShardStore, Store};
 
 /// A volume's identity.
 pub type Label = [u8; 16];
@@ -30,15 +32,44 @@ pub struct Volume {
     /// What it's called here, for people; the label is what it is.
     pub name: String,
     label: Label,
+    /// How to open it again: `db` or `flatfs`.
+    kind: &'static str,
+    /// Where it's mounted, if anywhere in particular.
+    path: Option<PathBuf>,
+    /// The device it's on, as a failure domain: copies on one device are
+    /// lost together.
+    device: Option<u64>,
     stores: Vec<Box<dyn Store>>,
 }
 
 impl Volume {
+    /// A database volume.
     pub fn new(name: impl Into<String>, label: Label, stores: Vec<Box<dyn Store>>) -> Self {
-        Self { name: name.into(), label, stores }
+        Self { name: name.into(), label, kind: "db", path: None, device: None, stores }
+    }
+
+    /// A flatfs directory.
+    pub fn flatfs(name: impl Into<String>, shards: Rc<ShardStore>) -> Self {
+        let path = shards.dir().to_owned();
+        let volume = Self { name: name.into(), label: shards.label(), kind: "flatfs", path: None, device: None, stores: vec![Box::new(shards)] };
+        volume.at(&path)
+    }
+
+    /// The volume, mounted at a path.
+    #[must_use]
+    pub fn at(mut self, path: &Path) -> Self {
+        self.device = device_of(path);
+        self.path = Some(path.to_owned());
+        self
     }
 
     pub const fn label(&self) -> Label { self.label }
+
+    pub const fn kind(&self) -> &'static str { self.kind }
+
+    pub fn path(&self) -> Option<&Path> { self.path.as_deref() }
+
+    pub const fn device(&self) -> Option<u64> { self.device }
 
     pub fn stores(&self) -> &[Box<dyn Store>] { &self.stores }
 
@@ -46,6 +77,11 @@ impl Volume {
     pub fn form(&self, name: &str) -> Option<&dyn Store> {
         self.stores.iter().find(|store| store.name() == name).map(AsRef::as_ref)
     }
+}
+
+/// The device a path is on.
+pub fn device_of(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|meta| meta.dev())
 }
 
 fn fresh() -> Result<Label> {
@@ -75,6 +111,21 @@ pub fn db_label(db: &Db) -> Result<Label> {
 /// A directory's label, from the file which holds it, made the first time
 /// it's asked for.
 pub fn dir_label(dir: &Path) -> Result<Label> {
+    if let Some(label) = read_dir_label(dir)? {
+        return Ok(label);
+    }
+    let label = fresh()?;
+    let mut text = String::with_capacity(label.len().saturating_mul(2).saturating_add(1));
+    for byte in label {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text.push('\n');
+    fs::write(dir.join(LABEL_FILE), text)?;
+    Ok(label)
+}
+
+/// A directory's label, if it has one.
+pub fn read_dir_label(dir: &Path) -> Result<Option<Label>> {
     let path = dir.join(LABEL_FILE);
     match fs::read_to_string(&path) {
         Ok(text) => {
@@ -88,18 +139,9 @@ pub fn dir_label(dir: &Path) -> Result<Label> {
                 let pair = std::str::from_utf8(pair).map_err(|_| invalid())?;
                 *byte = u8::from_str_radix(pair, 16).map_err(|_| invalid())?;
             }
-            Ok(label)
+            Ok(Some(label))
         },
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let label = fresh()?;
-            let mut text = String::with_capacity(label.len().saturating_mul(2).saturating_add(1));
-            for byte in label {
-                let _ = write!(text, "{byte:02x}");
-            }
-            text.push('\n');
-            fs::write(&path, text)?;
-            Ok(label)
-        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
 }

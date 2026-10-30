@@ -20,6 +20,7 @@
 //! interchange format between them.
 
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -76,6 +77,10 @@ pub enum Error {
     /// A block is kept as part of a file in the repo which is gone.
     #[error("block is kept in {}, which is missing", .0.display())]
     Missing(PathBuf),
+
+    /// A volume can't be added as asked.
+    #[error("{0}")]
+    Volume(String),
 
     /// A block is only on volumes which aren't attached.
     #[error("block {0} is only on volumes which aren't attached")]
@@ -147,15 +152,36 @@ pub trait RefIndex {
     fn backrefs(&self, key: Key<'_>) -> Result<Vec<Multihash>>;
 }
 
+/// Blocks a store gained and lost without being told, such as by another
+/// node writing to a shared volume.
+#[derive(Debug, Default)]
+pub struct Changes {
+    pub added: Vec<Multihash>,
+    pub removed: Vec<Multihash>,
+}
+
 /// A store a `Catalog` can place blocks in.
 pub trait Store: BlockIndex + BlockSource + BlockStore {
-    /// A stable name, recorded in the router's index.
+    /// A stable name for its form, recorded in the catalog's index.
     fn name(&self) -> &'static str;
 
     /// The store's own index of its blocks' links, if it keeps one. A
-    /// router indexes the links of blocks in stores which don't.
+    /// catalog indexes the links of blocks in stores which don't.
     fn refs(&self) -> Option<&dyn RefIndex> {
         None
+    }
+
+    /// Bring whatever the store caches up to date with what it holds,
+    /// cheaply, returning what changed. Only stores others can write to
+    /// change without being told.
+    fn catch_up(&self) -> Result<Changes> {
+        Ok(Changes::default())
+    }
+
+    /// Rebuild whatever the store caches from what it holds, however long
+    /// that takes.
+    fn rescan(&self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -325,13 +351,50 @@ pub struct Catalog {
 /// Where a block is: an attached volume, by index, and the form it's in.
 type Placement = (usize, String);
 
+/// A volume the catalog knows of.
+#[derive(Debug)]
+pub struct VolumeInfo {
+    pub name: String,
+    pub kind: String,
+    /// Where it was last seen.
+    pub path: Option<PathBuf>,
+    pub label: Vec<u8>,
+    pub attached: bool,
+    /// How many blocks are on it, by the index.
+    pub blocks: u64,
+}
+
+/// What `replicate` did.
+#[derive(Debug, Default)]
+pub struct Replication {
+    /// Copies made.
+    pub copied: usize,
+    /// Blocks still in fewer failure domains than asked for.
+    pub short: Vec<Multihash>,
+}
+
+fn path_bytes(path: &Path) -> &[u8] {
+    path.as_os_str().as_bytes()
+}
+
+fn path_from(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+}
+
 impl Catalog {
-    /// Open a repo directory with the standard stores.
+    /// Open a repo directory with the standard stores, attach whichever
+    /// other volumes are where they were last seen, and catch up with
+    /// them.
     pub fn open_repo(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let db = Db::open(&dir.join("blocks.db"))?;
+        let path = dir.join("blocks.db");
+        let db = Db::open(&path)?;
         let shards = ShardStore::open(db.clone(), &dir.join("shards"))?;
-        Self::with_shards(db, Some(shards))
+        let mut catalog = Self::with_shards(db, Some(shards))?;
+        catalog.locate(0, &path)?;
+        catalog.attach_known()?;
+        catalog.catch_up()?;
+        Ok(catalog)
     }
 
     /// The standard stores in one database, with no shards.
@@ -358,7 +421,7 @@ impl Catalog {
         let mut volumes = vec![Volume::new("db", volume::db_label(&db)?, stores)];
         let mut placement: Vec<_> = (0..raw).map(|store| (0, store)).collect();
         if let Some(shards) = &shards {
-            volumes.push(Volume::new("shards", shards.label(), vec![Box::new(Rc::clone(shards))]));
+            volumes.push(Volume::flatfs("shards", Rc::clone(shards)));
             placement.push((1, 0));
         }
         placement.push((0, raw));
@@ -392,13 +455,29 @@ impl Catalog {
     /// A catalog of volumes, offering blocks to their stores in the order
     /// given.
     pub fn with_volumes(db: Db, volumes: Vec<Volume>, placement: Vec<(usize, usize)>) -> Result<Self> {
+        Self::schema(&db)?;
+        if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
+            return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
+        }
+        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None };
+        for volume in volumes {
+            catalog.attach(volume)?;
+        }
+        Ok(catalog)
+    }
+
+    fn schema(db: &Db) -> Result<()> {
         db.conn().execute_batch(
             "-- Every volume the catalog knows of, attached or not, by the
-             -- label it carries.
+             -- label it carries: how to open it again, where it was last
+             -- seen, and the device it was on there.
              CREATE TABLE IF NOT EXISTS volumes (
                  id INTEGER PRIMARY KEY,
                  label BLOB UNIQUE NOT NULL,
-                 name TEXT NOT NULL
+                 name TEXT UNIQUE NOT NULL,
+                 kind TEXT NOT NULL,
+                 path BLOB,
+                 device INTEGER
              );
              CREATE TABLE IF NOT EXISTS forms (
                  id INTEGER PRIMARY KEY,
@@ -431,22 +510,232 @@ impl Catalog {
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS refs_target ON refs (target);",
         )?;
-        let mut ids = Vec::with_capacity(volumes.len());
-        for volume in &volumes {
-            ids.push(db.conn()
-                .prepare_cached(
-                    "INSERT INTO volumes (label, name) VALUES (?1, ?2)
-                     ON CONFLICT (label) DO UPDATE SET name = excluded.name RETURNING id",
-                )?
-                .query_row(params![volume.label().as_slice(), volume.name], |row| row.get(0))?);
-            for store in volume.stores() {
-                db.conn().execute("INSERT OR IGNORE INTO forms (name) VALUES (?1)", [store.name()])?;
+        Ok(())
+    }
+
+    /// Record a volume as attached, as of where it's mounted now.
+    fn attach(&mut self, volume: Volume) -> Result<usize> {
+        let path = volume.path().map(path_bytes);
+        let device = volume.device().and_then(|device| i64::try_from(device).ok());
+        let id: Id = self.db.conn()
+            .prepare_cached(
+                "INSERT INTO volumes (label, name, kind, path, device) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (label) DO UPDATE SET
+                     name = excluded.name, kind = excluded.kind,
+                     path = coalesce(excluded.path, path), device = coalesce(excluded.device, device)
+                 RETURNING id",
+            )?
+            .query_row(params![volume.label().as_slice(), volume.name, volume.kind(), path, device], |row| row.get(0))?;
+        for store in volume.stores() {
+            self.db.conn().execute("INSERT OR IGNORE INTO forms (name) VALUES (?1)", [store.name()])?;
+        }
+        self.ids.push(id);
+        self.volumes.push(volume);
+        Ok(self.volumes.len().saturating_sub(1))
+    }
+
+    /// Say where an attached volume is mounted.
+    fn locate(&mut self, volume: usize, path: &Path) -> Result<()> {
+        let (Some(v), Some(&id)) = (self.volumes.get_mut(volume), self.ids.get(volume)) else {
+            return Ok(());
+        };
+        let taken = std::mem::replace(v, Volume::new("", [0; 16], Vec::new()));
+        *v = taken.at(path);
+        let device = v.device().and_then(|device| i64::try_from(device).ok());
+        self.db.conn()
+            .prepare_cached("UPDATE volumes SET path = ?1, device = ?2 WHERE id = ?3")?
+            .execute(params![path_bytes(path), device, id])?;
+        Ok(())
+    }
+
+    /// Attach every flatfs volume found where it was last seen, carrying
+    /// its label. Those which aren't stay known, but unattached.
+    fn attach_known(&mut self) -> Result<()> {
+        let known: Vec<(Id, Vec<u8>, String, Vec<u8>)> = self.db.conn()
+            .prepare("SELECT id, label, name, path FROM volumes WHERE kind = 'flatfs' AND path IS NOT NULL")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, label, name, path) in known {
+            let Ok(label) = volume::Label::try_from(label) else {
+                continue;
+            };
+            if self.ids.contains(&id) {
+                continue;
+            }
+            let path = path_from(&path);
+            if let Some(mut shards) = ShardStore::attach(self.db.clone(), &path, label)? {
+                shards.threshold = None;
+                self.attach(Volume::flatfs(name, Rc::new(shards)))?;
             }
         }
-        if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
-            return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
+        Ok(())
+    }
+
+    /// Add a flatfs directory as a volume, to keep copies of any block in.
+    /// Returns the names of attached volumes on the same device, which
+    /// copies there wouldn't make more durable.
+    pub fn add_volume(&mut self, name: &str, dir: &Path) -> Result<Vec<String>> {
+        let mut shards = ShardStore::open(self.db.clone(), dir)?;
+        shards.threshold = None;
+        if self.volumes.iter().any(|volume| volume.label() == shards.label()) {
+            return Err(Error::Volume(format!("{} is already attached", dir.display())));
         }
-        Ok(Self { db, volumes, ids, placement, offsets: None, shards: None, claims: None })
+        let taken = self.db.conn()
+            .prepare_cached("SELECT 1 FROM volumes WHERE name = ?1 AND label != ?2")?
+            .exists(params![name, shards.label().as_slice()])?;
+        if taken {
+            return Err(Error::Volume(format!("a volume is already called {name:?}")));
+        }
+        let v = self.attach(Volume::flatfs(name, Rc::new(shards)))?;
+        self.catch_up()?;
+        let device = self.volumes.get(v).and_then(Volume::device);
+        Ok(self.volumes.iter().enumerate()
+            .filter(|&(other, volume)| other != v && device.is_some() && volume.device() == device)
+            .map(|(_, volume)| volume.name.clone())
+            .collect())
+    }
+
+    /// Every volume the catalog knows of.
+    pub fn volume_list(&self) -> Result<Vec<VolumeInfo>> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT v.id, v.name, v.kind, v.path, v.label, (SELECT count(*) FROM blocks b WHERE b.volume = v.id)
+             FROM volumes v ORDER BY v.id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((
+            row.get::<_, Id>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<Vec<u8>>>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+            row.get::<_, i64>(5)?,
+        )))?;
+        rows.map(|row| {
+            let (id, name, kind, path, label, blocks) = row?;
+            Ok(VolumeInfo {
+                name,
+                kind,
+                path: path.map(|path| path_from(&path)),
+                label,
+                attached: self.ids.contains(&id),
+                blocks: u64::try_from(blocks).unwrap_or_default(),
+            })
+        })
+        .collect()
+    }
+
+    /// Bring placement up to date with what attached volumes gained and
+    /// lost without the catalog hearing of it, such as by another node
+    /// writing to a shared one. Returns how many placements were added
+    /// and removed.
+    pub fn catch_up(&self) -> Result<(usize, usize)> {
+        self.db.atomically(|| {
+            let (mut added, mut removed) = (0usize, 0usize);
+            for (v, volume) in self.volumes.iter().enumerate() {
+                for store in volume.stores() {
+                    let changes = store.catch_up()?;
+                    for key in &changes.added {
+                        let id = self.db.intern(key.as_ref())?;
+                        if self.record(id, &(v, store.name().to_owned()))? {
+                            added = added.saturating_add(1);
+                            if store.refs().is_none() {
+                                self.reindex_links(store.as_ref(), id, key.as_ref())?;
+                            }
+                        }
+                    }
+                    for key in &changes.removed {
+                        if let Some(id) = self.db.lookup(key.as_ref())? {
+                            removed = removed.saturating_add(self.unrecord(id, v)?);
+                        }
+                    }
+                }
+            }
+            Ok((added, removed))
+        })
+    }
+
+    /// Forget a block's placement in a volume, returning how many there
+    /// were. Its links are forgotten with its last placement.
+    fn unrecord(&self, id: Id, volume: usize) -> Result<usize> {
+        let Some(&volume) = self.ids.get(volume) else {
+            return Ok(0);
+        };
+        let conn = self.db.conn();
+        let removed = conn.prepare_cached("DELETE FROM blocks WHERE block = ?1 AND volume = ?2")?.execute([id, volume])?;
+        if !conn.prepare_cached("SELECT 1 FROM blocks WHERE block = ?1")?.exists([id])? {
+            conn.prepare_cached("DELETE FROM refs WHERE source = ?1")?.execute([id])?;
+        }
+        Ok(removed)
+    }
+
+    /// The failure domains a block's copies are in: their volumes'
+    /// devices, or the volumes themselves where the device isn't known.
+    fn domains(&self, id: Id) -> Result<Vec<i64>> {
+        Ok(self.db.conn()
+            .prepare_cached(
+                "SELECT DISTINCT coalesce(v.device, -v.id) FROM blocks b JOIN volumes v ON v.id = b.volume WHERE b.block = ?1",
+            )?
+            .query_map([id], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn domain(&self, volume: usize) -> Option<i64> {
+        let id = *self.ids.get(volume)?;
+        let device = self.volumes.get(volume)?.device();
+        Some(device.and_then(|device| i64::try_from(device).ok()).unwrap_or_else(|| id.saturating_neg()))
+    }
+
+    /// Copy every block until it's in at least `copies` failure domains,
+    /// where attached volumes allow. Returns how many copies were made,
+    /// and the blocks still short of that.
+    pub fn replicate(&self, copies: usize) -> Result<Replication> {
+        let mut report = Replication::default();
+        for key in self.keys()? {
+            let Some(id) = self.db.lookup(key.as_ref())? else {
+                continue;
+            };
+            let mut domains = self.domains(id)?;
+            if domains.len() >= copies {
+                continue;
+            }
+            let Some(block) = self.readable(key.as_ref())? else {
+                report.short.push(key);
+                continue;
+            };
+            let held: Vec<usize> = self.placements(key.as_ref())?.into_iter().map(|(v, _)| v).collect();
+            for (v, volume) in self.volumes.iter().enumerate() {
+                let Some(domain) = self.domain(v) else {
+                    continue;
+                };
+                if domains.len() >= copies || held.contains(&v) || domains.contains(&domain) {
+                    continue;
+                }
+                for store in volume.stores() {
+                    if store.put(&block)? == Put::Stored {
+                        self.record(id, &(v, store.name().to_owned()))?;
+                        domains.push(domain);
+                        report.copied = report.copied.saturating_add(1);
+                        break;
+                    }
+                }
+            }
+            if domains.len() < copies {
+                report.short.push(key);
+            }
+        }
+        Ok(report)
+    }
+
+    /// A block as it can be read now, under the first CID it was put with,
+    /// verified; or None if no copy can be read.
+    fn readable(&self, key: Key<'_>) -> Result<Option<Block>> {
+        let Ok(Some(data)) = self.get(key) else {
+            return Ok(None);
+        };
+        let cid = match self.cids(key)?.into_iter().next() {
+            Some(cid) => cid.into(),
+            None => Cidv1::new(crate::cid::RAW_CODEC, decode_key("router", &key.to_bytes())?),
+        };
+        Ok(Block::verify(cid, data.into_boxed_slice()).ok())
     }
 
     /// Run `f` in one transaction, for speed and so that a failed import
@@ -650,8 +939,8 @@ impl Catalog {
     /// is kept.
     pub fn reindex(&self) -> Result<usize> {
         self.db.atomically(|| {
-            if let Some(shards) = &self.shards {
-                shards.rescan()?;
+            for store in self.volumes.iter().flat_map(Volume::stores) {
+                store.rescan()?;
             }
             let conn = self.db.conn();
             let mut forget = conn.prepare_cached("DELETE FROM blocks WHERE volume = ?1")?;
@@ -799,6 +1088,8 @@ impl BlockSink for Catalog {
 impl<T: Store + ?Sized> Store for Rc<T> {
     fn name(&self) -> &'static str { (**self).name() }
     fn refs(&self) -> Option<&dyn RefIndex> { (**self).refs() }
+    fn catch_up(&self) -> Result<Changes> { (**self).catch_up() }
+    fn rescan(&self) -> Result<()> { (**self).rescan() }
 }
 
 impl<T: BlockIndex + ?Sized> BlockIndex for Rc<T> {
@@ -909,7 +1200,7 @@ impl BlockSink for Copying<'_> {
             return self.router.put_block_from(&block, CidVersion::V1, provenance).map(drop).map_err(io_error);
         }
         file.held.push((block, offset));
-        let threshold = u64::try_from(shards.threshold).unwrap_or(u64::MAX);
+        let threshold = shards.threshold.map_or(0, |threshold| u64::try_from(threshold).unwrap_or(u64::MAX));
         if file.held.len() < 2 || file.whole.len() <= threshold {
             return Ok(());
         }

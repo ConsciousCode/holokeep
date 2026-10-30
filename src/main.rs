@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -110,6 +111,26 @@ enum Command {
     /// Work with the repo itself
     #[command(subcommand)]
     Repo(RepoCommand),
+    /// Keep copies of blocks on other volumes, such as other drives
+    #[command(subcommand)]
+    Volume(VolumeCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum VolumeCommand {
+    /// Add a directory as a volume, attached whenever it's found there
+    Add {
+        name: String,
+        path: PathBuf,
+    },
+    /// List the volumes the repo knows of, attached or not
+    Ls,
+    /// Copy blocks until each is on at least this many devices, where
+    /// attached volumes allow
+    Replicate {
+        #[arg(short, long, default_value_t = 2)]
+        copies: usize,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -163,7 +184,7 @@ enum DagCommand {
 
 #[derive(Subcommand, Debug)]
 enum RepoCommand {
-    /// How many blocks each store holds
+    /// How many blocks each volume holds, in each form
     Stat,
     /// Rebuild the block index from the stores
     Reindex,
@@ -239,7 +260,39 @@ fn run(args: Args) -> anyhow::Result<()> {
             println!("indexed {blocks} blocks");
             Ok(())
         },
+        Command::Volume(command) => volume(open_repo(args.repo)?, command),
     }
+}
+
+fn volume(mut repo: Catalog, command: VolumeCommand) -> anyhow::Result<()> {
+    match command {
+        VolumeCommand::Add { name, path } => {
+            let path = std::path::absolute(&path)?;
+            let others = repo.add_volume(&name, &path)?;
+            if !others.is_empty() {
+                eprintln!("warning: {name} is on the same device as {}, so copies on it won't count as more", others.join(", "));
+            }
+        },
+        VolumeCommand::Ls => {
+            for volume in repo.volume_list()? {
+                let label: String = volume.label.iter().fold(String::new(), |mut hex, byte| {
+                    let _ = write!(hex, "{byte:02x}");
+                    hex
+                });
+                let path = volume.path.map(|path| path.display().to_string()).unwrap_or_default();
+                let state = if volume.attached { "attached" } else { "detached" };
+                println!("{}\t{}\t{label}\t{state}\t{}\t{path}", volume.name, volume.kind, volume.blocks);
+            }
+        },
+        VolumeCommand::Replicate { copies } => {
+            let report = repo.batch(|repo| repo.replicate(copies))?;
+            println!("copied {} blocks", report.copied);
+            if !report.short.is_empty() {
+                eprintln!("{} blocks are on fewer than {copies} devices; attach more volumes, or ones on other devices", report.short.len());
+            }
+        },
+    }
+    Ok(())
 }
 
 fn add(importer: &Importer, path: &Path, quiet: bool, sink: &mut impl BlockSink) -> anyhow::Result<()> {

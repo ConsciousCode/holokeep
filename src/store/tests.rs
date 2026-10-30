@@ -822,7 +822,7 @@ fn copying_forgets_provenance() {
 fn sharded(scratch: &Scratch) -> Catalog {
     let db = Db::memory().expect("db");
     let mut shards = ShardStore::open(db.clone(), &scratch.path().join("shards")).expect("shards");
-    shards.threshold = 100;
+    shards.threshold = Some(100);
     Catalog::with_shards(db, Some(shards)).expect("router")
 }
 
@@ -1083,7 +1083,7 @@ fn blocks_on_detached_volumes_are_known() {
     let db = Db::open(&scratch.path().join("blocks.db")).expect("db");
     let (large, parent) = {
         let mut shards = ShardStore::open(db.clone(), &scratch.path().join("shards")).expect("shards");
-        shards.threshold = 100;
+        shards.threshold = Some(100);
         let router = Catalog::with_shards(db.clone(), Some(shards)).expect("router");
         let large = raw(&content(101, 0));
         let parent = ipld_block(DAG_CBOR_CODEC, &crate::model::Ipld::Link(link(&large)));
@@ -1104,4 +1104,138 @@ fn blocks_on_detached_volumes_are_known() {
         ("db".to_owned(), "ipld".to_owned(), 1),
         ("shards".to_owned(), "flatfs".to_owned(), 1),
     ]);
+}
+
+#[test]
+fn volumes_are_attached_where_they_were_seen() {
+    let scratch = Scratch::new("volumes-attach");
+    let (repo, backup) = (scratch.path().join("repo"), scratch.path().join("backup"));
+    let block = raw(b"kept twice");
+    {
+        let mut router = Catalog::open_repo(&repo).expect("open");
+        router.add_volume("backup", &backup).expect("add");
+        router.put_block(&block, CidVersion::V1).expect("put");
+        // Both are on the scratch directory's device, so replicating won't
+        // copy it there; another node's copy there is caught up with
+        assert_eq!(router.replicate(2).expect("replicate").copied, 0);
+        let mut other = ShardStore::open(Db::memory().expect("db"), &backup).expect("other");
+        other.threshold = None;
+        other.put(&block).expect("copy");
+        assert_eq!(router.catch_up().expect("catch up"), (1, 0));
+    }
+    let attached = |router: &Catalog| -> Vec<(String, bool)> {
+        router.volume_list().expect("list").into_iter().map(|v| (v.name, v.attached)).collect()
+    };
+    let router = Catalog::open_repo(&repo).expect("reopen");
+    assert_eq!(attached(&router), [("db".to_owned(), true), ("shards".to_owned(), true), ("backup".to_owned(), true)]);
+    assert_eq!(router.placements(block.cid().multihash()).expect("placements").len(), 2);
+    drop(router);
+
+    // Gone, or something else in its place, it's known but not attached
+    std::fs::rename(&backup, scratch.path().join("elsewhere")).expect("unmount");
+    let router = Catalog::open_repo(&repo).expect("reopen");
+    assert_eq!(attached(&router).last(), Some(&("backup".to_owned(), false)));
+    assert_eq!(router.placements(block.cid().multihash()).expect("placements").len(), 1);
+    drop(router);
+    ShardStore::open(Db::memory().expect("db"), &backup).expect("impostor");
+    let router = Catalog::open_repo(&repo).expect("reopen");
+    assert_eq!(attached(&router).last(), Some(&("backup".to_owned(), false)));
+}
+
+#[test]
+fn volumes_on_one_device_are_one_failure_domain() {
+    let scratch = Scratch::new("volumes-domains");
+    let mut router = router();
+    assert_eq!(router.add_volume("a", &scratch.path().join("a")).expect("add"), Vec::<String>::new());
+    // The database is in memory, so on no device; both directories are
+    // on the scratch directory's
+    assert_eq!(router.add_volume("b", &scratch.path().join("b")).expect("add"), ["a"]);
+    assert!(router.add_volume("a", &scratch.path().join("c")).is_err());
+    assert!(router.add_volume("again", &scratch.path().join("a")).is_err());
+
+    let block = raw(b"precious");
+    router.put_block(&block, CidVersion::V1).expect("put");
+    let report = router.replicate(3).expect("replicate");
+    assert_eq!((report.copied, report.short.len()), (1, 1));
+    assert_eq!(router.placements(block.cid().multihash()).expect("placements").len(), 2);
+    // Already in two domains, nothing more to do
+    assert_eq!(router.replicate(2).expect("replicate").copied, 0);
+}
+
+#[test]
+fn shared_volumes_are_caught_up_with() {
+    let scratch = Scratch::new("volumes-shared");
+    let shared = scratch.path().join("shared");
+    let (mut a, mut b) = (router(), router());
+    a.add_volume("shared", &shared).expect("add");
+    let (one, two) = (raw(b"one"), raw(b"two"));
+    a.put_block(&one, CidVersion::V1).expect("put");
+    a.replicate(2).expect("replicate");
+
+    // Another node opening it learns what's there
+    b.add_volume("shared", &shared).expect("add");
+    assert!(b.has(one.cid().multihash()).expect("has"));
+    assert_eq!(b.get(one.cid().multihash()).expect("get").as_deref(), Some(&b"one"[..]));
+
+    // And what's added and removed since
+    a.put_block(&two, CidVersion::V1).expect("put");
+    a.replicate(2).expect("replicate");
+    let shards = ShardStore::open(Db::memory().expect("db"), &shared).expect("shards");
+    std::fs::remove_file(shards.path(one.cid().multihash())).expect("remove");
+    assert_eq!(b.catch_up().expect("catch up"), (1, 1));
+    assert!(b.has(two.cid().multihash()).expect("has"));
+    assert!(!b.has(one.cid().multihash()).expect("has"));
+    assert_eq!(b.catch_up().expect("catch up"), (0, 0));
+}
+
+#[test]
+fn unreadable_blocks_are_short() {
+    let scratch = Scratch::new("volumes-unreadable");
+    let file = scratch.path().join("file");
+    std::fs::write(&file, content(1000, 0)).expect("write");
+    let mut router = router();
+    router.add_volume("backup", &scratch.path().join("backup")).expect("add");
+    import_in_place(&mut router, &file);
+    std::fs::write(&file, content(1000, 1)).expect("change");
+    // The node is copied; the leaves, whose file changed, can't be
+    let report = router.replicate(2).expect("replicate");
+    assert_eq!((report.copied, report.short.len()), (1, 16));
+}
+
+/// Set every shard directory's mtime, as if it was last written then.
+fn backdate(dir: &std::path::Path, when: std::time::SystemTime) {
+    for entry in std::fs::read_dir(dir).expect("dir") {
+        let path = entry.expect("entry").path();
+        if path.is_dir() {
+            std::fs::File::open(&path).expect("shard").set_modified(when).expect("backdate");
+        }
+    }
+}
+
+#[test]
+fn only_changed_shards_are_listed_again() {
+    let scratch = Scratch::new("volumes-mtimes");
+    let shared = scratch.path().join("shared");
+    let mut router = router();
+    router.add_volume("shared", &shared).expect("add");
+    let mut other = ShardStore::open(Db::memory().expect("db"), &shared).expect("other");
+    other.threshold = None;
+    let one = raw(b"one");
+    // Another block in the same shard
+    let shard_of = |block: &Block| other.path(block.cid().multihash()).parent().map(std::path::Path::to_owned);
+    let two = (0..u32::MAX).map(|i| raw(&i.to_le_bytes())).find(|block| shard_of(block) == shard_of(&one)).expect("a neighbour");
+    other.put(&one).expect("put");
+    let then = std::time::SystemTime::now() - std::time::Duration::from_mins(1);
+    backdate(other.dir(), then);
+    assert_eq!(router.catch_up().expect("catch up"), (1, 0));
+
+    // A blob slipped in without its shard's mtime changing isn't seen,
+    // which shows unchanged shards aren't listed...
+    other.put(&two).expect("put");
+    backdate(other.dir(), then);
+    assert_eq!(router.catch_up().expect("catch up"), (0, 0));
+    // ...and once its shard's mtime is anything else, it is
+    backdate(other.dir(), then + std::time::Duration::from_secs(1));
+    assert_eq!(router.catch_up().expect("catch up"), (1, 0));
+    assert!(router.has(two.cid().multihash()).expect("has"));
 }

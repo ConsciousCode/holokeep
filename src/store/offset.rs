@@ -166,12 +166,28 @@ pub(super) fn schema(db: &Db) -> Result<()> {
              inode INTEGER NOT NULL,
              PRIMARY KEY (blob, path)
          ) WITHOUT ROWID;
-         -- What's in the shards, so finding a blob needn't touch the
-         -- filesystem. Rebuilt from the directory by a rescan.
-         CREATE TABLE IF NOT EXISTS shard_files (
-             blob INTEGER PRIMARY KEY REFERENCES multihashes (id),
-             size INTEGER NOT NULL
+         -- Sharded directories, by their labels as volumes.
+         CREATE TABLE IF NOT EXISTS shard_dirs (
+             id INTEGER PRIMARY KEY,
+             label BLOB UNIQUE NOT NULL
          );
+         -- What's in each sharded directory, so finding a blob needn't
+         -- touch the filesystem. Rebuilt from the directory by a rescan.
+         CREATE TABLE IF NOT EXISTS shard_files (
+             dir INTEGER NOT NULL REFERENCES shard_dirs (id),
+             blob INTEGER NOT NULL REFERENCES multihashes (id),
+             shard TEXT NOT NULL,
+             size INTEGER NOT NULL,
+             PRIMARY KEY (dir, blob)
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS shard_files_shard ON shard_files (dir, shard);
+         -- Each shard's mtime when it was last listed, to catch up by.
+         CREATE TABLE IF NOT EXISTS shard_mtimes (
+             dir INTEGER NOT NULL REFERENCES shard_dirs (id),
+             shard TEXT NOT NULL,
+             mtime INTEGER NOT NULL,
+             PRIMARY KEY (dir, shard)
+         ) WITHOUT ROWID;
          -- Which UnixFS roots each kept file was imported as.
          CREATE TABLE IF NOT EXISTS shard_roots (
              blob INTEGER NOT NULL REFERENCES multihashes (id),
@@ -264,11 +280,12 @@ impl OffsetStore {
              FROM multihashes m
              JOIN offset_ranges r ON r.block = m.id
              JOIN multihashes b ON b.id = r.blob
-             LEFT JOIN shard_files s ON s.blob = r.blob
+             LEFT JOIN shard_files s ON s.blob = r.blob AND s.dir = ?2
              WHERE m.multihash = ?1
              ORDER BY s.blob IS NULL",
         )?;
-        let rows = stmt.query_map([key.to_bytes()], |row| Ok((
+        let shards = self.shards.as_ref().map(|shards| shards.id());
+        let rows = stmt.query_map(params![key.to_bytes(), shards], |row| Ok((
             row.get::<_, Vec<u8>>(0)?,
             row.get::<_, bool>(1)?,
             row.get::<_, i64>(2)?,
