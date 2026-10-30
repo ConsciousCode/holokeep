@@ -342,11 +342,10 @@ impl RoutingStore {
              CREATE VIEW IF NOT EXISTS links (source, target) AS
                  SELECT node, target FROM unixfs_links
                  UNION SELECT block, target FROM ipld_links
-                 UNION SELECT g.claim, t.target FROM group_targets t JOIN group_claims g ON g.id = t.group_
-                     WHERE g.claim IS NOT NULL
-                 UNION SELECT claim, into_ FROM group_claims WHERE claim IS NOT NULL
-                 UNION SELECT b.claim, t.target FROM tomb_targets t JOIN tombs b ON b.id = t.tomb
-                     WHERE b.claim IS NOT NULL
+                 UNION SELECT c.claim, t.target FROM claim_targets t JOIN claims c ON c.id = t.claim
+                     WHERE c.claim IS NOT NULL
+                 UNION SELECT c.claim, g.into_ FROM group_claims g JOIN claims c ON c.id = g.id
+                     WHERE c.claim IS NOT NULL
                  UNION SELECT source, target FROM refs;",
         )?;
         router.offsets = Some(offsets);

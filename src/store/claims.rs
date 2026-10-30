@@ -30,7 +30,9 @@ const NAME: &str = "claims";
 
 /// Whether a group counts: dissolved claims are deleted when they're
 /// tombstoned, precipitated ones have to be checked.
-const LIVE: &str = "(g.claim IS NULL OR NOT EXISTS (SELECT 1 FROM tomb_targets x WHERE x.target = g.claim))";
+const LIVE: &str = "(c.claim IS NULL OR NOT EXISTS (
+    SELECT 1 FROM claim_targets x JOIN claims k ON k.id = x.claim WHERE x.target = c.claim AND k.kind = 'tomb'
+))";
 
 /// Admits canonical claims, keeping them as rows.
 pub struct ClaimStore {
@@ -66,33 +68,29 @@ fn pair(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Vec<u8>, Vec<u8>)> {
 impl ClaimStore {
     pub fn open(db: Db) -> Result<Self> {
         db.conn().execute_batch(&format!(
-            "-- `claim` is a precipitated claim's multihash, NULL for a
-             -- dissolved one, which has none.
-             CREATE TABLE IF NOT EXISTS group_claims (
+            "-- Every claim, of any type. `claim` is a precipitated claim's
+             -- multihash, NULL for a dissolved one, which has none; `kind` is
+             -- its type, as the claim's own `claim` key says it.
+             CREATE TABLE IF NOT EXISTS claims (
                  id INTEGER PRIMARY KEY,
                  claim INTEGER UNIQUE REFERENCES multihashes (id),
+                 kind TEXT NOT NULL CHECK (kind IN ('group', 'tomb'))
+             );
+             -- Every claim's targets, which every type has.
+             CREATE TABLE IF NOT EXISTS claim_targets (
+                 claim INTEGER NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
+                 target INTEGER NOT NULL REFERENCES multihashes (id),
+                 prefix BLOB NOT NULL,
+                 PRIMARY KEY (claim, target, prefix)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS claim_targets_target ON claim_targets (target);
+             -- What's particular to each type; a tomb has nothing but targets.
+             CREATE TABLE IF NOT EXISTS group_claims (
+                 id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
                  into_ INTEGER NOT NULL REFERENCES multihashes (id),
                  into_prefix BLOB NOT NULL
              );
              CREATE INDEX IF NOT EXISTS group_claims_into ON group_claims (into_);
-             CREATE TABLE IF NOT EXISTS group_targets (
-                 group_ INTEGER NOT NULL REFERENCES group_claims (id) ON DELETE CASCADE,
-                 target INTEGER NOT NULL REFERENCES multihashes (id),
-                 prefix BLOB NOT NULL,
-                 PRIMARY KEY (group_, target, prefix)
-             ) WITHOUT ROWID;
-             CREATE INDEX IF NOT EXISTS group_targets_target ON group_targets (target);
-             CREATE TABLE IF NOT EXISTS tombs (
-                 id INTEGER PRIMARY KEY,
-                 claim INTEGER UNIQUE REFERENCES multihashes (id)
-             );
-             CREATE TABLE IF NOT EXISTS tomb_targets (
-                 tomb INTEGER NOT NULL REFERENCES tombs (id) ON DELETE CASCADE,
-                 target INTEGER NOT NULL REFERENCES multihashes (id),
-                 prefix BLOB NOT NULL,
-                 PRIMARY KEY (tomb, target, prefix)
-             ) WITHOUT ROWID;
-             CREATE INDEX IF NOT EXISTS tomb_targets_target ON tomb_targets (target);
              -- Every block's tags that still count. A simple tag's name is its
              -- identity digest, after the multihash's code and length varint
              -- (one byte, or two from 128).
@@ -101,8 +99,9 @@ impl ClaimStore {
                      CASE WHEN g.into_prefix = x'0155' AND substr(i.multihash, 1, 1) = x'00' THEN
                          CAST(substr(i.multihash, CASE WHEN length(i.multihash) <= 129 THEN 3 ELSE 4 END) AS TEXT)
                      END
-                 FROM group_targets t
-                 JOIN group_claims g ON g.id = t.group_
+                 FROM claim_targets t
+                 JOIN claims c ON c.id = t.claim
+                 JOIN group_claims g ON g.id = c.id
                  JOIN multihashes i ON i.id = g.into_
                  WHERE {LIVE};"
         ))?;
@@ -113,20 +112,28 @@ impl ClaimStore {
         let (prefix, into) = self.db.conn()
             .prepare_cached("SELECT g.into_prefix, i.multihash FROM group_claims g JOIN multihashes i ON i.id = g.into_ WHERE g.id = ?1")?
             .query_row([id], pair)?;
-        let mut stmt = self.db.conn().prepare_cached(
-            "SELECT t.prefix, m.multihash FROM group_targets t JOIN multihashes m ON m.id = t.target WHERE t.group_ = ?1",
-        )?;
-        let target = links(stmt.query_map([id], pair)?)?;
-        Group::new(target, link(&prefix, &into)?)
+        Group::new(self.targets(id)?, link(&prefix, &into)?)
             .ok_or_else(|| Error::Invalid { store: NAME, reason: "a group with no targets".into() })
     }
 
-    fn tomb(&self, id: Id) -> Result<Tomb> {
+    fn targets(&self, id: Id) -> Result<Vec<Link>> {
         let mut stmt = self.db.conn().prepare_cached(
-            "SELECT t.prefix, m.multihash FROM tomb_targets t JOIN multihashes m ON m.id = t.target WHERE t.tomb = ?1",
+            "SELECT t.prefix, m.multihash FROM claim_targets t JOIN multihashes m ON m.id = t.target WHERE t.claim = ?1",
         )?;
-        let target = links(stmt.query_map([id], pair)?)?;
-        Tomb::new(target).ok_or_else(|| Error::Invalid { store: NAME, reason: "a tomb with no targets".into() })
+        links(stmt.query_map([id], pair)?)
+    }
+
+    /// The claim in a row, by its type.
+    fn claim(&self, id: Id, kind: &str) -> Result<Claim> {
+        match kind {
+            "group" => self.group(id).map(Claim::Group),
+            "tomb" => self.tomb(id).map(Claim::Tomb),
+            _ => Err(Error::Invalid { store: NAME, reason: format!("a claim of kind {kind}") }),
+        }
+    }
+
+    fn tomb(&self, id: Id) -> Result<Tomb> {
+        Tomb::new(self.targets(id)?).ok_or_else(|| Error::Invalid { store: NAME, reason: "a tomb with no targets".into() })
     }
 
     /// A precipitated claim, by its multihash.
@@ -134,14 +141,11 @@ impl ClaimStore {
         let Some(id) = self.db.lookup(key)? else {
             return Ok(None);
         };
-        let conn = self.db.conn();
-        if let Some(group) = conn.prepare_cached("SELECT id FROM group_claims WHERE claim = ?1")?.query_row([id], |r| r.get(0)).optional()? {
-            return self.group(group).map(|g| Some(Claim::Group(g)));
-        }
-        if let Some(tomb) = conn.prepare_cached("SELECT id FROM tombs WHERE claim = ?1")?.query_row([id], |r| r.get(0)).optional()? {
-            return self.tomb(tomb).map(|t| Some(Claim::Tomb(t)));
-        }
-        Ok(None)
+        let row = self.db.conn()
+            .prepare_cached("SELECT id, kind FROM claims WHERE claim = ?1")?
+            .query_row([id], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, String>(1)?)))
+            .optional()?;
+        row.map(|(id, kind)| self.claim(id, &kind)).transpose()
     }
 
     /// The row of a dissolved claim, which has a single target, found by
@@ -162,16 +166,16 @@ impl ClaimStore {
                 };
                 self.db.conn()
                     .prepare_cached(
-                        "SELECT g.id FROM group_claims g JOIN group_targets t ON t.group_ = g.id
-                         WHERE g.claim IS NULL AND g.into_ = ?1 AND g.into_prefix = ?2 AND t.target = ?3 AND t.prefix = ?4",
+                        "SELECT c.id FROM claims c JOIN group_claims g ON g.id = c.id JOIN claim_targets t ON t.claim = c.id
+                         WHERE c.claim IS NULL AND g.into_ = ?1 AND g.into_prefix = ?2 AND t.target = ?3 AND t.prefix = ?4",
                     )?
                     .query_row(params![into, into_prefix, target, prefix], |r| r.get(0))
                     .optional()?
             },
             Claim::Tomb(_) => self.db.conn()
                 .prepare_cached(
-                    "SELECT b.id FROM tombs b JOIN tomb_targets t ON t.tomb = b.id
-                     WHERE b.claim IS NULL AND t.target = ?1 AND t.prefix = ?2",
+                    "SELECT c.id FROM claims c JOIN claim_targets t ON t.claim = c.id
+                     WHERE c.claim IS NULL AND c.kind = 'tomb' AND t.target = ?1 AND t.prefix = ?2",
                 )?
                 .query_row(params![target, prefix], |r| r.get(0))
                 .optional()?,
@@ -181,7 +185,10 @@ impl ClaimStore {
     /// Whether a tomb targets a claim's multihash.
     fn tombstoned(&self, key: Key<'_>) -> Result<bool> {
         Ok(self.db.conn()
-            .prepare_cached("SELECT 1 FROM multihashes m JOIN tomb_targets t ON t.target = m.id WHERE m.multihash = ?1 LIMIT 1")?
+            .prepare_cached(
+                "SELECT 1 FROM multihashes m JOIN claim_targets t ON t.target = m.id JOIN claims c ON c.id = t.claim
+                 WHERE m.multihash = ?1 AND c.kind = 'tomb' LIMIT 1",
+            )?
             .exists([key.to_bytes()])?)
     }
 
@@ -194,20 +201,18 @@ impl ClaimStore {
     fn insert(&self, claim: &Claim, multihash: Option<Key<'_>>) -> Result<()> {
         let id = multihash.map(|key| self.db.intern(key)).transpose()?;
         let conn = self.db.conn();
-        let (row, targets_sql) = match claim {
-            Claim::Group(group) => {
-                let (into_prefix, into) = split(group.group())?;
-                let into = self.db.intern(into.as_ref())?;
-                conn.prepare_cached("INSERT INTO group_claims (claim, into_, into_prefix) VALUES (?1, ?2, ?3)")?
-                    .execute(params![id, into, into_prefix])?;
-                (conn.last_insert_rowid(), "INSERT OR IGNORE INTO group_targets (group_, target, prefix) VALUES (?1, ?2, ?3)")
-            },
-            Claim::Tomb(_) => {
-                conn.prepare_cached("INSERT INTO tombs (claim) VALUES (?1)")?.execute([id])?;
-                (conn.last_insert_rowid(), "INSERT OR IGNORE INTO tomb_targets (tomb, target, prefix) VALUES (?1, ?2, ?3)")
-            },
+        let kind = match claim {
+            Claim::Group(_) => "group",
+            Claim::Tomb(_) => "tomb",
         };
-        let mut stmt = conn.prepare_cached(targets_sql)?;
+        conn.prepare_cached("INSERT INTO claims (claim, kind) VALUES (?1, ?2)")?.execute(params![id, kind])?;
+        let row = conn.last_insert_rowid();
+        if let Claim::Group(group) = claim {
+            let (into_prefix, into) = split(group.group())?;
+            conn.prepare_cached("INSERT INTO group_claims (id, into_, into_prefix) VALUES (?1, ?2, ?3)")?
+                .execute(params![row, self.db.intern(into.as_ref())?, into_prefix])?;
+        }
+        let mut stmt = conn.prepare_cached("INSERT OR IGNORE INTO claim_targets (claim, target, prefix) VALUES (?1, ?2, ?3)")?;
         for target in claim.target() {
             let (prefix, multihash) = split(target)?;
             stmt.execute(params![row, self.db.intern(multihash.as_ref())?, prefix])?;
@@ -221,7 +226,7 @@ impl ClaimStore {
             if let Some(Claim::Group(group)) = claim::dissolved(target)
                 && let Some(id) = self.find_dissolved(&Claim::Group(group))?
             {
-                self.db.conn().prepare_cached("DELETE FROM group_claims WHERE id = ?1")?.execute([id])?;
+                self.db.conn().prepare_cached("DELETE FROM claims WHERE id = ?1")?.execute([id])?;
             }
         }
         Ok(())
@@ -231,8 +236,9 @@ impl ClaimStore {
     pub fn tags(&self, target: Key<'_>) -> Result<Vec<Link>> {
         let mut stmt = self.db.conn().prepare_cached(&format!(
             "SELECT DISTINCT g.into_prefix, i.multihash FROM multihashes m
-             JOIN group_targets t ON t.target = m.id
-             JOIN group_claims g ON g.id = t.group_
+             JOIN claim_targets t ON t.target = m.id
+             JOIN claims c ON c.id = t.claim
+             JOIN group_claims g ON g.id = c.id
              JOIN multihashes i ON i.id = g.into_
              WHERE m.multihash = ?1 AND {LIVE}
              ORDER BY i.multihash"
@@ -245,7 +251,8 @@ impl ClaimStore {
         let mut stmt = self.db.conn().prepare_cached(&format!(
             "SELECT DISTINCT t.prefix, m.multihash FROM multihashes i
              JOIN group_claims g ON g.into_ = i.id
-             JOIN group_targets t ON t.group_ = g.id
+             JOIN claims c ON c.id = g.id
+             JOIN claim_targets t ON t.claim = c.id
              JOIN multihashes m ON m.id = t.target
              WHERE i.multihash = ?1 AND {LIVE}
              ORDER BY m.multihash, t.prefix"
@@ -257,11 +264,12 @@ impl ClaimStore {
     /// what they say.
     pub fn tagging(&self, target: Key<'_>, tag: Key<'_>) -> Result<Vec<(Link, Group)>> {
         let mut stmt = self.db.conn().prepare_cached(&format!(
-            "SELECT DISTINCT g.id, c.multihash FROM multihashes m
-             JOIN group_targets t ON t.target = m.id
-             JOIN group_claims g ON g.id = t.group_
+            "SELECT DISTINCT c.id, k.multihash FROM multihashes m
+             JOIN claim_targets t ON t.target = m.id
+             JOIN claims c ON c.id = t.claim
+             JOIN group_claims g ON g.id = c.id
              JOIN multihashes i ON i.id = g.into_
-             LEFT JOIN multihashes c ON c.id = g.claim
+             LEFT JOIN multihashes k ON k.id = c.claim
              WHERE m.multihash = ?1 AND i.multihash = ?2 AND {LIVE}"
         ))?;
         let rows = stmt.query_map([target.to_bytes(), tag.to_bytes()], |row| Ok((row.get::<_, Id>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)))?;
@@ -302,9 +310,7 @@ impl BlockIndex for ClaimStore {
         query_keys(
             &self.db,
             NAME,
-            "SELECT m.multihash FROM multihashes m WHERE m.id IN (
-                 SELECT claim FROM group_claims UNION SELECT claim FROM tombs
-             )",
+            "SELECT m.multihash FROM multihashes m WHERE m.id IN (SELECT claim FROM claims)",
         )
     }
 }
@@ -348,30 +354,16 @@ impl RefIndex for ClaimStore {
     /// Claims with a link to the multihash, as a target or what they're
     /// into.
     fn backrefs(&self, key: Key<'_>) -> Result<Vec<Multihash>> {
-        let mut out = Vec::new();
         let mut stmt = self.db.conn().prepare_cached(
-            "SELECT g.id, c.multihash FROM multihashes m JOIN group_targets t ON t.target = m.id
-             JOIN group_claims g ON g.id = t.group_ LEFT JOIN multihashes c ON c.id = g.claim WHERE m.multihash = ?1
+            "SELECT c.id, c.kind, k.multihash FROM multihashes m JOIN claim_targets t ON t.target = m.id
+             JOIN claims c ON c.id = t.claim LEFT JOIN multihashes k ON k.id = c.claim WHERE m.multihash = ?1
              UNION
-             SELECT g.id, c.multihash FROM multihashes m JOIN group_claims g ON g.into_ = m.id
-             LEFT JOIN multihashes c ON c.id = g.claim WHERE m.multihash = ?1",
+             SELECT c.id, c.kind, k.multihash FROM multihashes m JOIN group_claims g ON g.into_ = m.id
+             JOIN claims c ON c.id = g.id LEFT JOIN multihashes k ON k.id = c.claim WHERE m.multihash = ?1",
         )?;
-        let groups: Vec<(Id, Option<Vec<u8>>)> = stmt
-            .query_map([key.to_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))?
+        let rows: Vec<(Id, String, Option<Vec<u8>>)> = stmt
+            .query_map([key.to_bytes()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        for (id, claim) in groups {
-            out.push(key_of(claim, || self.group(id).map(Claim::Group))?);
-        }
-        let mut stmt = self.db.conn().prepare_cached(
-            "SELECT b.id, c.multihash FROM multihashes m JOIN tomb_targets t ON t.target = m.id
-             JOIN tombs b ON b.id = t.tomb LEFT JOIN multihashes c ON c.id = b.claim WHERE m.multihash = ?1",
-        )?;
-        let tombs: Vec<(Id, Option<Vec<u8>>)> = stmt
-            .query_map([key.to_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        for (id, claim) in tombs {
-            out.push(key_of(claim, || self.tomb(id).map(Claim::Tomb))?);
-        }
-        Ok(out)
+        rows.into_iter().map(|(id, kind, claim)| key_of(claim, || self.claim(id, &kind))).collect()
     }
 }
