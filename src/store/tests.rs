@@ -359,8 +359,11 @@ fn referenced_multihashes_cant_be_deleted() {
     let block = raw(b"hello");
     router.put_block(&block, CidVersion::V1).expect("put");
     assert!(router.db.conn().execute("DELETE FROM multihashes", []).is_err());
-    // Once nothing refers to it, it can go
+    // Once nothing refers to it, it can go, including the generation it
+    // left in
     router.db.conn().execute_batch("DELETE FROM raw_blocks; DELETE FROM blocks; DELETE FROM block_cids;").expect("clear");
+    assert!(router.db.conn().execute("DELETE FROM multihashes", []).is_err());
+    router.db.conn().execute_batch("DELETE FROM generations;").expect("clear");
     assert_eq!(router.db.conn().execute("DELETE FROM multihashes", []).expect("delete"), 1);
 }
 
@@ -1115,7 +1118,7 @@ fn volumes_are_attached_where_they_were_seen() {
         let mut router = Catalog::open_repo(&repo).expect("open");
         router.add_volume("backup", &backup).expect("add");
         router.put_block(&block, CidVersion::V1).expect("put");
-        // Both are on the scratch directory's device, so replicating won't
+        // Both are on the scratch directory's disk, so replicating won't
         // copy it there; another node's copy there is caught up with
         assert_eq!(router.replicate(2).expect("replicate").copied, 0);
         let mut other = ShardStore::open(Db::memory().expect("db"), &backup).expect("other");
@@ -1143,12 +1146,12 @@ fn volumes_are_attached_where_they_were_seen() {
 }
 
 #[test]
-fn volumes_on_one_device_are_one_failure_domain() {
+fn volumes_on_one_disk_are_one_failure_domain() {
     let scratch = Scratch::new("volumes-domains");
     let mut router = router();
     assert_eq!(router.add_volume("a", &scratch.path().join("a")).expect("add"), Vec::<String>::new());
-    // The database is in memory, so on no device; both directories are
-    // on the scratch directory's
+    // The database is in memory, so on no disk; both directories are on
+    // the scratch directory's
     assert_eq!(router.add_volume("b", &scratch.path().join("b")).expect("add"), ["a"]);
     assert!(router.add_volume("a", &scratch.path().join("c")).is_err());
     assert!(router.add_volume("again", &scratch.path().join("a")).is_err());
@@ -1238,4 +1241,101 @@ fn only_changed_shards_are_listed_again() {
     backdate(other.dir(), then + std::time::Duration::from_secs(1));
     assert_eq!(router.catch_up().expect("catch up"), (1, 0));
     assert!(router.has(two.cid().multihash()).expect("has"));
+}
+
+#[test]
+fn domains_are_disks() {
+    let scratch = Scratch::new("volumes-disks");
+    let here = volume::domain_of(scratch.path()).expect("domain");
+    // Wherever in a filesystem, the same domain; and a filesystem with no
+    // disk is named by its mount
+    assert_eq!(volume::domain_of(&scratch.path().join("..")), Some(here.clone()));
+    if let Some(proc) = volume::domain_of(std::path::Path::new("/proc")) {
+        assert_ne!(proc, here);
+        assert_eq!(proc, "proc:proc");
+    }
+}
+
+fn with_sqlite(scratch: &Scratch, file: &str) -> Catalog {
+    let mut router = router();
+    router.add_sqlite_volume("shared", &scratch.path().join(file)).expect("add");
+    router
+}
+
+/// Which volumes and forms a block is in, by name.
+fn placed(router: &Catalog, block: &Block) -> Vec<(String, String)> {
+    router.placements(block.cid().multihash()).expect("placements").into_iter()
+        .map(|(v, form)| (router.volumes.get(v).expect("volume").name.clone(), form))
+        .collect()
+}
+
+fn pair(volume: &str, form: &str) -> (String, String) {
+    (volume.to_owned(), form.to_owned())
+}
+
+#[test]
+fn database_volumes_are_caught_up_with_by_generation() {
+    let scratch = Scratch::new("volumes-generations");
+    let (a, mut b) = (with_sqlite(&scratch, "shared.db"), router());
+    let (leaf, other) = (raw(b"leaf"), raw(b"other"));
+    let parent = ipld_block(DAG_CBOR_CODEC, &crate::model::Ipld::Link(link(&leaf)));
+    // Kept as raw bytes, so only the codec it was put with says it links
+    let json = block(crate::cid::DAG_JSON_CODEC, format!(r#"[{{"/":"{}"}}]"#, leaf.cid()).as_bytes());
+    for block in [&leaf, &parent, &json, &other] {
+        a.put_block(block, CidVersion::V1).expect("put");
+    }
+    assert_eq!(a.copy_to("shared", &[link(&parent)]).expect("copy").copied, 2);
+    assert_eq!(a.copy_to("shared", &[]).expect("copy").copied, 2);
+    assert_eq!(a.copy_to("shared", &[]).expect("copy").copied, 0);
+
+    // Another node opening it learns what's there, and what links to what
+    b.add_sqlite_volume("shared", &scratch.path().join("shared.db")).expect("add");
+    assert!(b.has(leaf.cid().multihash()).expect("has"));
+    assert_eq!(sorted(b.backrefs(leaf.cid().multihash()).expect("backrefs")), sorted(vec![mh(&parent), mh(&json)]));
+    // Structure is kept in the catalog too; bulk isn't
+    assert_eq!(placed(&b, &parent), [pair("db", "ipld"), pair("shared", "ipld")]);
+    assert_eq!(placed(&b, &leaf), [pair("shared", "raw")]);
+    assert_eq!(b.catch_up().expect("catch up"), (0, 0));
+
+    // What's added since, and what's removed, however it was
+    let late = raw(b"late");
+    a.put_block(&late, CidVersion::V1).expect("put");
+    assert_eq!(a.copy_to("shared", &[link(&late)]).expect("copy").copied, 1);
+    let shared = a.volumes.last().and_then(Volume::db).expect("shared");
+    let id = shared.lookup(other.cid().multihash()).expect("lookup").expect("id");
+    shared.conn().execute("DELETE FROM raw_blocks WHERE block = ?1", [id]).expect("remove");
+    assert_eq!(b.catch_up().expect("catch up"), (1, 1));
+    assert!(b.has(late.cid().multihash()).expect("has"));
+    assert!(!b.has(other.cid().multihash()).expect("has"));
+    assert_eq!(b.catch_up().expect("catch up"), (0, 0));
+
+    // A reindex starts from the generation it saw
+    b.reindex().expect("reindex");
+    assert_eq!(b.catch_up().expect("catch up"), (0, 0));
+}
+
+#[test]
+fn database_volumes_are_attached_where_they_were_seen() {
+    let scratch = Scratch::new("volumes-attach-db");
+    let (repo, usb) = (scratch.path().join("repo"), scratch.path().join("usb.db"));
+    let block = raw(b"carried");
+    {
+        let mut router = Catalog::open_repo(&repo).expect("open");
+        router.add_sqlite_volume("usb", &usb).expect("add");
+        router.put_block(&block, CidVersion::V1).expect("put");
+        assert_eq!(router.copy_to("usb", &[link(&block)]).expect("copy").copied, 1);
+    }
+    let router = Catalog::open_repo(&repo).expect("reopen");
+    assert_eq!(placed(&router, &block), [pair("db", "raw"), pair("usb", "raw")]);
+    drop(router);
+
+    // Gone, or another database in its place, it's known but not attached
+    std::fs::rename(&usb, scratch.path().join("elsewhere.db")).expect("unplug");
+    let router = Catalog::open_repo(&repo).expect("reopen");
+    assert_eq!(placed(&router, &block), [pair("db", "raw")]);
+    drop(router);
+    with_sqlite(&scratch, "usb.db");
+    let router = Catalog::open_repo(&repo).expect("reopen");
+    assert_eq!(placed(&router, &block), [pair("db", "raw")]);
+    assert!(router.copy_to("usb", &[]).is_err());
 }

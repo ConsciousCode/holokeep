@@ -122,14 +122,24 @@ enum VolumeCommand {
     Add {
         name: String,
         path: PathBuf,
+        /// Make it a database file, holding structure in the forms the
+        /// repo's own does, rather than a flatfs directory
+        #[arg(long)]
+        sqlite: bool,
     },
     /// List the volumes the repo knows of, attached or not
     Ls,
-    /// Copy blocks until each is on at least this many devices, where
+    /// Copy blocks until each is on at least this many disks, where
     /// attached volumes allow
     Replicate {
         #[arg(short, long, default_value_t = 2)]
         copies: usize,
+    },
+    /// Copy blocks to a volume, wherever it is, such as to carry them to
+    /// another machine: the DAGs under these CIDs, or every block
+    Copy {
+        name: String,
+        cids: Vec<Link>,
     },
 }
 
@@ -266,11 +276,11 @@ fn run(args: Args) -> anyhow::Result<()> {
 
 fn volume(mut repo: Catalog, command: VolumeCommand) -> anyhow::Result<()> {
     match command {
-        VolumeCommand::Add { name, path } => {
+        VolumeCommand::Add { name, path, sqlite } => {
             let path = std::path::absolute(&path)?;
-            let others = repo.add_volume(&name, &path)?;
+            let others = if sqlite { repo.add_sqlite_volume(&name, &path)? } else { repo.add_volume(&name, &path)? };
             if !others.is_empty() {
-                eprintln!("warning: {name} is on the same device as {}, so copies on it won't count as more", others.join(", "));
+                eprintln!("warning: {name} is on the same disk as {}, so copies on it won't count as more", others.join(", "));
             }
         },
         VolumeCommand::Ls => {
@@ -288,7 +298,14 @@ fn volume(mut repo: Catalog, command: VolumeCommand) -> anyhow::Result<()> {
             let report = repo.batch(|repo| repo.replicate(copies))?;
             println!("copied {} blocks", report.copied);
             if !report.short.is_empty() {
-                eprintln!("{} blocks are on fewer than {copies} devices; attach more volumes, or ones on other devices", report.short.len());
+                eprintln!("{} blocks are on fewer than {copies} disks; attach more volumes, or ones on other disks", report.short.len());
+            }
+        },
+        VolumeCommand::Copy { name, cids } => {
+            let report = repo.batch(|repo| repo.copy_to(&name, &cids))?;
+            println!("copied {} blocks", report.copied);
+            if !report.unreadable.is_empty() {
+                eprintln!("{} blocks couldn't be read to be copied", report.unreadable.len());
             }
         },
     }

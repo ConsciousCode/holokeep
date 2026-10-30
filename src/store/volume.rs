@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use rusqlite::OptionalExtension;
 
-use super::{Db, Result, ShardStore, Store};
+use super::{ClaimStore, Db, IpldStore, RawStore, Result, ShardStore, Store, UnixfsStore};
 
 /// A volume's identity.
 pub type Label = [u8; 16];
@@ -36,29 +36,58 @@ pub struct Volume {
     kind: &'static str,
     /// Where it's mounted, if anywhere in particular.
     path: Option<PathBuf>,
-    /// The device it's on, as a failure domain: copies on one device are
-    /// lost together.
-    device: Option<u64>,
+    /// The failure domain it's in: copies in one are lost together.
+    domain: Option<String>,
+    /// Its database, if it's a database.
+    db: Option<Db>,
     stores: Vec<Box<dyn Store>>,
 }
 
 impl Volume {
     /// A database volume.
     pub fn new(name: impl Into<String>, label: Label, stores: Vec<Box<dyn Store>>) -> Self {
-        Self { name: name.into(), label, kind: "db", path: None, device: None, stores }
+        Self { name: name.into(), label, kind: "db", path: None, domain: None, db: None, stores }
+    }
+
+    /// A database volume which others may write to, stamping each block's
+    /// arrival and departure with a generation so they can catch up.
+    pub fn sqlite(name: impl Into<String>, db: Db, stores: Vec<Box<dyn Store>>) -> Result<Self> {
+        let label = db_label(&db)?;
+        db.conn().execute_batch(BLOCK_CIDS)?;
+        stamp(&db, stores.iter().map(|store| store.name()))?;
+        Ok(Self { db: Some(db), ..Self::new(name, label, stores) })
+    }
+
+    /// A database volume's file, opened with the forms a database holds,
+    /// if it's there and carries the label; any file if there's no label
+    /// to expect, making it a volume if it isn't one.
+    pub fn open_sqlite(name: impl Into<String>, path: &Path, expect: Option<Label>) -> Result<Option<Self>> {
+        if let Some(expect) = expect
+            && (!path.is_file() || read_db_label(path)? != Some(expect))
+        {
+            return Ok(None);
+        }
+        let db = Db::open(path)?;
+        let stores: Vec<Box<dyn Store>> = vec![
+            Box::new(UnixfsStore::open(db.clone())?),
+            Box::new(ClaimStore::open(db.clone())?),
+            Box::new(IpldStore::open(db.clone())?),
+            Box::new(RawStore::open(db.clone())?),
+        ];
+        Ok(Some(Self::sqlite(name, db, stores)?.at(path)))
     }
 
     /// A flatfs directory.
     pub fn flatfs(name: impl Into<String>, shards: Rc<ShardStore>) -> Self {
         let path = shards.dir().to_owned();
-        let volume = Self { name: name.into(), label: shards.label(), kind: "flatfs", path: None, device: None, stores: vec![Box::new(shards)] };
+        let volume = Self { name: name.into(), label: shards.label(), kind: "flatfs", path: None, domain: None, db: None, stores: vec![Box::new(shards)] };
         volume.at(&path)
     }
 
     /// The volume, mounted at a path.
     #[must_use]
     pub fn at(mut self, path: &Path) -> Self {
-        self.device = device_of(path);
+        self.domain = domain_of(path);
         self.path = Some(path.to_owned());
         self
     }
@@ -69,7 +98,9 @@ impl Volume {
 
     pub fn path(&self) -> Option<&Path> { self.path.as_deref() }
 
-    pub const fn device(&self) -> Option<u64> { self.device }
+    pub fn domain(&self) -> Option<&str> { self.domain.as_deref() }
+
+    pub const fn db(&self) -> Option<&Db> { self.db.as_ref() }
 
     pub fn stores(&self) -> &[Box<dyn Store>] { &self.stores }
 
@@ -79,15 +110,176 @@ impl Volume {
     }
 }
 
-/// The device a path is on.
-pub fn device_of(path: &Path) -> Option<u64> {
-    fs::metadata(path).ok().map(|meta| meta.dev())
+/// The failure domain a path is in: the physical disks under its
+/// filesystem, through partitions, LVM, RAID and encryption, by their
+/// WWIDs or serial numbers, which are the same wherever they're plugged
+/// in; or for a filesystem on no disk, its mount source. Filesystem UUIDs
+/// won't do, since two filesystems on one disk fail together.
+pub fn domain_of(path: &Path) -> Option<String> {
+    let dev = fs::metadata(path).ok()?.dev();
+    let mount = mount_of(dev);
+    // A btrfs subvolume's device number is anonymous; its source isn't
+    let block = sysfs_block(dev).or_else(|| {
+        let (_, source) = mount.as_ref()?;
+        source.starts_with("/dev/").then_some(())?;
+        sysfs_block(fs::metadata(source).ok()?.rdev())
+    });
+    if let Some(block) = block {
+        let mut disks = Vec::new();
+        disks_under(&block, &mut disks);
+        if !disks.is_empty() {
+            disks.sort();
+            disks.dedup();
+            return Some(format!("disk:{}", disks.join("+")));
+        }
+    }
+    Some(match mount {
+        Some((fstype, source)) => format!("{fstype}:{source}"),
+        None => format!("dev:{dev}"),
+    })
+}
+
+/// A device number's major and minor, as Linux encodes them.
+const fn major_minor(dev: u64) -> (u64, u64) {
+    ((dev >> 8 & 0xfff) | (dev >> 32 & !0xfff), (dev & 0xff) | (dev >> 12 & !0xff))
+}
+
+/// The filesystem type and source of the mount with this device number.
+fn mount_of(dev: u64) -> Option<(String, String)> {
+    let (major, minor) = major_minor(dev);
+    let id = format!("{major}:{minor}");
+    let mounts = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    mounts.lines().find_map(|line| {
+        let (fields, rest) = line.split_once(" - ")?;
+        (fields.split(' ').nth(2)? == id).then_some(())?;
+        let mut rest = rest.split(' ');
+        Some((rest.next()?.to_owned(), rest.next()?.to_owned()))
+    })
+}
+
+/// A block device's directory in sysfs.
+fn sysfs_block(dev: u64) -> Option<PathBuf> {
+    let (major, minor) = major_minor(dev);
+    fs::canonicalize(format!("/sys/dev/block/{major}:{minor}")).ok()
+}
+
+/// The identities of the disks a block device is on.
+fn disks_under(block: &Path, disks: &mut Vec<String>) {
+    let slaves: Vec<_> = fs::read_dir(block.join("slaves"))
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| fs::canonicalize(entry.ok()?.path()).ok())
+        .collect();
+    if !slaves.is_empty() {
+        for slave in slaves {
+            disks_under(&slave, disks);
+        }
+        return;
+    }
+    let disk = if block.join("partition").exists() { block.parent().unwrap_or(block) } else { block };
+    let id = ["wwid", "device/wwid", "device/serial"]
+        .iter()
+        .filter_map(|file| fs::read_to_string(disk.join(file)).ok())
+        .map(|id| id.trim().to_owned())
+        .find(|id| !id.is_empty());
+    if let Some(id) = id.or_else(|| Some(disk.file_name()?.to_string_lossy().into_owned())) {
+        disks.push(id);
+    }
 }
 
 fn fresh() -> Result<Label> {
     let mut label = Label::default();
     getrandom::getrandom(&mut label).map_err(io::Error::from)?;
     Ok(label)
+}
+
+/// The CID prefixes (version and codec) each block was put with. Unlike
+/// where blocks are, this isn't derivable from the stores, which needn't
+/// know how their bytes are meant to be read, so it survives a reindex;
+/// and a database volume carries it for its blocks, so whoever catches up
+/// with it can read their links.
+pub const BLOCK_CIDS: &str = "
+    CREATE TABLE IF NOT EXISTS block_cids (
+        block INTEGER NOT NULL REFERENCES multihashes (id),
+        prefix BLOB NOT NULL,
+        PRIMARY KEY (block, prefix)
+    ) WITHOUT ROWID;";
+
+/// Each form a database holds which can be stamped: its table of blocks,
+/// and the column naming them, which is NULL for rows that aren't blocks.
+const FORM_TABLES: [(&str, &str, &str); 4] = [
+    ("unixfs", "unixfs_nodes", "block"),
+    ("claims", "claims", "claim"),
+    ("ipld", "ipld_blocks", "block"),
+    ("raw", "raw_blocks", "block"),
+];
+
+/// Keep a generation for each block in each form, the database's
+/// generation when it last arrived or left: one more than any before.
+/// Whoever's seen every generation up to some number catches up by
+/// reading the blocks stamped since. It's kept by triggers, so whatever
+/// writes to the database stamps what it writes, even by hand.
+///
+/// Unlike a log, it's a row per block, not per change, and nothing's read
+/// but what's changed. A block that leaves keeps its row, as gone, so
+/// that whoever saw it arrive sees it leave.
+fn stamp<'a>(db: &Db, forms: impl Iterator<Item = &'a str>) -> Result<()> {
+    let conn = db.conn();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS generations (
+             form TEXT NOT NULL,
+             block INTEGER NOT NULL REFERENCES multihashes (id),
+             generation INTEGER NOT NULL,
+             present INTEGER NOT NULL,
+             PRIMARY KEY (form, block)
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS generations_generation ON generations (generation);",
+    )?;
+    for form in forms {
+        let Some(&(form, table, column)) = FORM_TABLES.iter().find(|(name, ..)| *name == form) else {
+            continue;
+        };
+        let trigger = format!("generations_{form}");
+        let stamped = conn
+            .prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?1")?
+            .exists([format!("{trigger}_added")])?;
+        if stamped {
+            continue;
+        }
+        let next = "(SELECT coalesce(max(generation), 0) + 1 FROM generations)";
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER {trigger}_added AFTER INSERT ON {table} WHEN NEW.{column} IS NOT NULL BEGIN
+                 INSERT OR REPLACE INTO generations (form, block, generation, present)
+                 VALUES ('{form}', NEW.{column}, {next}, 1);
+             END;
+             CREATE TRIGGER {trigger}_removed AFTER DELETE ON {table} WHEN OLD.{column} IS NOT NULL BEGIN
+                 INSERT OR REPLACE INTO generations (form, block, generation, present)
+                 VALUES ('{form}', OLD.{column}, {next}, 0);
+             END;
+             -- What was there before it was stamped arrives now
+             INSERT OR IGNORE INTO generations (form, block, generation, present)
+                 SELECT '{form}', {column}, {next}, 1 FROM {table} WHERE {column} IS NOT NULL;",
+        ))?;
+    }
+    Ok(())
+}
+
+/// The latest generation of a database volume.
+pub fn generation(db: &Db) -> Result<i64> {
+    Ok(db.conn().query_row("SELECT coalesce(max(generation), 0) FROM generations", [], |row| row.get(0))?)
+}
+
+/// A database file's label, if it's a volume, without changing it.
+fn read_db_label(path: &Path) -> Result<Option<Label>> {
+    let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let labelled = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'volume_label'")?
+        .exists([])?;
+    if !labelled {
+        return Ok(None);
+    }
+    let label: Option<Vec<u8>> = conn.query_row("SELECT label FROM volume_label", [], |row| row.get(0)).optional()?;
+    Ok(label.and_then(|label| Label::try_from(label).ok()))
 }
 
 /// A database's label, made the first time it's asked for.

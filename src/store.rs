@@ -373,6 +373,15 @@ pub struct Replication {
     pub short: Vec<Multihash>,
 }
 
+/// What `copy_to` did.
+#[derive(Debug, Default)]
+pub struct Copied {
+    /// Copies made.
+    pub copied: usize,
+    /// Blocks which couldn't be read to be copied.
+    pub unreadable: Vec<Multihash>,
+}
+
 fn path_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_bytes()
 }
@@ -418,7 +427,7 @@ impl Catalog {
             Box::new(RawStore::open(db.clone())?),
         ];
         let raw = stores.len().saturating_sub(1);
-        let mut volumes = vec![Volume::new("db", volume::db_label(&db)?, stores)];
+        let mut volumes = vec![Volume::sqlite("db", db.clone(), stores)?];
         let mut placement: Vec<_> = (0..raw).map(|store| (0, store)).collect();
         if let Some(shards) = &shards {
             volumes.push(Volume::flatfs("shards", Rc::clone(shards)));
@@ -470,14 +479,16 @@ impl Catalog {
         db.conn().execute_batch(
             "-- Every volume the catalog knows of, attached or not, by the
              -- label it carries: how to open it again, where it was last
-             -- seen, and the device it was on there.
+             -- seen, the failure domain it was in there, and for a
+             -- database, the latest of its generations caught up with.
              CREATE TABLE IF NOT EXISTS volumes (
                  id INTEGER PRIMARY KEY,
                  label BLOB UNIQUE NOT NULL,
                  name TEXT UNIQUE NOT NULL,
                  kind TEXT NOT NULL,
                  path BLOB,
-                 device INTEGER
+                 domain TEXT,
+                 cursor INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS forms (
                  id INTEGER PRIMARY KEY,
@@ -491,15 +502,6 @@ impl Catalog {
                  form INTEGER NOT NULL REFERENCES forms (id),
                  PRIMARY KEY (block, volume)
              ) WITHOUT ROWID;
-             -- The CID prefixes (version and codec) each block was put with.
-             -- Unlike `blocks` this isn't derivable from the stores, which
-             -- needn't know how their bytes are meant to be read, so it
-             -- survives a reindex.
-             CREATE TABLE IF NOT EXISTS block_cids (
-                 block INTEGER NOT NULL REFERENCES multihashes (id),
-                 prefix BLOB NOT NULL,
-                 PRIMARY KEY (block, prefix)
-             ) WITHOUT ROWID;
              -- The links of blocks in stores which don't index their own,
              -- read from their bytes by codec. With the stores' own link
              -- tables, every link in the repo, for backreferences.
@@ -510,22 +512,22 @@ impl Catalog {
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS refs_target ON refs (target);",
         )?;
+        db.conn().execute_batch(volume::BLOCK_CIDS)?;
         Ok(())
     }
 
     /// Record a volume as attached, as of where it's mounted now.
     fn attach(&mut self, volume: Volume) -> Result<usize> {
         let path = volume.path().map(path_bytes);
-        let device = volume.device().and_then(|device| i64::try_from(device).ok());
         let id: Id = self.db.conn()
             .prepare_cached(
-                "INSERT INTO volumes (label, name, kind, path, device) VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO volumes (label, name, kind, path, domain) VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT (label) DO UPDATE SET
                      name = excluded.name, kind = excluded.kind,
-                     path = coalesce(excluded.path, path), device = coalesce(excluded.device, device)
+                     path = coalesce(excluded.path, path), domain = coalesce(excluded.domain, domain)
                  RETURNING id",
             )?
-            .query_row(params![volume.label().as_slice(), volume.name, volume.kind(), path, device], |row| row.get(0))?;
+            .query_row(params![volume.label().as_slice(), volume.name, volume.kind(), path, volume.domain()], |row| row.get(0))?;
         for store in volume.stores() {
             self.db.conn().execute("INSERT OR IGNORE INTO forms (name) VALUES (?1)", [store.name()])?;
         }
@@ -541,21 +543,21 @@ impl Catalog {
         };
         let taken = std::mem::replace(v, Volume::new("", [0; 16], Vec::new()));
         *v = taken.at(path);
-        let device = v.device().and_then(|device| i64::try_from(device).ok());
         self.db.conn()
-            .prepare_cached("UPDATE volumes SET path = ?1, device = ?2 WHERE id = ?3")?
-            .execute(params![path_bytes(path), device, id])?;
+            .prepare_cached("UPDATE volumes SET path = ?1, domain = ?2 WHERE id = ?3")?
+            .execute(params![path_bytes(path), v.domain(), id])?;
         Ok(())
     }
 
-    /// Attach every flatfs volume found where it was last seen, carrying
-    /// its label. Those which aren't stay known, but unattached.
+    /// Attach every volume found where it was last seen, carrying its
+    /// label. Those which aren't stay known, but unattached.
     fn attach_known(&mut self) -> Result<()> {
-        let known: Vec<(Id, Vec<u8>, String, Vec<u8>)> = self.db.conn()
-            .prepare("SELECT id, label, name, path FROM volumes WHERE kind = 'flatfs' AND path IS NOT NULL")?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+        type Known = (Id, Vec<u8>, String, String, Vec<u8>);
+        let known: Vec<Known> = self.db.conn()
+            .prepare("SELECT id, label, name, kind, path FROM volumes WHERE path IS NOT NULL")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        for (id, label, name, path) in known {
+        for (id, label, name, kind, path) in known {
             let Ok(label) = volume::Label::try_from(label) else {
                 continue;
             };
@@ -563,36 +565,67 @@ impl Catalog {
                 continue;
             }
             let path = path_from(&path);
-            if let Some(mut shards) = ShardStore::attach(self.db.clone(), &path, label)? {
-                shards.threshold = None;
-                self.attach(Volume::flatfs(name, Rc::new(shards)))?;
+            let volume = match kind.as_str() {
+                "flatfs" => ShardStore::attach(self.db.clone(), &path, label)?.map(|mut shards| {
+                    shards.threshold = None;
+                    Volume::flatfs(name, Rc::new(shards))
+                }),
+                "db" => Volume::open_sqlite(name, &path, Some(label))?,
+                _ => None,
+            };
+            if let Some(volume) = volume {
+                self.attach(volume)?;
             }
         }
         Ok(())
     }
 
     /// Add a flatfs directory as a volume, to keep copies of any block in.
-    /// Returns the names of attached volumes on the same device, which
-    /// copies there wouldn't make more durable.
+    /// Returns the names of attached volumes in the same failure domain,
+    /// which copies there wouldn't make more durable.
     pub fn add_volume(&mut self, name: &str, dir: &Path) -> Result<Vec<String>> {
         let mut shards = ShardStore::open(self.db.clone(), dir)?;
         shards.threshold = None;
-        if self.volumes.iter().any(|volume| volume.label() == shards.label()) {
-            return Err(Error::Volume(format!("{} is already attached", dir.display())));
+        self.add(name, Volume::flatfs(name, Rc::new(shards)))
+    }
+
+    /// Add a database file as a volume, made one if it isn't yet. It
+    /// holds blocks in the forms the catalog's own database does, but for
+    /// files kept in place, and another node may write to it too.
+    pub fn add_sqlite_volume(&mut self, name: &str, path: &Path) -> Result<Vec<String>> {
+        let volume = Volume::open_sqlite(name, path, None)?.ok_or_else(|| Error::Volume(format!("can't open {}", path.display())))?;
+        self.add(name, volume)
+    }
+
+    fn add(&mut self, name: &str, volume: Volume) -> Result<Vec<String>> {
+        if self.volumes.iter().any(|attached| attached.label() == volume.label()) {
+            let path = volume.path().map(|path| path.display().to_string()).unwrap_or_default();
+            return Err(Error::Volume(format!("{path} is already attached")));
         }
         let taken = self.db.conn()
             .prepare_cached("SELECT 1 FROM volumes WHERE name = ?1 AND label != ?2")?
-            .exists(params![name, shards.label().as_slice()])?;
+            .exists(params![name, volume.label().as_slice()])?;
         if taken {
             return Err(Error::Volume(format!("a volume is already called {name:?}")));
         }
-        let v = self.attach(Volume::flatfs(name, Rc::new(shards)))?;
+        let v = self.attach(volume)?;
         self.catch_up()?;
-        let device = self.volumes.get(v).and_then(Volume::device);
+        let domain = self.volumes.get(v).and_then(Volume::domain);
         Ok(self.volumes.iter().enumerate()
-            .filter(|&(other, volume)| other != v && device.is_some() && volume.device() == device)
+            .filter(|&(other, volume)| other != v && domain.is_some() && volume.domain() == domain)
             .map(|(_, volume)| volume.name.clone())
             .collect())
+    }
+
+    /// Whether a volume is a database other than the catalog's own, which
+    /// others may write to.
+    fn foreign_db(&self, volume: usize) -> Option<&Db> {
+        self.volumes.get(volume)?.db().filter(|db| !Rc::ptr_eq(&db.0, &self.db.0))
+    }
+
+    /// The catalog's own volume, if it's one: its database.
+    fn own(&self) -> Option<usize> {
+        self.volumes.iter().position(|volume| volume.db().is_some_and(|db| Rc::ptr_eq(&db.0, &self.db.0)))
     }
 
     /// Every volume the catalog knows of.
@@ -631,6 +664,12 @@ impl Catalog {
         self.db.atomically(|| {
             let (mut added, mut removed) = (0usize, 0usize);
             for (v, volume) in self.volumes.iter().enumerate() {
+                if let Some(db) = self.foreign_db(v) {
+                    let (more, fewer) = self.catch_up_db(v, db)?;
+                    added = added.saturating_add(more);
+                    removed = removed.saturating_add(fewer);
+                    continue;
+                }
                 for store in volume.stores() {
                     let changes = store.catch_up()?;
                     for key in &changes.added {
@@ -653,35 +692,119 @@ impl Catalog {
         })
     }
 
+    /// Catch up with a database volume, from the generation after the
+    /// last caught up with. Structure is also kept in the catalog's own
+    /// database if it can be, so it's queried there, and so a tomb takes
+    /// effect; it's what the catalog is for.
+    fn catch_up_db(&self, v: usize, db: &Db) -> Result<(usize, usize)> {
+        let Some(&volume) = self.ids.get(v) else {
+            return Ok((0, 0));
+        };
+        let conn = self.db.conn();
+        let cursor: i64 = conn.prepare_cached("SELECT cursor FROM volumes WHERE id = ?1")?.query_row([volume], |row| row.get(0))?;
+        let changes: Vec<(String, Vec<u8>, bool, i64)> = db.conn()
+            .prepare_cached(
+                "SELECT g.form, m.multihash, g.present, g.generation FROM generations g
+                 JOIN multihashes m ON m.id = g.block
+                 WHERE g.generation > ?1 ORDER BY g.generation",
+            )?
+            .query_map([cursor], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let (mut added, mut removed, mut latest) = (0usize, 0usize, cursor);
+        for (form, key, present, generation) in changes {
+            latest = latest.max(generation);
+            let key = decode_key("router", &key)?;
+            let id = self.db.intern(key.as_ref())?;
+            if !present {
+                // Only if it's gone from the form it was known in, since it
+                // may have moved
+                let gone = conn
+                    .prepare_cached("DELETE FROM blocks WHERE block = ?1 AND volume = ?2 AND form = (SELECT id FROM forms WHERE name = ?3)")?
+                    .execute(params![id, volume, form])?;
+                if gone > 0 {
+                    removed = removed.saturating_add(gone);
+                    self.forget_links(id)?;
+                }
+                continue;
+            }
+            if !self.record(id, &(v, form.clone()))? {
+                continue;
+            }
+            added = added.saturating_add(1);
+            let mut stmt = db.conn().prepare_cached(
+                "SELECT c.prefix FROM block_cids c JOIN multihashes m ON m.id = c.block WHERE m.multihash = ?1",
+            )?;
+            let prefixes: Vec<Vec<u8>> = stmt.query_map([key.to_bytes()], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let mut insert = conn.prepare_cached("INSERT OR IGNORE INTO block_cids (block, prefix) VALUES (?1, ?2)")?;
+            for prefix in &prefixes {
+                insert.execute(params![id, prefix])?;
+            }
+            if !self.keep_structure(id, key.as_ref(), &form)? {
+                self.reindex_links(self.named(&(v, form))?, id, key.as_ref())?;
+            }
+        }
+        conn.prepare_cached("UPDATE volumes SET cursor = ?1 WHERE id = ?2")?.execute([latest, volume])?;
+        Ok((added, removed))
+    }
+
+    /// Keep a copy of a block from another volume in the catalog's own,
+    /// if the catalog keeps that form there and it isn't bulk. Returns
+    /// whether it's there now, links indexed.
+    fn keep_structure(&self, id: Id, key: Key<'_>, form: &str) -> Result<bool> {
+        let Some(own) = self.own() else {
+            return Ok(false);
+        };
+        let bulk = self.placement.last().and_then(|&(v, s)| self.volumes.get(v)?.stores().get(s)).map(|store| store.name());
+        if bulk == Some(form) {
+            return Ok(false);
+        }
+        let Some(store) = self.volumes.get(own).and_then(|volume| volume.form(form)) else {
+            return Ok(false);
+        };
+        let Some(block) = self.readable(key)? else {
+            return Ok(false);
+        };
+        if store.put(&block)? != Put::Stored {
+            return Ok(false);
+        }
+        self.record(id, &(own, form.to_owned()))?;
+        Ok(true)
+    }
+
     /// Forget a block's placement in a volume, returning how many there
     /// were. Its links are forgotten with its last placement.
     fn unrecord(&self, id: Id, volume: usize) -> Result<usize> {
         let Some(&volume) = self.ids.get(volume) else {
             return Ok(0);
         };
+        let removed = self.db.conn().prepare_cached("DELETE FROM blocks WHERE block = ?1 AND volume = ?2")?.execute([id, volume])?;
+        self.forget_links(id)?;
+        Ok(removed)
+    }
+
+    /// Forget the links read from a block, if it's nowhere any more.
+    fn forget_links(&self, id: Id) -> Result<()> {
         let conn = self.db.conn();
-        let removed = conn.prepare_cached("DELETE FROM blocks WHERE block = ?1 AND volume = ?2")?.execute([id, volume])?;
         if !conn.prepare_cached("SELECT 1 FROM blocks WHERE block = ?1")?.exists([id])? {
             conn.prepare_cached("DELETE FROM refs WHERE source = ?1")?.execute([id])?;
         }
-        Ok(removed)
+        Ok(())
     }
 
     /// The failure domains a block's copies are in: their volumes'
     /// devices, or the volumes themselves where the device isn't known.
-    fn domains(&self, id: Id) -> Result<Vec<i64>> {
+    fn domains(&self, id: Id) -> Result<Vec<String>> {
         Ok(self.db.conn()
             .prepare_cached(
-                "SELECT DISTINCT coalesce(v.device, -v.id) FROM blocks b JOIN volumes v ON v.id = b.volume WHERE b.block = ?1",
+                "SELECT DISTINCT coalesce(v.domain, 'volume:' || v.id) FROM blocks b JOIN volumes v ON v.id = b.volume WHERE b.block = ?1",
             )?
             .query_map([id], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    fn domain(&self, volume: usize) -> Option<i64> {
+    fn domain(&self, volume: usize) -> Option<String> {
         let id = *self.ids.get(volume)?;
-        let device = self.volumes.get(volume)?.device();
-        Some(device.and_then(|device| i64::try_from(device).ok()).unwrap_or_else(|| id.saturating_neg()))
+        Some(self.volumes.get(volume)?.domain().map_or_else(|| format!("volume:{id}"), str::to_owned))
     }
 
     /// Copy every block until it's in at least `copies` failure domains,
@@ -702,20 +825,16 @@ impl Catalog {
                 continue;
             };
             let held: Vec<usize> = self.placements(key.as_ref())?.into_iter().map(|(v, _)| v).collect();
-            for (v, volume) in self.volumes.iter().enumerate() {
+            for v in 0..self.volumes.len() {
                 let Some(domain) = self.domain(v) else {
                     continue;
                 };
                 if domains.len() >= copies || held.contains(&v) || domains.contains(&domain) {
                     continue;
                 }
-                for store in volume.stores() {
-                    if store.put(&block)? == Put::Stored {
-                        self.record(id, &(v, store.name().to_owned()))?;
-                        domains.push(domain);
-                        report.copied = report.copied.saturating_add(1);
-                        break;
-                    }
+                if self.copy_into(v, id, &block)? {
+                    domains.push(domain);
+                    report.copied = report.copied.saturating_add(1);
                 }
             }
             if domains.len() < copies {
@@ -723,6 +842,62 @@ impl Catalog {
             }
         }
         Ok(report)
+    }
+
+    /// Copy blocks to a volume, wherever it is: those under the roots, or
+    /// every block if there are none. Returns how many were copied, and
+    /// the blocks which couldn't be read to be.
+    pub fn copy_to(&self, name: &str, roots: &[Link]) -> Result<Copied> {
+        let v = self.volumes.iter().position(|volume| volume.name == name)
+            .ok_or_else(|| Error::Volume(format!("no volume called {name:?} is attached")))?;
+        let mut report = Copied::default();
+        let mut copy = |key: Multihash| -> Result<Option<Block>> {
+            let Some(id) = self.db.lookup(key.as_ref())? else {
+                report.unreadable.push(key);
+                return Ok(None);
+            };
+            let Some(block) = self.readable(key.as_ref())? else {
+                report.unreadable.push(key);
+                return Ok(None);
+            };
+            if !self.placements(key.as_ref())?.iter().any(|&(held, _)| held == v) && self.copy_into(v, id, &block)? {
+                report.copied = report.copied.saturating_add(1);
+            }
+            Ok(Some(block))
+        };
+        if roots.is_empty() {
+            for key in self.keys()? {
+                copy(key)?;
+            }
+            return Ok(report);
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<Link> = roots.to_vec();
+        while let Some(cid) = stack.pop() {
+            if cid.hashcode() == IDENTITY || !seen.insert(cid.multihash().to_bytes()) {
+                continue;
+            }
+            let key = cid.multihash();
+            if let Some(block) = copy(Multihash::try_wrap(key.code(), key.digest_ref()).map_err(|_| Error::Oversized(key.len()))?)? {
+                stack.extend(crate::links::links(cid.codec(), block.data()).unwrap_or_default());
+            }
+        }
+        Ok(report)
+    }
+
+    /// Put a block in the first of a volume's stores which takes it.
+    /// Returns whether one did.
+    fn copy_into(&self, v: usize, id: Id, block: &Block) -> Result<bool> {
+        let Some(volume) = self.volumes.get(v) else {
+            return Ok(false);
+        };
+        for store in volume.stores() {
+            if store.put(block)? == Put::Stored {
+                self.record(id, &(v, store.name().to_owned()))?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// A block as it can be read now, under the first CID it was put with,
@@ -739,20 +914,21 @@ impl Catalog {
     }
 
     /// Run `f` in one transaction, for speed and so that a failed import
-    /// leaves nothing behind.
+    /// leaves nothing behind. Other databases written to get one each,
+    /// committed first: if the catalog's then fails, what they gained is
+    /// caught up with.
     pub fn batch<T, E: From<Error>>(&mut self, f: impl FnOnce(&mut Self) -> std::result::Result<T, E>) -> std::result::Result<T, E> {
-        let db = self.db.clone();
-        db.conn().execute_batch("BEGIN").map_err(Error::from)?;
-        match f(self) {
-            Ok(value) => {
-                db.conn().execute_batch("COMMIT").map_err(Error::from)?;
-                Ok(value)
-            },
-            Err(e) => {
-                db.conn().execute_batch("ROLLBACK").map_err(Error::from)?;
-                Err(e)
-            },
+        let mut dbs: Vec<Db> = (0..self.volumes.len()).filter_map(|v| self.foreign_db(v).cloned()).collect();
+        dbs.push(self.db.clone());
+        for db in &dbs {
+            db.conn().execute_batch("BEGIN").map_err(Error::from)?;
         }
+        let result = f(self);
+        let end = if result.is_ok() { "COMMIT" } else { "ROLLBACK" };
+        for db in &dbs {
+            db.conn().execute_batch(end).map_err(Error::from)?;
+        }
+        result
     }
 
     /// The claim store, if there is one.
@@ -842,6 +1018,9 @@ impl Catalog {
         let prefix = cid_prefix(block.cid(), version);
         self.db.atomically(|| {
             let id = self.db.intern(key)?;
+            let new_cid = self.db.conn()
+                .prepare_cached("INSERT OR IGNORE INTO block_cids (block, prefix) VALUES (?1, ?2)")?
+                .execute(params![id, prefix])? > 0;
             let placed = if let Some(placed) = self.placements(key)?.into_iter().next() {
                 if provenance != Provenance::Unknown {
                     self.named(&placed)?.put_from(block, provenance)?;
@@ -853,9 +1032,6 @@ impl Catalog {
                 self.record(id, &placed)?;
                 placed
             };
-            let new_cid = self.db.conn()
-                .prepare_cached("INSERT OR IGNORE INTO block_cids (block, prefix) VALUES (?1, ?2)")?
-                .execute(params![id, prefix])? > 0;
             // Read under each codec it's put with, since that's what says
             // where its links are
             if new_cid && self.named(&placed)?.refs().is_none() {
@@ -902,11 +1078,31 @@ impl Catalog {
     /// Index a block as being in a volume, returning whether it's new
     /// there.
     fn record(&self, id: Id, (volume, form): &Placement) -> Result<bool> {
-        let volume = self.ids.get(*volume).ok_or_else(|| Error::UnknownStore(form.clone()))?;
+        let v = *volume;
+        let volume = self.ids.get(v).ok_or_else(|| Error::UnknownStore(form.clone()))?;
         let added = self.db.conn()
             .prepare_cached("INSERT OR IGNORE INTO blocks (block, volume, form) SELECT ?1, ?2, id FROM forms WHERE name = ?3")?
             .execute(params![id, volume, form])?;
+        if added > 0 && let Some(db) = self.foreign_db(v) {
+            self.share_cids(id, db)?;
+        }
         Ok(added > 0)
+    }
+
+    /// Tell a database volume the CIDs a block was put with, so whoever
+    /// catches up with it can read its links.
+    fn share_cids(&self, id: Id, db: &Db) -> Result<()> {
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = self.db.conn()
+            .prepare_cached("SELECT m.multihash, c.prefix FROM block_cids c JOIN multihashes m ON m.id = c.block WHERE c.block = ?1")?
+            .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (key, prefix) in rows {
+            let theirs = db.intern(decode_key("router", &key)?.as_ref())?;
+            db.conn()
+                .prepare_cached("INSERT OR IGNORE INTO block_cids (block, prefix) VALUES (?1, ?2)")?
+                .execute(params![theirs, prefix])?;
+        }
+        Ok(())
     }
 
     /// Offer a block to each store in turn.
@@ -951,6 +1147,12 @@ impl Catalog {
             conn.execute_batch("DELETE FROM refs WHERE source NOT IN (SELECT block FROM blocks);")?;
             let mut count = 0usize;
             for (v, volume) in self.volumes.iter().enumerate() {
+                // The catalog keeps the links of what's in other databases
+                // too, so they're known while those are detached
+                let foreign = self.foreign_db(v);
+                if let (Some(db), Some(id)) = (foreign, self.ids.get(v)) {
+                    conn.prepare_cached("UPDATE volumes SET cursor = ?1 WHERE id = ?2")?.execute([volume::generation(db)?, *id])?;
+                }
                 for store in volume.stores() {
                     for key in store.keys()? {
                         let id = self.db.intern(key.as_ref())?;
@@ -958,7 +1160,7 @@ impl Catalog {
                             continue;
                         }
                         count = count.saturating_add(1);
-                        if store.refs().is_none() {
+                        if store.refs().is_none() || foreign.is_some() {
                             self.reindex_links(store.as_ref(), id, key.as_ref())?;
                         }
                     }
