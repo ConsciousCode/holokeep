@@ -792,7 +792,7 @@ impl Catalog {
     }
 
     /// The failure domains a block's copies are in: their volumes'
-    /// devices, or the volumes themselves where the device isn't known.
+    /// disks, or the volumes themselves where those aren't known.
     fn domains(&self, id: Id) -> Result<Vec<String>> {
         Ok(self.db.conn()
             .prepare_cached(
