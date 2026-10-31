@@ -1366,6 +1366,27 @@ impl Catalog {
         Ok(claim.cid())
     }
 
+    /// Keep a block, and what it links to, with a claim of its own so it
+    /// can be let go of alone. Returns the claim's CID.
+    pub fn keep(&self, target: &Link) -> Result<Link> {
+        let claim = Claim::Keep(crate::claim::Keep::new([target.clone()]).ok_or(Error::NoClaims)?);
+        self.put_block(&claim.block(), CidVersion::V1)?;
+        Ok(claim.cid())
+    }
+
+    /// Stop keeping a block, tombing every keep of it. Returns the tombs'
+    /// CIDs.
+    pub fn unkeep(&self, target: &Link) -> Result<Vec<Link>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let mut tombs = Vec::new();
+        for keep in claims.keeping(target.multihash())? {
+            let tomb = Claim::Tomb(Tomb::new([keep]).ok_or(Error::NoClaims)?);
+            self.put_block(&tomb.block(), CidVersion::V1)?;
+            tombs.push(tomb.cid());
+        }
+        Ok(tombs)
+    }
+
     /// Untag a block, tombing every claim tagging it with the tag. A claim
     /// is retracted whole, so whatever else one tagged is tagged again on
     /// its own. Returns the tombs' CIDs.

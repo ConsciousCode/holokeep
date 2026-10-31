@@ -51,6 +51,10 @@ enum Command {
         /// readable while the files are unchanged.
         #[arg(long, conflicts_with = "only_hash")]
         nocopy: bool,
+        /// Don't keep what's added: without a keep, what nothing kept links
+        /// to may in time be collected
+        #[arg(long)]
+        no_keep: bool,
     },
     /// Write a file's contents to stdout, like `ipfs cat`
     Cat {
@@ -74,6 +78,10 @@ enum Command {
     /// Tag blocks, and find them by their tags
     #[command(subcommand)]
     Tag(TagCommand),
+    /// Keep blocks and what they link to, which `hk add` does for what it
+    /// adds, or stop
+    #[command(subcommand)]
+    Keep(KeepCommand),
     /// Work with raw blocks
     #[command(subcommand)]
     Block(BlockCommand),
@@ -195,6 +203,22 @@ enum BlockCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum KeepCommand {
+    /// Keep blocks, printing the claim keeping each
+    Add {
+        #[arg(required = true)]
+        cids: Vec<Link>,
+    },
+    /// Stop keeping blocks, printing the tombs which retract their keeps
+    Rm {
+        #[arg(required = true)]
+        cids: Vec<Link>,
+    },
+    /// List what's kept
+    Ls,
+}
+
+#[derive(Subcommand, Debug)]
 enum TagCommand {
     /// Tag blocks with a name, printing the claim tagging each
     Add {
@@ -287,7 +311,7 @@ fn open_repo(repo: Option<PathBuf>) -> anyhow::Result<Catalog> {
 
 fn run(args: Args) -> anyhow::Result<()> {
     match args.command {
-        Command::Add { path, only_hash, hidden, quiet, chunker, max_file_links, nocopy } => {
+        Command::Add { path, only_hash, hidden, quiet, chunker, max_file_links, nocopy, no_keep } => {
             let Some(ChunkerType::Size(chunk_size)) = ChunkerType::parse(&chunker) else {
                 anyhow::bail!("unsupported chunker {chunker:?}, expected size-[bytes]");
             };
@@ -301,14 +325,19 @@ fn run(args: Args) -> anyhow::Result<()> {
                 ..Importer::default()
             };
             if only_hash {
-                add(&importer, &path, quiet, &mut NullSink)
+                return add(&importer, &path, quiet, &mut NullSink).map(drop);
             }
-            else if nocopy {
-                open_repo(args.repo)?.batch(|repo| add(&importer, &path, quiet, &mut InPlace::new(repo)))
-            }
-            else {
-                open_repo(args.repo)?.batch(|repo| add(&importer, &path, quiet, &mut Copying::new(repo)))
-            }
+            open_repo(args.repo)?.batch(|repo| {
+                let root = if nocopy {
+                    add(&importer, &path, quiet, &mut InPlace::new(repo))?
+                } else {
+                    add(&importer, &path, quiet, &mut Copying::new(repo))?
+                };
+                if !no_keep {
+                    repo.keep(&root)?;
+                }
+                anyhow::Ok(())
+            })
         },
         Command::Cat { cid } => {
             fetch_first(&args.repo, &cid)?;
@@ -326,6 +355,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Refs { cid, back } => refs(&open_repo(args.repo)?, &cid, back),
         Command::Dag(command) => dag(args.repo, command),
         Command::Tag(command) => tag(open_repo(args.repo)?, command),
+        Command::Keep(command) => keep(open_repo(args.repo)?, command),
         Command::Block(BlockCommand::Get { cid }) => {
             let repo = open_repo(args.repo)?;
             let block = repo.get_block(&cid)?.with_context(|| format!("block {cid} not found"))?;
@@ -466,11 +496,12 @@ fn volume(mut repo: Catalog, command: VolumeCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn add(importer: &Importer, path: &Path, quiet: bool, sink: &mut impl BlockSink) -> anyhow::Result<()> {
+/// Add a file or directory, returning its root.
+fn add(importer: &Importer, path: &Path, quiet: bool, sink: &mut impl BlockSink) -> anyhow::Result<Link> {
     if path == Path::new("-") {
         let root = importer.add_file(std::io::stdin().lock(), sink)?;
         println!("{}", root.cid);
-        return Ok(());
+        return Ok(root.cid.into());
     }
 
     // Report paths relative to the parent, like Kubo
@@ -487,7 +518,7 @@ fn add(importer: &Importer, path: &Path, quiet: bool, sink: &mut impl BlockSink)
     if quiet {
         println!("{}", root.cid);
     }
-    Ok(())
+    Ok(root.cid.into())
 }
 
 /// A block's links, or the blocks linking to it.
@@ -570,6 +601,32 @@ fn tag_cid(name: &str) -> anyhow::Result<Link> {
 }
 
 /// Tag blocks or find them by tag.
+fn keep(mut repo: Catalog, command: KeepCommand) -> anyhow::Result<()> {
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    match command {
+        KeepCommand::Add { cids } => repo.batch(|repo| {
+            for cid in cids {
+                writeln!(out, "{}", repo.keep(&cid)?)?;
+            }
+            anyhow::Ok(())
+        })?,
+        KeepCommand::Rm { cids } => repo.batch(|repo| {
+            for cid in cids {
+                for tomb in repo.unkeep(&cid)? {
+                    writeln!(out, "{tomb}")?;
+                }
+            }
+            anyhow::Ok(())
+        })?,
+        KeepCommand::Ls => {
+            for cid in repo.claims().context("this repo keeps no claims")?.keeps()? {
+                writeln!(out, "{cid}")?;
+            }
+        },
+    }
+    Ok(out.flush()?)
+}
+
 fn tag(mut repo: Catalog, command: TagCommand) -> anyhow::Result<()> {
     let mut out = io::BufWriter::new(io::stdout().lock());
     match command {

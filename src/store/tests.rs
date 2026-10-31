@@ -650,6 +650,56 @@ fn untagging_retags_the_rest() {
 }
 
 #[test]
+fn keeps_are_claims_and_can_be_let_go_of() {
+    let router = router();
+    let (a, b) = (raw(b"kept"), raw(b"also kept"));
+    let claims = router.claims().expect("claims");
+    let keep = router.keep(&link(&a)).expect("keep");
+    // One target: dissolved, its own CID
+    assert_eq!(keep.hashcode(), crate::block::IDENTITY);
+    assert!(router.holds(&keep).expect("holds"));
+    router.keep(&link(&b)).expect("keep");
+    assert!(claims.kept(a.cid().multihash()).expect("kept"));
+    assert_eq!(claims.keeps().expect("keeps"), by_multihash(vec![link(&a), link(&b)]));
+    // Keeps are backrefs, so holders of what's kept hear of them
+    assert!(router.backrefs(a.cid().multihash()).expect("backrefs").iter().any(|source| source.code() == crate::block::IDENTITY));
+
+    let tombs = router.unkeep(&link(&a)).expect("unkeep");
+    assert_eq!(tombs.len(), 1);
+    assert!(!claims.kept(a.cid().multihash()).expect("kept"));
+    assert!(!router.holds(&keep).expect("holds"), "retracted at once, being dissolved");
+    assert_eq!(claims.keeps().expect("keeps"), [link(&b)]);
+    assert!(router.unkeep(&link(&a)).expect("unkeep").is_empty());
+    // And it isn't brought back
+    router.put_block(&crate::claim::dissolved(&keep).expect("claim").block(), CidVersion::V1).expect("put");
+    assert!(!claims.kept(a.cid().multihash()).expect("kept"));
+}
+
+#[test]
+fn claims_tables_from_before_keeps_take_them() {
+    let db = Db::memory().expect("db");
+    db.conn()
+        .execute_batch(
+            "CREATE TABLE claims (
+                 id INTEGER PRIMARY KEY,
+                 claim INTEGER UNIQUE REFERENCES multihashes (id),
+                 kind TEXT NOT NULL CHECK (kind IN ('group', 'tomb'))
+             );
+             INSERT INTO claims (kind) VALUES ('group');",
+        )
+        .expect("old schema");
+    assert!(db.conn().execute("INSERT INTO claims (kind) VALUES ('keep')", []).is_err());
+    let router = Catalog::standard(db.clone()).expect("open");
+    router.keep(&link(&raw(b"kept"))).expect("keep");
+    let kinds: Vec<String> = db.conn().prepare("SELECT kind FROM claims ORDER BY id").expect("prepare")
+        .query_map([], |row| row.get(0)).expect("query").collect::<rusqlite::Result<_>>().expect("rows");
+    assert_eq!(kinds, ["group", "keep"]);
+    assert!(db.conn().execute("INSERT INTO claims (kind) VALUES ('neither')", []).is_err(), "still checked");
+    let check: String = db.conn().query_row("PRAGMA integrity_check", [], |row| row.get(0)).expect("check");
+    assert_eq!(check, "ok");
+}
+
+#[test]
 fn tags_keep_target_cids() {
     let router = router();
     let dir = unixfs::node_block(&[], &unixfs::Data::directory());

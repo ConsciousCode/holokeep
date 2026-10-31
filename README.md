@@ -160,7 +160,7 @@ Implemented so far (`src/store/`), in the repo's SQLite file and its shards dire
 - **`ShardStore`** is a volume of its own, in the `flatfs` form. It keeps blobs too large to be worth keeping in SQLite, over 64 KiB at its default 4 KiB pages ([Internal Versus External BLOBs](https://sqlite.org/intern-v-extern-blob.html)), as files in a sharded directory laid out as Kubo's flatfs: named by multihash in base32upper with no multibase prefix, sharded `next-to-last/2`, so a blob's name checks its bytes without the database. It serves two cases: any large block, such as those pieced together from the network, and whole files, which plain `hk add` (`Copying`) writes into a temporary file as their leaves go by, so their leaves become ranges of it and stay contiguous on disk. A file is kept whole once it has more than one leaf and more than 64 KiB; until then its leaves are held back, and a smaller file is copied block by block. `shard_files` caches what's in the directory, just blob and size, so reads needn't touch the filesystem to find a blob; reindexing rebuilds it from the directory. Kept files aren't blocks: `shard_roots` records which UnixFS roots each was imported as, and a kept file none of whose leaves landed in it is let go.
 - **`UnixfsStore`** keeps UnixFS nodes as a node row and link rows, admitting only nodes it can manifest exactly: every link named and sized, no mode or mtime, Kubo's field order. A link row is the target's id plus the CID prefix it was written with, and link rows double as a `RefIndex` by multihash. A HAMT shard's link names are split into the bucket and the entry's name, so entries are named the same whether their directory is sharded or not, and the `unixfs_entries` view lists every directory's entries alike, descending through sub-shards: `SELECT directory FROM unixfs_entries WHERE name = CAST('notes.txt' AS BLOB)` finds a file in any directory. Every node `hk add` makes lands here; of the 17 dag-pb blocks in codec-fixtures, the 2 in Kubo's form do.
 - **`IpldStore`** keeps dag-cbor and dag-json blocks as SQLite JSONB in dag-json form (links `{"/": "<CID>"}`, bytes `{"/": {"bytes": …}}`), so their contents can be queried in place, eg `WHERE data ->> '$.name' = …`. A block is admitted only if what SQLite hands back manifests it exactly, which excludes non-canonical encodings and the data dag-json can't express (a map whose only key is `/` with a string value). Links are also kept as rows by interned multihash, as a `RefIndex`. All 256 dag-cbor and dag-json blocks in codec-fixtures land here, and fuzzing checks that everything dag-json can express round-trips.
-- **`ClaimStore`** keeps claims as rows: a tag is a row, not a blob. It admits `Group` and `Tomb` claims, exactly canonical (`claim::Claim::parse`): the `claim` discriminant, a non-empty `target` set sorted by CID bytes, `into` for a group, nothing else. Every claim is a row in `claims`, with its type in `kind`, and its targets are rows in one `claim_targets` table shared by every type, so "which claims are about this block" is one lookup whatever the type; a type keeps only what's particular to it in a table of its own (`group_claims` for `into`; a tomb has nothing but targets). A dissolved claim is rows with no multihash, found by what it says; a precipitated one is rows under its multihash. Claims with the same `into` combine their targets, so tagging is a union over rows, and the `tags (target, tag, name)` view names simple tags, which are raw identity CIDs of their names: the same CID `ipfs add --inline --raw-leaves` makes of a name. A tomb deletes the dissolved claims it targets at once and keeps them from being put again; a precipitated claim it targets stays a block until it's collected, but stops counting as a tag. Its rows are a `RefIndex`, so a claim is a backref of what it tags and of the tag, and a tomb of what it buries.
+- **`ClaimStore`** keeps claims as rows: a tag is a row, not a blob. It admits `Group`, `Keep` and `Tomb` claims, exactly canonical (`claim::Claim::parse`): the `claim` discriminant, a non-empty `target` set sorted by CID bytes, `into` for a group, nothing else. Every claim is a row in `claims`, with its type in `kind`, and its targets are rows in one `claim_targets` table shared by every type, so "which claims are about this block" is one lookup whatever the type; a type keeps only what's particular to it in a table of its own (`group_claims` for `into`; a tomb has nothing but targets). A dissolved claim is rows with no multihash, found by what it says; a precipitated one is rows under its multihash. Claims with the same `into` combine their targets, so tagging is a union over rows, and the `tags (target, tag, name)` view names simple tags, which are raw identity CIDs of their names: the same CID `ipfs add --inline --raw-leaves` makes of a name. A tomb deletes the dissolved claims it targets at once and keeps them from being put again; a precipitated claim it targets stays a block until it's collected, but stops counting as a tag. Its rows are a `RefIndex`, so a claim is a backref of what it tags and of the tag, and a tomb of what it buries.
 - **`RawStore`** takes anything else as bytes.
 - **Backreferences** span every store without storing a link twice. A store which keeps its own link rows says so (`Store::refs`); for blocks in any other store, the router reads their links by codec as they're put and keeps them in `refs`, under every codec a block is put with, since that's what says where its links are. The `Catalog`'s `RefIndex` is the union, and the `links (source, target)` view is the same in SQL. Reindexing rebuilds `refs`, reading only blocks with a codec that can link, so offset blocks whose files are gone aren't needed. `hk refs <cid>` lists a block's links as `ipfs refs` does, and `hk refs --back <cid>` every block linking to it, under each CID it was put with.
 
@@ -332,6 +332,7 @@ Checklist:
 - [x] Tagging
   - [x] Tags as `Group` claims, kept as rows (`hk tag add/ls/find`)
   - [x] Untagging, by tombstoning the claims (`hk tag rm`)
+  - [x] Keeps, `Keep` claims which say to keep their targets and what they link to: `hk add` keeps what it adds unless `--no-keep` (`hk keep add/rm/ls`)
   - [x] Dissolved claims, named by identity CIDs
 - [ ] Purging blocks immediately, across stores and permission tiers
 - [ ] Querying
@@ -346,7 +347,7 @@ Checklist:
   - [x] Auditing as a trickle: what's arrived and a random sample each tick, paced by what it finds; full audits only when asked (`hk node status`)
   - [x] Trimming surplus copies between free-space watermarks, confirmed with members first, lowest-ranked first (`hk node run --low-water/--high-water`, `hk node trim`)
   - [x] Advertising what's let go of, so sightings of members connected since needn't expire
-  - [ ] Keep claims on what's added, and collecting garbage: what nothing kept links to, judged by backrefs (best effort, so with care for slippage)
+  - [ ] Collecting garbage: what nothing kept links to. Liveness could be judged by backrefs, since nodes make a best effort to hear of every one to what they hold, but best effort can slip, so a node shouldn't take not having heard of a keep as there being none
   - [ ] Trimming leaves kept as ranges of whole files, a file at a time
   - [ ] Kademlia provider records, once broadcast wants don't scale
 - [ ] Public Amino DHT
@@ -388,7 +389,7 @@ Checklist:
 ```sh
 cargo build --release
 hk=target/release/hk
-$hk add <path>                      # store it, printing CIDs like `ipfs add -r`
+$hk add <path> [--no-keep]          # store it, printing CIDs like `ipfs add -r`, and keep it
 $hk add -n <path>                   # only print CIDs, like `ipfs add --only-hash`
 $hk add --nocopy <path>             # keep contents in place, like Kubo's filestore
 $hk cat <cid>                       # a file's contents
@@ -398,6 +399,8 @@ $hk refs [--back] <cid>             # a block's links, or what links to it
 $hk tag add <name> <cid>...         # tag blocks, with a Group claim
 $hk tag ls <cid>                    # a block's tags
 $hk tag find <name>                 # the blocks with a tag
+$hk keep add|rm <cid>...            # keep blocks and what they link to, or stop
+$hk keep ls                         # what's kept
 $hk tag rm <name> <cid>...          # untag blocks, with tombs
 $hk dag export <cid> -o <file.car>  # a DAG as a CARv1, like `ipfs dag export`
 $hk dag import <file.car>...        # CARv1 or v2 files, like `ipfs dag import`

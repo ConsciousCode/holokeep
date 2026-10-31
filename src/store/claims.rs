@@ -1,6 +1,6 @@
 //! A store specialized for claims, keeping each as rows rather than bytes:
-//! a tag is a row, not a blob. So far `Group` claims, which are tags, and
-//! `Tomb`s, which retract them.
+//! a tag is a row, not a blob. So far `Group` claims, which are tags,
+//! `Keep`s, and `Tomb`s, which retract them.
 //!
 //! A claim is admitted only if it's exactly a claim in canonical form (see
 //! `claim::Claim::parse`); anything else that's dag-cbor belongs to the
@@ -20,7 +20,7 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::block::{Block, IDENTITY};
 use crate::cid::{BaseCid, Cid, CidRef, Cidv1, DAG_CBOR_CODEC};
-use crate::claim::{self, Claim, Group, Tomb};
+use crate::claim::{self, Claim, Group, Keep, Tomb};
 use crate::model::Link;
 use crate::multihash::Multihash;
 
@@ -74,7 +74,7 @@ impl ClaimStore {
              CREATE TABLE IF NOT EXISTS claims (
                  id INTEGER PRIMARY KEY,
                  claim INTEGER UNIQUE REFERENCES multihashes (id),
-                 kind TEXT NOT NULL CHECK (kind IN ('group', 'tomb'))
+                 kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'tomb'))
              );
              -- Every claim's targets, which every type has.
              CREATE TABLE IF NOT EXISTS claim_targets (
@@ -105,6 +105,7 @@ impl ClaimStore {
                  JOIN multihashes i ON i.id = g.into_
                  WHERE {LIVE};"
         ))?;
+        widen_kinds(&db)?;
         Ok(Self { db })
     }
 
@@ -127,6 +128,9 @@ impl ClaimStore {
     fn claim(&self, id: Id, kind: &str) -> Result<Claim> {
         match kind {
             "group" => self.group(id).map(Claim::Group),
+            "keep" => Keep::new(self.targets(id)?)
+                .map(Claim::Keep)
+                .ok_or_else(|| Error::Invalid { store: NAME, reason: "a keep with no targets".into() }),
             "tomb" => self.tomb(id).map(Claim::Tomb),
             _ => Err(Error::Invalid { store: NAME, reason: format!("a claim of kind {kind}") }),
         }
@@ -172,13 +176,16 @@ impl ClaimStore {
                     .query_row(params![into, into_prefix, target, prefix], |r| r.get(0))
                     .optional()?
             },
-            Claim::Tomb(_) => self.db.conn()
-                .prepare_cached(
-                    "SELECT c.id FROM claims c JOIN claim_targets t ON t.claim = c.id
-                     WHERE c.claim IS NULL AND c.kind = 'tomb' AND t.target = ?1 AND t.prefix = ?2",
-                )?
-                .query_row(params![target, prefix], |r| r.get(0))
-                .optional()?,
+            Claim::Keep(_) | Claim::Tomb(_) => {
+                let kind = if matches!(claim, Claim::Keep(_)) { "keep" } else { "tomb" };
+                self.db.conn()
+                    .prepare_cached(
+                        "SELECT c.id FROM claims c JOIN claim_targets t ON t.claim = c.id
+                         WHERE c.claim IS NULL AND c.kind = ?3 AND t.target = ?1 AND t.prefix = ?2",
+                    )?
+                    .query_row(params![target, prefix, kind], |r| r.get(0))
+                    .optional()?
+            },
         })
     }
 
@@ -221,6 +228,7 @@ impl ClaimStore {
         let conn = self.db.conn();
         let kind = match claim {
             Claim::Group(_) => "group",
+            Claim::Keep(_) => "keep",
             Claim::Tomb(_) => "tomb",
         };
         conn.prepare_cached("INSERT INTO claims (claim, kind) VALUES (?1, ?2)")?.execute(params![id, kind])?;
@@ -241,13 +249,56 @@ impl ClaimStore {
     /// Retract the dissolved claims a tomb targets.
     fn bury(&self, tomb: &Tomb) -> Result<()> {
         for target in tomb.target() {
-            if let Some(Claim::Group(group)) = claim::dissolved(target)
-                && let Some(id) = self.find_dissolved(&Claim::Group(group))?
+            if let Some(claim @ (Claim::Group(_) | Claim::Keep(_))) = claim::dissolved(target)
+                && let Some(id) = self.find_dissolved(&claim)?
             {
                 self.db.conn().prepare_cached("DELETE FROM claims WHERE id = ?1")?.execute([id])?;
             }
         }
         Ok(())
+    }
+
+    /// Whether a keep that counts targets a block, under any CID.
+    pub fn kept(&self, target: Key<'_>) -> Result<bool> {
+        Ok(self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT 1 FROM multihashes m JOIN claim_targets t ON t.target = m.id JOIN claims c ON c.id = t.claim
+                 WHERE m.multihash = ?1 AND c.kind = 'keep' AND {LIVE}"
+            ))?
+            .exists([target.to_bytes()])?)
+    }
+
+    /// Every block a keep that counts targets, under the CIDs it was kept
+    /// by.
+    pub fn keeps(&self) -> Result<Vec<Link>> {
+        let mut stmt = self.db.conn().prepare_cached(&format!(
+            "SELECT DISTINCT t.prefix, m.multihash FROM claims c
+             JOIN claim_targets t ON t.claim = c.id
+             JOIN multihashes m ON m.id = t.target
+             WHERE c.kind = 'keep' AND {LIVE}
+             ORDER BY m.multihash, t.prefix"
+        ))?;
+        links(stmt.query_map([], pair)?)
+    }
+
+    /// The keeps that count of a block, as CIDs.
+    pub fn keeping(&self, target: Key<'_>) -> Result<Vec<Link>> {
+        let rows: Vec<(Id, Option<Vec<u8>>)> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT DISTINCT c.id, k.multihash FROM multihashes m
+                 JOIN claim_targets t ON t.target = m.id
+                 JOIN claims c ON c.id = t.claim
+                 LEFT JOIN multihashes k ON k.id = c.claim
+                 WHERE m.multihash = ?1 AND c.kind = 'keep' AND {LIVE}"
+            ))?
+            .query_map([target.to_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter()
+            .map(|(id, multihash)| match multihash {
+                Some(multihash) => Ok(crate::cid::AnyCid::V1(Cidv1::new(DAG_CBOR_CODEC, super::decode_key(NAME, &multihash)?))),
+                None => Ok(self.claim(id, "keep")?.cid()),
+            })
+            .collect()
     }
 
     /// Every tag on a block that counts, under any CID.
@@ -302,6 +353,29 @@ impl ClaimStore {
         })
         .collect()
     }
+}
+
+/// Let a claims table made before keeps hold them: its CHECK constraint,
+/// which doesn't touch how rows are stored, is rewritten in place, as
+/// `SQLite` documents for such changes.
+fn widen_kinds(db: &Db) -> Result<()> {
+    const OLD: &str = "CHECK (kind IN ('group', 'tomb'))";
+    let conn = db.conn();
+    let sql: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'claims'", [], |row| row.get(0))?;
+    if !sql.contains(OLD) {
+        return Ok(());
+    }
+    let version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+    conn.execute_batch("PRAGMA writable_schema = ON")?;
+    let widened = conn.execute(
+        "UPDATE sqlite_schema SET sql = replace(sql, ?1, ?2) WHERE type = 'table' AND name = 'claims'",
+        params![OLD, "CHECK (kind IN ('group', 'keep', 'tomb'))"],
+    );
+    let bumped = conn.execute_batch(&format!("PRAGMA schema_version = {}", version.saturating_add(1)));
+    conn.execute_batch("PRAGMA writable_schema = OFF")?;
+    widened?;
+    bumped?;
+    Ok(())
 }
 
 /// The multihash a claim row is known by: its own if precipitated, its

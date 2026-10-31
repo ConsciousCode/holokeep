@@ -1,5 +1,6 @@
 //! Claims: sidecar blocks about their targets, which the README describes.
-//! So far `Group`, which is what a tag is, and `Tomb`, which retracts.
+//! So far `Group`, which is what a tag is, `Keep`, which says to keep its
+//! targets, and `Tomb`, which retracts.
 //!
 //! A claim is dag-cbor with its type inline, under the key `claim`. Its
 //! `target` is a set, written as an array sorted by CID bytes, so equal
@@ -38,10 +39,19 @@ pub struct Tomb {
     target: Vec<Link>,
 }
 
+/// "Keep the targets, and what they link to." What's added is kept unless
+/// said otherwise; what nothing kept links to is, in time, collectable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Keep {
+    /// Sorted by CID bytes and distinct.
+    target: Vec<Link>,
+}
+
 /// Any claim this understands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
     Group(Group),
+    Keep(Keep),
     Tomb(Tomb),
 }
 
@@ -68,6 +78,16 @@ impl Group {
     pub const fn group(&self) -> &Link { &self.into }
 }
 
+impl Keep {
+    /// A keep of the targets, if there are any.
+    pub fn new(target: impl IntoIterator<Item = Link>) -> Option<Self> {
+        let target = set(target);
+        (!target.is_empty()).then_some(Self { target })
+    }
+
+    pub fn target(&self) -> &[Link] { &self.target }
+}
+
 impl Tomb {
     /// A tomb for the targets, if there are any.
     pub fn new(target: impl IntoIterator<Item = Link>) -> Option<Self> {
@@ -82,6 +102,7 @@ impl Claim {
     pub fn target(&self) -> &[Link] {
         match self {
             Self::Group(group) => group.target(),
+            Self::Keep(keep) => keep.target(),
             Self::Tomb(tomb) => tomb.target(),
         }
     }
@@ -89,6 +110,7 @@ impl Claim {
     fn to_ipld(&self) -> Ipld {
         let (kind, mut map) = match self {
             Self::Group(group) => ("group", BTreeMap::from([("into".to_owned(), Ipld::Link(group.into.clone()))])),
+            Self::Keep(_) => ("keep", BTreeMap::new()),
             Self::Tomb(_) => ("tomb", BTreeMap::new()),
         };
         map.insert("claim".to_owned(), Ipld::String(kind.to_owned()));
@@ -149,6 +171,7 @@ impl Claim {
                 };
                 Self::Group(Group::new(target.clone(), into)?)
             },
+            "keep" => Self::Keep(Keep::new(target.clone())?),
             "tomb" => Self::Tomb(Tomb::new(target.clone())?),
             _ => return None,
         };
@@ -260,5 +283,17 @@ mod tests {
         ] {
             assert_eq!(Claim::parse(&data), None, "{label}");
         }
+    }
+
+    #[test]
+    fn keeps_round_trip_and_dissolve() {
+        let keep = Claim::Keep(Keep::new([cid(b"b"), cid(b"a"), cid(b"a")]).expect("keep"));
+        assert_eq!(keep.target().len(), 2, "a set");
+        assert!(!keep.dissolves(), "two targets");
+        assert_eq!(Claim::parse(keep.block().data()), Some(keep));
+        let one = Claim::Keep(Keep::new([cid(b"a")]).expect("keep"));
+        assert!(one.dissolves());
+        assert_eq!(dissolved(&one.cid()), Some(one));
+        assert!(Keep::new([]).is_none());
     }
 }
