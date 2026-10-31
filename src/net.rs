@@ -5,6 +5,7 @@
 // `Send`; so are the futures which use them
 #![allow(clippy::future_not_send)]
 
+pub mod blocks;
 pub mod mesh;
 pub mod node;
 pub mod daemon;

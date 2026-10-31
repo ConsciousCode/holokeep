@@ -11,6 +11,7 @@
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -18,9 +19,10 @@ use libp2p::Multiaddr;
 use sha2::Digest as _;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
+use tokio::net::unix::OwnedWriteHalf;
 
 use super::mesh::{self, Error, Members, Result};
-use super::node::{Event, Node};
+use super::node::{Event, FetchId, Node};
 use crate::store::Db;
 
 /// The daemon's socket, in the repo.
@@ -56,10 +58,20 @@ fn socket(dir: &Path) -> PathBuf {
 
 /// Ask the running daemon something, or None if there isn't one.
 pub fn ask(dir: &Path, command: &str) -> Result<Option<Vec<String>>> {
+    ask_within(dir, command, Some(Duration::from_secs(10)))
+}
+
+/// Ask the running daemon something which may take a while, such as
+/// fetching a DAG: as long as it takes.
+pub fn ask_patiently(dir: &Path, command: &str) -> Result<Option<Vec<String>>> {
+    ask_within(dir, command, None)
+}
+
+fn ask_within(dir: &Path, command: &str, time: Option<Duration>) -> Result<Option<Vec<String>>> {
     let Ok(mut stream) = UnixStream::connect(socket(dir)) else {
         return Ok(None);
     };
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(time)?;
     writeln!(stream, "{command}")?;
     let lines = BufReader::new(stream).lines().collect::<std::io::Result<_>>()?;
     Ok(Some(lines))
@@ -69,7 +81,8 @@ pub fn ask(dir: &Path, command: &str) -> Result<Option<Vec<String>>> {
 pub async fn run(dir: &Path, listen: Multiaddr) -> Result<()> {
     let key = mesh::node_key(dir)?;
     let swarm_key = mesh::swarm_key(dir)?.ok_or_else(|| Error::Invalid("this node isn't in a mesh: invite another, or join one".into()))?;
-    let mut node = Node::tcp(&key, swarm_key, members(dir)?)?;
+    let catalog = crate::store::Catalog::open_repo(dir)?;
+    let mut node = Node::tcp(&key, swarm_key, catalog, members(dir)?)?;
     node.listen(listen)?;
     node.dial_members()?;
     let path = socket(dir);
@@ -83,17 +96,34 @@ pub async fn run(dir: &Path, listen: Multiaddr) -> Result<()> {
     let control = UnixListener::bind(&path)?;
     eprintln!("node {} in mesh {}", node.peer_id(), swarm_key.fingerprint());
     let mut redial = tokio::time::interval(REDIAL);
+    // Those waiting on fetches, to be answered when they finish
+    let mut waiting: HashMap<FetchId, OwnedWriteHalf> = HashMap::new();
     let result = loop {
         tokio::select! {
             event = node.next() => match event {
+                Ok(Event::Fetched { id, fetched, missing }) => {
+                    if let Some(mut write) = waiting.remove(&id) {
+                        let mut out = format!("fetched {fetched}\n");
+                        for cid in missing {
+                            let _ = writeln!(out, "missing {cid}");
+                        }
+                        // They may have given up
+                        let _ = write.write_all(out.as_bytes()).await;
+                    }
+                },
                 Ok(event) => report(&event),
                 Err(e) => break Err(e),
             },
             accepted = control.accept() => {
-                if let Ok((stream, _)) = accepted
-                    && let Err(e) = answer(&mut node, stream).await
-                {
-                    eprintln!("control: {e}");
+                let Ok((stream, _)) = accepted else {
+                    continue;
+                };
+                match answer(&mut node, stream).await {
+                    Ok(Some((id, write))) => {
+                        waiting.insert(id, write);
+                    },
+                    Ok(None) => {},
+                    Err(e) => eprintln!("control: {e}"),
                 }
             },
             _ = redial.tick() => node.dial_members()?,
@@ -116,11 +146,13 @@ fn report(event: &Event) {
         },
         // Members which are offline fail to be dialed all the time
         Event::Failed(..) => {},
+        Event::Fetched { fetched, missing, .. } => eprintln!("fetched {fetched} blocks, {} missing", missing.len()),
     }
 }
 
-/// Answer one command on the control socket.
-async fn answer(node: &mut Node, stream: tokio::net::UnixStream) -> Result<()> {
+/// Answer one command on the control socket, or say which fetch it waits
+/// on, to be answered when that finishes.
+async fn answer(node: &mut Node, stream: tokio::net::UnixStream) -> Result<Option<(FetchId, OwnedWriteHalf)>> {
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
     tokio::time::timeout(Duration::from_secs(1), tokio::io::BufReader::new(read).read_line(&mut line))
@@ -145,10 +177,19 @@ async fn answer(node: &mut Node, stream: tokio::net::UnixStream) -> Result<()> {
             node.reload()?;
             node.dial_members()?;
         },
+        command if command.starts_with("fetch ") => {
+            let cid = command.trim_start_matches("fetch ").trim();
+            match cid.parse::<crate::model::Link>() {
+                Ok(root) => return Ok(Some((node.fetch(root)?, write))),
+                Err(_) => {
+                    let _ = writeln!(out, "not a CID: {cid}");
+                },
+            }
+        },
         other => {
             let _ = writeln!(out, "unknown command {other:?}");
         },
     }
     write.write_all(out.as_bytes()).await?;
-    Ok(())
+    Ok(None)
 }

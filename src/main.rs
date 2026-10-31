@@ -209,6 +209,12 @@ enum DagCommand {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Fetch whatever of the DAG under a CID isn't here from other members
+    /// of the mesh, through the running node
+    #[cfg(feature = "net")]
+    Fetch {
+        cid: Link,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -231,6 +237,24 @@ fn repo_dir(repo: Option<PathBuf>) -> anyhow::Result<PathBuf> {
         Some(dir) => Ok(dir),
         None => Ok(PathBuf::from(std::env::var_os("HOME").context("no HOME, so use --repo")?).join(".holokeep")),
     }
+}
+
+/// Fetch what isn't here of a DAG about to be read, if the node's running
+/// to fetch it. What can't be is reported by the reading.
+fn fetch_first(repo: &Option<PathBuf>, cid: &Link) -> anyhow::Result<()> {
+    #[cfg(feature = "net")]
+    {
+        let dir = repo_dir(repo.clone())?;
+        if let Some(lines) = holokeep::net::daemon::ask_patiently(&dir, &format!("fetch {cid}"))? {
+            let missing = lines.iter().filter(|line| line.starts_with("missing")).count();
+            if missing > 0 {
+                eprintln!("warning: {missing} blocks aren't here or on any connected member");
+            }
+        }
+    }
+    #[cfg(not(feature = "net"))]
+    let _ = (repo, cid);
+    Ok(())
 }
 
 fn open_repo(repo: Option<PathBuf>) -> anyhow::Result<Catalog> {
@@ -264,18 +288,20 @@ fn run(args: Args) -> anyhow::Result<()> {
             }
         },
         Command::Cat { cid } => {
+            fetch_first(&args.repo, &cid)?;
             let repo = open_repo(args.repo)?;
             let mut out = io::BufWriter::new(io::stdout().lock());
             export::cat(&repo, &cid, &mut out)?;
             Ok(out.flush()?)
         },
         Command::Get { cid, output } => {
+            fetch_first(&args.repo, &cid)?;
             let repo = open_repo(args.repo)?;
             let dest = output.unwrap_or_else(|| PathBuf::from(cid.to_string()));
             export::get(&repo, &cid, &dest).with_context(|| format!("writing {}", dest.display()))
         },
         Command::Refs { cid, back } => refs(&open_repo(args.repo)?, &cid, back),
-        Command::Dag(command) => dag(open_repo(args.repo)?, command),
+        Command::Dag(command) => dag(args.repo, command),
         Command::Tag(command) => tag(open_repo(args.repo)?, command),
         Command::Block(BlockCommand::Get { cid }) => {
             let repo = open_repo(args.repo)?;
@@ -447,11 +473,22 @@ fn refs(repo: &Catalog, cid: &Link, back: bool) -> anyhow::Result<()> {
     }
 }
 
-/// Import or export CAR files.
-fn dag(mut repo: Catalog, command: DagCommand) -> anyhow::Result<()> {
+/// Import, export or fetch whole DAGs.
+fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {
     match command {
+        #[cfg(feature = "net")]
+        DagCommand::Fetch { cid } => {
+            let dir = repo_dir(repo)?;
+            let lines = holokeep::net::daemon::ask_patiently(&dir, &format!("fetch {cid}"))?
+                .context("this node isn't running: start `hk node run`")?;
+            for line in &lines {
+                println!("{line}");
+            }
+            anyhow::ensure!(!lines.iter().any(|line| line.starts_with("missing")), "some blocks aren't here or on any connected member");
+            Ok(())
+        },
         DagCommand::Import { paths } => {
-            repo.batch(|repo| {
+            open_repo(repo)?.batch(|repo| {
                 for path in paths {
                     let reader: Box<dyn io::Read> = if path == Path::new("-") {
                         Box::new(io::stdin())
@@ -471,6 +508,8 @@ fn dag(mut repo: Catalog, command: DagCommand) -> anyhow::Result<()> {
             })
         },
         DagCommand::Export { cid, output } => {
+            fetch_first(&repo, &cid)?;
+            let repo = open_repo(repo)?;
             if let Some(path) = output {
                 // Written aside and renamed, so a failed export leaves nothing
                 let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));

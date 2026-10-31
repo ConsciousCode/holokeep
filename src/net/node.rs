@@ -10,8 +10,9 @@
 //! - mDNS finds members on the LAN; identify tells each where the others
 //!   listen; Kademlia, under its own protocol name so it's no part of
 //!   Amino, finds members' addresses as they move.
+//! - Members want blocks of each other; see `blocks`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -28,7 +29,10 @@ use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport, identify, kad, mdns, noise, ping, tcp, yamux};
 use serde::{Deserialize, Serialize};
 
+use super::blocks::{self, Blocks, Fetch, Want};
 use super::mesh::{Error, Members, Result};
+use crate::model::Link;
+use crate::store::Catalog;
 
 const IDENTIFY: &str = "/holokeep/id/1.0.0";
 const KAD: StreamProtocol = StreamProtocol::new("/holokeep/kad/1.0.0");
@@ -68,7 +72,11 @@ pub struct Behaviour {
     mdns: Toggle<mdns::tokio::Behaviour>,
     kad: kad::Behaviour<kad::store::MemoryStore>,
     members: request_response::cbor::Behaviour<Roster, Roster>,
+    blocks: request_response::cbor::Behaviour<Want, Blocks>,
 }
+
+/// A fetch, as the node knows it.
+pub type FetchId = u64;
 
 /// What happened, as far as the mesh is concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +88,9 @@ pub enum Event {
     Learned(Vec<PeerId>),
     /// A connection which failed or was refused, and why.
     Failed(Option<PeerId>, String),
+    /// A fetch finished: how many blocks it fetched, and those no member
+    /// had.
+    Fetched { id: FetchId, fetched: usize, missing: Vec<Link> },
 }
 
 /// A transport for the mesh, over some base transport: the private
@@ -106,17 +117,22 @@ where
 pub struct Node {
     swarm: Swarm<Behaviour>,
     members: Members,
+    catalog: Catalog,
+    fetches: BTreeMap<FetchId, Fetch>,
+    next_fetch: FetchId,
+    /// Events which happened outside `next`, for it to return first.
+    ready: VecDeque<Event>,
 }
 
 impl Node {
     /// A node over TCP, finding members on the LAN by mDNS.
-    pub fn tcp(key: &Keypair, swarm_key: PreSharedKey, members: Members) -> Result<Self> {
+    pub fn tcp(key: &Keypair, swarm_key: PreSharedKey, catalog: Catalog, members: Members) -> Result<Self> {
         let base = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
-        Self::new(transport(base, key, swarm_key)?, key, members, true)
+        Self::new(transport(base, key, swarm_key)?, key, catalog, members, true)
     }
 
     /// A node over a transport, with or without mDNS.
-    pub fn new(transport: Boxed<(PeerId, StreamMuxerBox)>, key: &Keypair, members: Members, lan: bool) -> Result<Self> {
+    pub fn new(transport: Boxed<(PeerId, StreamMuxerBox)>, key: &Keypair, catalog: Catalog, members: Members, lan: bool) -> Result<Self> {
         let peer = key.public().to_peer_id();
         let mdns = if lan { Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer)?) } else { None };
         let mut kad = kad::Behaviour::with_config(peer, kad::store::MemoryStore::new(peer), kad::Config::new(KAD));
@@ -128,9 +144,14 @@ impl Node {
             mdns: mdns.into(),
             kad,
             members: request_response::cbor::Behaviour::new([(MEMBERS, ProtocolSupport::Full)], request_response::Config::default()),
+            blocks: request_response::cbor::Behaviour::new(
+                [(blocks::PROTOCOL, ProtocolSupport::Full)],
+                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
+            ),
         };
         let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(IDLE);
-        let mut node = Self { swarm: Swarm::new(transport, behaviour, peer, config), members };
+        let swarm = Swarm::new(transport, behaviour, peer, config);
+        let mut node = Self { swarm, members, catalog, fetches: BTreeMap::new(), next_fetch: 0, ready: VecDeque::new() };
         node.reload()?;
         Ok(node)
     }
@@ -141,6 +162,45 @@ impl Node {
 
     pub const fn members(&self) -> &Members {
         &self.members
+    }
+
+    pub const fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    /// Fetch the DAG under a root from other members, keeping what's
+    /// fetched. It's done when `next` returns `Fetched` with the id.
+    pub fn fetch(&mut self, root: Link) -> Result<FetchId> {
+        let id = self.next_fetch;
+        self.next_fetch = id.wrapping_add(1);
+        self.fetches.insert(id, Fetch::new(root));
+        self.drive(id)?;
+        Ok(id)
+    }
+
+    /// Send what a fetch has to ask, or finish it.
+    fn drive(&mut self, id: FetchId) -> Result<()> {
+        let mut peers = self.connected();
+        peers.sort();
+        let Some(fetch) = self.fetches.get_mut(&id) else {
+            return Ok(());
+        };
+        for (peer, batch) in fetch.plan(&self.catalog, &peers)? {
+            let request = self.swarm.behaviour_mut().blocks.send_request(&peer, Fetch::want(&batch));
+            fetch.sent(request, batch);
+        }
+        if fetch.done()
+            && let Some(fetch) = self.fetches.remove(&id)
+        {
+            let (fetched, missing) = fetch.outcome();
+            self.ready.push_back(Event::Fetched { id, fetched, missing });
+        }
+        Ok(())
+    }
+
+    /// The fetch which sent a want.
+    fn fetch_of(&self, request: request_response::OutboundRequestId) -> Option<FetchId> {
+        self.fetches.iter().find(|(_, fetch)| fetch.asked(request)).map(|(&id, _)| id)
     }
 
     /// Let in every member, and learn where they listen, as of the list.
@@ -208,6 +268,9 @@ impl Node {
     /// The next thing that happens which the mesh cares about.
     pub async fn next(&mut self) -> Result<Event> {
         loop {
+            if let Some(event) = self.ready.pop_front() {
+                return Ok(event);
+            }
             let Some(event) = self.swarm.next().await else {
                 return Err(Error::Invalid("the swarm stopped".into()));
             };
@@ -268,6 +331,32 @@ impl Node {
                     let new = self.learn(&response)?;
                     (!new.is_empty()).then_some(Event::Learned(new))
                 },
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Blocks(request_response::Event::Message { message, .. })) => match message {
+                request_response::Message::Request { request, channel, .. } => {
+                    let answer = blocks::answer(&self.catalog, &request);
+                    // The asker may be gone already
+                    let _ = self.swarm.behaviour_mut().blocks.send_response(channel, answer);
+                    None
+                },
+                request_response::Message::Response { request_id, response } => {
+                    if let Some(id) = self.fetch_of(request_id) {
+                        if let Some(fetch) = self.fetches.get_mut(&id) {
+                            fetch.received(&self.catalog, request_id, response)?;
+                        }
+                        self.drive(id)?;
+                    }
+                    None
+                },
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Blocks(request_response::Event::OutboundFailure { request_id, .. })) => {
+                if let Some(id) = self.fetch_of(request_id) {
+                    if let Some(fetch) = self.fetches.get_mut(&id) {
+                        fetch.failed(request_id);
+                    }
+                    self.drive(id)?;
+                }
+                None
             },
             _ => None,
         })

@@ -9,7 +9,8 @@ async fn node(swarm_key: PreSharedKey) -> Node {
     let key = Keypair::generate_ed25519();
     let members = Members::open(Db::memory().expect("db")).expect("members");
     let transport = transport(MemoryTransport::default(), &key, swarm_key).expect("transport");
-    let mut node = Node::new(transport, &key, members, false).expect("node");
+    let catalog = Catalog::standard(Db::memory().expect("db")).expect("catalog");
+    let mut node = Node::new(transport, &key, catalog, members, false).expect("node");
     node.listen(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
     loop {
         if let Event::Listening(_) = node.next().await.expect("event") {
@@ -101,4 +102,135 @@ async fn members_tell_each_other_of_members() {
     }
     // Once both have spoken to a, b and c let each other in and connect
     assert!(until(&mut [&mut a, &mut b, &mut c], |n| connected(n[0], n[1]) && connected(n[0], n[2]) && connected(n[1], n[2])).await);
+}
+
+//--------------//
+//-[ Fetching ]-//
+//--------------//
+
+use crate::block::Block;
+use crate::cid::{AnyCid, CidVersion, Cidv1Spec, DAG_CBOR_CODEC};
+use crate::model::Ipld;
+use crate::multihash::MultihashFunc;
+use crate::cid::CidRef;
+use crate::store::BlockIndex;
+
+fn raw(data: &[u8]) -> Block {
+    Block::hash(Cidv1Spec::default(), data.into())
+}
+
+fn link(block: &Block) -> Link {
+    AnyCid::V1(block.cid().clone())
+}
+
+fn cbor(value: &Ipld) -> Block {
+    let data = crate::dagcbor::to_vec(value).expect("encode");
+    Block::hash(Cidv1Spec::new(DAG_CBOR_CODEC, MultihashFunc::Sha2_256), data.into())
+}
+
+/// Two members, connected, the first holding a small DAG: a root linking
+/// to a branch and a leaf, the branch to another leaf. Returns the blocks,
+/// root first.
+async fn holding() -> (Node, Node, Vec<Block>) {
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let (mut a, mut b) = (node(swarm_key).await, node(swarm_key).await);
+    invite(&a, &b, swarm_key);
+    a.reload().expect("reload");
+    b.reload().expect("reload");
+    b.dial_members().expect("dial");
+    assert!(until(&mut [&mut a, &mut b], |n| connected(n[0], n[1])).await);
+    let (leaf, deep) = (raw(b"leaf"), raw(b"deep"));
+    let branch = cbor(&Ipld::List(vec![Ipld::Link(link(&deep))]));
+    let root = cbor(&Ipld::List(vec![Ipld::Link(link(&branch)), Ipld::Link(link(&leaf))]));
+    let blocks = vec![root, branch, leaf, deep];
+    for block in &blocks {
+        a.catalog().put_block(block, CidVersion::V1).expect("put");
+    }
+    (a, b, blocks)
+}
+
+/// Fetch a DAG with one node, while driving both, and say what came of it.
+async fn fetch(a: &mut Node, b: &mut Node, root: Link) -> (usize, Vec<Link>) {
+    let id = b.fetch(root).expect("fetch");
+    let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(10)).expect("deadline");
+    loop {
+        let event = tokio::time::timeout_at(deadline, async {
+            tokio::select! {
+                event = a.next() => event,
+                event = b.next() => event,
+            }
+        });
+        if let Event::Fetched { id: done, fetched, missing } = event.await.expect("in time").expect("event")
+            && done == id
+        {
+            return (fetched, missing);
+        }
+    }
+}
+
+#[tokio::test]
+async fn members_fetch_dags_from_each_other() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    let root = link(blocks.first().expect("root"));
+    assert_eq!(fetch(&mut a, &mut b, root.clone()).await, (4, vec![]));
+    for block in &blocks {
+        let got = b.catalog().get_block(&link(block)).expect("get");
+        assert_eq!(got.as_ref(), Some(block));
+    }
+    // Now it's all here, nothing's asked
+    assert_eq!(fetch(&mut a, &mut b, root).await, (0, vec![]));
+}
+
+#[tokio::test]
+async fn only_whats_missing_is_fetched() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    // The branch is here already, its leaf isn't
+    let branch = blocks.get(1).expect("branch");
+    b.catalog().put_block(branch, CidVersion::V1).expect("put");
+    assert_eq!(fetch(&mut a, &mut b, link(blocks.first().expect("root"))).await, (3, vec![]));
+    assert!(b.catalog().has(blocks.get(3).expect("deep").cid().multihash()).expect("has"));
+}
+
+#[tokio::test]
+async fn what_no_member_has_is_missing() {
+    let (mut a, mut b, _) = Box::pin(holding()).await;
+    let nowhere = raw(b"nowhere");
+    assert_eq!(fetch(&mut a, &mut b, link(&nowhere)).await, (0, vec![link(&nowhere)]));
+}
+
+#[tokio::test]
+async fn a_member_without_a_block_passes_it_on() {
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let (mut a, mut b, mut c) = (node(swarm_key).await, node(swarm_key).await, node(swarm_key).await);
+    invite(&a, &b, swarm_key);
+    invite(&a, &c, swarm_key);
+    a.reload().expect("reload");
+    for joiner in [&mut b, &mut c] {
+        joiner.reload().expect("reload");
+        joiner.dial_members().expect("dial");
+    }
+    assert!(until(&mut [&mut a, &mut b, &mut c], |n| connected(n[0], n[1]) && connected(n[0], n[2]) && connected(n[1], n[2])).await);
+    // Only b has them; for some, c asks a first, for some b
+    let leaves: Vec<Block> = (0..16u8).map(|i| raw(&[i])).collect();
+    let root = cbor(&Ipld::List(leaves.iter().map(|leaf| Ipld::Link(link(leaf))).collect()));
+    for block in leaves.iter().chain([&root]) {
+        b.catalog().put_block(block, CidVersion::V1).expect("put");
+    }
+    let id = c.fetch(link(&root)).expect("fetch");
+    let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(10)).expect("deadline");
+    loop {
+        let event = tokio::time::timeout_at(deadline, async {
+            tokio::select! {
+                event = a.next() => event,
+                event = b.next() => event,
+                event = c.next() => event,
+            }
+        });
+        if let Event::Fetched { id: done, fetched, missing } = event.await.expect("in time").expect("event")
+            && done == id
+        {
+            assert_eq!((fetched, missing), (17, vec![]));
+            break;
+        }
+    }
 }
