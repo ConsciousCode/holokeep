@@ -288,6 +288,11 @@ const FORM_TABLES: [(&str, &str, &str); 4] = [
 /// Unlike a log, it's a row per block, not per change, and nothing's read
 /// but what's changed. A block that leaves keeps its row, as gone, so
 /// that whoever saw it arrive sees it leave.
+///
+/// Dissolved claims have no multihash, so they're stamped by their rows
+/// in `claim_generations`, from the same generations. One leaves only by
+/// being tombed, and its stamp goes with it: whoever saw it arrive learns
+/// it's gone from the tomb, which is stamped like any other claim.
 fn stamp<'a>(db: &Db, forms: impl Iterator<Item = &'a str>) -> Result<()> {
     let conn = db.conn();
     conn.execute_batch(
@@ -298,7 +303,12 @@ fn stamp<'a>(db: &Db, forms: impl Iterator<Item = &'a str>) -> Result<()> {
              present INTEGER NOT NULL,
              PRIMARY KEY (form, block)
          ) WITHOUT ROWID;
-         CREATE INDEX IF NOT EXISTS generations_generation ON generations (generation);",
+         CREATE INDEX IF NOT EXISTS generations_generation ON generations (generation);
+         CREATE TABLE IF NOT EXISTS claim_generations (
+             claim INTEGER PRIMARY KEY,
+             generation INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS claim_generations_generation ON claim_generations (generation);",
     )?;
     for form in forms {
         let Some(&(form, table, column)) = FORM_TABLES.iter().find(|(name, ..)| *name == form) else {
@@ -311,27 +321,48 @@ fn stamp<'a>(db: &Db, forms: impl Iterator<Item = &'a str>) -> Result<()> {
         if stamped {
             continue;
         }
-        let next = "(SELECT coalesce(max(generation), 0) + 1 FROM generations)";
         conn.execute_batch(&format!(
             "CREATE TRIGGER {trigger}_added AFTER INSERT ON {table} WHEN NEW.{column} IS NOT NULL BEGIN
                  INSERT OR REPLACE INTO generations (form, block, generation, present)
-                 VALUES ('{form}', NEW.{column}, {next}, 1);
+                 VALUES ('{form}', NEW.{column}, {NEXT}, 1);
              END;
              CREATE TRIGGER {trigger}_removed AFTER DELETE ON {table} WHEN OLD.{column} IS NOT NULL BEGIN
                  INSERT OR REPLACE INTO generations (form, block, generation, present)
-                 VALUES ('{form}', OLD.{column}, {next}, 0);
+                 VALUES ('{form}', OLD.{column}, {NEXT}, 0);
              END;
              -- What was there before it was stamped arrives now
              INSERT OR IGNORE INTO generations (form, block, generation, present)
-                 SELECT '{form}', {column}, {next}, 1 FROM {table} WHERE {column} IS NOT NULL;",
+                 SELECT '{form}', {column}, {NEXT}, 1 FROM {table} WHERE {column} IS NOT NULL;",
         ))?;
+        if form == "claims" {
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER generations_dissolved_added AFTER INSERT ON claims WHEN NEW.claim IS NULL BEGIN
+                     INSERT OR REPLACE INTO claim_generations (claim, generation) VALUES (NEW.id, {NEXT});
+                 END;
+                 CREATE TRIGGER generations_dissolved_removed AFTER DELETE ON claims WHEN OLD.claim IS NULL BEGIN
+                     DELETE FROM claim_generations WHERE claim = OLD.id;
+                 END;
+                 INSERT OR IGNORE INTO claim_generations (claim, generation)
+                     SELECT id, {NEXT} FROM claims WHERE claim IS NULL;",
+            ))?;
+        }
     }
     Ok(())
 }
 
+/// The latest generation, of blocks or dissolved claims.
+const LATEST: &str = "(SELECT coalesce(max(latest), 0) FROM (
+    SELECT max(generation) AS latest FROM generations
+    UNION ALL SELECT max(generation) FROM claim_generations))";
+
+/// The generation after the latest.
+const NEXT: &str = "(SELECT coalesce(max(latest), 0) + 1 FROM (
+    SELECT max(generation) AS latest FROM generations
+    UNION ALL SELECT max(generation) FROM claim_generations))";
+
 /// The latest generation of a database volume.
 pub fn generation(db: &Db) -> Result<i64> {
-    Ok(db.conn().query_row("SELECT coalesce(max(generation), 0) FROM generations", [], |row| row.get(0))?)
+    Ok(db.conn().query_row(&format!("SELECT {LATEST}"), [], |row| row.get(0))?)
 }
 
 /// A database file's label, if it's a volume, without changing it.

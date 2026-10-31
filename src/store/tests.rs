@@ -1385,3 +1385,49 @@ fn database_volumes_are_attached_where_they_were_seen() {
     assert_eq!(placed(&router, &block), [pair("db", "raw")]);
     assert!(router.copy_to("usb", &[]).is_err());
 }
+
+#[test]
+fn tags_go_where_what_they_tag_does() {
+    let scratch = Scratch::new("volumes-tags");
+    let (a, mut b) = (with_sqlite(&scratch, "shared.db"), router());
+    let (leaf, elsewhere) = (raw(b"leaf"), raw(b"elsewhere"));
+    let parent = ipld_block(DAG_CBOR_CODEC, &crate::model::Ipld::Link(link(&leaf)));
+    for block in [&leaf, &parent, &elsewhere] {
+        a.put_block(block, CidVersion::V1).expect("put");
+    }
+    // A dissolved tag on the leaf, and a precipitated claim tagging it and
+    // something not under the root
+    a.tag(&link(&leaf), &tag("music")).expect("tag");
+    let pair = Claim::Group(Group::new([link(&leaf), link(&elsewhere)], tag("pair")).expect("group"));
+    a.put_block(&pair.block(), CidVersion::V1).expect("put");
+    let report = a.copy_to("shared", &[link(&parent)]).expect("copy");
+    assert_eq!((report.copied, report.claims), (3, 1));
+    assert!(!a.placements(elsewhere.cid().multihash()).expect("placements").iter().any(|&(v, _)| v == a.volumes.len() - 1));
+
+    b.add_sqlite_volume("shared", &scratch.path().join("shared.db")).expect("add");
+    let claims = b.claims().expect("claims");
+    assert_eq!(claims.tags(leaf.cid().multihash()).expect("tags"), [tag("pair"), tag("music")]);
+
+    // Untagging follows them too, dissolved and precipitated
+    a.untag(&link(&leaf), &tag("music")).expect("untag");
+    a.untag(&link(&leaf), &tag("pair")).expect("untag");
+    let report = a.copy_to("shared", &[link(&parent)]).expect("copy");
+    assert!(report.claims >= 1, "the tombs: {report:?}");
+    b.catch_up().expect("catch up");
+    assert_eq!(b.claims().expect("claims").tags(leaf.cid().multihash()).expect("tags"), Vec::<crate::model::Link>::new());
+    assert_eq!(b.catch_up().expect("catch up"), (0, 0));
+}
+
+#[test]
+fn replicas_keep_dissolved_claims() {
+    let scratch = Scratch::new("volumes-replica-claims");
+    let (a, mut b) = (with_sqlite(&scratch, "shared.db"), router());
+    let block = raw(b"tagged");
+    a.put_block(&block, CidVersion::V1).expect("put");
+    a.tag(&link(&block), &tag("kept")).expect("tag");
+    let report = a.replicate(2).expect("replicate");
+    assert_eq!((report.copied, report.claims), (1, 1));
+    assert_eq!(a.replicate(2).expect("replicate").claims, 0);
+    b.add_sqlite_volume("shared", &scratch.path().join("shared.db")).expect("add");
+    assert_eq!(b.claims().expect("claims").tagged(tag("kept").multihash()).expect("tagged"), [link(&block)]);
+}

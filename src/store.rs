@@ -371,15 +371,24 @@ pub struct Replication {
     pub copied: usize,
     /// Blocks it would still take fewer failures than asked for to lose.
     pub short: Vec<Multihash>,
+    /// Dissolved claims copied, which aren't blocks.
+    pub claims: usize,
 }
 
 /// What `copy_to` did.
 #[derive(Debug, Default)]
-pub struct Copied {
+pub struct CopyReport {
     /// Copies made.
     pub copied: usize,
     /// Blocks which couldn't be read to be copied.
     pub unreadable: Vec<Multihash>,
+    /// Dissolved claims copied, which aren't blocks.
+    pub claims: usize,
+}
+
+/// A multihash of one's own.
+fn owned(key: Key<'_>) -> Result<Multihash> {
+    Multihash::try_wrap(key.code(), key.digest_ref()).map_err(|_| Error::Oversized(key.len()))
 }
 
 fn path_bytes(path: &Path) -> &[u8] {
@@ -830,8 +839,51 @@ impl Catalog {
                 self.reindex_links(self.named(&(v, form))?, id, key.as_ref())?;
             }
         }
+        // Dissolved claims, stamped by row
+        let rows: Vec<(Id, i64)> = db.conn()
+            .prepare_cached("SELECT claim, generation FROM claim_generations WHERE generation > ?1 ORDER BY generation")?
+            .query_map([cursor], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if let (Some(claims), false) = (&self.claims, rows.is_empty()) {
+            let theirs = ClaimStore::open(db.clone())?;
+            for (row, generation) in rows {
+                latest = latest.max(generation);
+                let Some(claim) = theirs.dissolved_row(row)? else {
+                    continue;
+                };
+                if !claims.has_dissolved(&claim)? {
+                    self.put_block(&claim.block(), CidVersion::V1)?;
+                    added = added.saturating_add(1);
+                }
+            }
+        }
         conn.prepare_cached("UPDATE volumes SET cursor = ?1 WHERE id = ?2")?.execute([latest, volume])?;
         Ok((added, removed))
+    }
+
+    /// Put dissolved claims in a database volume, returning how many it
+    /// didn't have. They're small, and only a database keeps them.
+    fn copy_dissolved(&self, v: usize, dissolved: &[Claim]) -> Result<usize> {
+        let Some(db) = self.foreign_db(v) else {
+            return Ok(0);
+        };
+        if self.volumes.get(v).and_then(|volume| volume.form("claims")).is_none() {
+            return Ok(0);
+        }
+        let theirs = ClaimStore::open(db.clone())?;
+        let mut copied = 0usize;
+        for claim in dissolved {
+            if !theirs.has_dissolved(claim)? && theirs.put(&claim.block())? == Put::Stored {
+                copied = copied.saturating_add(1);
+            }
+        }
+        Ok(copied)
+    }
+
+    /// The claims about a block, as multihashes: identities for dissolved
+    /// ones.
+    fn claims_about(&self, key: Key<'_>) -> Result<Vec<Multihash>> {
+        self.claims.as_ref().map_or_else(|| Ok(Vec::new()), |claims| claims.backrefs(key))
     }
 
     /// Keep a copy of a block from another volume in the catalog's own,
@@ -933,16 +985,24 @@ impl Catalog {
                 report.short.push(key);
             }
         }
+        // Dissolved claims aren't blocks, so they've no copies to count;
+        // they're small, so every database volume keeps them all
+        let dissolved = self.claims.as_ref().map_or_else(|| Ok(Vec::new()), |claims| claims.dissolved())?;
+        for v in 0..self.volumes.len() {
+            report.claims = report.claims.saturating_add(self.copy_dissolved(v, &dissolved)?);
+        }
         Ok(report)
     }
 
     /// Copy blocks to a volume, wherever it is: those under the roots, or
-    /// every block if there are none. Returns how many were copied, and
-    /// the blocks which couldn't be read to be.
-    pub fn copy_to(&self, name: &str, roots: &[Link]) -> Result<Copied> {
+    /// every block if there are none. Claims about what's copied go too,
+    /// and tombs retracting them, so tags go where what they tag does.
+    /// Returns how many were copied, and the blocks which couldn't be read
+    /// to be.
+    pub fn copy_to(&self, name: &str, roots: &[Link]) -> Result<CopyReport> {
         let v = self.volumes.iter().position(|volume| volume.name == name)
             .ok_or_else(|| Error::Volume(format!("no volume called {name:?} is attached")))?;
-        let mut report = Copied::default();
+        let mut report = CopyReport::default();
         let mut copy = |key: Multihash| -> Result<Option<Block>> {
             let Some(id) = self.db.lookup(key.as_ref())? else {
                 report.unreadable.push(key);
@@ -961,19 +1021,48 @@ impl Catalog {
             for key in self.keys()? {
                 copy(key)?;
             }
+            let dissolved = self.claims.as_ref().map_or_else(|| Ok(Vec::new()), |claims| claims.dissolved())?;
+            report.claims = self.copy_dissolved(v, &dissolved)?;
             return Ok(report);
         }
         let mut seen = std::collections::HashSet::new();
         let mut stack: Vec<Link> = roots.to_vec();
+        let mut claims = Vec::new();
         while let Some(cid) = stack.pop() {
             if cid.hashcode() == IDENTITY || !seen.insert(cid.multihash().to_bytes()) {
                 continue;
             }
-            let key = cid.multihash();
-            if let Some(block) = copy(Multihash::try_wrap(key.code(), key.digest_ref()).map_err(|_| Error::Oversized(key.len()))?)? {
+            let key = owned(cid.multihash())?;
+            claims.extend(self.claims_about(key.as_ref())?);
+            if let Some(block) = copy(key)? {
                 stack.extend(crate::links::links(cid.codec(), block.data()).unwrap_or_default());
             }
         }
+        // A claim's own links are what it's about, not part of the DAG;
+        // only what's about it, tombs, follows it
+        let mut dissolved = Vec::new();
+        while let Some(key) = claims.pop() {
+            if !seen.insert(key.to_bytes()) {
+                continue;
+            }
+            if key.code() == IDENTITY {
+                dissolved.extend(crate::claim::dissolved_cid(key.digest_ref()).as_ref().and_then(crate::claim::dissolved));
+                continue;
+            }
+            claims.extend(self.claims_about(key.as_ref())?);
+            copy(key)?;
+        }
+        // A tombed dissolved claim is gone, leaving its tomb, which says
+        // what it was
+        if let Some(store) = &self.claims {
+            for tomb in store.dissolved()? {
+                let about = |claim: &Claim| claim.target().iter().any(|target| seen.contains(&target.multihash().to_bytes()));
+                if tomb.target().iter().filter_map(crate::claim::dissolved).any(|claim| about(&claim)) {
+                    dissolved.push(tomb);
+                }
+            }
+        }
+        report.claims = self.copy_dissolved(v, &dissolved)?;
         Ok(report)
     }
 

@@ -316,7 +316,7 @@ fn volume(mut repo: Catalog, command: VolumeCommand) -> anyhow::Result<()> {
         },
         VolumeCommand::Replicate { copies } => {
             let report = repo.batch(|repo| repo.replicate(copies))?;
-            println!("copied {} blocks", report.copied);
+            println!("copied {} blocks and {} dissolved claims", report.copied, report.claims);
             if !report.short.is_empty() {
                 eprintln!("{} blocks would take fewer than {copies} failures to lose; attach volumes which risk less in common", report.short.len());
             }
@@ -338,7 +338,7 @@ fn volume(mut repo: Catalog, command: VolumeCommand) -> anyhow::Result<()> {
         },
         VolumeCommand::Copy { name, cids } => {
             let report = repo.batch(|repo| repo.copy_to(&name, &cids))?;
-            println!("copied {} blocks", report.copied);
+            println!("copied {} blocks and {} dissolved claims", report.copied, report.claims);
             if !report.unreadable.is_empty() {
                 eprintln!("{} blocks couldn't be read to be copied", report.unreadable.len());
             }

@@ -192,6 +192,24 @@ impl ClaimStore {
             .exists([key.to_bytes()])?)
     }
 
+    /// Every dissolved claim here.
+    pub fn dissolved(&self) -> Result<Vec<Claim>> {
+        let rows: Vec<(Id, String)> = self.db.conn()
+            .prepare_cached("SELECT id, kind FROM claims WHERE claim IS NULL ORDER BY id")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter().map(|(id, kind)| self.claim(id, &kind)).collect()
+    }
+
+    /// The dissolved claim in a row, if it's one.
+    pub fn dissolved_row(&self, id: Id) -> Result<Option<Claim>> {
+        let kind: Option<String> = self.db.conn()
+            .prepare_cached("SELECT kind FROM claims WHERE id = ?1 AND claim IS NULL")?
+            .query_row([id], |r| r.get(0))
+            .optional()?;
+        kind.map(|kind| self.claim(id, &kind)).transpose()
+    }
+
     /// Whether a dissolved claim is here.
     pub fn has_dissolved(&self, claim: &Claim) -> Result<bool> {
         Ok(self.find_dissolved(claim)?.is_some())
