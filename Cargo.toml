@@ -7,9 +7,15 @@ edition = "2024"
 name = "hk"
 path = "src/main.rs"
 
+[features]
+default = ["net"]
+# The private mesh: libp2p, and a daemon to run it
+net = ["dep:libp2p", "dep:tokio"]
+
 [dependencies]
+libp2p = { version = "0.56", optional = true, features = ["tokio", "tcp", "noise", "yamux", "pnet", "macros", "identify", "ping", "mdns", "kad", "request-response", "cbor", "ed25519"] }
+tokio = { version = "1", optional = true, features = ["rt", "net", "macros", "time", "io-util", "sync", "signal"] }
 thiserror = "2.0"
-libp2p = "0.56"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 anyhow = { version = "1.0.104", features = ["backtrace"] }
 bytes = "1.12.1"
@@ -33,7 +39,7 @@ serde_bytes = "0.11.19"
 paste = "1.0.15"
 rusqlite = { version = "0.41", features = ["bundled"] }
 tempfile = "3.27.0"
-getrandom = "0.2"
+getrandom = { version = "0.2", features = ["std"] }
 
 [lints]
 [lints.clippy]
@@ -55,6 +61,7 @@ exit = "deny"
 as_conversions = "deny"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 ipld-core = "0.4"
 proptest = "1"
 serde_ipld_dagcbor = "0.7"

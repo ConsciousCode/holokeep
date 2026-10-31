@@ -21,6 +21,8 @@ pub mod links;
 pub mod export;
 pub mod model;
 pub mod store;
+#[cfg(feature = "net")]
+pub mod net;
 #[cfg(test)]
 mod codec_fixtures;
 #[cfg(test)]

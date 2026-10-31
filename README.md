@@ -32,7 +32,7 @@ Holokeep is early. What exists is the content-addressing core, each piece checke
 - **Storage and retrieval**: `hk add` stores into a repo where a routing store sorts blocks by structure: UnixFS nodes as rows, dag-cbor and dag-json as queryable JSONB, large blocks and whole files in a flatfs-style sharded directory, file leaves as ranges of whole files kept there (or left in place with `--nocopy`), and everything else as raw bytes. `hk cat`/`hk get` read them back out, checked against the original files.
 - **Interchange**: `hk dag export` writes a DAG as a CARv1 byte-for-byte identical to `ipfs dag export`, and `hk dag import` reads CARv1 and CARv2 files, Kubo's included, verifying every block. Legacy CIDv0 DAGs round-trip unchanged.
 
-Everything lives on one node so far; next is indexing, see the [roadmap](#roadmap).
+Nodes can join a private mesh (`hk node`), but don't exchange blocks yet; see the [roadmap](#roadmap).
 
 ## Vision
 
@@ -282,9 +282,19 @@ Audit/repair and trickle GC are the same homeostasis with opposite signs, akin t
 
 Nodes within a mesh use anti-entropy to maintain a well-replicated set of blocks, mediated by set reconciliation. When a new node joins, all peers share lists of multihashes they believe are under-replicated; each node aggregates these and responds with a Bloom filter of every block it hosts.
 
+**Nodes exchange what's needed, not their indexes.** Catching up (`catch_up`, generations) belongs to shared volumes, where two catalogs index the same storage and each must notice what the other wrote. Between nodes there are no unindexed blocks, only blocks elsewhere, and mirroring every node's placement into every catalog would cost every machine for nothing it needs. Each exchange has its own trigger:
+
+- *Durability*: a holder advertises, over gossipsub, the blocks it believes are under-replicated, by its volumes' risks and what it believes of copies elsewhere. Holders answer "have" with their volumes' labels and risks, which corrects the belief, and labels keep a volume two nodes share from counting twice. If that's still short, a target is chosen by rendezvous hashing over the block and the candidates, weighted by how much each raises tolerance and its free space, and the same ranking over the holders picks which one sends it. Every node computes the same answer without coordinating, so there's no herd and no block left unreplicated or replicated twice; a target which refuses (a friend, later) passes it to the next in the ranking.
+- *Access*: a reader wants what it doesn't hold, broadcast while the mesh is small, through Kademlia provider records once it isn't.
+- *Backrefs*: a writer pushes structure (links, claims) to the holders of what it links to, which is how they make their best effort to know every backref to what they hold.
+
+Beliefs about other nodes' copies are kept apart from `blocks`, which stays authoritative for the node's own volumes: only for blocks the node holds, expiring by its own clock. An expired belief lowers a block's tolerance, which brings an advertisement, which brings a "have" or a new copy: audit and repair are the same loop.
+
+**Joining**, so far: every node of a repository shares a *swarm key*, a libp2p private-network key (Kubo's `swarm.key` format), which encrypts a connection before anything else is said, so a machine without it can't speak to the mesh; it works over TCP, not QUIC. Each node also keeps the members it lets in, so one can be shut out without changing the key, and members tell each other of the members they know whenever they connect, so a machine invited by one is let in by all. A machine joins with a ticket from a member: `hk node id` on it, `hk node invite <id>` on the member, `hk node join <ticket>` back on it. The keys are files beside the catalog (`node.key`, `swarm.key`), not rows in it, since its database is a volume another node may open. mDNS finds members on the LAN; identify tells each where the others listen; Kademlia, under `/holokeep/kad/1.0.0` so it's no part of Amino, will find them as they move. `hk node run` owns the mesh on one thread, the catalog's database with it; other commands open the repo as ever, and ask the daemon over a Unix socket for what needs the mesh. Until users have DIDs, holding the key and being on the list is what being yours means.
+
 Ideas:
 
-- *Failure-domain placement*: describe each blockstore's risk with a set of tags, eg `{living-room, home, new-mexico, us}` is very far from `{bangkok, data-center}` and very close to `{living-room, raid-3, home, new-mexico, us}`, and place replicas to maximize the distance between them. Possibly with Ceph's CRUSH; possibly latency-aware.
+- *Failure-domain placement*: describe each blockstore's risk with a set of tags, eg `{living-room, home, new-mexico, us}` is very far from `{bangkok, data-center}` and very close to `{living-room, raid-3, home, new-mexico, us}`, and place replicas to maximize the distance between them. Volumes' risks, found and said, now do this for counting (see durability above); what's open is weighing distance beyond shared risks, perhaps with Ceph's CRUSH, perhaps latency-aware.
 - *CAR files* are the interchange format between repos, Kubo included, before any networking exists. Export walks the DAG depth first, writing each block the first time it's reached, which is Kubo's order. Import trusts nothing: every block is verified, sections are bounded as go-car's are (8 MiB, headers 32 MiB), and a CARv2's index is ignored, since the repo indexes for itself. Blocks are placed by structure like any others; importing into the offset store would need provenance into the CAR, which isn't a whole file of anything.
 
 ## Roadmap
@@ -324,7 +334,12 @@ Checklist:
 - [ ] Perkeep-style claims
 - [ ] File mutation
 - [ ] FUSE
-- [ ] P2P private DHT
+- [ ] P2P private mesh
+  - [x] Joining: swarm key, members, tickets, mDNS, identify (`hk node id/invite/join/run/peers`)
+  - [ ] Wanting blocks from other nodes
+  - [ ] Advertising under-replication, sightings, recruiting by rendezvous hashing
+  - [ ] Pushing structure to holders, for backrefs and claims
+  - [ ] Kademlia provider records, once broadcast wants don't scale
 - [ ] Public Amino DHT
 - [ ] BitTorrent bridging
 - [ ] User ownership model
@@ -385,6 +400,11 @@ $hk volume risk add <name> <risk>   # say what volumes fail together: a house, a
 $hk volume risk ls                  # every volume's risks, found or said
 $hk volume replicate [--copies n]   # copy blocks until it takes n failures to lose each
 $hk volume copy <name> [cid...]     # copy DAGs, or everything, to a volume wherever it is
+$hk node id                         # this node's peer id, to be invited by
+$hk node invite <peer-id>           # let a machine into the mesh; prints a secret ticket
+$hk node join <ticket>              # join a mesh
+$hk node run [--listen <addr>]      # run in the mesh (default /ip4/0.0.0.0/tcp/4011)
+$hk node peers                      # members, and which are connected
 ```
 
 The repo is `~/.holokeep` unless `--repo` or `HOLOKEEP_REPO` says otherwise.

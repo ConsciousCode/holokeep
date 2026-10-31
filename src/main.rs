@@ -86,6 +86,33 @@ enum Command {
     /// Keep copies of blocks on other volumes, such as other drives
     #[command(subcommand)]
     Volume(VolumeCommand),
+    /// Link this repo's machines into a private mesh
+    #[cfg(feature = "net")]
+    #[command(subcommand)]
+    Node(NodeCommand),
+}
+
+#[cfg(feature = "net")]
+#[derive(Subcommand, Debug)]
+enum NodeCommand {
+    /// Print this node's peer id, for another node to invite
+    Id,
+    /// Let a machine into the mesh, printing a ticket for it to join with.
+    /// The ticket holds the mesh's key: keep it secret
+    Invite {
+        peer: String,
+    },
+    /// Join a mesh with a ticket from a node already in it
+    Join {
+        ticket: String,
+    },
+    /// Run this node in the mesh until interrupted
+    Run {
+        #[arg(long, default_value = holokeep::net::daemon::LISTEN)]
+        listen: String,
+    },
+    /// List the mesh's members, and which are connected
+    Peers,
 }
 
 #[derive(Subcommand, Debug)]
@@ -199,11 +226,15 @@ fn main() {
     }
 }
 
+fn repo_dir(repo: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    match repo {
+        Some(dir) => Ok(dir),
+        None => Ok(PathBuf::from(std::env::var_os("HOME").context("no HOME, so use --repo")?).join(".holokeep")),
+    }
+}
+
 fn open_repo(repo: Option<PathBuf>) -> anyhow::Result<Catalog> {
-    let dir = match repo {
-        Some(dir) => dir,
-        None => PathBuf::from(std::env::var_os("HOME").context("no HOME, so use --repo")?).join(".holokeep"),
-    };
+    let dir = repo_dir(repo)?;
     Catalog::open_repo(&dir).with_context(|| format!("opening repo {}", dir.display()))
 }
 
@@ -263,7 +294,59 @@ fn run(args: Args) -> anyhow::Result<()> {
             Ok(())
         },
         Command::Volume(command) => volume(open_repo(args.repo)?, command),
+        #[cfg(feature = "net")]
+        Command::Node(command) => node(&repo_dir(args.repo)?, command),
     }
+}
+
+#[cfg(feature = "net")]
+fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
+    use holokeep::net::{daemon, mesh};
+    match command {
+        NodeCommand::Id => println!("{}", mesh::node_key(dir)?.public().to_peer_id()),
+        NodeCommand::Invite { peer } => {
+            let peer: libp2p::PeerId = peer.parse().context("not a peer id")?;
+            let me = mesh::node_key(dir)?.public().to_peer_id();
+            anyhow::ensure!(peer != me, "that's this node");
+            let swarm_key = mesh::ensure_swarm_key(dir)?;
+            let members = daemon::members(dir)?;
+            members.add(&peer)?;
+            let mut list = members.list()?;
+            // Where this node listens, if it's running
+            let listening = daemon::ask(dir, "listeners")?.unwrap_or_default();
+            list.insert(me, listening.iter().filter_map(|addr| addr.parse().ok()).collect());
+            daemon::ask(dir, "reload")?;
+            println!("{}", mesh::Ticket { swarm_key, inviter: me, members: list }.encode());
+            if listening.is_empty() {
+                eprintln!("note: this node isn't running, so the ticket says nowhere to find it; it'll be found on the LAN, or start `hk node run` and invite again");
+            }
+        },
+        NodeCommand::Join { ticket } => {
+            let mut ticket = mesh::Ticket::decode(&ticket)?;
+            let me = mesh::node_key(dir)?.public().to_peer_id();
+            anyhow::ensure!(ticket.members.remove(&me).is_some(), "the ticket isn't for this node, {me}");
+            mesh::set_swarm_key(dir, ticket.swarm_key)?;
+            daemon::members(dir)?.merge(&ticket.members)?;
+            daemon::ask(dir, "reload")?;
+            eprintln!("joined the mesh of {}; `hk node run` to connect", ticket.inviter);
+        },
+        NodeCommand::Run { listen } => {
+            let listen = listen.parse().context("not a multiaddr")?;
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            runtime.block_on(daemon::run(dir, listen))?;
+        },
+        NodeCommand::Peers => match daemon::ask(dir, "peers")? {
+            Some(lines) => lines.iter().for_each(|line| println!("{line}")),
+            None => {
+                eprintln!("this node isn't running; members it knows of:");
+                for (peer, addrs) in daemon::members(dir)?.list()? {
+                    let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
+                    println!("{peer}\t-\t{}", addrs.join(" "));
+                }
+            },
+        },
+    }
+    Ok(())
 }
 
 fn volume(mut repo: Catalog, command: VolumeCommand) -> anyhow::Result<()> {
