@@ -48,7 +48,7 @@ use offset::{Fingerprint, Location, Whole};
 pub use raw::RawStore;
 pub use shards::ShardStore;
 pub use unixfs::UnixfsStore;
-pub use volume::Volume;
+pub use volume::{Volume, tolerance};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -386,6 +386,39 @@ pub struct CopyReport {
     pub claims: usize,
 }
 
+/// A copy of a block, as other nodes are told of it: the volume it's on,
+/// by label, and what that volume risks, itself included.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Replica {
+    #[serde(with = "serde_bytes")]
+    pub label: Vec<u8>,
+    pub risks: Vec<String>,
+}
+
+/// Where a node would keep a block it's sent: its own volume's risks, and
+/// the free space there, if it's known.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Offer {
+    pub risks: Vec<String>,
+    pub free: Option<u64>,
+}
+
+/// The risk every volume runs of itself, by its label, so it means the
+/// same volume to every catalog which knows it.
+fn volume_risk(label: &[u8]) -> String {
+    use std::fmt::Write as _;
+    label.iter().fold("volume:".to_owned(), |mut risk, byte| {
+        let _ = write!(risk, "{byte:02x}");
+        risk
+    })
+}
+
+/// Free space under a path.
+fn free_space(path: &Path) -> Option<u64> {
+    let stat = rustix::fs::statvfs(path).ok()?;
+    Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
 /// A multihash of one's own.
 fn owned(key: Key<'_>) -> Result<Multihash> {
     Multihash::try_wrap(key.code(), key.digest_ref()).map_err(|_| Error::Oversized(key.len()))
@@ -637,7 +670,8 @@ impl Catalog {
             .prepare_cached("SELECT risk FROM risks WHERE volume = ?1")?
             .query_map([id], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        risks.push(format!("volume:{id}"));
+        let label: Vec<u8> = self.db.conn().prepare_cached("SELECT label FROM volumes WHERE id = ?1")?.query_row([id], |row| row.get(0))?;
+        risks.push(volume_risk(&label));
         Ok(risks)
     }
 
@@ -937,6 +971,41 @@ impl Catalog {
             .query_map([id], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         volumes.into_iter().map(|volume| self.risks(volume)).collect()
+    }
+
+    /// The catalog's database, for others to keep what concerns its blocks
+    /// beside them.
+    pub const fn db(&self) -> &Db {
+        &self.db
+    }
+
+    /// The copies of a block the catalog knows of, on its volumes attached
+    /// or not.
+    pub fn replicas(&self, key: Key<'_>) -> Result<Vec<Replica>> {
+        let Some(id) = self.db.lookup(key)? else {
+            return Ok(Vec::new());
+        };
+        let volumes: Vec<(Id, Vec<u8>)> = self.db.conn()
+            .prepare_cached("SELECT v.id, v.label FROM blocks b JOIN volumes v ON v.id = b.volume WHERE b.block = ?1 ORDER BY v.id")?
+            .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        volumes.into_iter().map(|(volume, label)| Ok(Replica { label, risks: self.risks(volume)? })).collect()
+    }
+
+    /// Where this catalog would keep a block another node sends it: its own
+    /// volume, or failing that its first.
+    pub fn offer(&self) -> Result<Offer> {
+        let v = self.own().unwrap_or_default();
+        let (Some(&id), Some(volume)) = (self.ids.get(v), self.volumes.get(v)) else {
+            return Ok(Offer { risks: Vec::new(), free: None });
+        };
+        Ok(Offer { risks: self.risks(id)?, free: volume.path().and_then(free_space) })
+    }
+
+    /// A block as it can be read now, verified, under the first CID it was
+    /// put with; or None if no copy can be read.
+    pub fn read_block(&self, key: Key<'_>) -> Result<Option<Block>> {
+        self.readable(key)
     }
 
     /// Copy every block until it would take at least `copies` failures to

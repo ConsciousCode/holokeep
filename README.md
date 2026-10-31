@@ -32,7 +32,7 @@ Holokeep is early. What exists is the content-addressing core, each piece checke
 - **Storage and retrieval**: `hk add` stores into a repo where a routing store sorts blocks by structure: UnixFS nodes as rows, dag-cbor and dag-json as queryable JSONB, large blocks and whole files in a flatfs-style sharded directory, file leaves as ranges of whole files kept there (or left in place with `--nocopy`), and everything else as raw bytes. `hk cat`/`hk get` read them back out, checked against the original files.
 - **Interchange**: `hk dag export` writes a DAG as a CARv1 byte-for-byte identical to `ipfs dag export`, and `hk dag import` reads CARv1 and CARv2 files, Kubo's included, verifying every block. Legacy CIDv0 DAGs round-trip unchanged.
 
-Nodes can join a private mesh (`hk node`) and fetch blocks from each other, so any file in the repo can be read from any running node; they don't yet keep each other's blocks replicated, see the [roadmap](#roadmap).
+Nodes can join a private mesh (`hk node`) and fetch blocks from each other, so any file in the repo can be read from any running node, and they keep each other's blocks replicated, counting the risks each copy shares, so a block isn't one disk failure from being lost; see the [roadmap](#roadmap) for what isn't done.
 
 ## Vision
 
@@ -284,11 +284,11 @@ Nodes within a mesh use anti-entropy to maintain a well-replicated set of blocks
 
 **Nodes exchange what's needed, not their indexes.** Catching up (`catch_up`, generations) belongs to shared volumes, where two catalogs index the same storage and each must notice what the other wrote. Between nodes there are no unindexed blocks, only blocks elsewhere, and mirroring every node's placement into every catalog would cost every machine for nothing it needs. Each exchange has its own trigger:
 
-- *Durability*: a holder advertises, over gossipsub, the blocks it believes are under-replicated, by its volumes' risks and what it believes of copies elsewhere. Holders answer "have" with their volumes' labels and risks, which corrects the belief, and labels keep a volume two nodes share from counting twice. If that's still short, a target is chosen by rendezvous hashing over the block and the candidates, weighted by how much each raises tolerance and its free space, and the same ranking over the holders picks which one sends it. Every node computes the same answer without coordinating, so there's no herd and no block left unreplicated or replicated twice; a target which refuses (a friend, later) passes it to the next in the ranking.
+- *Durability*: a node audits what it holds every hour (`hk node run --copies`, 2 by default, or now with `hk node audit`), and advertises (`/holokeep/adverts/1.0.0`) the blocks it believes would take fewer failures than that to lose, by its volumes' risks and the copies it has sighted elsewhere. Every member answers with the copies it holds of those, by volume label and risks, which corrects the belief (labels keep a volume two nodes share from counting twice, and each volume's implicit risk is its label, so it means the same volume everywhere), and with an *offer*: what its own volume risks, and its free space. If a block's still short, a target is chosen by rendezvous hashing over the block and the members whose copy would raise its tolerance most, weighted by free space, and it's sent there (`/holokeep/push/1.0.0`), again until it's enough or no one can raise it. The same hashing, unweighted, over the holders picks which one does this: a holder advertises only what it's responsible for among the holders it knows of, and passes over a block once it learns of a holder ranked higher, so holders auditing at once still send each block once. Every node computes the same answer without coordinating, so there's no herd and no block left unreplicated or replicated twice; a target which doesn't keep what it's sent (full, or a friend, later) is passed over for the next. Every member answering suits a small mesh; gossip is for when it isn't fully connected.
 - *Access*: a reader wants what it doesn't hold (`/holokeep/blocks/1.0.0`). A fetch walks a DAG from its root, reading what's here for its links (a raw block has none, so it's only looked for) and wanting what isn't, in batches. Each multihash is asked of one connected member at a time, starting from a different one for each block so a big DAG's load is spread, and a member without it passes it to the next; an answer carries each block under the CID it was put with, so its codec comes along, and keeps to a few megabytes, leaving the rest to be asked again. Every block is verified before it's kept, and what's fetched is kept, as a cached copy. `hk dag fetch` fetches a DAG, and `hk cat`, `get` and `dag export` fetch first whenever the node's running. Asking members in turn suits a small mesh; Kademlia provider records are for when it isn't.
 - *Backrefs*: a writer pushes structure (links, claims) to the holders of what it links to, which is how they make their best effort to know every backref to what they hold.
 
-Beliefs about other nodes' copies are kept apart from `blocks`, which stays authoritative for the node's own volumes: only for blocks the node holds, expiring by its own clock. An expired belief lowers a block's tolerance, which brings an advertisement, which brings a "have" or a new copy: audit and repair are the same loop.
+Beliefs about other nodes' copies, *sightings*, are kept apart from `blocks`, which stays authoritative for the node's own volumes: only for blocks the node holds, expiring by its own clock after a week. An expired belief lowers a block's tolerance, which brings an advertisement, which brings a "have" or a new copy: audit and repair are the same loop.
 
 **Joining**, so far: every node of a repository shares a *swarm key*, a libp2p private-network key (Kubo's `swarm.key` format), which encrypts a connection before anything else is said, so a machine without it can't speak to the mesh; it works over TCP, not QUIC. Each node also keeps the members it lets in, so one can be shut out without changing the key, and members tell each other of the members they know whenever they connect, so a machine invited by one is let in by all. A machine joins with a ticket from a member: `hk node id` on it, `hk node invite <id>` on the member, `hk node join <ticket>` back on it. The keys are files beside the catalog (`node.key`, `swarm.key`), not rows in it, since its database is a volume another node may open. mDNS finds members on the LAN; identify tells each where the others listen; Kademlia, under `/holokeep/kad/1.0.0` so it's no part of Amino, will find them as they move. `hk node run` owns the mesh on one thread, the catalog's database with it; other commands open the repo as ever, and ask the daemon over a Unix socket for what needs the mesh. Until users have DIDs, holding the key and being on the list is what being yours means.
 
@@ -337,7 +337,7 @@ Checklist:
 - [ ] P2P private mesh
   - [x] Joining: swarm key, members, tickets, mDNS, identify (`hk node id/invite/join/run/peers`)
   - [x] Fetching DAGs from other nodes (`hk dag fetch`, and `cat`/`get`/`dag export` through a running node)
-  - [ ] Advertising under-replication, sightings, recruiting by rendezvous hashing
+  - [x] Advertising under-replication, sightings, recruiting by rendezvous hashing (`hk node run --copies`, `hk node audit`)
   - [ ] Pushing structure to holders, for backrefs and claims
   - [ ] Kademlia provider records, once broadcast wants don't scale
 - [ ] Public Amino DHT
@@ -403,8 +403,10 @@ $hk volume copy <name> [cid...]     # copy DAGs, or everything, to a volume wher
 $hk node id                         # this node's peer id, to be invited by
 $hk node invite <peer-id>           # let a machine into the mesh; prints a secret ticket
 $hk node join <ticket>              # join a mesh
-$hk node run [--listen <addr>]      # run in the mesh (default /ip4/0.0.0.0/tcp/4011)
+$hk node run [--listen <addr>] [--copies n]  # run in the mesh (default /ip4/0.0.0.0/tcp/4011),
+                                    # copying blocks to members until it takes n failures to lose each
 $hk node peers                      # members, and which are connected
+$hk node audit [--copies n]         # have the running node advertise and copy what's short now
 $hk dag fetch <cid>                 # fetch what isn't here of a DAG from the mesh
 ```
 

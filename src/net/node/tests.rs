@@ -234,3 +234,139 @@ async fn a_member_without_a_block_passes_it_on() {
         }
     }
 }
+
+//----------------//
+//-[ Durability ]-//
+//----------------//
+
+use crate::net::durability::Report;
+
+/// Drive every node until each audit named, by node and id, reports.
+async fn audited(nodes: &mut [&mut Node], audits: &[(usize, AuditId)]) -> Vec<Report> {
+    let mut reports: Vec<Option<Report>> = vec![None; audits.len()];
+    let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(10)).expect("deadline");
+    while reports.iter().any(Option::is_none) {
+        let events = futures::future::select_all(nodes.iter_mut().map(|node| Box::pin(node.next())));
+        let (event, from, _) = tokio::time::timeout_at(deadline, events).await.expect("in time");
+        if let Event::Audited { id, report } = event.expect("event")
+            && let Some(i) = audits.iter().position(|&audit| audit == (from, id))
+            && let Some(slot) = reports.get_mut(i)
+        {
+            *slot = Some(report);
+        }
+    }
+    reports.into_iter().flatten().collect()
+}
+
+fn report(advertised: usize, copied: usize, short: usize) -> Report {
+    Report { advertised, copied, short }
+}
+
+/// Three members, all connected.
+async fn three() -> (Node, Node, Node) {
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let (mut a, mut b, mut c) = (node(swarm_key).await, node(swarm_key).await, node(swarm_key).await);
+    invite(&a, &b, swarm_key);
+    invite(&a, &c, swarm_key);
+    a.reload().expect("reload");
+    for joiner in [&mut b, &mut c] {
+        joiner.reload().expect("reload");
+        joiner.dial_members().expect("dial");
+    }
+    assert!(until(&mut [&mut a, &mut b, &mut c], |n| connected(n[0], n[1]) && connected(n[0], n[2]) && connected(n[1], n[2])).await);
+    (a, b, c)
+}
+
+/// Sixteen leaves and a root linking them.
+fn wide() -> Vec<Block> {
+    let leaves: Vec<Block> = (0..16u8).map(|i| raw(&[i, 0xd0])).collect();
+    let root = cbor(&Ipld::List(leaves.iter().map(|leaf| Ipld::Link(link(leaf))).collect()));
+    leaves.into_iter().chain([root]).collect()
+}
+
+fn has(node: &Node, block: &Block) -> bool {
+    node.catalog().has(block.cid().multihash()).expect("has")
+}
+
+#[tokio::test]
+async fn short_blocks_are_copied_to_a_member() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    let id = a.audit(2).expect("audit");
+    assert_eq!(audited(&mut [&mut a, &mut b], &[(0, id)]).await, [report(4, 4, 0)]);
+    for block in &blocks {
+        assert!(has(&b, block));
+        // And a knows b has it
+        let sighted = a.sightings().of(block.cid().multihash()).expect("sightings");
+        assert_eq!(sighted.iter().map(|(peer, _)| *peer).collect::<Vec<_>>(), [b.peer_id()]);
+    }
+    // Now nothing's short
+    let id = a.audit(2).expect("audit");
+    assert_eq!(audited(&mut [&mut a, &mut b], &[(0, id)]).await, [report(0, 0, 0)]);
+}
+
+#[tokio::test]
+async fn a_copy_a_member_has_is_sighted_not_sent() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    let branch = blocks.get(1).expect("branch");
+    b.catalog().put_block(branch, CidVersion::V1).expect("put");
+    let id = a.audit(2).expect("audit");
+    assert_eq!(audited(&mut [&mut a, &mut b], &[(0, id)]).await, [report(4, 3, 0)]);
+    assert_eq!(a.sightings().of(branch.cid().multihash()).expect("sightings").len(), 1);
+}
+
+#[tokio::test]
+async fn a_lone_node_reports_whats_short() {
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let mut a = node(swarm_key).await;
+    for block in wide() {
+        a.catalog().put_block(&block, CidVersion::V1).expect("put");
+    }
+    let id = a.audit(2).expect("audit");
+    assert_eq!(audited(&mut [&mut a], &[(0, id)]).await, [report(17, 0, 17)]);
+    // One copy is all it takes failing to lose one
+    let id = a.audit(1).expect("audit");
+    assert_eq!(audited(&mut [&mut a], &[(0, id)]).await, [report(0, 0, 0)]);
+}
+
+#[tokio::test]
+async fn each_block_goes_to_one_member() {
+    let (mut a, mut b, mut c) = Box::pin(three()).await;
+    let blocks = wide();
+    for block in &blocks {
+        a.catalog().put_block(block, CidVersion::V1).expect("put");
+    }
+    let id = a.audit(2).expect("audit");
+    assert_eq!(audited(&mut [&mut a, &mut b, &mut c], &[(0, id)]).await, [report(17, 17, 0)]);
+    let on_b = blocks.iter().filter(|block| has(&b, block)).count();
+    let on_c = blocks.iter().filter(|block| has(&c, block)).count();
+    assert_eq!(on_b + on_c, 17, "one copy each, not two");
+    assert!(on_b > 0 && on_c > 0, "spread: {on_b} on b, {on_c} on c");
+    // Three copies takes all three; a sees to those it's responsible for
+    // among the two holders, the other holder to the rest
+    let audits = [(0, a.audit(3).expect("audit")), (1, b.audit(3).expect("audit")), (2, c.audit(3).expect("audit"))];
+    let reports = audited(&mut [&mut a, &mut b, &mut c], &audits).await;
+    assert_eq!(reports.iter().map(|report| report.copied).sum::<usize>(), 17, "{reports:?}");
+    assert!(blocks.iter().all(|block| has(&b, block) && has(&c, block)));
+}
+
+#[tokio::test]
+async fn holders_auditing_at_once_send_each_block_once() {
+    let (mut a, mut b, mut c) = Box::pin(three()).await;
+    let blocks = wide();
+    for block in &blocks {
+        a.catalog().put_block(block, CidVersion::V1).expect("put");
+        b.catalog().put_block(block, CidVersion::V1).expect("put");
+    }
+    // Neither knows the other holds them, so both advertise everything;
+    // the answers tell each which of them is responsible for which
+    let (on_a, on_b) = (a.audit(3).expect("audit"), b.audit(3).expect("audit"));
+    let reports = audited(&mut [&mut a, &mut b, &mut c], &[(0, on_a), (1, on_b)]).await;
+    assert_eq!(reports.iter().map(|report| report.advertised).collect::<Vec<_>>(), [17, 17]);
+    assert_eq!(reports.iter().map(|report| report.copied).sum::<usize>(), 17, "{reports:?}");
+    assert!(reports.iter().all(|report| report.copied > 0), "{reports:?}");
+    assert!(blocks.iter().all(|block| has(&c, block)));
+    // And now each knows, only the one responsible advertises
+    let (on_a, on_b) = (a.audit(3).expect("audit"), b.audit(3).expect("audit"));
+    let reports = audited(&mut [&mut a, &mut b, &mut c], &[(0, on_a), (1, on_b)]).await;
+    assert_eq!(reports, [report(0, 0, 0), report(0, 0, 0)]);
+}

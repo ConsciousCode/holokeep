@@ -11,6 +11,7 @@
 //!   listen; Kademlia, under its own protocol name so it's no part of
 //!   Amino, finds members' addresses as they move.
 //! - Members want blocks of each other; see `blocks`.
+//! - Members keep each other's blocks durable; see `durability`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::str::FromStr;
@@ -30,6 +31,7 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport, identify, kad,
 use serde::{Deserialize, Serialize};
 
 use super::blocks::{self, Blocks, Fetch, Want};
+use super::durability::{self, Advert, Audit, Haves, Kept, Push, Report, Sightings};
 use super::mesh::{Error, Members, Result};
 use crate::model::Link;
 use crate::store::Catalog;
@@ -73,10 +75,15 @@ pub struct Behaviour {
     kad: kad::Behaviour<kad::store::MemoryStore>,
     members: request_response::cbor::Behaviour<Roster, Roster>,
     blocks: request_response::cbor::Behaviour<Want, Blocks>,
+    adverts: request_response::cbor::Behaviour<Advert, Haves>,
+    push: request_response::cbor::Behaviour<Push, Kept>,
 }
 
 /// A fetch, as the node knows it.
 pub type FetchId = u64;
+
+/// An audit, as the node knows it.
+pub type AuditId = u64;
 
 /// What happened, as far as the mesh is concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +98,8 @@ pub enum Event {
     /// A fetch finished: how many blocks it fetched, and those no member
     /// had.
     Fetched { id: FetchId, fetched: usize, missing: Vec<Link> },
+    /// An audit finished.
+    Audited { id: AuditId, report: Report },
 }
 
 /// A transport for the mesh, over some base transport: the private
@@ -120,6 +129,9 @@ pub struct Node {
     catalog: Catalog,
     fetches: BTreeMap<FetchId, Fetch>,
     next_fetch: FetchId,
+    sightings: Sightings,
+    audits: BTreeMap<AuditId, Audit>,
+    next_audit: AuditId,
     /// Events which happened outside `next`, for it to return first.
     ready: VecDeque<Event>,
 }
@@ -148,10 +160,29 @@ impl Node {
                 [(blocks::PROTOCOL, ProtocolSupport::Full)],
                 request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
             ),
+            adverts: request_response::cbor::Behaviour::new(
+                [(durability::ADVERTS, ProtocolSupport::Full)],
+                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
+            ),
+            push: request_response::cbor::Behaviour::new(
+                [(durability::PUSH, ProtocolSupport::Full)],
+                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
+            ),
         };
         let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(IDLE);
         let swarm = Swarm::new(transport, behaviour, peer, config);
-        let mut node = Self { swarm, members, catalog, fetches: BTreeMap::new(), next_fetch: 0, ready: VecDeque::new() };
+        let sightings = Sightings::open(catalog.db().clone())?;
+        let mut node = Self {
+            swarm,
+            members,
+            catalog,
+            fetches: BTreeMap::new(),
+            next_fetch: 0,
+            sightings,
+            audits: BTreeMap::new(),
+            next_audit: 0,
+            ready: VecDeque::new(),
+        };
         node.reload()?;
         Ok(node)
     }
@@ -166,6 +197,115 @@ impl Node {
 
     pub const fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    pub const fn sightings(&self) -> &Sightings {
+        &self.sightings
+    }
+
+    /// Whether an audit is under way.
+    pub fn auditing(&self) -> bool {
+        !self.audits.is_empty()
+    }
+
+    /// Audit what this node holds, advertising what would take fewer than
+    /// `copies` failures to lose and sending copies to members to raise
+    /// it. It's done when `next` returns `Audited` with the id.
+    pub fn audit(&mut self, copies: usize) -> Result<AuditId> {
+        let id = self.next_audit;
+        self.next_audit = id.wrapping_add(1);
+        let mut peers = self.connected();
+        peers.sort();
+        let (mut audit, adverts) = Audit::start(&self.catalog, &self.sightings, self.peer_id(), &peers, copies)?;
+        for advert in &adverts {
+            for &peer in &peers {
+                let request = self.swarm.behaviour_mut().adverts.send_request(&peer, advert.clone());
+                audit.sent_advert(request, peer, advert);
+            }
+        }
+        self.audits.insert(id, audit);
+        self.drive_audit(id)?;
+        Ok(id)
+    }
+
+    /// Send what an audit has to push, once it's heard back, or finish it.
+    fn drive_audit(&mut self, id: AuditId) -> Result<()> {
+        let Some(audit) = self.audits.get_mut(&id) else {
+            return Ok(());
+        };
+        if audit.waiting() {
+            return Ok(());
+        }
+        if let Some(pushes) = audit.decide(&self.catalog)? {
+            for (peer, push, keys) in pushes {
+                let request = self.swarm.behaviour_mut().push.send_request(&peer, push);
+                audit.sent_push(request, peer, keys);
+            }
+        } else {
+            let report = audit.report();
+            self.audits.remove(&id);
+            self.ready.push_back(Event::Audited { id, report });
+        }
+        Ok(())
+    }
+
+    fn on_advert(&mut self, event: request_response::Event<Advert, Haves>) -> Result<()> {
+        match event {
+            request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
+                let haves = durability::answer_advert(&self.catalog, &self.sightings, &peer, &request)?;
+                // The advertiser may be gone already
+                let _ = self.swarm.behaviour_mut().adverts.send_response(channel, haves);
+                return Ok(());
+            },
+            request_response::Event::Message { message: request_response::Message::Response { request_id, response }, .. } => {
+                if let Some(audit) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
+                    audit.haves(&self.sightings, request_id, response)?;
+                }
+            },
+            request_response::Event::OutboundFailure { request_id, .. } => {
+                if let Some(audit) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
+                    audit.advert_failed(request_id);
+                }
+            },
+            _ => return Ok(()),
+        }
+        self.drive_audits()
+    }
+
+    fn on_push(&mut self, event: request_response::Event<Push, Kept>) -> Result<()> {
+        match event {
+            request_response::Event::Message { message: request_response::Message::Request { request, channel, .. }, .. } => {
+                let kept = durability::answer_push(&self.catalog, request)?;
+                let _ = self.swarm.behaviour_mut().push.send_response(channel, kept);
+                return Ok(());
+            },
+            request_response::Event::Message { message: request_response::Message::Response { request_id, response }, .. } => {
+                if let Some(audit) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
+                    audit.kept(&self.sightings, request_id, response)?;
+                }
+            },
+            request_response::Event::OutboundFailure { request_id, .. } => {
+                if let Some(audit) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
+                    audit.push_failed(request_id);
+                }
+            },
+            _ => return Ok(()),
+        }
+        self.drive_audits()
+    }
+
+    /// Drive every audit which is no longer waiting.
+    fn drive_audits(&mut self) -> Result<()> {
+        let ids: Vec<AuditId> = self.audits.keys().copied().collect();
+        for id in ids {
+            self.drive_audit(id)?;
+        }
+        Ok(())
+    }
+
+    /// The audit which sent an advert or push.
+    fn audit_of(&self, request: request_response::OutboundRequestId) -> Option<AuditId> {
+        self.audits.iter().find(|(_, audit)| audit.asked(request)).map(|(&id, _)| id)
     }
 
     /// Fetch the DAG under a root from other members, keeping what's
@@ -356,6 +496,14 @@ impl Node {
                     }
                     self.drive(id)?;
                 }
+                None
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Adverts(event)) => {
+                self.on_advert(event)?;
+                None
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Push(event)) => {
+                self.on_push(event)?;
                 None
             },
             _ => None,

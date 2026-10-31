@@ -1274,6 +1274,7 @@ dependencies = [
  "paste",
  "proptest",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_bytes",
  "serde_ipld_dagcbor",

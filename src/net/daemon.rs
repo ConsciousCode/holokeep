@@ -22,7 +22,8 @@ use tokio::net::UnixListener;
 use tokio::net::unix::OwnedWriteHalf;
 
 use super::mesh::{self, Error, Members, Result};
-use super::node::{Event, FetchId, Node};
+use super::durability::Report;
+use super::node::{AuditId, Event, FetchId, Node};
 use crate::store::Db;
 
 /// The daemon's socket, in the repo.
@@ -33,6 +34,18 @@ pub const LISTEN: &str = "/ip4/0.0.0.0/tcp/4011";
 
 /// How often to dial members which aren't connected.
 const REDIAL: Duration = Duration::from_mins(1);
+
+/// How often to audit what's held, and raise what's short.
+const AUDIT: Duration = Duration::from_hours(1);
+
+/// How long after starting to first audit, so members have connected.
+const SETTLE: Duration = Duration::from_secs(30);
+
+/// Someone on the control socket waiting for something to finish.
+enum Waiter {
+    Fetch(FetchId),
+    Audit(AuditId),
+}
 
 /// The members of the repo's mesh, as this node knows them.
 pub fn members(dir: &Path) -> Result<Members> {
@@ -91,6 +104,29 @@ pub fn fetch(dir: &Path, root: &crate::model::Link) -> Result<Option<(usize, Vec
     Ok(Some((fetched, missing)))
 }
 
+/// Have the running daemon audit now, as many failures to lose a block as
+/// it's run with unless said: what it reported, or None if it isn't
+/// running.
+pub fn audit(dir: &Path, copies: Option<usize>) -> Result<Option<Report>> {
+    let command = copies.map_or_else(|| "audit".to_owned(), |copies| format!("audit {copies}"));
+    let Some(lines) = ask_patiently(dir, &command)? else {
+        return Ok(None);
+    };
+    let mut report = None;
+    for line in lines {
+        let mut words = line.split_whitespace();
+        if words.next() == Some("audited") {
+            let mut number = || words.next().and_then(|n| n.parse().ok()).unwrap_or_default();
+            report = Some(Report { advertised: number(), copied: number(), short: number() });
+        } else if line.starts_with("unknown command") {
+            return Err(Error::Invalid("the running node is older than this hk: restart `hk node run`".into()));
+        } else if let Some(e) = line.strip_prefix("error: ") {
+            return Err(Error::Invalid(e.to_owned()));
+        }
+    }
+    report.map(Some).ok_or_else(|| Error::Invalid("the node hung up without saying what it audited".into()))
+}
+
 fn ask_within(dir: &Path, command: &str, time: Option<Duration>) -> Result<Option<Vec<String>>> {
     let Ok(mut stream) = UnixStream::connect(socket(dir)) else {
         return Ok(None);
@@ -101,8 +137,9 @@ fn ask_within(dir: &Path, command: &str, time: Option<Duration>) -> Result<Optio
     Ok(Some(lines))
 }
 
-/// Run the node until interrupted.
-pub async fn run(dir: &Path, listen: Multiaddr) -> Result<()> {
+/// Run the node until interrupted, auditing every so often that it would
+/// take `copies` failures to lose each block it holds.
+pub async fn run(dir: &Path, listen: Multiaddr, copies: usize) -> Result<()> {
     let key = mesh::node_key(dir)?;
     let swarm_key = mesh::swarm_key(dir)?.ok_or_else(|| Error::Invalid("this node isn't in a mesh: invite another, or join one".into()))?;
     let catalog = crate::store::Catalog::open_repo(dir)?;
@@ -120,13 +157,23 @@ pub async fn run(dir: &Path, listen: Multiaddr) -> Result<()> {
     let control = UnixListener::bind(&path)?;
     eprintln!("node {} in mesh {}", node.peer_id(), swarm_key.fingerprint());
     let mut redial = tokio::time::interval(REDIAL);
-    // Those waiting on fetches, to be answered when they finish
-    let mut waiting: HashMap<FetchId, OwnedWriteHalf> = HashMap::new();
+    let start = tokio::time::Instant::now().checked_add(SETTLE).unwrap_or_else(tokio::time::Instant::now);
+    let mut audit = tokio::time::interval_at(start, AUDIT);
+    // Those waiting on fetches and audits, to be answered when they finish
+    let mut fetching: HashMap<FetchId, OwnedWriteHalf> = HashMap::new();
+    let mut auditing: HashMap<AuditId, OwnedWriteHalf> = HashMap::new();
     let result = loop {
         tokio::select! {
             event = node.next() => match event {
+                Ok(Event::Audited { id, report }) => {
+                    eprintln!("audited: {} advertised, {} copied, {} short", report.advertised, report.copied, report.short);
+                    if let Some(mut write) = auditing.remove(&id) {
+                        let line = format!("audited {} {} {}\n", report.advertised, report.copied, report.short);
+                        let _ = write.write_all(line.as_bytes()).await;
+                    }
+                },
                 Ok(Event::Fetched { id, fetched, missing }) => {
-                    if let Some(mut write) = waiting.remove(&id) {
+                    if let Some(mut write) = fetching.remove(&id) {
                         let mut out = format!("fetched {fetched}\n");
                         for cid in missing {
                             let _ = writeln!(out, "missing {cid}");
@@ -142,15 +189,23 @@ pub async fn run(dir: &Path, listen: Multiaddr) -> Result<()> {
                 let Ok((stream, _)) = accepted else {
                     continue;
                 };
-                match answer(&mut node, stream).await {
-                    Ok(Some((id, write))) => {
-                        waiting.insert(id, write);
+                match answer(&mut node, stream, copies).await {
+                    Ok(Some((Waiter::Fetch(id), write))) => {
+                        fetching.insert(id, write);
+                    },
+                    Ok(Some((Waiter::Audit(id), write))) => {
+                        auditing.insert(id, write);
                     },
                     Ok(None) => {},
                     Err(e) => eprintln!("control: {e}"),
                 }
             },
             _ = redial.tick() => node.dial_members()?,
+            _ = audit.tick() => {
+                if !node.auditing() {
+                    node.audit(copies)?;
+                }
+            },
             _ = tokio::signal::ctrl_c() => break Ok(()),
         }
     };
@@ -168,15 +223,16 @@ fn report(event: &Event) {
                 eprintln!("learned of member {peer}");
             }
         },
-        // Members which are offline fail to be dialed all the time
-        Event::Failed(..) => {},
+        // Members which are offline fail to be dialed all the time, and
+        // audits are reported as they finish
+        Event::Failed(..) | Event::Audited { .. } => {},
         Event::Fetched { fetched, missing, .. } => eprintln!("fetched {fetched} blocks, {} missing", missing.len()),
     }
 }
 
 /// Answer one command on the control socket, or say which fetch it waits
 /// on, to be answered when that finishes.
-async fn answer(node: &mut Node, stream: tokio::net::UnixStream) -> Result<Option<(FetchId, OwnedWriteHalf)>> {
+async fn answer(node: &mut Node, stream: tokio::net::UnixStream, copies: usize) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
     tokio::time::timeout(Duration::from_secs(1), tokio::io::BufReader::new(read).read_line(&mut line))
@@ -204,11 +260,18 @@ async fn answer(node: &mut Node, stream: tokio::net::UnixStream) -> Result<Optio
         command if command.starts_with("fetch ") => {
             let cid = command.trim_start_matches("fetch ").trim();
             match cid.parse::<crate::model::Link>() {
-                Ok(root) => return Ok(Some((node.fetch(root)?, write))),
+                Ok(root) => return Ok(Some((Waiter::Fetch(node.fetch(root)?), write))),
                 Err(_) => {
                     let _ = writeln!(out, "error: not a CID: {cid}");
                 },
             }
+        },
+        "audit" => return Ok(Some((Waiter::Audit(node.audit(copies)?), write))),
+        command if command.starts_with("audit ") => match command.trim_start_matches("audit ").trim().parse() {
+            Ok(copies) => return Ok(Some((Waiter::Audit(node.audit(copies)?), write))),
+            Err(_) => {
+                let _ = writeln!(out, "error: not a number of copies: {command}");
+            },
         },
         other => {
             // Not prefixed with "error: ", which daemons from before fetching

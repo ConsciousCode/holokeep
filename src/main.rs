@@ -110,9 +110,20 @@ enum NodeCommand {
     Run {
         #[arg(long, default_value = holokeep::net::daemon::LISTEN)]
         listen: String,
+        /// Every hour, copy blocks to other members until it would take
+        /// this many failures to lose each, counting risks
+        #[arg(short, long, default_value_t = 2)]
+        copies: usize,
     },
     /// List the mesh's members, and which are connected
     Peers,
+    /// Have the running node audit now: advertise the blocks it holds
+    /// which are short of the copies it runs with, or of these, and copy
+    /// them to other members
+    Audit {
+        #[arg(short, long)]
+        copies: Option<usize>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -355,10 +366,17 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
             daemon::ask(dir, "reload")?;
             eprintln!("joined the mesh of {}; `hk node run` to connect", ticket.inviter);
         },
-        NodeCommand::Run { listen } => {
+        NodeCommand::Run { listen, copies } => {
             let listen = listen.parse().context("not a multiaddr")?;
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            runtime.block_on(daemon::run(dir, listen))?;
+            runtime.block_on(daemon::run(dir, listen, copies))?;
+        },
+        NodeCommand::Audit { copies } => {
+            let report = daemon::audit(dir, copies)?.context("this node isn't running: start `hk node run`")?;
+            println!("advertised {}, copied {}", report.advertised, report.copied);
+            if report.short > 0 {
+                eprintln!("{} blocks are still short, with no connected member to raise them", report.short);
+            }
         },
         NodeCommand::Peers => match daemon::ask(dir, "peers")? {
             Some(lines) => lines.iter().for_each(|line| println!("{line}")),
