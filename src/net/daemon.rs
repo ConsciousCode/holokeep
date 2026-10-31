@@ -23,7 +23,7 @@ use tokio::net::unix::OwnedWriteHalf;
 
 use super::mesh::{self, Error, Members, Result};
 use super::durability::Report;
-use super::node::{AuditId, Event, FetchId, Node};
+use super::node::{AuditId, Event, FetchId, Node, TrimId};
 use crate::store::Db;
 
 /// The daemon's socket, in the repo.
@@ -43,10 +43,35 @@ const ANNOUNCE: Duration = Duration::from_secs(10);
 /// connected.
 const SETTLE: Duration = Duration::from_secs(5);
 
+/// How often to look at free space, to trim between the watermarks.
+const PRESSURE: Duration = Duration::from_secs(30);
+
 /// Someone on the control socket waiting for something to finish.
+#[derive(Debug, Clone, Copy)]
 enum Waiter {
     Fetch(FetchId),
     Audit(AuditId),
+    Trim(TrimId),
+}
+
+/// Parse a size: bytes, or with a K, M, G or T suffix, in powers of two.
+pub fn parse_size(text: &str) -> std::result::Result<u64, String> {
+    let text = text.trim();
+    let (number, shift) = match text.char_indices().last() {
+        Some((at, unit)) if unit.is_ascii_alphabetic() => {
+            let shift = match unit.to_ascii_uppercase() {
+                'K' => 10,
+                'M' => 20,
+                'G' => 30,
+                'T' => 40,
+                _ => return Err(format!("unknown unit in {text:?}")),
+            };
+            (text.get(..at).unwrap_or_default(), shift)
+        },
+        _ => (text, 0),
+    };
+    let number: u64 = number.trim().parse().map_err(|_| format!("not a size: {text:?}"))?;
+    number.checked_shl(shift).filter(|size| size >> shift == number).ok_or_else(|| format!("too large: {text:?}"))
 }
 
 /// The members of the repo's mesh, as this node knows them.
@@ -129,6 +154,31 @@ pub fn audit(dir: &Path, copies: Option<usize>) -> Result<Option<Report>> {
     report.map(Some).ok_or_else(|| Error::Invalid("the node hung up without saying what it audited".into()))
 }
 
+/// Have the running daemon let go of whatever the mesh can spare of what's
+/// here, pressed or not: (considered, dropped, freed), or None if it isn't
+/// running.
+pub fn trim(dir: &Path) -> Result<Option<super::trim::Report>> {
+    let Some(lines) = ask_patiently(dir, "trim")? else {
+        return Ok(None);
+    };
+    for line in lines {
+        let mut words = line.split_whitespace();
+        if words.next() == Some("trimmed") {
+            let mut number = || words.next().and_then(|n| n.parse::<u64>().ok()).unwrap_or_default();
+            let (considered, dropped, freed) = (number(), number(), number());
+            return Ok(Some(super::trim::Report {
+                considered: usize::try_from(considered).unwrap_or_default(),
+                dropped: usize::try_from(dropped).unwrap_or_default(),
+                freed,
+            }));
+        }
+        if line.starts_with("unknown command") {
+            return Err(Error::Invalid("the running node is older than this hk: restart `hk node run`".into()));
+        }
+    }
+    Err(Error::Invalid("the node hung up without saying what it trimmed".into()))
+}
+
 fn ask_within(dir: &Path, command: &str, time: Option<Duration>) -> Result<Option<Vec<String>>> {
     let Ok(mut stream) = UnixStream::connect(socket(dir)) else {
         return Ok(None);
@@ -141,11 +191,16 @@ fn ask_within(dir: &Path, command: &str, time: Option<Duration>) -> Result<Optio
 
 /// Run the node until interrupted, auditing as a trickle that it would
 /// take `copies` failures to lose each block it holds.
-pub async fn run(dir: &Path, listen: Multiaddr, copies: usize) -> Result<()> {
+///
+/// Free space is kept between watermarks, `(low, high)`: below the low,
+/// the node lets go of copies the mesh can spare until it's above the
+/// high.
+pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64, u64)) -> Result<()> {
     let key = mesh::node_key(dir)?;
     let swarm_key = mesh::swarm_key(dir)?.ok_or_else(|| Error::Invalid("this node isn't in a mesh: invite another, or join one".into()))?;
     let catalog = crate::store::Catalog::open_repo(dir)?;
     let mut node = Node::tcp(&key, swarm_key, catalog, members(dir)?)?;
+    node.set_watermarks(low, high);
     node.listen(listen)?;
     node.dial_members()?;
     let path = socket(dir);
@@ -162,34 +217,20 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize) -> Result<()> {
     let later = |delay| tokio::time::Instant::now().checked_add(delay).unwrap_or_else(tokio::time::Instant::now);
     let mut trickle = later(SETTLE);
     let mut announce = tokio::time::interval(ANNOUNCE);
-    // Those waiting on fetches and audits, to be answered when they finish
-    let mut fetching: HashMap<FetchId, OwnedWriteHalf> = HashMap::new();
-    let mut auditing: HashMap<AuditId, OwnedWriteHalf> = HashMap::new();
+    let mut pressure = later(SETTLE);
+    let mut waiting = Waiting::default();
     let result = loop {
         tokio::select! {
             event = node.next() => match event {
-                Ok(Event::Audited { id, report }) => {
-                    // The trickle's ticks are worth hearing of only when they
-                    // do something
-                    if report.copied > 0 || auditing.contains_key(&id) {
-                        eprintln!("audited: {} advertised, {} copied, {} short", report.advertised, report.copied, report.short);
+                Ok(event) => {
+                    // Still pressed, and a trim helped: again, at once
+                    if let Event::Trimmed { report, .. } = &event
+                        && report.dropped > 0
+                    {
+                        pressure = tokio::time::Instant::now();
                     }
-                    if let Some(mut write) = auditing.remove(&id) {
-                        let line = format!("audited {} {} {}\n", report.advertised, report.copied, report.short);
-                        let _ = write.write_all(line.as_bytes()).await;
-                    }
+                    waiting.finished(event).await;
                 },
-                Ok(Event::Fetched { id, fetched, missing }) => {
-                    if let Some(mut write) = fetching.remove(&id) {
-                        let mut out = format!("fetched {fetched}\n");
-                        for cid in missing {
-                            let _ = writeln!(out, "missing {cid}");
-                        }
-                        // They may have given up
-                        let _ = write.write_all(out.as_bytes()).await;
-                    }
-                },
-                Ok(event) => report(&event),
                 Err(e) => break Err(e),
             },
             accepted = control.accept() => {
@@ -197,12 +238,7 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize) -> Result<()> {
                     continue;
                 };
                 match answer(&mut node, stream, copies).await {
-                    Ok(Some((Waiter::Fetch(id), write))) => {
-                        fetching.insert(id, write);
-                    },
-                    Ok(Some((Waiter::Audit(id), write))) => {
-                        auditing.insert(id, write);
-                    },
+                    Ok(Some((waiter, write))) => waiting.wait(waiter, write),
                     Ok(None) => {},
                     Err(e) => eprintln!("control: {e}"),
                 }
@@ -222,11 +258,71 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize) -> Result<()> {
                 }
                 trickle = later(node.trickle_delay());
             },
+            () = tokio::time::sleep_until(pressure) => {
+                if !node.trimming() && node.pressed()? && !node.connected().is_empty() {
+                    node.trim_some(copies, false)?;
+                }
+                pressure = later(PRESSURE);
+            },
             _ = tokio::signal::ctrl_c() => break Ok(()),
         }
     };
     std::fs::remove_file(&path)?;
     result
+}
+
+/// Those on the control socket waiting on fetches, audits and trims, to be
+/// answered when they finish.
+#[derive(Default)]
+struct Waiting {
+    fetching: HashMap<FetchId, OwnedWriteHalf>,
+    auditing: HashMap<AuditId, OwnedWriteHalf>,
+    trimming: HashMap<TrimId, OwnedWriteHalf>,
+}
+
+impl Waiting {
+    fn wait(&mut self, waiter: Waiter, write: OwnedWriteHalf) {
+        match waiter {
+            Waiter::Fetch(id) => self.fetching.insert(id, write),
+            Waiter::Audit(id) => self.auditing.insert(id, write),
+            Waiter::Trim(id) => self.trimming.insert(id, write),
+        };
+    }
+
+    /// Answer whoever was waiting on what's finished, and report it.
+    async fn finished(&mut self, event: Event) {
+        let (write, out) = match event {
+            Event::Audited { id, report } => {
+                // The trickle's ticks are worth hearing of only when they do
+                // something
+                if report.copied > 0 || self.auditing.contains_key(&id) {
+                    eprintln!("audited: {} advertised, {} copied, {} short", report.advertised, report.copied, report.short);
+                }
+                (self.auditing.remove(&id), format!("audited {} {} {}\n", report.advertised, report.copied, report.short))
+            },
+            Event::Trimmed { id, report } => {
+                if report.dropped > 0 || self.trimming.contains_key(&id) {
+                    eprintln!("trimmed: {} spare, {} let go of, {} bytes freed", report.considered, report.dropped, report.freed);
+                }
+                (self.trimming.remove(&id), format!("trimmed {} {} {}\n", report.considered, report.dropped, report.freed))
+            },
+            Event::Fetched { id, fetched, missing } => {
+                let mut out = format!("fetched {fetched}\n");
+                for cid in missing {
+                    let _ = writeln!(out, "missing {cid}");
+                }
+                (self.fetching.remove(&id), out)
+            },
+            event => {
+                report(&event);
+                return;
+            },
+        };
+        if let Some(mut write) = write {
+            // They may have given up
+            let _ = write.write_all(out.as_bytes()).await;
+        }
+    }
 }
 
 fn report(event: &Event) {
@@ -241,7 +337,7 @@ fn report(event: &Event) {
         },
         // Members which are offline fail to be dialed all the time, and
         // audits are reported as they finish
-        Event::Failed(..) | Event::Audited { .. } => {},
+        Event::Failed(..) | Event::Audited { .. } | Event::Trimmed { .. } => {},
         Event::Fetched { fetched, missing, .. } => eprintln!("fetched {fetched} blocks, {} missing", missing.len()),
     }
 }
@@ -270,6 +366,11 @@ async fn answer(node: &mut Node, stream: tokio::net::UnixStream, copies: usize) 
             let _ = writeln!(out, "blocks\t{}", node.catalog().block_count()?);
             let _ = writeln!(out, "copies\t{copies}");
             let _ = writeln!(out, "trickle\t{:.1}s", node.trickle_interval().as_secs_f64());
+            let free = node.catalog().offer()?.free;
+            let _ = writeln!(out, "free\t{}", free.map_or_else(|| "unknown".to_owned(), |free| format!("{} MiB", free >> 20)));
+            let marks = node.watermarks();
+            let _ = writeln!(out, "watermarks\t{} MiB to {} MiB", marks.low >> 20, marks.high >> 20);
+            let _ = writeln!(out, "pressed\t{}", if marks.pressed() { "yes" } else { "no" });
         },
         "listeners" => {
             for addr in node.listeners() {
@@ -290,6 +391,7 @@ async fn answer(node: &mut Node, stream: tokio::net::UnixStream, copies: usize) 
             }
         },
         "audit" => return Ok(Some((Waiter::Audit(node.audit(copies)?), write))),
+        "trim" => return Ok(Some((Waiter::Trim(node.trim_some(copies, true)?), write))),
         command if command.starts_with("audit ") => match command.trim_start_matches("audit ").trim().parse() {
             Ok(copies) => return Ok(Some((Waiter::Audit(node.audit(copies)?), write))),
             Err(_) => {

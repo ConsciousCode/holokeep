@@ -152,9 +152,16 @@ fn now() -> i64 {
 }
 
 /// Copies of blocks this node holds, sighted on other nodes.
+///
+/// A sighting expires after a while, unless the peer's been connected
+/// since it was made: a member lets the others know what it lets go of,
+/// so while it stays connected nothing it said it held has gone unsaid.
+/// Expiry is for what a disconnection hides.
 pub struct Sightings {
     db: Db,
     ttl: Duration,
+    /// Peers connected, and since when.
+    live: std::cell::RefCell<HashMap<PeerId, i64>>,
 }
 
 impl Sightings {
@@ -176,7 +183,7 @@ impl Sightings {
                  value INTEGER NOT NULL
              );",
         )?;
-        Ok(Self { db, ttl: TTL })
+        Ok(Self { db, ttl: TTL, live: std::cell::RefCell::default() })
     }
 
     /// Believe in sightings for this long instead.
@@ -190,12 +197,35 @@ impl Sightings {
         now().saturating_sub(i64::try_from(self.ttl.as_secs()).unwrap_or(i64::MAX))
     }
 
+    /// A peer's connected, as of now.
+    pub fn connected(&self, peer: PeerId) {
+        self.live.borrow_mut().entry(peer).or_insert_with(now);
+    }
+
+    pub fn disconnected(&self, peer: &PeerId) {
+        self.live.borrow_mut().remove(peer);
+    }
+
+    /// Whether a sighting is still believed in: recent enough, or vouched
+    /// for by the peer's having stayed connected since.
+    fn believed(&self, peer: &PeerId, seen: i64, cutoff: i64) -> bool {
+        seen >= cutoff || self.live.borrow().get(peer).is_some_and(|&since| since <= seen)
+    }
+
     /// Note that a peer holds a copy of a block.
     pub fn see(&self, key: Key<'_>, peer: &PeerId, replica: &Replica) -> Result<()> {
         let block = self.db.intern(key)?;
         self.db.conn()
             .prepare_cached("INSERT OR REPLACE INTO sightings (block, label, peer, risks, seen) VALUES (?1, ?2, ?3, ?4, ?5)")?
             .execute(params![block, replica.label, peer.to_string(), replica.risks.join("\n"), now()])?;
+        Ok(())
+    }
+
+    /// Forget every sighting of a block: this node no longer holds it.
+    pub fn forget(&self, key: Key<'_>) -> Result<()> {
+        if let Some(block) = self.db.lookup(key)? {
+            self.db.conn().prepare_cached("DELETE FROM sightings WHERE block = ?1")?.execute([block])?;
+        }
         Ok(())
     }
 
@@ -215,9 +245,18 @@ impl Sightings {
             return Ok(false);
         };
         let half = i64::try_from(self.ttl.as_secs() / 2).unwrap_or(i64::MAX);
-        Ok(self.db.conn()
-            .prepare_cached("SELECT 1 FROM sightings WHERE block = ?1 AND seen >= ?2 AND seen < ?3")?
-            .exists(params![block, self.cutoff(), now().saturating_sub(half)])?)
+        let due = now().saturating_sub(half);
+        let cutoff = self.cutoff();
+        let mut stmt = self.db.conn().prepare_cached("SELECT peer, seen FROM sightings WHERE block = ?1 AND seen < ?2")?;
+        let rows = stmt.query_map(params![block, due], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (peer, seen) = row?;
+            let vouched = PeerId::from_str(&peer).is_ok_and(|peer| self.live.borrow().get(&peer).is_some_and(|&since| since <= seen));
+            if seen >= cutoff && !vouched {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Where the trickle's read up to of what's arrived.
@@ -239,12 +278,15 @@ impl Sightings {
         let Some(block) = self.db.lookup(key)? else {
             return Ok(Vec::new());
         };
-        let mut stmt = self.db.conn().prepare_cached("SELECT peer, label, risks FROM sightings WHERE block = ?1 AND seen >= ?2 ORDER BY label")?;
-        let rows = stmt.query_map(params![block, self.cutoff()], |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get::<_, String>(2)?)))?;
+        let mut stmt = self.db.conn().prepare_cached("SELECT peer, label, risks, seen FROM sightings WHERE block = ?1 ORDER BY label")?;
+        let rows = stmt.query_map([block], |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?)))?;
+        let cutoff = self.cutoff();
         let mut sighted = Vec::new();
         for row in rows {
-            let (peer, label, risks) = row?;
-            if let Ok(peer) = PeerId::from_str(&peer) {
+            let (peer, label, risks, seen) = row?;
+            if let Ok(peer) = PeerId::from_str(&peer)
+                && self.believed(&peer, seen, cutoff)
+            {
                 sighted.push((peer, Replica { label, risks: risks.split('\n').filter(|risk| !risk.is_empty()).map(str::to_owned).collect() }));
             }
         }
@@ -254,9 +296,20 @@ impl Sightings {
     /// Forget sightings no longer believed in, and those of blocks this
     /// node no longer holds. Returns how many.
     pub fn expire(&self) -> Result<usize> {
-        Ok(self.db.conn()
-            .prepare_cached("DELETE FROM sightings WHERE seen < ?1 OR block NOT IN (SELECT block FROM blocks)")?
-            .execute([self.cutoff()])?)
+        let conn = self.db.conn();
+        let mut forgotten = conn.prepare_cached("DELETE FROM sightings WHERE block NOT IN (SELECT block FROM blocks)")?.execute([])?;
+        let cutoff = self.cutoff();
+        let old: Vec<(i64, Vec<u8>, String, i64)> = conn
+            .prepare_cached("SELECT block, label, peer, seen FROM sightings WHERE seen < ?1")?
+            .query_map([cutoff], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut delete = conn.prepare_cached("DELETE FROM sightings WHERE block = ?1 AND label = ?2")?;
+        for (block, label, peer, seen) in old {
+            if !PeerId::from_str(&peer).is_ok_and(|peer| self.believed(&peer, seen, cutoff)) {
+                forgotten = forgotten.saturating_add(delete.execute(params![block, label])?);
+            }
+        }
+        Ok(forgotten)
     }
 }
 
@@ -269,7 +322,7 @@ fn draw(key: &[u8], peer: &PeerId) -> f64 {
 
 /// A peer's rendezvous score for a block, weighted: the highest wins, and
 /// each peer wins in proportion to its weight.
-fn score(key: &[u8], peer: &PeerId, weight: f64) -> f64 {
+pub(crate) fn score(key: &[u8], peer: &PeerId, weight: f64) -> f64 {
     -weight / draw(key, peer).ln()
 }
 
@@ -287,7 +340,7 @@ fn weight(free: Option<u64>) -> f64 {
 
 /// The risks of each distinct copy, by label: a volume two nodes share is
 /// one copy.
-fn distinct<'a>(replicas: impl IntoIterator<Item = &'a Replica>) -> Vec<Vec<String>> {
+pub(crate) fn distinct<'a>(replicas: impl IntoIterator<Item = &'a Replica>) -> Vec<Vec<String>> {
     let by_label: BTreeMap<&[u8], &Vec<String>> = replicas.into_iter().map(|replica| (replica.label.as_slice(), &replica.risks)).collect();
     by_label.into_values().cloned().collect()
 }
@@ -315,7 +368,7 @@ pub fn choose<'a>(key: &[u8], held: &[Replica], offers: impl IntoIterator<Item =
 
 /// Answer an advert: the copies held here of what it names, noting the
 /// advertiser's copies of those, and where this node would keep a block.
-pub fn answer_advert(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, advert: &Advert) -> Result<Haves> {
+pub fn answer_advert(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, advert: &Advert, marks: &super::trim::Watermarks) -> Result<Haves> {
     let mut held = Vec::new();
     for (key, theirs) in &advert.blocks {
         let Ok(multihash) = decode(key) else {
@@ -329,14 +382,16 @@ pub fn answer_advert(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, ad
         }
         held.push((key.clone(), catalog.replicas(multihash.as_ref())?));
     }
-    Ok(Haves { held, offer: Some(catalog.offer()?) })
+    let mut offer = catalog.offer()?;
+    offer.free = offer.free.map(|free| marks.spare(free));
+    Ok(Haves { held, offer: Some(offer) })
 }
 
 /// Keep what's pushed, if there's room and each block matches its CID,
 /// noting the sender's copies of what's kept.
-pub fn answer_push(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, push: Push) -> Result<Kept> {
+pub fn answer_push(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, push: Push, marks: &super::trim::Watermarks) -> Result<Kept> {
     let size = push.blocks.iter().fold(0usize, |size, (_, data)| size.saturating_add(data.len()));
-    if catalog.offer()?.free.is_some_and(|free| u64::try_from(size).unwrap_or(u64::MAX) > free) {
+    if catalog.offer()?.free.is_some_and(|free| u64::try_from(size).unwrap_or(u64::MAX) > marks.spare(free)) {
         return Ok(Kept::default());
     }
     let mut kept = Vec::new();
@@ -829,6 +884,24 @@ mod tests {
         // Four days on, it's due
         db.conn().execute("UPDATE sightings SET seen = seen - 4 * 86400", []).expect("age");
         assert_eq!(advertised(&sightings), 1);
+    }
+
+    #[test]
+    fn a_peer_connected_since_vouches_for_its_sightings() {
+        let (db, _catalog, blocks) = catalog_of(1);
+        let key = blocks.first().expect("block").cid().multihash();
+        let peer = PeerId::random();
+        let sightings = Sightings::open(db).expect("open").with_ttl(Duration::ZERO);
+        sightings.connected(peer);
+        sightings.see(key, &peer, &replica(1, &["volume:01"])).expect("see");
+        std::thread::sleep(Duration::from_millis(1100));
+        // Past its time, but the peer's been connected since
+        assert_eq!(sightings.of(key).expect("of").len(), 1);
+        assert!(!sightings.stale(key).expect("stale"));
+        assert_eq!(sightings.expire().expect("expire"), 0);
+        sightings.disconnected(&peer);
+        assert!(sightings.of(key).expect("of").is_empty());
+        assert_eq!(sightings.expire().expect("expire"), 1);
     }
 
     #[test]

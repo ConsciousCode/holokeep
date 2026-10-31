@@ -275,6 +275,23 @@ impl ShardStore {
 impl Store for ShardStore {
     fn name(&self) -> &'static str { NAME }
 
+    /// A blob other blocks are ranges of stays: it's theirs too.
+    fn remove(&self, key: Key<'_>) -> Result<Option<u64>> {
+        let Some(id) = self.db.lookup(key)? else {
+            return Ok(Some(0));
+        };
+        let conn = self.db.conn();
+        if conn.prepare_cached("SELECT 1 FROM offset_ranges WHERE blob = ?1 AND block != ?1")?.exists([id])? {
+            return Ok(None);
+        }
+        let size: Option<i64> = conn
+            .prepare_cached("SELECT size FROM shard_files WHERE dir = ?1 AND blob = ?2")?
+            .query_row([self.id, id], |row| row.get(0))
+            .optional()?;
+        self.forget(key)?;
+        Ok(Some(size.map_or(0, |size| u64::try_from(size).unwrap_or_default())))
+    }
+
     /// List again only the shards whose mtime has changed since they were
     /// last listed, and forget those which are gone.
     fn catch_up(&self) -> Result<Changes> {

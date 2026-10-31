@@ -14,6 +14,8 @@
 //! - Members keep each other's blocks durable; see `durability`.
 //! - Members tell each other of structure linking to what they hold; see
 //!   `structure`.
+//! - Members let go of copies the mesh can spare when space runs short;
+//!   see `trim`.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
@@ -38,6 +40,7 @@ use crate::multihash::Multihash;
 use crate::store::BlockIndex;
 use super::mesh::{Error, Members, Result};
 use super::structure::{self, Cursors, Notice, Wants};
+use super::trim::{self, Ack, Dropped, Grant, Intent, Trim, Watermarks};
 use crate::model::Link;
 use crate::store::Catalog;
 
@@ -83,6 +86,8 @@ pub struct Behaviour {
     adverts: request_response::cbor::Behaviour<Advert, Haves>,
     push: request_response::cbor::Behaviour<Push, Kept>,
     notices: request_response::cbor::Behaviour<Notice, Wants>,
+    trim: request_response::cbor::Behaviour<Intent, Grant>,
+    dropped: request_response::cbor::Behaviour<Dropped, Ack>,
 }
 
 /// A fetch, as the node knows it.
@@ -90,6 +95,9 @@ pub type FetchId = u64;
 
 /// An audit, as the node knows it.
 pub type AuditId = u64;
+
+/// A trim, as the node knows it.
+pub type TrimId = u64;
 
 /// What happened, as far as the mesh is concerned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +114,8 @@ pub enum Event {
     Fetched { id: FetchId, fetched: usize, missing: Vec<Link> },
     /// An audit finished.
     Audited { id: AuditId, report: Report },
+    /// A trim finished.
+    Trimmed { id: TrimId, report: trim::Report },
 }
 
 /// A transport for the mesh, over some base transport: the private
@@ -139,6 +149,11 @@ pub struct Node {
     audits: BTreeMap<AuditId, Audit>,
     next_audit: AuditId,
     trickle: Trickle,
+    trims: BTreeMap<TrimId, Trim>,
+    next_trim: TrimId,
+    marks: Watermarks,
+    /// Blocks members let go of which this node holds, to audit soon.
+    suspects: Vec<Multihash>,
     /// The trickle's audit under way, and whether more arrived than it
     /// took in.
     trickling: Option<(AuditId, bool)>,
@@ -188,6 +203,14 @@ impl Node {
                 [(structure::PROTOCOL, ProtocolSupport::Full)],
                 request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
             ),
+            trim: request_response::cbor::Behaviour::new(
+                [(trim::PROTOCOL, ProtocolSupport::Full)],
+                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
+            ),
+            dropped: request_response::cbor::Behaviour::new(
+                [(trim::DROPPED, ProtocolSupport::Full)],
+                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
+            ),
         };
         let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(IDLE);
         let swarm = Swarm::new(transport, behaviour, peer, config);
@@ -203,6 +226,10 @@ impl Node {
             audits: BTreeMap::new(),
             next_audit: 0,
             trickle: Trickle::default(),
+            trims: BTreeMap::new(),
+            next_trim: 0,
+            marks: Watermarks::default(),
+            suspects: Vec::new(),
             trickling: None,
             cursors,
             notices: HashMap::new(),
@@ -327,6 +354,7 @@ impl Node {
         let (mut keys, latest) = self.catalog.fresh_since(cursor, durability::FRESH)?;
         self.sightings.set_fresh_cursor(latest)?;
         let more = keys.len() >= durability::FRESH;
+        keys.append(&mut self.suspects);
         keys.extend(self.catalog.sample(Trickle::sample_size(self.catalog.block_count()?))?);
         // Before it starts, since one with nothing to ask finishes at once
         self.trickling = Some((self.next_audit, more));
@@ -342,6 +370,128 @@ impl Node {
             self.trickle.alarm();
         }
         Ok(arrived)
+    }
+
+    /// Keep the repo's free space between watermarks: trim below `low`
+    /// until above `high`, and offer others only what's above `high`.
+    pub const fn set_watermarks(&mut self, low: u64, high: u64) {
+        self.marks = Watermarks::new(low, high);
+    }
+
+    /// Whether the repo's short of space and should trim, by the
+    /// watermarks: from below the low until above the high.
+    pub fn pressed(&mut self) -> Result<bool> {
+        let free = self.catalog.offer()?.free;
+        Ok(free.is_some_and(|free| self.marks.update(free)))
+    }
+
+    pub const fn watermarks(&self) -> Watermarks {
+        self.marks
+    }
+
+    pub fn trimming(&self) -> bool {
+        !self.trims.is_empty()
+    }
+
+    /// Let go of what the mesh can spare of these blocks' copies here. It's
+    /// done when `next` returns `Trimmed` with the id.
+    pub fn trim(&mut self, copies: usize, keys: Vec<Multihash>) -> Result<TrimId> {
+        let id = self.next_trim;
+        self.next_trim = id.wrapping_add(1);
+        let peers = self.connected();
+        let (mut trim, intents) = Trim::start(&self.catalog, &self.sightings, &peers, copies, keys)?;
+        for intent in intents {
+            for peer in &peers {
+                let request = self.swarm.behaviour_mut().trim.send_request(peer, intent.clone());
+                trim.sent(request);
+            }
+        }
+        self.trims.insert(id, trim);
+        self.drive_trim(id)?;
+        Ok(id)
+    }
+
+    /// Let go of what's spare of a sample of what's here, under pressure,
+    /// or of everything when asked.
+    pub fn trim_some(&mut self, copies: usize, all: bool) -> Result<TrimId> {
+        let keys = if all { self.catalog.keys()? } else { self.catalog.sample(durability::FRESH)? };
+        self.trim(copies, keys)
+    }
+
+    /// Once every member's answered a trim's intent, let go of what can
+    /// go, tell the members, and finish.
+    fn drive_trim(&mut self, id: TrimId) -> Result<()> {
+        let Some(trim) = self.trims.get_mut(&id) else {
+            return Ok(());
+        };
+        if trim.waiting() {
+            return Ok(());
+        }
+        let mut gone = Vec::new();
+        let mut freed = 0u64;
+        for key in trim.decide() {
+            if let Some(bytes) = self.catalog.drop_copies(key.as_ref())? {
+                if !self.catalog.has(key.as_ref())? {
+                    self.sightings.forget(key.as_ref())?;
+                }
+                freed = freed.saturating_add(bytes);
+                gone.push(key);
+            }
+        }
+        trim.dropped(gone.len(), freed);
+        let report = trim.report();
+        self.trims.remove(&id);
+        if !gone.is_empty() {
+            let dropped = trim::dropped(&gone);
+            for peer in self.connected() {
+                self.swarm.behaviour_mut().dropped.send_request(&peer, dropped.clone());
+            }
+        }
+        self.ready.push_back(Event::Trimmed { id, report });
+        Ok(())
+    }
+
+    fn on_trim(&mut self, event: request_response::Event<Intent, Grant>) -> Result<()> {
+        match event {
+            request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
+                let me = self.peer_id();
+                let mut trims: Vec<&mut Trim> = self.trims.values_mut().collect();
+                let grant = trim::answer(&self.catalog, &me, &peer, &request, &mut trims)?;
+                // The asker may be gone already
+                let _ = self.swarm.behaviour_mut().trim.send_response(channel, grant);
+            },
+            request_response::Event::Message { peer, message: request_response::Message::Response { request_id, response }, .. } => {
+                if let Some((&id, trim)) = self.trims.iter_mut().find(|(_, trim)| trim.asked(request_id)) {
+                    trim.granted(request_id, peer, response);
+                    self.drive_trim(id)?;
+                }
+            },
+            request_response::Event::OutboundFailure { request_id, .. } => {
+                if let Some((&id, trim)) = self.trims.iter_mut().find(|(_, trim)| trim.asked(request_id)) {
+                    trim.failed(request_id);
+                    self.drive_trim(id)?;
+                }
+            },
+            _ => {},
+        }
+        Ok(())
+    }
+
+    /// A member let go of copies: forget them, and audit soon what's here.
+    fn on_dropped(&mut self, event: request_response::Event<Dropped, Ack>) -> Result<()> {
+        if let request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } = event {
+            for key in request.keys() {
+                self.sightings.unsee(key.as_ref(), &peer)?;
+                if self.catalog.has(key.as_ref())? {
+                    self.suspects.push(key);
+                }
+            }
+            if !self.suspects.is_empty() {
+                self.trickle.alarm();
+            }
+            let _ = self.swarm.behaviour_mut().dropped.send_response(channel, Ack {});
+        }
+        Ok(())
     }
 
     /// How long until the trickle's next tick.
@@ -401,7 +551,7 @@ impl Node {
     fn on_advert(&mut self, event: request_response::Event<Advert, Haves>) -> Result<()> {
         match event {
             request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
-                let haves = durability::answer_advert(&self.catalog, &self.sightings, &peer, &request)?;
+                let haves = durability::answer_advert(&self.catalog, &self.sightings, &peer, &request, &self.marks)?;
                 // The advertiser may be gone already
                 let _ = self.swarm.behaviour_mut().adverts.send_response(channel, haves);
                 return Ok(());
@@ -424,7 +574,7 @@ impl Node {
     fn on_push(&mut self, event: request_response::Event<Push, Kept>) -> Result<()> {
         match event {
             request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
-                let kept = durability::answer_push(&self.catalog, &self.sightings, &peer, request)?;
+                let kept = durability::answer_push(&self.catalog, &self.sightings, &peer, request, &self.marks)?;
                 let _ = self.swarm.behaviour_mut().push.send_response(channel, kept);
                 return Ok(());
             },
@@ -574,6 +724,40 @@ impl Node {
         }
     }
 
+    /// A member's newly connected: tell it of the members, notice it of
+    /// what it's missed, and vouch for its sightings from now on.
+    fn on_connected(&mut self, peer: PeerId) -> Result<()> {
+        let roster = self.roster()?;
+        self.swarm.behaviour_mut().members.send_request(&peer, roster);
+        self.announce_to(peer)?;
+        self.sightings.connected(peer);
+        self.trickle.alarm();
+        Ok(())
+    }
+
+    /// Peers found on the LAN: dial whichever are members.
+    fn on_discovered(&mut self, found: Vec<(PeerId, Multiaddr)>) -> Result<()> {
+        let mut dial: BTreeMap<PeerId, Vec<Multiaddr>> = BTreeMap::new();
+        for (peer, addr) in found {
+            if self.members.contains(&peer)? {
+                self.members.add_addr(&peer, &addr)?;
+                dial.entry(peer).or_default().push(addr);
+            }
+        }
+        for (peer, addrs) in dial {
+            if !self.swarm.is_connected(&peer) {
+                self.dial(peer, addrs);
+            }
+        }
+        Ok(())
+    }
+
+    fn on_disconnected(&mut self, peer: &PeerId) {
+        self.noticing.remove(peer);
+        self.sightings.disconnected(peer);
+        self.trickle.alarm();
+    }
+
     fn handle(&mut self, event: SwarmEvent<BehaviourEvent>) -> Result<Option<Event>> {
         Ok(match event {
             SwarmEvent::NewListenAddr { address, .. } => Some(Event::Listening(address)),
@@ -584,15 +768,11 @@ impl Node {
                 if num_established.get() > 1 {
                     return Ok(None);
                 }
-                let roster = self.roster()?;
-                self.swarm.behaviour_mut().members.send_request(&peer_id, roster);
-                self.announce_to(peer_id)?;
-                self.trickle.alarm();
+                self.on_connected(peer_id)?;
                 Some(Event::Connected(peer_id))
             },
             SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
-                self.noticing.remove(&peer_id);
-                self.trickle.alarm();
+                self.on_disconnected(&peer_id);
                 Some(Event::Disconnected(peer_id))
             },
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => Some(Event::Failed(peer_id, error.to_string())),
@@ -605,18 +785,7 @@ impl Node {
                 None
             },
             SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(found))) => {
-                let mut dial: BTreeMap<PeerId, Vec<Multiaddr>> = BTreeMap::new();
-                for (peer, addr) in found {
-                    if self.members.contains(&peer)? {
-                        self.members.add_addr(&peer, &addr)?;
-                        dial.entry(peer).or_default().push(addr);
-                    }
-                }
-                for (peer, addrs) in dial {
-                    if !self.swarm.is_connected(&peer) {
-                        self.dial(peer, addrs);
-                    }
-                }
+                self.on_discovered(found)?;
                 None
             },
             SwarmEvent::Behaviour(BehaviourEvent::Members(request_response::Event::Message { message, .. })) => match message {
@@ -644,7 +813,7 @@ impl Node {
                 request_response::Message::Response { request_id, response } => {
                     if let Some(id) = self.fetch_of(request_id) {
                         if let Some(fetch) = self.fetches.get_mut(&id) {
-                            fetch.received(&self.catalog, request_id, response)?;
+                            fetch.received(&self.catalog, &self.sightings, &peer, request_id, response)?;
                         }
                         self.drive(id)?;
                     }
@@ -670,6 +839,14 @@ impl Node {
             },
             SwarmEvent::Behaviour(BehaviourEvent::Notices(event)) => {
                 self.on_notice(event)?;
+                None
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Trim(event)) => {
+                self.on_trim(event)?;
+                None
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Dropped(event)) => {
+                self.on_dropped(event)?;
                 None
             },
             _ => None,

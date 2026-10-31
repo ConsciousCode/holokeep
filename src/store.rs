@@ -183,6 +183,14 @@ pub trait Store: BlockIndex + BlockSource + BlockStore {
     fn rescan(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Let a block go, returning how many bytes that frees, or None if
+    /// this store can't let it go by itself, such as a range of a file
+    /// other blocks are ranges of too.
+    fn remove(&self, key: Key<'_>) -> Result<Option<u64>> {
+        let _ = key;
+        Ok(None)
+    }
 }
 
 //--------------//
@@ -1068,6 +1076,59 @@ impl Catalog {
         Ok(found.into_values().collect())
     }
 
+    /// The labels of the volumes new blocks are placed in, the repo's own:
+    /// those whose copies this node can let go of.
+    pub fn own_labels(&self) -> Vec<Vec<u8>> {
+        let mut labels: Vec<Vec<u8>> = self.placement.iter().filter_map(|&(v, _)| Some(self.volumes.get(v)?.label().to_vec())).collect();
+        labels.dedup();
+        labels
+    }
+
+    /// Where a leaf is in the repo's own volumes, if every copy there can
+    /// be let go of: a block with no links, under every CID it's had, in
+    /// stores which can remove it. Structure stays, being small and what's
+    /// queried.
+    fn droppable(&self, key: Key<'_>) -> Result<Option<Vec<Placement>>> {
+        if key.code() == IDENTITY || self.cids(key)?.iter().any(|cid| cid.codec() != crate::cid::RAW_CODEC) {
+            return Ok(None);
+        }
+        let own: Vec<usize> = self.placement.iter().map(|&(v, _)| v).collect();
+        let placed: Vec<Placement> = self.placements(key)?.into_iter().filter(|(v, _)| own.contains(v)).collect();
+        if placed.is_empty() || placed.iter().any(|(_, form)| form == "offset") {
+            return Ok(None);
+        }
+        Ok(Some(placed))
+    }
+
+    /// Whether this node could let go of its own copies of a block.
+    pub fn can_drop(&self, key: Key<'_>) -> Result<bool> {
+        Ok(self.droppable(key)?.is_some())
+    }
+
+    /// Let go of a leaf's copies in the repo's own volumes, returning the
+    /// bytes freed, or None if they can't all be let go of. Copies on
+    /// other volumes stay. Whether the mesh can spare them is for the
+    /// caller to know.
+    pub fn drop_copies(&self, key: Key<'_>) -> Result<Option<u64>> {
+        let Some(placed) = self.droppable(key)? else {
+            return Ok(None);
+        };
+        let Some(id) = self.db.lookup(key)? else {
+            return Ok(None);
+        };
+        self.db.atomically(|| {
+            let mut freed = 0u64;
+            for placement in &placed {
+                let Some(bytes) = self.named(placement)?.remove(key)? else {
+                    return Err(Error::Volume(format!("{} can't let {key:?} go", placement.1)));
+                };
+                freed = freed.saturating_add(bytes);
+                self.unrecord(id, placement.0)?;
+            }
+            Ok(Some(freed))
+        })
+    }
+
     /// Whether a block is here: as `has`, but a dissolved claim's identity
     /// is here only if the claim is.
     pub fn holds(&self, cid: &Link) -> Result<bool> {
@@ -1653,6 +1714,7 @@ impl<T: Store + ?Sized> Store for Rc<T> {
     fn refs(&self) -> Option<&dyn RefIndex> { (**self).refs() }
     fn catch_up(&self) -> Result<Changes> { (**self).catch_up() }
     fn rescan(&self) -> Result<()> { (**self).rescan() }
+    fn remove(&self, key: Key<'_>) -> Result<Option<u64>> { (**self).remove(key) }
 }
 
 impl<T: BlockIndex + ?Sized> BlockIndex for Rc<T> {

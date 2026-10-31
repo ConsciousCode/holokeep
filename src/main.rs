@@ -114,7 +114,17 @@ enum NodeCommand {
         /// failures to lose each, counting risks, auditing a few at a time
         #[arg(short, long, default_value_t = 2)]
         copies: usize,
+        /// When free space falls below this, let go of copies the mesh can
+        /// spare (bytes, or with K, M, G, T)
+        #[arg(long, default_value = "2G", value_parser = holokeep::net::daemon::parse_size)]
+        low_water: u64,
+        /// ...until it's back above this; nor take others' copies past it
+        #[arg(long, default_value = "4G", value_parser = holokeep::net::daemon::parse_size)]
+        high_water: u64,
     },
+    /// Let go now of every copy here the mesh can spare, short of space or
+    /// not
+    Trim,
     /// List the mesh's members, and which are connected
     Peers,
     /// How the running node is: connected members, blocks, and the
@@ -369,10 +379,14 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
             daemon::ask(dir, "reload")?;
             eprintln!("joined the mesh of {}; `hk node run` to connect", ticket.inviter);
         },
-        NodeCommand::Run { listen, copies } => {
+        NodeCommand::Run { listen, copies, low_water, high_water } => {
             let listen = listen.parse().context("not a multiaddr")?;
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            runtime.block_on(daemon::run(dir, listen, copies))?;
+            runtime.block_on(daemon::run(dir, listen, copies, (low_water, high_water)))?;
+        },
+        NodeCommand::Trim => {
+            let report = daemon::trim(dir)?.context("this node isn't running: start `hk node run`")?;
+            println!("let go of {} of {} spare blocks, freeing {} bytes", report.dropped, report.considered, report.freed);
         },
         NodeCommand::Status => {
             let lines = daemon::ask(dir, "status")?.context("this node isn't running: start `hk node run`")?;

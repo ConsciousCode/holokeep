@@ -10,4 +10,5 @@ pub mod durability;
 pub mod mesh;
 pub mod node;
 pub mod structure;
+pub mod trim;
 pub mod daemon;

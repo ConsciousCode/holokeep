@@ -240,6 +240,7 @@ async fn a_member_without_a_block_passes_it_on() {
 //----------------//
 
 use crate::net::durability::Report;
+use crate::multihash::Multihash;
 
 /// Drive every node until each audit named, by node and id, reports.
 async fn audited(nodes: &mut [&mut Node], audits: &[(usize, AuditId)]) -> Vec<Report> {
@@ -497,4 +498,86 @@ async fn the_trickle_waits_for_someone_to_send_copies_to() {
     assert_eq!(a.trickle(2).expect("trickle"), None);
     // What arrived is still to be audited
     assert_eq!(a.sightings().fresh_cursor().expect("cursor"), 0);
+}
+
+//----------//
+//-[ Trim ]-//
+//----------//
+
+/// Drive every node until each trim named, by node and id, reports.
+async fn trimmed(nodes: &mut [&mut Node], trims: &[(usize, TrimId)]) -> Vec<trim::Report> {
+    let mut reports: Vec<Option<trim::Report>> = vec![None; trims.len()];
+    let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(10)).expect("deadline");
+    while reports.iter().any(Option::is_none) {
+        let events = futures::future::select_all(nodes.iter_mut().map(|node| Box::pin(node.next())));
+        let (event, from, _) = tokio::time::timeout_at(deadline, events).await.expect("in time");
+        if let Event::Trimmed { id, report } = event.expect("event")
+            && let Some(i) = trims.iter().position(|&trim| trim == (from, id))
+            && let Some(slot) = reports.get_mut(i)
+        {
+            *slot = Some(report);
+        }
+    }
+    reports.into_iter().flatten().collect()
+}
+
+fn keys(blocks: &[Block]) -> Vec<Multihash> {
+    blocks.iter().map(|block| Multihash::decode(&block.cid().multihash().to_bytes()).expect("key")).collect()
+}
+
+#[tokio::test]
+async fn surplus_copies_are_let_go_of_once() {
+    let (mut a, mut b, mut c) = Box::pin(three()).await;
+    let blocks = wide();
+    let (_, leaves) = blocks.split_last().expect("root");
+    for node in [&a, &b, &c] {
+        for block in &blocks {
+            node.catalog().put_block(block, CidVersion::V1).expect("put");
+        }
+    }
+    // Each learns the others hold everything
+    let audits = [(0, a.audit(2).expect("audit")), (1, b.audit(2).expect("audit")), (2, c.audit(2).expect("audit"))];
+    audited(&mut [&mut a, &mut b, &mut c], &audits).await;
+    // Three copies of each where two will do: all three mean to let go of
+    // every leaf at once, and for each the lowest-ranked does
+    let trims = [
+        (0, a.trim(2, keys(&blocks)).expect("trim")),
+        (1, b.trim(2, keys(&blocks)).expect("trim")),
+        (2, c.trim(2, keys(&blocks)).expect("trim")),
+    ];
+    let reports = trimmed(&mut [&mut a, &mut b, &mut c], &trims).await;
+    assert!(reports.iter().all(|report| report.considered == 16), "the root is structure: {reports:?}");
+    assert_eq!(reports.iter().map(|report| report.dropped).sum::<usize>(), 16, "{reports:?}");
+    for leaf in leaves {
+        let holders: Vec<&Node> = [&a, &b, &c].into_iter().filter(|node| has(node, leaf)).collect();
+        assert_eq!(holders.len(), 2);
+    }
+    // And the others were told, so each holder counts only the other, and
+    // whoever let go forgets
+    assert!(until(&mut [&mut a, &mut b, &mut c], |n| {
+        leaves.iter().all(|leaf| {
+            n.iter().all(|node| node.sightings().of(leaf.cid().multihash()).expect("of").len() == usize::from(has(node, leaf)))
+        })
+    })
+    .await);
+    // Two copies left, none spare
+    let trims = [(0, a.trim(2, keys(&blocks)).expect("trim")), (1, b.trim(2, keys(&blocks)).expect("trim"))];
+    let reports = trimmed(&mut [&mut a, &mut b, &mut c], &trims).await;
+    assert!(reports.iter().all(|report| report.dropped == 0), "{reports:?}");
+}
+
+#[tokio::test]
+async fn sightings_arent_trusted_with_the_last_copies() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    let leaf = blocks.get(2).expect("leaf");
+    b.catalog().put_block(leaf, CidVersion::V1).expect("put");
+    let id = a.audit(2).expect("audit");
+    audited(&mut [&mut a, &mut b], &[(0, id)]).await;
+    // a believes b holds it, but b has let it go without saying
+    b.catalog().drop_copies(leaf.cid().multihash()).expect("drop");
+    // One copy will do, and a believes there'd be one left
+    let id = a.trim(1, keys(std::slice::from_ref(leaf))).expect("trim");
+    let reports = trimmed(&mut [&mut a, &mut b], &[(0, id)]).await;
+    assert_eq!(reports, [trim::Report { considered: 1, dropped: 0, freed: 0 }]);
+    assert!(has(&a, leaf));
 }

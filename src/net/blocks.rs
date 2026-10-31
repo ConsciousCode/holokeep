@@ -27,7 +27,9 @@ use crate::block::{Block, IDENTITY};
 use crate::cid::{AnyCid, BaseCid, Cid, CidRef, Cidv1, RAW_CODEC};
 use crate::model::Link;
 use crate::multihash::Multihash;
-use crate::store::{BlockIndex, BlockSource, Catalog};
+use crate::store::{BlockIndex, BlockSource, Catalog, Replica};
+
+use super::durability::Sightings;
 
 use super::mesh::Result;
 
@@ -47,17 +49,21 @@ pub struct Want {
 }
 
 /// An answer to a want: blocks as (CID, bytes), and the multihashes of
-/// those the peer doesn't have.
+/// those the peer doesn't have; and the copies the peer holds of each
+/// block, so the asker knows where else it lives.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Blocks {
-    blocks: Vec<(ByteBuf, ByteBuf)>,
+    #[serde(rename = "blocks")]
+    found: Vec<(ByteBuf, ByteBuf)>,
     missing: Vec<ByteBuf>,
+    #[serde(default)]
+    copies: Vec<Vec<Replica>>,
 }
 
 impl Blocks {
     /// The multihashes of the blocks it carries.
     pub fn served(&self) -> Vec<Vec<u8>> {
-        self.blocks.iter().filter_map(|(cid, _)| Some(Link::decode(cid).ok()?.multihash().to_bytes())).collect()
+        self.found.iter().filter_map(|(cid, _)| Some(Link::decode(cid).ok()?.multihash().to_bytes())).collect()
     }
 }
 
@@ -74,14 +80,15 @@ pub fn answer(catalog: &Catalog, want: &Want) -> Blocks {
             answer.missing.push(key.clone());
             continue;
         };
-        if !answer.blocks.is_empty() && size.saturating_add(data.len()) > BUDGET {
+        if !answer.found.is_empty() && size.saturating_add(data.len()) > BUDGET {
             // Left out, to be asked again
             continue;
         }
         size = size.saturating_add(data.len());
         let cid = catalog.cids(multihash.as_ref()).ok().and_then(|cids| cids.into_iter().next());
+        answer.copies.push(catalog.replicas(multihash.as_ref()).unwrap_or_default());
         let cid = cid.unwrap_or_else(|| AnyCid::V1(Cidv1::new(RAW_CODEC, multihash)));
-        answer.blocks.push((ByteBuf::from(cid.to_bytes()), ByteBuf::from(data)));
+        answer.found.push((ByteBuf::from(cid.to_bytes()), ByteBuf::from(data)));
     }
     answer
 }
@@ -168,11 +175,14 @@ impl Fetch {
 
     /// Keep what a member sent, if it's what was asked for and its bytes
     /// match its CID, and queue its links.
-    pub fn received(&mut self, catalog: &Catalog, request: OutboundRequestId, answer: Blocks) -> Result<()> {
+    /// The sender's copies of what's kept are sighted.
+    pub fn received(&mut self, catalog: &Catalog, sightings: &Sightings, peer: &PeerId, request: OutboundRequestId, answer: Blocks) -> Result<()> {
         let Some(mut asked) = self.inflight.remove(&request) else {
             return Ok(());
         };
-        for (cid, data) in answer.blocks {
+        let mut copies = answer.copies.into_iter();
+        for (cid, data) in answer.found {
+            let theirs = copies.next().unwrap_or_default();
             let Ok(link) = Link::decode(&cid) else {
                 continue;
             };
@@ -186,6 +196,11 @@ impl Fetch {
                 continue;
             };
             catalog.put_block(&block, link.version())?;
+            if link.hashcode() != IDENTITY {
+                for replica in &theirs {
+                    sightings.see(link.multihash(), peer, replica)?;
+                }
+            }
             self.fetched = self.fetched.saturating_add(1);
             if link.codec() != RAW_CODEC {
                 self.queue.extend(crate::links::links(link.codec(), block.data()).unwrap_or_default());
