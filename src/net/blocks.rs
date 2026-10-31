@@ -54,6 +54,13 @@ pub struct Blocks {
     missing: Vec<ByteBuf>,
 }
 
+impl Blocks {
+    /// The multihashes of the blocks it carries.
+    pub fn served(&self) -> Vec<Vec<u8>> {
+        self.blocks.iter().filter_map(|(cid, _)| Some(Link::decode(cid).ok()?.multihash().to_bytes())).collect()
+    }
+}
+
 /// Answer a want from what the catalog can read.
 pub fn answer(catalog: &Catalog, want: &Want) -> Blocks {
     let mut answer = Blocks::default();

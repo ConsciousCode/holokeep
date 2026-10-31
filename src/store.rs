@@ -979,6 +979,63 @@ impl Catalog {
         &self.db
     }
 
+    /// Structure which arrived in the catalog's own database after a
+    /// generation, in the order it did: UnixFS nodes, IPLD and claims,
+    /// dissolved claims included, up to `limit` of them. Returns their CIDs
+    /// and the latest generation read, to read on from.
+    pub fn structure_since(&self, generation: i64, limit: usize) -> Result<(Vec<Link>, i64)> {
+        let conn = self.db.conn();
+        if !conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'generations'")?.exists([])? {
+            return Ok((Vec::new(), generation));
+        }
+        let rows: Vec<(i64, bool, Id)> = conn
+            .prepare_cached(
+                "SELECT generation, 0, block FROM generations
+                     WHERE generation > ?1 AND present AND form IN ('unixfs', 'claims', 'ipld')
+                 UNION ALL SELECT generation, 1, claim FROM claim_generations WHERE generation > ?1
+                 ORDER BY 1 LIMIT ?2",
+            )?
+            .query_map(params![generation, i64::try_from(limit).unwrap_or(i64::MAX)], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut latest = generation;
+        let mut found = Vec::new();
+        for (stamp, dissolved, id) in rows {
+            latest = latest.max(stamp);
+            if dissolved {
+                if let Some(claim) = self.claims.as_ref().map(|claims| claims.dissolved_row(id)).transpose()?.flatten() {
+                    found.push(claim.cid());
+                }
+                continue;
+            }
+            let bytes: Vec<u8> = conn.prepare_cached("SELECT multihash FROM multihashes WHERE id = ?1")?.query_row([id], |row| row.get(0))?;
+            let key = decode_key("router", &bytes)?;
+            found.extend(self.cids(key.as_ref())?.into_iter().next());
+        }
+        Ok((found, latest))
+    }
+
+    /// Whether a block is here: as `has`, but a dissolved claim's identity
+    /// is here only if the claim is.
+    pub fn holds(&self, cid: &Link) -> Result<bool> {
+        if cid.hashcode() != IDENTITY {
+            return self.has(cid.multihash());
+        }
+        match (crate::claim::dissolved(cid), &self.claims) {
+            (Some(claim), Some(claims)) => claims.has_dissolved(&claim),
+            (Some(_), None) => Ok(false),
+            (None, _) => Ok(true),
+        }
+    }
+
+    /// A CID for a block by its multihash: the first it was put with, or a
+    /// dissolved claim's.
+    pub fn cid_of(&self, key: Key<'_>) -> Result<Option<Link>> {
+        if key.code() == IDENTITY {
+            return Ok(crate::claim::dissolved_cid(key.digest_ref()));
+        }
+        Ok(self.cids(key)?.into_iter().next())
+    }
+
     /// The copies of a block the catalog knows of, on its volumes attached
     /// or not.
     pub fn replicas(&self, key: Key<'_>) -> Result<Vec<Replica>> {

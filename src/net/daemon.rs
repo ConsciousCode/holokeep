@@ -38,6 +38,10 @@ const REDIAL: Duration = Duration::from_mins(1);
 /// How often to audit what's held, and raise what's short.
 const AUDIT: Duration = Duration::from_hours(1);
 
+/// How often to notice members of structure which arrived, such as from
+/// commands run since.
+const ANNOUNCE: Duration = Duration::from_secs(10);
+
 /// How long after starting to first audit, so members have connected.
 const SETTLE: Duration = Duration::from_secs(30);
 
@@ -159,6 +163,7 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize) -> Result<()> {
     let mut redial = tokio::time::interval(REDIAL);
     let start = tokio::time::Instant::now().checked_add(SETTLE).unwrap_or_else(tokio::time::Instant::now);
     let mut audit = tokio::time::interval_at(start, AUDIT);
+    let mut announce = tokio::time::interval(ANNOUNCE);
     // Those waiting on fetches and audits, to be answered when they finish
     let mut fetching: HashMap<FetchId, OwnedWriteHalf> = HashMap::new();
     let mut auditing: HashMap<AuditId, OwnedWriteHalf> = HashMap::new();
@@ -201,6 +206,7 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize) -> Result<()> {
                 }
             },
             _ = redial.tick() => node.dial_members()?,
+            _ = announce.tick() => node.announce()?,
             _ = audit.tick() => {
                 if !node.auditing() {
                     node.audit(copies)?;

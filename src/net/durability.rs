@@ -83,10 +83,53 @@ pub struct Push {
     blocks: Vec<(ByteBuf, ByteBuf)>,
 }
 
+impl Push {
+    /// Pushes of these blocks, each about a few megabytes at most.
+    pub fn batches(blocks: impl IntoIterator<Item = Block>) -> Vec<Self> {
+        let mut pushes = Vec::new();
+        let (mut push, mut size) = (Self::default(), 0usize);
+        for block in blocks {
+            if !push.blocks.is_empty() && size.saturating_add(block.data().len()) > BUDGET {
+                pushes.push(std::mem::take(&mut push));
+                size = 0;
+            }
+            size = size.saturating_add(block.data().len());
+            push.blocks.push((ByteBuf::from(block.cid().to_bytes()), ByteBuf::from(block.data().to_vec())));
+        }
+        if !push.blocks.is_empty() {
+            pushes.push(push);
+        }
+        pushes
+    }
+}
+
 /// The blocks of a push which were kept, and the copies of each now.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Kept {
     kept: Vec<(ByteBuf, Vec<Replica>)>,
+}
+
+impl Kept {
+    /// The multihashes of what was kept.
+    pub fn keys(&self) -> Vec<Vec<u8>> {
+        self.kept.iter().map(|(key, _)| key.to_vec()).collect()
+    }
+
+    /// Note the copies a member kept of what was pushed to it outside an
+    /// audit, of what this node holds.
+    pub fn sight(&self, catalog: &Catalog, sightings: &Sightings, peer: &PeerId) -> Result<()> {
+        for (key, replicas) in &self.kept {
+            let Ok(key) = decode(key) else {
+                continue;
+            };
+            if key.code() != IDENTITY && catalog.has(key.as_ref())? {
+                for replica in replicas {
+                    sightings.see(key.as_ref(), peer, replica)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn decode(key: &[u8]) -> std::result::Result<Multihash, crate::multihash::DecodeError> {

@@ -113,7 +113,7 @@ use crate::cid::{AnyCid, CidVersion, Cidv1Spec, DAG_CBOR_CODEC};
 use crate::model::Ipld;
 use crate::multihash::MultihashFunc;
 use crate::cid::CidRef;
-use crate::store::BlockIndex;
+use crate::store::{BlockIndex, RefIndex};
 
 fn raw(data: &[u8]) -> Block {
     Block::hash(Cidv1Spec::default(), data.into())
@@ -369,4 +369,96 @@ async fn holders_auditing_at_once_send_each_block_once() {
     let (on_a, on_b) = (a.audit(3).expect("audit"), b.audit(3).expect("audit"));
     let reports = audited(&mut [&mut a, &mut b, &mut c], &[(0, on_a), (1, on_b)]).await;
     assert_eq!(reports, [report(0, 0, 0), report(0, 0, 0)]);
+}
+
+//---------------//
+//-[ Structure ]-//
+//---------------//
+
+fn holds(node: &Node, cid: &Link) -> bool {
+    node.catalog().holds(cid).expect("holds")
+}
+
+fn tags(node: &Node, target: &Block) -> Vec<Link> {
+    node.catalog().claims().expect("claims").tags(target.cid().multihash()).expect("tags")
+}
+
+#[tokio::test]
+async fn structure_reaches_holders_of_what_it_links_to() {
+    let (mut a, mut b, mut c) = Box::pin(three()).await;
+    let target = raw(b"held by a and b");
+    for node in [&a, &b] {
+        node.catalog().put_block(&target, CidVersion::V1).expect("put");
+    }
+    let linking = cbor(&Ipld::List(vec![Ipld::Link(link(&target))]));
+    a.catalog().put_block(&linking, CidVersion::V1).expect("put");
+    a.announce().expect("announce");
+    let cid = link(&linking);
+    assert!(until(&mut [&mut a, &mut b, &mut c], |n| holds(n[1], &cid)).await);
+    let backrefs = b.catalog().backrefs(target.cid().multihash()).expect("backrefs");
+    assert_eq!(backrefs, [linking.cid().multihash()]);
+    // c holds nothing it links to, so it isn't sent it
+    assert!(!within(Duration::from_millis(500), &mut [&mut a, &mut b, &mut c], |n| holds(n[2], &cid)).await);
+}
+
+#[tokio::test]
+async fn tags_reach_holders_of_what_they_tag() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    let leaf = blocks.get(2).expect("leaf");
+    b.catalog().put_block(leaf, CidVersion::V1).expect("put");
+    let tag = raw(b"favourite");
+    a.catalog().put_block(&tag, CidVersion::V1).expect("put");
+    a.catalog().tag(&link(leaf), &link(&tag)).expect("tag");
+    a.announce().expect("announce");
+    assert!(until(&mut [&mut a, &mut b], |n| tags(n[1], leaf) == [link(&tag)]).await);
+}
+
+#[tokio::test]
+async fn a_member_hears_of_what_it_missed_when_it_connects() {
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let (mut a, mut b) = (node(swarm_key).await, node(swarm_key).await);
+    let target = raw(b"held by both");
+    let linking = cbor(&Ipld::List(vec![Ipld::Link(link(&target))]));
+    for block in [&target, &linking] {
+        a.catalog().put_block(block, CidVersion::V1).expect("put");
+    }
+    b.catalog().put_block(&target, CidVersion::V1).expect("put");
+    invite(&a, &b, swarm_key);
+    a.reload().expect("reload");
+    b.reload().expect("reload");
+    b.dial_members().expect("dial");
+    let cid = link(&linking);
+    assert!(until(&mut [&mut a, &mut b], |n| holds(n[1], &cid)).await);
+}
+
+#[tokio::test]
+async fn copies_take_what_links_to_them_along() {
+    let (mut a, mut b, mut c) = Box::pin(three()).await;
+    let blocks = wide();
+    let (root, leaves) = blocks.split_last().expect("root");
+    for block in &blocks {
+        a.catalog().put_block(block, CidVersion::V1).expect("put");
+    }
+    // Only what's copied, not what's noticed from a's cursor
+    for (peer, node) in [(b.peer_id(), &a), (c.peer_id(), &a)] {
+        let latest = node.catalog().structure_since(0, usize::MAX).expect("latest").1;
+        node.cursors.set(&peer, latest).expect("cursor");
+    }
+    let id = a.audit(2).expect("audit");
+    audited(&mut [&mut a, &mut b, &mut c], &[(0, id)]).await;
+    let root = link(root);
+    let holding_a_leaf = |node: &Node| leaves.iter().any(|leaf| has(node, leaf));
+    assert!(holding_a_leaf(&b) && holding_a_leaf(&c));
+    assert!(until(&mut [&mut a, &mut b, &mut c], |n| holds(n[1], &root) && holds(n[2], &root)).await);
+}
+
+#[tokio::test]
+async fn fetching_takes_tags_along() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    let leaf = blocks.get(2).expect("leaf");
+    let tag = raw(b"fetched with it");
+    a.catalog().put_block(&tag, CidVersion::V1).expect("put");
+    a.catalog().tag(&link(leaf), &link(&tag)).expect("tag");
+    assert_eq!(fetch(&mut a, &mut b, link(leaf)).await, (1, vec![]));
+    assert!(until(&mut [&mut a, &mut b], |n| tags(n[1], leaf) == [link(&tag)]).await);
 }

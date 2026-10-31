@@ -12,8 +12,10 @@
 //!   Amino, finds members' addresses as they move.
 //! - Members want blocks of each other; see `blocks`.
 //! - Members keep each other's blocks durable; see `durability`.
+//! - Members tell each other of structure linking to what they hold; see
+//!   `structure`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -33,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use super::blocks::{self, Blocks, Fetch, Want};
 use super::durability::{self, Advert, Audit, Haves, Kept, Push, Report, Sightings};
 use super::mesh::{Error, Members, Result};
+use super::structure::{self, Cursors, Notice, Wants};
 use crate::model::Link;
 use crate::store::Catalog;
 
@@ -77,6 +80,7 @@ pub struct Behaviour {
     blocks: request_response::cbor::Behaviour<Want, Blocks>,
     adverts: request_response::cbor::Behaviour<Advert, Haves>,
     push: request_response::cbor::Behaviour<Push, Kept>,
+    notices: request_response::cbor::Behaviour<Notice, Wants>,
 }
 
 /// A fetch, as the node knows it.
@@ -132,6 +136,12 @@ pub struct Node {
     sightings: Sightings,
     audits: BTreeMap<AuditId, Audit>,
     next_audit: AuditId,
+    cursors: Cursors,
+    /// Notices sent: to whom, and for one from a cursor, where it moves to
+    /// once answered.
+    notices: HashMap<request_response::OutboundRequestId, (PeerId, Option<i64>)>,
+    /// Members with a notice from their cursor unanswered.
+    noticing: HashSet<PeerId>,
     /// Events which happened outside `next`, for it to return first.
     ready: VecDeque<Event>,
 }
@@ -168,10 +178,15 @@ impl Node {
                 [(durability::PUSH, ProtocolSupport::Full)],
                 request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
             ),
+            notices: request_response::cbor::Behaviour::new(
+                [(structure::PROTOCOL, ProtocolSupport::Full)],
+                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
+            ),
         };
         let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(IDLE);
         let swarm = Swarm::new(transport, behaviour, peer, config);
         let sightings = Sightings::open(catalog.db().clone())?;
+        let cursors = Cursors::open(catalog.db().clone())?;
         let mut node = Self {
             swarm,
             members,
@@ -181,6 +196,9 @@ impl Node {
             sightings,
             audits: BTreeMap::new(),
             next_audit: 0,
+            cursors,
+            notices: HashMap::new(),
+            noticing: HashSet::new(),
             ready: VecDeque::new(),
         };
         node.reload()?;
@@ -201,6 +219,80 @@ impl Node {
 
     pub const fn sightings(&self) -> &Sightings {
         &self.sightings
+    }
+
+    /// Notice each connected member of structure which arrived since it
+    /// was last noticed, unless it's still to answer the last.
+    pub fn announce(&mut self) -> Result<()> {
+        for peer in self.connected() {
+            self.announce_to(peer)?;
+        }
+        Ok(())
+    }
+
+    fn announce_to(&mut self, peer: PeerId) -> Result<()> {
+        if self.noticing.contains(&peer) {
+            return Ok(());
+        }
+        let mut cursor = self.cursors.get(&peer)?;
+        loop {
+            let (arrived, latest) = self.catalog.structure_since(cursor, structure::BATCH)?;
+            if latest == cursor {
+                return Ok(());
+            }
+            // Fewer than a batch arrived, so they make one notice at most
+            if let Some(notice) = structure::notices(&self.catalog, &arrived)?.into_iter().next() {
+                let request = self.swarm.behaviour_mut().notices.send_request(&peer, notice);
+                self.notices.insert(request, (peer, Some(latest)));
+                self.noticing.insert(peer);
+                return Ok(());
+            }
+            // Nothing that links anywhere
+            self.cursors.set(&peer, latest)?;
+            cursor = latest;
+        }
+    }
+
+    /// Notice a member of the structure here linking to blocks it's been
+    /// sent.
+    fn notice_backrefs(&mut self, peer: PeerId, keys: &[Vec<u8>]) -> Result<()> {
+        let linking = structure::backrefs(&self.catalog, keys.iter().map(Vec::as_slice))?;
+        for notice in structure::notices(&self.catalog, &linking)? {
+            let request = self.swarm.behaviour_mut().notices.send_request(&peer, notice);
+            self.notices.insert(request, (peer, None));
+        }
+        Ok(())
+    }
+
+    fn on_notice(&mut self, event: request_response::Event<Notice, Wants>) -> Result<()> {
+        match event {
+            request_response::Event::Message { message: request_response::Message::Request { request, channel, .. }, .. } => {
+                let wants = structure::answer(&self.catalog, &request)?;
+                // The noticer may be gone already
+                let _ = self.swarm.behaviour_mut().notices.send_response(channel, wants);
+            },
+            request_response::Event::Message { message: request_response::Message::Response { request_id, response }, .. } => {
+                let Some((peer, cursor)) = self.notices.remove(&request_id) else {
+                    return Ok(());
+                };
+                for push in structure::pushes(&self.catalog, &response)? {
+                    self.swarm.behaviour_mut().push.send_request(&peer, push);
+                }
+                if let Some(cursor) = cursor {
+                    self.cursors.set(&peer, cursor)?;
+                    self.noticing.remove(&peer);
+                    self.announce_to(peer)?;
+                }
+            },
+            request_response::Event::OutboundFailure { request_id, .. } => {
+                // Noticed again from its cursor, later
+                if let Some((peer, Some(_))) = self.notices.remove(&request_id) {
+                    self.noticing.remove(&peer);
+                }
+            },
+            _ => {},
+        }
+        Ok(())
     }
 
     /// Whether an audit is under way.
@@ -279,9 +371,14 @@ impl Node {
                 let _ = self.swarm.behaviour_mut().push.send_response(channel, kept);
                 return Ok(());
             },
-            request_response::Event::Message { message: request_response::Message::Response { request_id, response }, .. } => {
+            request_response::Event::Message { peer, message: request_response::Message::Response { request_id, response }, .. } => {
                 if let Some(audit) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
+                    // What links to the copies goes after them
+                    let kept = response.keys();
                     audit.kept(&self.sightings, request_id, response)?;
+                    self.notice_backrefs(peer, &kept)?;
+                } else {
+                    response.sight(&self.catalog, &self.sightings, &peer)?;
                 }
             },
             request_response::Event::OutboundFailure { request_id, .. } => {
@@ -432,9 +529,13 @@ impl Node {
                 }
                 let roster = self.roster()?;
                 self.swarm.behaviour_mut().members.send_request(&peer_id, roster);
+                self.announce_to(peer_id)?;
                 Some(Event::Connected(peer_id))
             },
-            SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => Some(Event::Disconnected(peer_id)),
+            SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                self.noticing.remove(&peer_id);
+                Some(Event::Disconnected(peer_id))
+            },
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => Some(Event::Failed(peer_id, error.to_string())),
             SwarmEvent::IncomingConnectionError { error, .. } => Some(Event::Failed(None, error.to_string())),
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
@@ -472,11 +573,13 @@ impl Node {
                     (!new.is_empty()).then_some(Event::Learned(new))
                 },
             },
-            SwarmEvent::Behaviour(BehaviourEvent::Blocks(request_response::Event::Message { message, .. })) => match message {
+            SwarmEvent::Behaviour(BehaviourEvent::Blocks(request_response::Event::Message { peer, message, .. })) => match message {
                 request_response::Message::Request { request, channel, .. } => {
                     let answer = blocks::answer(&self.catalog, &request);
+                    let served = answer.served();
                     // The asker may be gone already
                     let _ = self.swarm.behaviour_mut().blocks.send_response(channel, answer);
+                    self.notice_backrefs(peer, &served)?;
                     None
                 },
                 request_response::Message::Response { request_id, response } => {
@@ -504,6 +607,10 @@ impl Node {
             },
             SwarmEvent::Behaviour(BehaviourEvent::Push(event)) => {
                 self.on_push(event)?;
+                None
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Notices(event)) => {
+                self.on_notice(event)?;
                 None
             },
             _ => None,
