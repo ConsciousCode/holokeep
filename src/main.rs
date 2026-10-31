@@ -5,42 +5,14 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
-mod cid;
-mod car;
-mod claim;
-mod block;
-mod chunker;
-mod varint;
-mod multihash;
-mod pb;
-mod unixfs;
-mod dag;
-mod hamt;
-mod import;
-mod links;
-mod export;
-mod model;
-mod store;
-#[cfg(test)]
-mod codec_fixtures;
-#[cfg(test)]
-mod differential;
-#[cfg(test)]
-mod testutil;
-// Generic IPLD/serde layer, not needed by the importer yet
-//mod dagpb;
-mod canon;
-//mod ipld;
-mod dagcbor;
-mod dagjson;
-mod serde;
 
-use chunker::ChunkerType;
-use dag::{BalancedLayout, BlockSink, NullSink};
-use import::Importer;
-use model::Link;
-use cid::{BaseCid, CidRef};
-use store::{Copying, InPlace, RefIndex, Catalog};
+use holokeep::{car, claim, dag, export, links};
+use holokeep::chunker::ChunkerType;
+use holokeep::dag::{BalancedLayout, BlockSink, NullSink};
+use holokeep::import::Importer;
+use holokeep::model::Link;
+use holokeep::cid::{BaseCid, CidRef};
+use holokeep::store::{Copying, InPlace, RefIndex, Catalog};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
