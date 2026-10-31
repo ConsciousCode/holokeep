@@ -33,7 +33,9 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport, identify, kad,
 use serde::{Deserialize, Serialize};
 
 use super::blocks::{self, Blocks, Fetch, Want};
-use super::durability::{self, Advert, Audit, Haves, Kept, Push, Report, Sightings};
+use super::durability::{self, Advert, Audit, Haves, Kept, Push, Report, Sightings, Trickle};
+use crate::multihash::Multihash;
+use crate::store::BlockIndex;
 use super::mesh::{Error, Members, Result};
 use super::structure::{self, Cursors, Notice, Wants};
 use crate::model::Link;
@@ -136,6 +138,10 @@ pub struct Node {
     sightings: Sightings,
     audits: BTreeMap<AuditId, Audit>,
     next_audit: AuditId,
+    trickle: Trickle,
+    /// The trickle's audit under way, and whether more arrived than it
+    /// took in.
+    trickling: Option<(AuditId, bool)>,
     cursors: Cursors,
     /// Notices sent: to whom, and for one from a cursor, where it moves to
     /// once answered.
@@ -196,6 +202,8 @@ impl Node {
             sightings,
             audits: BTreeMap::new(),
             next_audit: 0,
+            trickle: Trickle::default(),
+            trickling: None,
             cursors,
             notices: HashMap::new(),
             noticing: HashSet::new(),
@@ -304,11 +312,54 @@ impl Node {
     /// `copies` failures to lose and sending copies to members to raise
     /// it. It's done when `next` returns `Audited` with the id.
     pub fn audit(&mut self, copies: usize) -> Result<AuditId> {
+        let keys = self.catalog.keys()?;
+        self.audit_of_keys(copies, keys)
+    }
+
+    /// One tick of the trickle: audit what's arrived since the last, and a
+    /// sample of the rest. Nothing, while no member's connected to send
+    /// copies to; what's arrived waits. See `Trickle`.
+    pub fn trickle(&mut self, copies: usize) -> Result<Option<AuditId>> {
+        if self.connected().is_empty() {
+            return Ok(None);
+        }
+        let cursor = self.sightings.fresh_cursor()?;
+        let (mut keys, latest) = self.catalog.fresh_since(cursor, durability::FRESH)?;
+        self.sightings.set_fresh_cursor(latest)?;
+        let more = keys.len() >= durability::FRESH;
+        keys.extend(self.catalog.sample(Trickle::sample_size(self.catalog.block_count()?))?);
+        // Before it starts, since one with nothing to ask finishes at once
+        self.trickling = Some((self.next_audit, more));
+        self.audit_of_keys(copies, keys).map(Some)
+    }
+
+    /// Whether blocks have arrived which the trickle's yet to audit, as from
+    /// a command run since; if so it's alarmed, to audit them soon.
+    pub fn arrived(&mut self) -> Result<bool> {
+        let cursor = self.sightings.fresh_cursor()?;
+        let arrived = !self.catalog.fresh_since(cursor, 1)?.0.is_empty();
+        if arrived {
+            self.trickle.alarm();
+        }
+        Ok(arrived)
+    }
+
+    /// How long until the trickle's next tick.
+    pub fn trickle_delay(&self) -> Duration {
+        self.trickle.delay()
+    }
+
+    /// The trickle's interval, as it stands.
+    pub const fn trickle_interval(&self) -> Duration {
+        self.trickle.interval()
+    }
+
+    fn audit_of_keys(&mut self, copies: usize, keys: Vec<Multihash>) -> Result<AuditId> {
         let id = self.next_audit;
         self.next_audit = id.wrapping_add(1);
         let mut peers = self.connected();
         peers.sort();
-        let (mut audit, adverts) = Audit::start(&self.catalog, &self.sightings, self.peer_id(), &peers, copies)?;
+        let (mut audit, adverts) = Audit::start(&self.catalog, &self.sightings, self.peer_id(), &peers, copies, keys)?;
         for advert in &adverts {
             for &peer in &peers {
                 let request = self.swarm.behaviour_mut().adverts.send_request(&peer, advert.clone());
@@ -336,6 +387,12 @@ impl Node {
         } else {
             let report = audit.report();
             self.audits.remove(&id);
+            if let Some((trickled, more)) = self.trickling
+                && trickled == id
+            {
+                self.trickle.observe(&report, more);
+                self.trickling = None;
+            }
             self.ready.push_back(Event::Audited { id, report });
         }
         Ok(())
@@ -366,8 +423,8 @@ impl Node {
 
     fn on_push(&mut self, event: request_response::Event<Push, Kept>) -> Result<()> {
         match event {
-            request_response::Event::Message { message: request_response::Message::Request { request, channel, .. }, .. } => {
-                let kept = durability::answer_push(&self.catalog, request)?;
+            request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
+                let kept = durability::answer_push(&self.catalog, &self.sightings, &peer, request)?;
                 let _ = self.swarm.behaviour_mut().push.send_response(channel, kept);
                 return Ok(());
             },
@@ -530,10 +587,12 @@ impl Node {
                 let roster = self.roster()?;
                 self.swarm.behaviour_mut().members.send_request(&peer_id, roster);
                 self.announce_to(peer_id)?;
+                self.trickle.alarm();
                 Some(Event::Connected(peer_id))
             },
             SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
                 self.noticing.remove(&peer_id);
+                self.trickle.alarm();
                 Some(Event::Disconnected(peer_id))
             },
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => Some(Event::Failed(peer_id, error.to_string())),

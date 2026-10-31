@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use libp2p::request_response::OutboundRequestId;
 use libp2p::{PeerId, StreamProtocol};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha2::Digest as _;
@@ -77,15 +77,19 @@ pub struct Haves {
     offer: Option<Offer>,
 }
 
-/// Blocks sent to be kept, as (CID, bytes).
+/// Blocks sent to be kept, as (CID, bytes), and the copies the sender
+/// holds of each, so the receiver knows of them without asking.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Push {
     blocks: Vec<(ByteBuf, ByteBuf)>,
+    #[serde(default)]
+    copies: Vec<Vec<Replica>>,
 }
 
 impl Push {
-    /// Pushes of these blocks, each about a few megabytes at most.
-    pub fn batches(blocks: impl IntoIterator<Item = Block>) -> Vec<Self> {
+    /// Pushes of these blocks, each about a few megabytes at most, with
+    /// the copies held here.
+    pub fn batches(catalog: &Catalog, blocks: impl IntoIterator<Item = Block>) -> Result<Vec<Self>> {
         let mut pushes = Vec::new();
         let (mut push, mut size) = (Self::default(), 0usize);
         for block in blocks {
@@ -94,12 +98,18 @@ impl Push {
                 size = 0;
             }
             size = size.saturating_add(block.data().len());
-            push.blocks.push((ByteBuf::from(block.cid().to_bytes()), ByteBuf::from(block.data().to_vec())));
+            push.add(catalog, &block)?;
         }
         if !push.blocks.is_empty() {
             pushes.push(push);
         }
-        pushes
+        Ok(pushes)
+    }
+
+    fn add(&mut self, catalog: &Catalog, block: &Block) -> Result<()> {
+        self.copies.push(catalog.replicas(block.cid().multihash())?);
+        self.blocks.push((ByteBuf::from(block.cid().to_bytes()), ByteBuf::from(block.data().to_vec())));
+        Ok(())
     }
 }
 
@@ -159,7 +169,12 @@ impl Sightings {
                  risks TEXT NOT NULL,
                  seen INTEGER NOT NULL,
                  PRIMARY KEY (block, label)
-             ) WITHOUT ROWID;",
+             ) WITHOUT ROWID;
+             -- Where audits are up to.
+             CREATE TABLE IF NOT EXISTS audit_state (
+                 name TEXT PRIMARY KEY,
+                 value INTEGER NOT NULL
+             );",
         )?;
         Ok(Self { db, ttl: TTL })
     }
@@ -190,6 +205,32 @@ impl Sightings {
             return Ok(());
         };
         self.db.conn().prepare_cached("DELETE FROM sightings WHERE block = ?1 AND peer = ?2")?.execute(params![block, peer.to_string()])?;
+        Ok(())
+    }
+
+    /// Whether any copy of a block still believed in is past half its
+    /// time: due to be sighted again before it's forgotten.
+    pub fn stale(&self, key: Key<'_>) -> Result<bool> {
+        let Some(block) = self.db.lookup(key)? else {
+            return Ok(false);
+        };
+        let half = i64::try_from(self.ttl.as_secs() / 2).unwrap_or(i64::MAX);
+        Ok(self.db.conn()
+            .prepare_cached("SELECT 1 FROM sightings WHERE block = ?1 AND seen >= ?2 AND seen < ?3")?
+            .exists(params![block, self.cutoff(), now().saturating_sub(half)])?)
+    }
+
+    /// Where the trickle's read up to of what's arrived.
+    pub fn fresh_cursor(&self) -> Result<i64> {
+        Ok(self.db.conn()
+            .prepare_cached("SELECT value FROM audit_state WHERE name = 'fresh'")?
+            .query_row([], |row| row.get(0))
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    pub fn set_fresh_cursor(&self, cursor: i64) -> Result<()> {
+        self.db.conn().prepare_cached("INSERT OR REPLACE INTO audit_state (name, value) VALUES ('fresh', ?1)")?.execute([cursor])?;
         Ok(())
     }
 
@@ -291,14 +332,17 @@ pub fn answer_advert(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, ad
     Ok(Haves { held, offer: Some(catalog.offer()?) })
 }
 
-/// Keep what's pushed, if there's room and each block matches its CID.
-pub fn answer_push(catalog: &Catalog, push: Push) -> Result<Kept> {
+/// Keep what's pushed, if there's room and each block matches its CID,
+/// noting the sender's copies of what's kept.
+pub fn answer_push(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, push: Push) -> Result<Kept> {
     let size = push.blocks.iter().fold(0usize, |size, (_, data)| size.saturating_add(data.len()));
     if catalog.offer()?.free.is_some_and(|free| u64::try_from(size).unwrap_or(u64::MAX) > free) {
         return Ok(Kept::default());
     }
     let mut kept = Vec::new();
+    let mut copies = push.copies.into_iter();
     for (cid, data) in push.blocks {
+        let theirs = copies.next().unwrap_or_default();
         let Ok(link) = Link::decode(&cid) else {
             continue;
         };
@@ -306,6 +350,11 @@ pub fn answer_push(catalog: &Catalog, push: Push) -> Result<Kept> {
             continue;
         };
         catalog.put_block(&block, link.version())?;
+        if link.hashcode() != IDENTITY {
+            for replica in &theirs {
+                sightings.see(link.multihash(), peer, replica)?;
+            }
+        }
         kept.push((ByteBuf::from(link.multihash().to_bytes()), catalog.replicas(link.multihash())?));
     }
     Ok(Kept { kept })
@@ -349,10 +398,19 @@ pub struct Audit {
 }
 
 impl Audit {
-    /// Find what this node holds short of `copies` failures to lose, and
-    /// is responsible for among the holders it knows of, connected or
-    /// itself. Returns the audit and the adverts to send every peer.
-    pub fn start(catalog: &Catalog, sightings: &Sightings, me: PeerId, peers: &[PeerId], copies: usize) -> Result<(Self, Vec<Advert>)> {
+    /// Audit these blocks: find those short of `copies` failures to lose,
+    /// or whose copies elsewhere are due to be sighted again, and which
+    /// this node is responsible for among the holders it knows of,
+    /// connected or itself. Returns the audit and the adverts to send
+    /// every peer.
+    pub fn start(
+        catalog: &Catalog,
+        sightings: &Sightings,
+        me: PeerId,
+        peers: &[PeerId],
+        copies: usize,
+        keys: impl IntoIterator<Item = Multihash>,
+    ) -> Result<(Self, Vec<Advert>)> {
         sightings.expire()?;
         let mut audit = Self {
             me,
@@ -366,8 +424,8 @@ impl Audit {
         };
         let mut adverts = Vec::new();
         let mut advert = Advert::default();
-        for key in catalog.keys()? {
-            if key.code() == IDENTITY {
+        for key in keys {
+            if key.code() == IDENTITY || audit.blocks.contains_key(&key.to_bytes()) {
                 continue;
             }
             let ours = catalog.replicas(key.as_ref())?;
@@ -378,7 +436,7 @@ impl Audit {
                 }
             }
             let have = distinct(ours.iter().chain(holding.holders.values().flatten()));
-            if tolerance(&have, copies) >= copies {
+            if tolerance(&have, copies) >= copies && !sightings.stale(key.as_ref())? {
                 continue;
             }
             let bytes = key.to_bytes();
@@ -544,7 +602,7 @@ impl Audit {
                     size = 0;
                 }
                 size = size.saturating_add(block.data().len());
-                push.blocks.push((ByteBuf::from(block.cid().to_bytes()), ByteBuf::from(block.data().to_vec())));
+                push.add(catalog, &block)?;
                 batch.push(key);
             }
             if !push.blocks.is_empty() {
@@ -556,6 +614,80 @@ impl Audit {
 
     pub fn report(&self) -> Report {
         self.report.clone()
+    }
+}
+
+/// The interval the trickle keeps when there's nothing to do.
+pub const CALM: Duration = Duration::from_mins(1);
+
+/// The interval it keeps when there is.
+pub const ALERT: Duration = Duration::from_secs(2);
+
+/// About how often, while calm, each block is sampled: often enough that a
+/// sighting is usually refreshed in the second half of its time, before
+/// it's forgotten.
+const REVISIT: Duration = Duration::from_secs(TTL.as_secs() / 8);
+
+/// The most of what's arrived audited at once.
+pub const FRESH: usize = 256;
+
+/// Auditing as a trickle, a few blocks at a time, at a pace that answers
+/// to what it finds.
+///
+/// Copies made means more may be needed, so it hurries, halving its
+/// interval down to `ALERT`; nothing to do and it relaxes, back up to
+/// `CALM`. A member coming or going alarms it. Blocks no member can raise
+/// don't count, or they'd keep it hurrying for nothing.
+///
+/// Each tick audits what's arrived since the last, so new blocks find
+/// copies within seconds, and a sample at random of the rest, sized so
+/// that at the calm pace each block comes up about every `REVISIT`.
+#[derive(Debug, Clone)]
+pub struct Trickle {
+    interval: Duration,
+}
+
+impl Default for Trickle {
+    fn default() -> Self {
+        Self { interval: ALERT }
+    }
+}
+
+impl Trickle {
+    /// How many blocks of `blocks` to sample each tick.
+    pub fn sample_size(blocks: u64) -> usize {
+        let size = blocks.saturating_mul(CALM.as_secs()).div_ceil(REVISIT.as_secs().max(1));
+        usize::try_from(size).unwrap_or(usize::MAX).max(1)
+    }
+
+    /// Answer what a tick found: whether copies were made, or more has
+    /// arrived than one tick audits.
+    pub fn observe(&mut self, report: &Report, more: bool) {
+        self.interval = if report.copied > 0 || more {
+            self.interval.checked_div(2).unwrap_or(ALERT).max(ALERT)
+        } else {
+            self.interval.saturating_add(self.interval.checked_div(4).unwrap_or_default()).min(CALM)
+        };
+    }
+
+    /// Something changed which may have left blocks short.
+    pub const fn alarm(&mut self) {
+        self.interval = ALERT;
+    }
+
+    pub const fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// How long until the next tick: the interval, give or take a fifth,
+    /// so nodes don't fall into step.
+    pub fn delay(&self) -> Duration {
+        let mut byte = [0u8];
+        let _ = getrandom::getrandom(&mut byte);
+        // 0.8 to 1.2 of the interval
+        let [byte] = byte;
+        let fifths = 0.8 + 0.4 * f64::from(byte) / 255.0;
+        self.interval.mul_f64(fifths)
     }
 }
 
@@ -620,6 +752,83 @@ mod tests {
             firsts.insert(first);
         }
         assert_eq!(firsts.len(), 4, "each is responsible for some");
+    }
+
+    #[test]
+    fn the_trickle_hurries_when_theres_work_and_relaxes_when_not() {
+        let mut trickle = Trickle::default();
+        assert_eq!(trickle.interval(), ALERT);
+        for _ in 0..30 {
+            trickle.observe(&Report::default(), false);
+        }
+        assert_eq!(trickle.interval(), CALM);
+        trickle.observe(&Report { advertised: 3, copied: 0, short: 3 }, false);
+        assert_eq!(trickle.interval(), CALM, "what no one can raise is no reason to hurry");
+        trickle.observe(&Report { advertised: 3, copied: 1, short: 0 }, false);
+        assert_eq!(trickle.interval(), CALM / 2);
+        trickle.observe(&Report::default(), true);
+        assert_eq!(trickle.interval(), CALM / 4);
+        trickle.alarm();
+        assert_eq!(trickle.interval(), ALERT);
+        let delay = trickle.delay();
+        assert!(delay >= ALERT.mul_f64(0.79) && delay <= ALERT.mul_f64(1.21), "{delay:?}");
+    }
+
+    #[test]
+    fn samples_visit_every_block_about_as_often_as_asked() {
+        assert_eq!(Trickle::sample_size(0), 1);
+        // A tick a minute, every block about every 21 hours
+        assert_eq!(Trickle::sample_size(75_600), 60);
+        assert_eq!(Trickle::sample_size(1_000_000), 794);
+    }
+
+    fn catalog_of(n: u8) -> (Db, Catalog, Vec<Block>) {
+        let db = Db::memory().expect("db");
+        let catalog = Catalog::standard(db.clone()).expect("catalog");
+        let blocks: Vec<Block> = (0..n).map(|i| Block::hash(crate::cid::Cidv1Spec::default(), vec![i, 0x5a].into())).collect();
+        for block in &blocks {
+            catalog.put_block(block, crate::cid::CidVersion::V1).expect("put");
+        }
+        (db, catalog, blocks)
+    }
+
+    #[test]
+    fn samples_are_of_whats_here() {
+        let (_, catalog, blocks) = catalog_of(50);
+        assert_eq!(catalog.block_count().expect("count"), 50);
+        let sample = catalog.sample(10).expect("sample");
+        assert!(sample.len() > 5 && sample.len() <= 10, "{}", sample.len());
+        assert!(sample.iter().all(|key| catalog.has(key.as_ref()).expect("has")));
+        let all = catalog.sample(1000).expect("sample");
+        assert!(all.len() <= 50 && all.len() > 40, "{}", all.len());
+        // What's arrived, in order, read on from where it was left
+        let (first, at) = catalog.fresh_since(0, 30).expect("fresh");
+        let (rest, end) = catalog.fresh_since(at, 30).expect("fresh");
+        assert_eq!((first.len(), rest.len()), (30, 20));
+        assert!(catalog.fresh_since(end, 30).expect("fresh").0.is_empty());
+        let keys: Vec<Vec<u8>> = first.iter().chain(&rest).map(Multihash::to_bytes).collect();
+        assert_eq!(keys, blocks.iter().map(|block| block.cid().multihash().to_bytes()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn copies_elsewhere_are_sighted_again_before_theyre_forgotten() {
+        let (db, catalog, blocks) = catalog_of(1);
+        let key = decode(&blocks.first().expect("block").cid().multihash().to_bytes()).expect("key");
+        let me = PeerId::random();
+        // A peer this node outranks, so it's the one to refresh
+        let peer = std::iter::repeat_with(PeerId::random)
+            .find(|peer| first_holder(&key.to_bytes(), [&me, peer]) == Some(me))
+            .expect("one soon enough");
+        let sightings = Sightings::open(db.clone()).expect("open");
+        sightings.see(key.as_ref(), &peer, &replica(1, &["volume:01", "disk:elsewhere"])).expect("see");
+        // Enough copies, freshly sighted: nothing to say
+        let advertised = |sightings: &Sightings| {
+            Audit::start(&catalog, sightings, me, &[peer], 2, [key.clone()]).expect("start").0.report.advertised
+        };
+        assert_eq!(advertised(&sightings), 0);
+        // Four days on, it's due
+        db.conn().execute("UPDATE sightings SET seen = seen - 4 * 86400", []).expect("age");
+        assert_eq!(advertised(&sightings), 1);
     }
 
     #[test]

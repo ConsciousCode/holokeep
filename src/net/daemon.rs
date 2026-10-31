@@ -35,15 +35,13 @@ pub const LISTEN: &str = "/ip4/0.0.0.0/tcp/4011";
 /// How often to dial members which aren't connected.
 const REDIAL: Duration = Duration::from_mins(1);
 
-/// How often to audit what's held, and raise what's short.
-const AUDIT: Duration = Duration::from_hours(1);
-
 /// How often to notice members of structure which arrived, such as from
 /// commands run since.
 const ANNOUNCE: Duration = Duration::from_secs(10);
 
-/// How long after starting to first audit, so members have connected.
-const SETTLE: Duration = Duration::from_secs(30);
+/// How long after starting to begin the trickle, so members have
+/// connected.
+const SETTLE: Duration = Duration::from_secs(5);
 
 /// Someone on the control socket waiting for something to finish.
 enum Waiter {
@@ -141,7 +139,7 @@ fn ask_within(dir: &Path, command: &str, time: Option<Duration>) -> Result<Optio
     Ok(Some(lines))
 }
 
-/// Run the node until interrupted, auditing every so often that it would
+/// Run the node until interrupted, auditing as a trickle that it would
 /// take `copies` failures to lose each block it holds.
 pub async fn run(dir: &Path, listen: Multiaddr, copies: usize) -> Result<()> {
     let key = mesh::node_key(dir)?;
@@ -161,8 +159,8 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize) -> Result<()> {
     let control = UnixListener::bind(&path)?;
     eprintln!("node {} in mesh {}", node.peer_id(), swarm_key.fingerprint());
     let mut redial = tokio::time::interval(REDIAL);
-    let start = tokio::time::Instant::now().checked_add(SETTLE).unwrap_or_else(tokio::time::Instant::now);
-    let mut audit = tokio::time::interval_at(start, AUDIT);
+    let later = |delay| tokio::time::Instant::now().checked_add(delay).unwrap_or_else(tokio::time::Instant::now);
+    let mut trickle = later(SETTLE);
     let mut announce = tokio::time::interval(ANNOUNCE);
     // Those waiting on fetches and audits, to be answered when they finish
     let mut fetching: HashMap<FetchId, OwnedWriteHalf> = HashMap::new();
@@ -171,7 +169,11 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize) -> Result<()> {
         tokio::select! {
             event = node.next() => match event {
                 Ok(Event::Audited { id, report }) => {
-                    eprintln!("audited: {} advertised, {} copied, {} short", report.advertised, report.copied, report.short);
+                    // The trickle's ticks are worth hearing of only when they
+                    // do something
+                    if report.copied > 0 || auditing.contains_key(&id) {
+                        eprintln!("audited: {} advertised, {} copied, {} short", report.advertised, report.copied, report.short);
+                    }
                     if let Some(mut write) = auditing.remove(&id) {
                         let line = format!("audited {} {} {}\n", report.advertised, report.copied, report.short);
                         let _ = write.write_all(line.as_bytes()).await;
@@ -206,11 +208,19 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize) -> Result<()> {
                 }
             },
             _ = redial.tick() => node.dial_members()?,
-            _ = announce.tick() => node.announce()?,
-            _ = audit.tick() => {
-                if !node.auditing() {
-                    node.audit(copies)?;
+            _ = announce.tick() => {
+                node.announce()?;
+                // What's been added since is copied without waiting out a
+                // calm interval
+                if node.arrived()? && !node.connected().is_empty() {
+                    trickle = tokio::time::Instant::now();
                 }
+            },
+            () = tokio::time::sleep_until(trickle) => {
+                if !node.auditing() {
+                    node.trickle(copies)?;
+                }
+                trickle = later(node.trickle_delay());
             },
             _ = tokio::signal::ctrl_c() => break Ok(()),
         }
@@ -253,6 +263,13 @@ async fn answer(node: &mut Node, stream: tokio::net::UnixStream, copies: usize) 
                 let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
                 let _ = writeln!(out, "{peer}\t{state}\t{}", addrs.join(" "));
             }
+        },
+        "status" => {
+            let _ = writeln!(out, "peer\t{}", node.peer_id());
+            let _ = writeln!(out, "connected\t{}", node.connected().len());
+            let _ = writeln!(out, "blocks\t{}", node.catalog().block_count()?);
+            let _ = writeln!(out, "copies\t{copies}");
+            let _ = writeln!(out, "trickle\t{:.1}s", node.trickle_interval().as_secs_f64());
         },
         "listeners" => {
             for addr in node.listeners() {

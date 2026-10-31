@@ -110,16 +110,19 @@ enum NodeCommand {
     Run {
         #[arg(long, default_value = holokeep::net::daemon::LISTEN)]
         listen: String,
-        /// Every hour, copy blocks to other members until it would take
-        /// this many failures to lose each, counting risks
+        /// Copy blocks to other members until it would take this many
+        /// failures to lose each, counting risks, auditing a few at a time
         #[arg(short, long, default_value_t = 2)]
         copies: usize,
     },
     /// List the mesh's members, and which are connected
     Peers,
-    /// Have the running node audit now: advertise the blocks it holds
-    /// which are short of the copies it runs with, or of these, and copy
-    /// them to other members
+    /// How the running node is: connected members, blocks, and the
+    /// trickle's pace
+    Status,
+    /// Have the running node audit every block now, not a few at a time:
+    /// advertise those short of the copies it runs with, or of these, and
+    /// copy them to other members
     Audit {
         #[arg(short, long)]
         copies: Option<usize>,
@@ -370,6 +373,10 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
             let listen = listen.parse().context("not a multiaddr")?;
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
             runtime.block_on(daemon::run(dir, listen, copies))?;
+        },
+        NodeCommand::Status => {
+            let lines = daemon::ask(dir, "status")?.context("this node isn't running: start `hk node run`")?;
+            lines.iter().for_each(|line| println!("{line}"));
         },
         NodeCommand::Audit { copies } => {
             let report = daemon::audit(dir, copies)?.context("this node isn't running: start `hk node run`")?;

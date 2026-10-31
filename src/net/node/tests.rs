@@ -462,3 +462,39 @@ async fn fetching_takes_tags_along() {
     assert_eq!(fetch(&mut a, &mut b, link(leaf)).await, (1, vec![]));
     assert!(until(&mut [&mut a, &mut b], |n| tags(n[1], leaf) == [link(&tag)]).await);
 }
+
+//-------------//
+//-[ Trickle ]-//
+//-------------//
+
+#[tokio::test]
+async fn the_trickle_copies_what_arrives() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    let id = a.trickle(2).expect("trickle").expect("connected");
+    assert_eq!(audited(&mut [&mut a, &mut b], &[(0, id)]).await, [report(4, 4, 0)]);
+    assert!(blocks.iter().all(|block| has(&b, block)));
+    // b was told of a's copies with them, so it needn't ask
+    let id = b.trickle(2).expect("trickle").expect("connected");
+    assert_eq!(audited(&mut [&mut a, &mut b], &[(1, id)]).await, [report(0, 0, 0)]);
+    // And what a's seen arrive it doesn't audit again unless sampled,
+    // when it finds nothing to do, and relaxes
+    let before = a.trickle_interval();
+    let id = a.trickle(2).expect("trickle").expect("connected");
+    assert_eq!(audited(&mut [&mut a, &mut b], &[(0, id)]).await, [report(0, 0, 0)]);
+    assert!(a.trickle_interval() > before, "{:?} after {before:?}", a.trickle_interval());
+    // Until something new arrives
+    assert!(!a.arrived().expect("arrived"));
+    a.catalog().put_block(&raw(b"new"), CidVersion::V1).expect("put");
+    assert!(a.arrived().expect("arrived"));
+    assert_eq!(a.trickle_interval(), durability::ALERT);
+}
+
+#[tokio::test]
+async fn the_trickle_waits_for_someone_to_send_copies_to() {
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let mut a = node(swarm_key).await;
+    a.catalog().put_block(&raw(b"alone"), CidVersion::V1).expect("put");
+    assert_eq!(a.trickle(2).expect("trickle"), None);
+    // What arrived is still to be audited
+    assert_eq!(a.sightings().fresh_cursor().expect("cursor"), 0);
+}

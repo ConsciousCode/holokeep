@@ -138,7 +138,7 @@ pub fn pushes(catalog: &Catalog, wants: &Wants) -> Result<Vec<Push>> {
             blocks.push(block);
         }
     }
-    Ok(Push::batches(blocks))
+    Push::batches(catalog, blocks)
 }
 
 /// How far through the catalog's generations each member's been noticed.

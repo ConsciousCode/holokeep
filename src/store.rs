@@ -1014,6 +1014,60 @@ impl Catalog {
         Ok((found, latest))
     }
 
+    /// Blocks here whose multihashes were first known after `after`, by
+    /// their ids, which only grow: what's arrived, mostly, since a block is
+    /// usually known first when it's put. Up to `limit` of them, and the
+    /// latest id read, to read on from.
+    pub fn fresh_since(&self, after: Id, limit: usize) -> Result<(Vec<Multihash>, Id)> {
+        let rows: Vec<(Id, Vec<u8>)> = self.db.conn()
+            .prepare_cached(
+                "SELECT DISTINCT b.block, m.multihash FROM blocks b JOIN multihashes m ON m.id = b.block
+                 WHERE b.block > ?1 ORDER BY b.block LIMIT ?2",
+            )?
+            .query_map(params![after, i64::try_from(limit).unwrap_or(i64::MAX)], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let latest = rows.last().map_or(after, |&(id, _)| id);
+        let keys = rows.into_iter().map(|(_, bytes)| decode_key("router", &bytes)).collect::<Result<_>>()?;
+        Ok((keys, latest))
+    }
+
+    /// How many blocks are here.
+    pub fn block_count(&self) -> Result<u64> {
+        let count: i64 = self.db.conn().prepare_cached("SELECT count(DISTINCT block) FROM blocks")?.query_row([], |row| row.get(0))?;
+        Ok(u64::try_from(count).unwrap_or_default())
+    }
+
+    /// Up to `k` blocks here, chosen at random: each the first at or after
+    /// a random id, so a block after a gap in the ids is likelier, which is
+    /// fine for sampling.
+    pub fn sample(&self, k: usize) -> Result<Vec<Multihash>> {
+        let conn = self.db.conn();
+        let (lo, hi): (Option<Id>, Option<Id>) = conn.prepare_cached("SELECT min(block), max(block) FROM blocks")?.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let (Some(lo), Some(hi)) = (lo, hi) else {
+            return Ok(Vec::new());
+        };
+        let span = u64::try_from(hi.saturating_sub(lo)).unwrap_or_default().saturating_add(1);
+        let mut found = std::collections::BTreeMap::new();
+        let mut stmt = conn.prepare_cached(
+            "SELECT m.multihash FROM blocks b JOIN multihashes m ON m.id = b.block WHERE b.block >= ?1 ORDER BY b.block LIMIT 1",
+        )?;
+        // Twice as many tries as wanted, since some land on the same block
+        for _ in 0..k.saturating_mul(2) {
+            if found.len() >= k {
+                break;
+            }
+            let mut bytes = [0u8; 8];
+            getrandom::getrandom(&mut bytes).map_err(io::Error::from)?;
+            let offset = u64::from_le_bytes(bytes).checked_rem(span).unwrap_or_default();
+            let at = lo.saturating_add(i64::try_from(offset).unwrap_or_default());
+            if let Some(bytes) = stmt.query_row([at], |row| row.get::<_, Vec<u8>>(0)).optional()? {
+                let key = decode_key("router", &bytes)?;
+                found.insert(bytes, key);
+            }
+        }
+        Ok(found.into_values().collect())
+    }
+
     /// Whether a block is here: as `has`, but a dissolved claim's identity
     /// is here only if the claim is.
     pub fn holds(&self, cid: &Link) -> Result<bool> {
