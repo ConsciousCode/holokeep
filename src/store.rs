@@ -1542,6 +1542,7 @@ impl BlockSink for InPlace<'_> {
 }
 
 /// Imports files as copies, so nothing is kept as part of the originals.
+///
 /// A file of more than one leaf and more than the shards' threshold is
 /// kept whole in the shards, written as its leaves go by, and its leaves
 /// become ranges of it; the rest are copied block by block.
