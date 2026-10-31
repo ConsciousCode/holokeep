@@ -245,11 +245,10 @@ fn fetch_first(repo: &Option<PathBuf>, cid: &Link) -> anyhow::Result<()> {
     #[cfg(feature = "net")]
     {
         let dir = repo_dir(repo.clone())?;
-        if let Some(lines) = holokeep::net::daemon::ask_patiently(&dir, &format!("fetch {cid}"))? {
-            let missing = lines.iter().filter(|line| line.starts_with("missing")).count();
-            if missing > 0 {
-                eprintln!("warning: {missing} blocks aren't here or on any connected member");
-            }
+        if let Some((_, missing)) = holokeep::net::daemon::fetch(&dir, cid)?
+            && !missing.is_empty()
+        {
+            eprintln!("warning: {} blocks aren't here or on any connected member", missing.len());
         }
     }
     #[cfg(not(feature = "net"))]
@@ -479,12 +478,12 @@ fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {
         #[cfg(feature = "net")]
         DagCommand::Fetch { cid } => {
             let dir = repo_dir(repo)?;
-            let lines = holokeep::net::daemon::ask_patiently(&dir, &format!("fetch {cid}"))?
-                .context("this node isn't running: start `hk node run`")?;
-            for line in &lines {
-                println!("{line}");
+            let (fetched, missing) = holokeep::net::daemon::fetch(&dir, &cid)?.context("this node isn't running: start `hk node run`")?;
+            println!("fetched {fetched}");
+            for cid in &missing {
+                println!("missing {cid}");
             }
-            anyhow::ensure!(!lines.iter().any(|line| line.starts_with("missing")), "some blocks aren't here or on any connected member");
+            anyhow::ensure!(missing.is_empty(), "{} blocks aren't here or on any connected member", missing.len());
             Ok(())
         },
         DagCommand::Import { paths } => {

@@ -67,6 +67,30 @@ pub fn ask_patiently(dir: &Path, command: &str) -> Result<Option<Vec<String>>> {
     ask_within(dir, command, None)
 }
 
+/// Have the running daemon fetch the DAG under a root: how many blocks it
+/// fetched and the CIDs no connected member had, or None if it isn't
+/// running.
+pub fn fetch(dir: &Path, root: &crate::model::Link) -> Result<Option<(usize, Vec<String>)>> {
+    let Some(lines) = ask_patiently(dir, &format!("fetch {root}"))? else {
+        return Ok(None);
+    };
+    let (mut fetched, mut missing) = (None, Vec::new());
+    for line in lines {
+        if let Some(n) = line.strip_prefix("fetched ") {
+            fetched = n.trim().parse().ok();
+        } else if let Some(cid) = line.strip_prefix("missing ") {
+            missing.push(cid.trim().to_owned());
+        } else if line.starts_with("unknown command") {
+            // A daemon from before fetching, still running after an upgrade
+            return Err(Error::Invalid("the running node is older than this hk: restart `hk node run`".into()));
+        } else if let Some(e) = line.strip_prefix("error: ") {
+            return Err(Error::Invalid(e.to_owned()));
+        }
+    }
+    let fetched = fetched.ok_or_else(|| Error::Invalid("the node hung up without saying what it fetched".into()))?;
+    Ok(Some((fetched, missing)))
+}
+
 fn ask_within(dir: &Path, command: &str, time: Option<Duration>) -> Result<Option<Vec<String>>> {
     let Ok(mut stream) = UnixStream::connect(socket(dir)) else {
         return Ok(None);
@@ -182,12 +206,14 @@ async fn answer(node: &mut Node, stream: tokio::net::UnixStream) -> Result<Optio
             match cid.parse::<crate::model::Link>() {
                 Ok(root) => return Ok(Some((node.fetch(root)?, write))),
                 Err(_) => {
-                    let _ = writeln!(out, "not a CID: {cid}");
+                    let _ = writeln!(out, "error: not a CID: {cid}");
                 },
             }
         },
         other => {
-            let _ = writeln!(out, "unknown command {other:?}");
+            // Not prefixed with "error: ", which daemons from before fetching
+                // didn't, so a newer hk can tell an old daemon by it
+                let _ = writeln!(out, "unknown command {other:?}");
         },
     }
     write.write_all(out.as_bytes()).await?;
