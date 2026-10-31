@@ -1146,13 +1146,15 @@ fn volumes_are_attached_where_they_were_seen() {
 }
 
 #[test]
-fn volumes_on_one_disk_are_one_failure_domain() {
+fn volumes_on_one_disk_risk_it_together() {
     let scratch = Scratch::new("volumes-domains");
     let mut router = router();
-    assert_eq!(router.add_volume("a", &scratch.path().join("a")).expect("add"), Vec::<String>::new());
+    assert!(router.add_volume("a", &scratch.path().join("a")).expect("add").is_empty());
     // The database is in memory, so on no disk; both directories are on
     // the scratch directory's
-    assert_eq!(router.add_volume("b", &scratch.path().join("b")).expect("add"), ["a"]);
+    let shared = router.add_volume("b", &scratch.path().join("b")).expect("add");
+    assert_eq!(shared.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["a"]);
+    assert_eq!(shared.first().map(|(_, risks)| risks.clone()), Some(volume::risks_of(scratch.path())));
     assert!(router.add_volume("a", &scratch.path().join("c")).is_err());
     assert!(router.add_volume("again", &scratch.path().join("a")).is_err());
 
@@ -1161,7 +1163,7 @@ fn volumes_on_one_disk_are_one_failure_domain() {
     let report = router.replicate(3).expect("replicate");
     assert_eq!((report.copied, report.short.len()), (1, 1));
     assert_eq!(router.placements(block.cid().multihash()).expect("placements").len(), 2);
-    // Already in two domains, nothing more to do
+    // It takes two failures to lose it already, nothing more to do
     assert_eq!(router.replicate(2).expect("replicate").copied, 0);
 }
 
@@ -1244,16 +1246,60 @@ fn only_changed_shards_are_listed_again() {
 }
 
 #[test]
-fn domains_are_disks() {
+fn risks_are_found() {
     let scratch = Scratch::new("volumes-disks");
-    let here = volume::domain_of(scratch.path()).expect("domain");
-    // Wherever in a filesystem, the same domain; and a filesystem with no
-    // disk is named by its mount
-    assert_eq!(volume::domain_of(&scratch.path().join("..")), Some(here.clone()));
-    if let Some(proc) = volume::domain_of(std::path::Path::new("/proc")) {
-        assert_ne!(proc, here);
-        assert_eq!(proc, "proc:proc");
+    let here = volume::risks_of(scratch.path());
+    assert!(!here.is_empty());
+    // Wherever in a filesystem, the same; and a filesystem with no disk is
+    // named by its mount
+    assert_eq!(volume::risks_of(&scratch.path().join("..")), here);
+    if std::path::Path::new("/proc/self/mountinfo").exists() {
+        assert_eq!(volume::risks_of(std::path::Path::new("/proc")), ["proc:proc"]);
     }
+}
+
+#[test]
+fn tolerance_is_failures_to_lose_every_copy() {
+    let copies = |sets: &[&[&str]]| -> Vec<Vec<String>> {
+        sets.iter().map(|set| set.iter().map(|&risk| risk.to_owned()).collect()).collect()
+    };
+    let tolerance = |sets: &[&[&str]]| volume::tolerance(&copies(sets), 5);
+    assert_eq!(tolerance(&[]), 0);
+    assert_eq!(tolerance(&[&["a"]]), 1);
+    assert_eq!(tolerance(&[&["a"], &["b"]]), 2);
+    // Two volumes on one disk, or in one house
+    assert_eq!(tolerance(&[&["a", "nvme"], &["b", "nvme"]]), 1);
+    assert_eq!(tolerance(&[&["a", "nvme", "home"], &["b", "usb", "home"], &["c", "cloud"]]), 2);
+    assert_eq!(volume::tolerance(&copies(&[&["a"], &["b"], &["c"]]), 2), 2, "counted only so far");
+}
+
+#[test]
+fn said_risks_count() {
+    let scratch = Scratch::new("volumes-said");
+    let mut router = router();
+    router.add_volume("a", &scratch.path().join("a")).expect("add");
+    let block = raw(b"precious");
+    router.put_block(&block, CidVersion::V1).expect("put");
+    assert_eq!(router.replicate(2).expect("replicate").copied, 1);
+
+    // The database and the copy are in one house after all, so one more
+    // copy, even on a's disk, helps
+    router.add_risk("db", "home").expect("risk");
+    router.add_risk("a", "home").expect("risk");
+    router.add_volume("b", &scratch.path().join("b")).expect("add");
+    let report = router.replicate(2).expect("replicate");
+    assert_eq!((report.copied, report.short.len()), (1, 0));
+
+    // Said risks can be unsaid; found ones can't
+    let found = volume::risks_of(scratch.path());
+    let disk = found.first().expect("a risk");
+    assert!(router.remove_risk("a", disk).is_err());
+    assert!(router.remove_risk("a", "office").is_err());
+    router.remove_risk("a", "home").expect("unsay");
+    let list = router.risk_list().expect("list");
+    assert!(list.contains(&("db".to_owned(), "home".to_owned(), false)));
+    assert!(list.contains(&("a".to_owned(), disk.clone(), true)));
+    assert!(!list.contains(&("a".to_owned(), "home".to_owned(), false)));
 }
 
 fn with_sqlite(scratch: &Scratch, file: &str) -> Catalog {

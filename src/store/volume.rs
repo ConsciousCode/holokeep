@@ -36,8 +36,9 @@ pub struct Volume {
     kind: &'static str,
     /// Where it's mounted, if anywhere in particular.
     path: Option<PathBuf>,
-    /// The failure domain it's in: copies in one are lost together.
-    domain: Option<String>,
+    /// The risks it's found to share with others where it's mounted:
+    /// whatever fails takes every volume sharing it.
+    risks: Vec<String>,
     /// Its database, if it's a database.
     db: Option<Db>,
     stores: Vec<Box<dyn Store>>,
@@ -46,7 +47,7 @@ pub struct Volume {
 impl Volume {
     /// A database volume.
     pub fn new(name: impl Into<String>, label: Label, stores: Vec<Box<dyn Store>>) -> Self {
-        Self { name: name.into(), label, kind: "db", path: None, domain: None, db: None, stores }
+        Self { name: name.into(), label, kind: "db", path: None, risks: Vec::new(), db: None, stores }
     }
 
     /// A database volume which others may write to, stamping each block's
@@ -80,14 +81,14 @@ impl Volume {
     /// A flatfs directory.
     pub fn flatfs(name: impl Into<String>, shards: Rc<ShardStore>) -> Self {
         let path = shards.dir().to_owned();
-        let volume = Self { name: name.into(), label: shards.label(), kind: "flatfs", path: None, domain: None, db: None, stores: vec![Box::new(shards)] };
+        let volume = Self { name: name.into(), label: shards.label(), kind: "flatfs", path: None, risks: Vec::new(), db: None, stores: vec![Box::new(shards)] };
         volume.at(&path)
     }
 
     /// The volume, mounted at a path.
     #[must_use]
     pub fn at(mut self, path: &Path) -> Self {
-        self.domain = domain_of(path);
+        self.risks = risks_of(path);
         self.path = Some(path.to_owned());
         self
     }
@@ -98,7 +99,7 @@ impl Volume {
 
     pub fn path(&self) -> Option<&Path> { self.path.as_deref() }
 
-    pub fn domain(&self) -> Option<&str> { self.domain.as_deref() }
+    pub fn risks(&self) -> &[String] { &self.risks }
 
     pub const fn db(&self) -> Option<&Db> { self.db.as_ref() }
 
@@ -110,13 +111,24 @@ impl Volume {
     }
 }
 
-/// The failure domain a path is in: the physical disks under its
-/// filesystem, through partitions, LVM, RAID and encryption, by their
-/// WWIDs or serial numbers, which are the same wherever they're plugged
-/// in; or for a filesystem on no disk, its mount source. Filesystem UUIDs
-/// won't do, since two filesystems on one disk fail together.
-pub fn domain_of(path: &Path) -> Option<String> {
-    let dev = fs::metadata(path).ok()?.dev();
+/// The risks a path can be found to share with others, each something
+/// whose failure takes everything sharing it:
+///
+/// - `disk:` each physical disk under its filesystem, through partitions,
+///   LVM, RAID and encryption, by WWID or serial number, which are the
+///   same wherever it's plugged in. Device numbers aren't, and neither
+///   they nor filesystem UUIDs know that two filesystems share a disk. A
+///   mirror's disks are one risk, `disk:a+b`, since it takes both.
+/// - `host:` this machine, by its machine id, for disks inside it rather
+///   than on USB: what's lost if the machine is.
+/// - for a filesystem on no disk, its mount source, `nfs4:server:/data`.
+///
+/// What can't be found, such as which building a drive is in, is said.
+pub fn risks_of(path: &Path) -> Vec<String> {
+    let Ok(meta) = fs::metadata(path) else {
+        return Vec::new();
+    };
+    let dev = meta.dev();
     let mount = mount_of(dev);
     // A btrfs subvolume's device number is anonymous; its source isn't
     let block = sysfs_block(dev).or_else(|| {
@@ -124,19 +136,24 @@ pub fn domain_of(path: &Path) -> Option<String> {
         source.starts_with("/dev/").then_some(())?;
         sysfs_block(fs::metadata(source).ok()?.rdev())
     });
+    let mut disks = Vec::new();
     if let Some(block) = block {
-        let mut disks = Vec::new();
         disks_under(&block, &mut disks);
-        if !disks.is_empty() {
-            disks.sort();
-            disks.dedup();
-            return Some(format!("disk:{}", disks.join("+")));
-        }
     }
-    Some(match mount {
-        Some((fstype, source)) => format!("{fstype}:{source}"),
-        None => format!("dev:{dev}"),
-    })
+    if disks.is_empty() {
+        return vec![match mount {
+            Some((fstype, source)) => format!("{fstype}:{source}"),
+            None => format!("dev:{dev}"),
+        }];
+    }
+    let internal = disks.iter().any(|disk| !disk.usb);
+    let mut risks: Vec<String> = disks.into_iter().map(|disk| format!("disk:{}", disk.id)).collect();
+    if internal && let Ok(id) = fs::read_to_string("/etc/machine-id") {
+        risks.push(format!("host:{}", id.trim()));
+    }
+    risks.sort();
+    risks.dedup();
+    risks
 }
 
 /// A device number's major and minor, as Linux encodes them.
@@ -163,16 +180,35 @@ fn sysfs_block(dev: u64) -> Option<PathBuf> {
     fs::canonicalize(format!("/sys/dev/block/{major}:{minor}")).ok()
 }
 
-/// The identities of the disks a block device is on.
-fn disks_under(block: &Path, disks: &mut Vec<String>) {
+/// A physical disk.
+struct Disk {
+    id: String,
+    usb: bool,
+}
+
+/// RAID levels which survive losing a disk.
+const REDUNDANT: [&str; 5] = ["raid1", "raid4", "raid5", "raid6", "raid10"];
+
+/// The disks a block device is on.
+fn disks_under(block: &Path, disks: &mut Vec<Disk>) {
     let slaves: Vec<_> = fs::read_dir(block.join("slaves"))
         .into_iter()
         .flatten()
         .filter_map(|entry| fs::canonicalize(entry.ok()?.path()).ok())
         .collect();
     if !slaves.is_empty() {
+        let level = fs::read_to_string(block.join("md/level")).unwrap_or_default();
+        let mut under = Vec::new();
         for slave in slaves {
-            disks_under(&slave, disks);
+            disks_under(&slave, &mut under);
+        }
+        if REDUNDANT.contains(&level.trim()) {
+            let mut ids: Vec<String> = under.iter().map(|disk| disk.id.clone()).collect();
+            ids.sort();
+            disks.push(Disk { id: ids.join("+"), usb: under.iter().all(|disk| disk.usb) });
+        }
+        else {
+            disks.extend(under);
         }
         return;
     }
@@ -183,8 +219,37 @@ fn disks_under(block: &Path, disks: &mut Vec<String>) {
         .map(|id| id.trim().to_owned())
         .find(|id| !id.is_empty());
     if let Some(id) = id.or_else(|| Some(disk.file_name()?.to_string_lossy().into_owned())) {
-        disks.push(id);
+        let usb = disk.components().any(|part| part.as_os_str().to_string_lossy().starts_with("usb"));
+        disks.push(Disk { id, usb });
     }
+}
+
+/// How many risks would have to fail to lose every copy, where each copy
+/// is lost if any of its risks fail: the smallest set of risks touching
+/// every copy, counted up to `cap`. Copies with no risks in common need
+/// one failure each; a risk they all share loses them all at once.
+pub fn tolerance(copies: &[Vec<String>], cap: usize) -> usize {
+    let mut all: Vec<&String> = copies.iter().flatten().collect();
+    all.sort();
+    all.dedup();
+    let hits = |chosen: &[&String]| copies.iter().all(|risks| risks.iter().any(|risk| chosen.contains(&risk)));
+    (0..cap).find(|&k| subsets(&all, k, &mut Vec::new(), &hits)).unwrap_or(cap)
+}
+
+/// Whether some `k` of the risks satisfy `f`.
+fn subsets<'a>(from: &[&'a String], k: usize, chosen: &mut Vec<&'a String>, f: &impl Fn(&[&String]) -> bool) -> bool {
+    if k == 0 {
+        return f(chosen);
+    }
+    for (i, &risk) in from.iter().enumerate() {
+        chosen.push(risk);
+        let found = subsets(from.get(i.saturating_add(1)..).unwrap_or_default(), k.saturating_sub(1), chosen, f);
+        chosen.pop();
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
 fn fresh() -> Result<Label> {

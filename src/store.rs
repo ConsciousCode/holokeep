@@ -369,7 +369,7 @@ pub struct VolumeInfo {
 pub struct Replication {
     /// Copies made.
     pub copied: usize,
-    /// Blocks still in fewer failure domains than asked for.
+    /// Blocks it would still take fewer failures than asked for to lose.
     pub short: Vec<Multihash>,
 }
 
@@ -479,17 +479,26 @@ impl Catalog {
         db.conn().execute_batch(
             "-- Every volume the catalog knows of, attached or not, by the
              -- label it carries: how to open it again, where it was last
-             -- seen, the failure domain it was in there, and for a
-             -- database, the latest of its generations caught up with.
+             -- seen, and for a database, the latest of its generations
+             -- caught up with.
              CREATE TABLE IF NOT EXISTS volumes (
                  id INTEGER PRIMARY KEY,
                  label BLOB UNIQUE NOT NULL,
                  name TEXT UNIQUE NOT NULL,
                  kind TEXT NOT NULL,
                  path BLOB,
-                 domain TEXT,
                  cursor INTEGER NOT NULL DEFAULT 0
              );
+             -- What each volume shares with others which could fail, taking
+             -- them all: a disk, a machine, a building. Some are found where
+             -- the volume was last seen, the rest said. Every volume also
+             -- risks itself, which isn't written down.
+             CREATE TABLE IF NOT EXISTS risks (
+                 volume INTEGER NOT NULL REFERENCES volumes (id),
+                 risk TEXT NOT NULL,
+                 found INTEGER NOT NULL,
+                 PRIMARY KEY (volume, risk)
+             ) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS forms (
                  id INTEGER PRIMARY KEY,
                  name TEXT UNIQUE NOT NULL
@@ -521,13 +530,13 @@ impl Catalog {
         let path = volume.path().map(path_bytes);
         let id: Id = self.db.conn()
             .prepare_cached(
-                "INSERT INTO volumes (label, name, kind, path, domain) VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO volumes (label, name, kind, path) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT (label) DO UPDATE SET
-                     name = excluded.name, kind = excluded.kind,
-                     path = coalesce(excluded.path, path), domain = coalesce(excluded.domain, domain)
+                     name = excluded.name, kind = excluded.kind, path = coalesce(excluded.path, path)
                  RETURNING id",
             )?
-            .query_row(params![volume.label().as_slice(), volume.name, volume.kind(), path, volume.domain()], |row| row.get(0))?;
+            .query_row(params![volume.label().as_slice(), volume.name, volume.kind(), path], |row| row.get(0))?;
+        self.found_risks(id, &volume)?;
         for store in volume.stores() {
             self.db.conn().execute("INSERT OR IGNORE INTO forms (name) VALUES (?1)", [store.name()])?;
         }
@@ -544,9 +553,83 @@ impl Catalog {
         let taken = std::mem::replace(v, Volume::new("", [0; 16], Vec::new()));
         *v = taken.at(path);
         self.db.conn()
-            .prepare_cached("UPDATE volumes SET path = ?1, domain = ?2 WHERE id = ?3")?
-            .execute(params![path_bytes(path), v.domain(), id])?;
+            .prepare_cached("UPDATE volumes SET path = ?1 WHERE id = ?2")?
+            .execute(params![path_bytes(path), id])?;
+        let Some(v) = self.volumes.get(volume) else {
+            return Ok(());
+        };
+        self.found_risks(id, v)
+    }
+
+    /// Record the risks found of a volume where it's mounted now, in place
+    /// of those found before. What's said stays.
+    fn found_risks(&self, id: Id, volume: &Volume) -> Result<()> {
+        if volume.path().is_none() {
+            return Ok(());
+        }
+        let conn = self.db.conn();
+        conn.prepare_cached("DELETE FROM risks WHERE volume = ?1 AND found")?.execute([id])?;
+        let mut insert = conn.prepare_cached("INSERT OR IGNORE INTO risks (volume, risk, found) VALUES (?1, ?2, 1)")?;
+        for risk in volume.risks() {
+            insert.execute(params![id, risk])?;
+        }
         Ok(())
+    }
+
+    /// A volume's id by name, attached or not.
+    fn volume_id(&self, name: &str) -> Result<Id> {
+        self.db.conn()
+            .prepare_cached("SELECT id FROM volumes WHERE name = ?1")?
+            .query_row([name], |row| row.get(0))
+            .optional()?
+            .ok_or_else(|| Error::Volume(format!("no volume is called {name:?}")))
+    }
+
+    /// Say that a volume shares a risk with whichever others are said or
+    /// found to, such as the building it's in.
+    pub fn add_risk(&self, name: &str, risk: &str) -> Result<()> {
+        self.db.conn()
+            .prepare_cached("INSERT INTO risks (volume, risk, found) VALUES (?1, ?2, 0) ON CONFLICT DO UPDATE SET found = 0")?
+            .execute(params![self.volume_id(name)?, risk])?;
+        Ok(())
+    }
+
+    /// Unsay a risk. One that's found can't be, since it would be found
+    /// again.
+    pub fn remove_risk(&self, name: &str, risk: &str) -> Result<()> {
+        let id = self.volume_id(name)?;
+        let found: Option<bool> = self.db.conn()
+            .prepare_cached("SELECT found FROM risks WHERE volume = ?1 AND risk = ?2")?
+            .query_row(params![id, risk], |row| row.get(0))
+            .optional()?;
+        match found {
+            None => Err(Error::Volume(format!("{name} isn't said to risk {risk}"))),
+            Some(true) => Err(Error::Volume(format!("{name} is found to risk {risk} where it's mounted; it would be found again"))),
+            Some(false) => {
+                self.db.conn().prepare_cached("DELETE FROM risks WHERE volume = ?1 AND risk = ?2")?.execute(params![id, risk])?;
+                Ok(())
+            },
+        }
+    }
+
+    /// Every volume's risks, by volume name, and whether each was found
+    /// rather than said.
+    pub fn risk_list(&self) -> Result<Vec<(String, String, bool)>> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT v.name, r.risk, r.found FROM risks r JOIN volumes v ON v.id = r.volume ORDER BY v.id, r.risk",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A volume's risks, itself included.
+    fn risks(&self, id: Id) -> Result<Vec<String>> {
+        let mut risks: Vec<String> = self.db.conn()
+            .prepare_cached("SELECT risk FROM risks WHERE volume = ?1")?
+            .query_map([id], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        risks.push(format!("volume:{id}"));
+        Ok(risks)
     }
 
     /// Attach every volume found where it was last seen, carrying its
@@ -581,9 +664,8 @@ impl Catalog {
     }
 
     /// Add a flatfs directory as a volume, to keep copies of any block in.
-    /// Returns the names of attached volumes in the same failure domain,
-    /// which copies there wouldn't make more durable.
-    pub fn add_volume(&mut self, name: &str, dir: &Path) -> Result<Vec<String>> {
+    /// Returns the attached volumes it shares risks with, and which.
+    pub fn add_volume(&mut self, name: &str, dir: &Path) -> Result<Vec<(String, Vec<String>)>> {
         let mut shards = ShardStore::open(self.db.clone(), dir)?;
         shards.threshold = None;
         self.add(name, Volume::flatfs(name, Rc::new(shards)))
@@ -592,12 +674,12 @@ impl Catalog {
     /// Add a database file as a volume, made one if it isn't yet. It
     /// holds blocks in the forms the catalog's own database does, but for
     /// files kept in place, and another node may write to it too.
-    pub fn add_sqlite_volume(&mut self, name: &str, path: &Path) -> Result<Vec<String>> {
+    pub fn add_sqlite_volume(&mut self, name: &str, path: &Path) -> Result<Vec<(String, Vec<String>)>> {
         let volume = Volume::open_sqlite(name, path, None)?.ok_or_else(|| Error::Volume(format!("can't open {}", path.display())))?;
         self.add(name, volume)
     }
 
-    fn add(&mut self, name: &str, volume: Volume) -> Result<Vec<String>> {
+    fn add(&mut self, name: &str, volume: Volume) -> Result<Vec<(String, Vec<String>)>> {
         if self.volumes.iter().any(|attached| attached.label() == volume.label()) {
             let path = volume.path().map(|path| path.display().to_string()).unwrap_or_default();
             return Err(Error::Volume(format!("{path} is already attached")));
@@ -610,11 +692,16 @@ impl Catalog {
         }
         let v = self.attach(volume)?;
         self.catch_up()?;
-        let domain = self.volumes.get(v).and_then(Volume::domain);
-        Ok(self.volumes.iter().enumerate()
-            .filter(|&(other, volume)| other != v && domain.is_some() && volume.domain() == domain)
-            .map(|(_, volume)| volume.name.clone())
-            .collect())
+        let id = self.ids.get(v).copied().unwrap_or_default();
+        let risks = self.risks(id)?;
+        let mut shared = Vec::new();
+        for (other, volume) in self.ids.iter().zip(&self.volumes) {
+            let common: Vec<String> = self.risks(*other)?.into_iter().filter(|risk| *other != id && risks.contains(risk)).collect();
+            if !common.is_empty() {
+                shared.push((volume.name.clone(), common));
+            }
+        }
+        Ok(shared)
     }
 
     /// Whether a volume is a database other than the catalog's own, which
@@ -791,53 +878,58 @@ impl Catalog {
         Ok(())
     }
 
-    /// The failure domains a block's copies are in: their volumes'
-    /// disks, or the volumes themselves where those aren't known.
-    fn domains(&self, id: Id) -> Result<Vec<String>> {
-        Ok(self.db.conn()
-            .prepare_cached(
-                "SELECT DISTINCT coalesce(v.domain, 'volume:' || v.id) FROM blocks b JOIN volumes v ON v.id = b.volume WHERE b.block = ?1",
-            )?
+    /// The risks of each volume a block's copies are on.
+    fn copy_risks(&self, id: Id) -> Result<Vec<Vec<String>>> {
+        let volumes: Vec<Id> = self.db.conn()
+            .prepare_cached("SELECT volume FROM blocks WHERE block = ?1")?
             .query_map([id], |row| row.get(0))?
-            .collect::<rusqlite::Result<_>>()?)
+            .collect::<rusqlite::Result<_>>()?;
+        volumes.into_iter().map(|volume| self.risks(volume)).collect()
     }
 
-    fn domain(&self, volume: usize) -> Option<String> {
-        let id = *self.ids.get(volume)?;
-        Some(self.volumes.get(volume)?.domain().map_or_else(|| format!("volume:{id}"), str::to_owned))
-    }
-
-    /// Copy every block until it's in at least `copies` failure domains,
-    /// where attached volumes allow. Returns how many copies were made,
-    /// and the blocks still short of that.
+    /// Copy every block until it would take at least `copies` failures to
+    /// lose it, as if it had that many copies sharing no risks, where
+    /// attached volumes allow. Each copy goes wherever adds most. Returns
+    /// how many copies were made, and the blocks still short of that.
     pub fn replicate(&self, copies: usize) -> Result<Replication> {
         let mut report = Replication::default();
         for key in self.keys()? {
             let Some(id) = self.db.lookup(key.as_ref())? else {
                 continue;
             };
-            let mut domains = self.domains(id)?;
-            if domains.len() >= copies {
+            let mut held = self.copy_risks(id)?;
+            let mut tolerance = volume::tolerance(&held, copies);
+            if tolerance >= copies {
                 continue;
             }
             let Some(block) = self.readable(key.as_ref())? else {
                 report.short.push(key);
                 continue;
             };
-            let held: Vec<usize> = self.placements(key.as_ref())?.into_iter().map(|(v, _)| v).collect();
-            for v in 0..self.volumes.len() {
-                let Some(domain) = self.domain(v) else {
-                    continue;
-                };
-                if domains.len() >= copies || held.contains(&v) || domains.contains(&domain) {
-                    continue;
+            let mut tried: Vec<usize> = self.placements(key.as_ref())?.into_iter().map(|(v, _)| v).collect();
+            while tolerance < copies {
+                let mut best = None;
+                for (v, &volume) in self.ids.iter().enumerate() {
+                    if tried.contains(&v) {
+                        continue;
+                    }
+                    let risks = self.risks(volume)?;
+                    let with = volume::tolerance(&[held.as_slice(), std::slice::from_ref(&risks)].concat(), copies);
+                    if with > best.as_ref().map_or(tolerance, |&(_, t, _)| t) {
+                        best = Some((v, with, risks));
+                    }
                 }
+                let Some((v, with, risks)) = best else {
+                    break;
+                };
+                tried.push(v);
                 if self.copy_into(v, id, &block)? {
-                    domains.push(domain);
+                    held.push(risks);
+                    tolerance = with;
                     report.copied = report.copied.saturating_add(1);
                 }
             }
-            if domains.len() < copies {
+            if tolerance < copies {
                 report.short.push(key);
             }
         }

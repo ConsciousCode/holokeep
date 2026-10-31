@@ -129,18 +129,38 @@ enum VolumeCommand {
     },
     /// List the volumes the repo knows of, attached or not
     Ls,
-    /// Copy blocks until each is on at least this many disks, where
-    /// attached volumes allow
+    /// Copy blocks until it would take this many failures to lose each,
+    /// counting volumes' risks, where attached volumes allow
     Replicate {
         #[arg(short, long, default_value_t = 2)]
         copies: usize,
     },
+    /// Say what volumes risk together, beyond the disks and machines
+    /// found: a building, a person, a cloud account
+    #[command(subcommand)]
+    Risk(RiskCommand),
     /// Copy blocks to a volume, wherever it is, such as to carry them to
     /// another machine: the DAGs under these CIDs, or every block
     Copy {
         name: String,
         cids: Vec<Link>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum RiskCommand {
+    /// Say a volume shares these risks with whichever others do
+    Add {
+        name: String,
+        risks: Vec<String>,
+    },
+    /// Unsay risks of a volume
+    Rm {
+        name: String,
+        risks: Vec<String>,
+    },
+    /// List every volume's risks, found or said
+    Ls,
 }
 
 #[derive(Subcommand, Debug)]
@@ -279,8 +299,8 @@ fn volume(mut repo: Catalog, command: VolumeCommand) -> anyhow::Result<()> {
         VolumeCommand::Add { name, path, sqlite } => {
             let path = std::path::absolute(&path)?;
             let others = if sqlite { repo.add_sqlite_volume(&name, &path)? } else { repo.add_volume(&name, &path)? };
-            if !others.is_empty() {
-                eprintln!("warning: {name} is on the same disk as {}, so copies on it won't count as more", others.join(", "));
+            for (other, risks) in others {
+                eprintln!("warning: {name} shares risks with {other} ({}): one failure there loses copies on both", risks.join(", "));
             }
         },
         VolumeCommand::Ls => {
@@ -298,7 +318,22 @@ fn volume(mut repo: Catalog, command: VolumeCommand) -> anyhow::Result<()> {
             let report = repo.batch(|repo| repo.replicate(copies))?;
             println!("copied {} blocks", report.copied);
             if !report.short.is_empty() {
-                eprintln!("{} blocks are on fewer than {copies} disks; attach more volumes, or ones on other disks", report.short.len());
+                eprintln!("{} blocks would take fewer than {copies} failures to lose; attach volumes which risk less in common", report.short.len());
+            }
+        },
+        VolumeCommand::Risk(RiskCommand::Add { name, risks }) => {
+            for risk in risks {
+                repo.add_risk(&name, &risk)?;
+            }
+        },
+        VolumeCommand::Risk(RiskCommand::Rm { name, risks }) => {
+            for risk in risks {
+                repo.remove_risk(&name, &risk)?;
+            }
+        },
+        VolumeCommand::Risk(RiskCommand::Ls) => {
+            for (name, risk, found) in repo.risk_list()? {
+                println!("{name}\t{risk}\t{}", if found { "found" } else { "said" });
             }
         },
         VolumeCommand::Copy { name, cids } => {
