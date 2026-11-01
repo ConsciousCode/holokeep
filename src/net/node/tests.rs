@@ -489,7 +489,7 @@ fn one_user(nodes: &mut [&mut Node]) -> crate::keys::Key {
         }
     }
     for (node, device) in nodes.iter_mut().zip(devices) {
-        node.catalog_mut().set_signer(device);
+        node.catalog_mut().set_signer(device).expect("signer");
     }
     root
 }
@@ -505,7 +505,7 @@ async fn a_devices_claims_count_where_they_go_and_a_strangers_dont() {
     }
     a.catalog().tag(&link(signed), &link(&tag)).expect("tag");
     // A key the user never certified, as a stranger's
-    a.catalog_mut().set_signer(crate::keys::Key::generate().expect("key"));
+    a.catalog_mut().set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
     a.catalog().tag(&link(unsigned), &link(&other)).expect("tag");
     assert!(tags(&a, unsigned).is_empty(), "not even where it was made");
 

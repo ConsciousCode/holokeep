@@ -1746,7 +1746,7 @@ fn signed_router(root: &crate::keys::Key) -> (Catalog, crate::keys::Key) {
     let device = crate::keys::Key::generate().expect("key");
     router.set_user(&root.id()).expect("user");
     router.certify(root, &device.id()).expect("certify");
-    router.set_signer(device.clone());
+    router.set_signer(device.clone()).expect("signer");
     (router, device)
 }
 
@@ -1922,7 +1922,7 @@ fn a_batch_says_what_it_says_in_one_sign_and_signs_follow_each_other() {
 fn what_a_device_said_before_it_had_a_user_counts_once_the_user_certifies_it() {
     let mut router = router();
     let device = crate::keys::Key::generate().expect("key");
-    router.set_signer(device.clone());
+    router.set_signer(device.clone()).expect("signer");
     let block = raw(b"kept");
     router.keep(&link(&block)).expect("keep");
     let kept = |router: &Catalog| router.claims().expect("claims").kept(block.cid().multihash()).expect("kept");
@@ -1939,4 +1939,69 @@ fn what_a_device_said_before_it_had_a_user_counts_once_the_user_certifies_it() {
     assert!(!kept(&router));
     router.certify(&other, &device.id()).expect("certify");
     assert!(kept(&router));
+}
+
+#[test]
+fn accounts_see_what_counts_for_them_and_collecting_respects_them_all() {
+    use crate::keys::{Cost, Key};
+    let scratch = Scratch::new("accounts");
+    let mut repo = Catalog::open_repo(scratch.path()).expect("open");
+    let (a, b) = (raw(b"alice's"), raw(b"bob's"));
+    for block in [&a, &b] {
+        repo.put_block(block, CidVersion::V1).expect("put");
+    }
+    let owner = repo.signer().expect("signer").clone();
+    let me = repo.uid();
+    let bob = me.wrapping_add(1);
+    let bobs = Key::generate().expect("key");
+    let tags = |repo: &Catalog, block: &Block| repo.claims().expect("claims").tags(block.cid().multihash()).expect("tags");
+    let kept = |repo: &Catalog, block: &Block| repo.claims().expect("claims").kept(block.cid().multihash()).expect("kept");
+    let referenced = |repo: &Catalog, block: &Block| repo.referenced(block.cid().multihash()).expect("referenced");
+
+    let alices_keep = repo.keep(&link(&a)).expect("keep");
+    repo.tag(&link(&a), &tag("alice")).expect("tag");
+    repo.act_for(bob, bobs.clone()).expect("act");
+    repo.keep(&link(&b)).expect("keep");
+    repo.tag(&link(&a), &tag("bob")).expect("tag");
+    // Bob sees his own
+    assert_eq!(tags(&repo, &a), [tag("bob")]);
+    assert!(kept(&repo, &b) && !kept(&repo, &a));
+    // A tomb of Alice's keep, signed by Bob, retracts nothing of hers
+    let tomb = Claim::Tomb(Tomb::new([alices_keep]).expect("tomb"));
+    repo.put_claim(&tomb).expect("tomb");
+
+    repo.act_for(me, owner.clone()).expect("act");
+    assert_eq!(tags(&repo, &a), [tag("alice")]);
+    assert!(kept(&repo, &a) && !kept(&repo, &b));
+    // Collecting respects everyone's keeps, whoever's acting
+    assert!(referenced(&repo, &a) && referenced(&repo, &b));
+    let accounts = repo.claims().expect("claims").accounts().expect("accounts");
+    assert_eq!(accounts.iter().map(|account| (account.uid, account.device.clone())).collect::<Vec<_>>(), [(me, Some(owner.id())), (bob, Some(bobs.id()))]);
+
+    // Bob stops keeping his: nothing keeps it now
+    repo.act_for(bob, bobs.clone()).expect("act");
+    repo.unkeep(&link(&b)).expect("unkeep");
+    assert!(!referenced(&repo, &b));
+    // Bob makes a mesh of his own: what he said still counts for him
+    let root = repo.found_user(b"bob's", Cost::NONE).expect("found");
+    assert_eq!(repo.user().expect("user"), Some(root.id()));
+    assert_eq!(tags(&repo, &a), [tag("bob")]);
+    assert_eq!(repo.devices().expect("devices"), [(bobs.id(), true)]);
+    repo.act_for(me, owner).expect("act");
+    assert!(repo.user().expect("user").is_none());
+    assert_eq!(tags(&repo, &a), [tag("alice")]);
+    assert!(repo.devices().expect("devices").is_empty(), "Bob's user certified no device of Alice's");
+}
+
+#[test]
+fn a_repo_from_when_there_was_one_user_keeps_it() {
+    let scratch = Scratch::new("one-user");
+    let root = crate::keys::Key::generate().expect("key");
+    let db = Db::open(&scratch.path().join("blocks.db")).expect("db");
+    let key = db.intern(root.id().multihash()).expect("intern");
+    db.conn().execute_batch("CREATE TABLE users (key INTEGER PRIMARY KEY); CREATE TABLE authorized (key INTEGER PRIMARY KEY);").expect("old");
+    db.conn().execute("INSERT INTO users (key) VALUES (?1)", [key]).expect("user");
+    let repo = Catalog::standard(db).expect("open");
+    assert_eq!(repo.user().expect("user"), Some(root.id()));
+    assert!(repo.claims().expect("claims").authorized(&root.id()).expect("authorized"));
 }

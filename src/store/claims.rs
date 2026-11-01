@@ -35,54 +35,64 @@ const NAME: &str = "claims";
 /// A key's CID prefix: CIDv1, `libp2p-key`.
 const KEY_PREFIX: [u8; 2] = [0x01, 0x72];
 
-/// Whether a claims row, by its alias, is signed by a key the user has
-/// authorized, or there's no user to say.
-macro_rules! signed {
+/// Whether a claims row, by its alias, is signed by a key the user `u`
+/// has authorized.
+macro_rules! signed_for {
     ($alias:literal) => {
         concat!(
-            "(NOT EXISTS (SELECT 1 FROM users) OR EXISTS (
+            "EXISTS (
                 SELECT 1 FROM claim_keys sk JOIN claim_targets st ON st.target = sk.key
-                JOIN sign_claims sg ON sg.id = st.claim JOIN authorized au ON au.key = sg.by
-                WHERE sk.claim = ", $alias, ".id))"
+                JOIN sign_claims sg ON sg.id = st.claim JOIN authorized au ON au.key = sg.by AND au.user = u.key
+                WHERE sk.claim = ", $alias, ".id)"
         )
     };
 }
 
-/// `LIVE`, of a claims row by another alias than `c`.
-pub(super) fn live(alias: &str) -> String {
-    LIVE.replace("c.id", &format!("{alias}.id"))
-}
-
-/// Whether the claims row `c` counts: it's signed, if it has to be, and
-/// no tomb that counts targets it.
-pub(super) const LIVE: &str = concat!(
-    "(", signed!("c"), " AND NOT EXISTS (
-        SELECT 1 FROM claim_keys tk JOIN claim_targets x ON x.target = tk.key JOIN claims k ON k.id = x.claim
-        WHERE tk.claim = c.id AND k.kind = 'tomb' AND ", signed!("k"), "))"
-);
-
-/// What the user's root key signed, by its alias in `claim_keys`.
-macro_rules! rooted {
-    ($alias:literal) => {
+/// Whether the claims row `c` counts for one of the users the condition
+/// on `u` allows: one of their keys signed it and none signed a tomb of
+/// it. With no users, every claim counts that no tomb targets.
+macro_rules! live {
+    ($users:literal) => {
         concat!(
-            "EXISTS (SELECT 1 FROM claim_targets rt JOIN sign_claims rs ON rs.id = rt.claim
-                WHERE rt.target = ", $alias, ".key AND rs.by IN (SELECT key FROM users))"
+            "(CASE WHEN NOT EXISTS (SELECT 1 FROM users) THEN NOT EXISTS (
+                 SELECT 1 FROM claim_keys tk JOIN claim_targets x ON x.target = tk.key JOIN claims k ON k.id = x.claim
+                 WHERE tk.claim = c.id AND k.kind = 'tomb')
+             ELSE EXISTS (SELECT 1 FROM users u WHERE ", $users, " AND ", signed_for!("c"), " AND NOT EXISTS (
+                 SELECT 1 FROM claim_keys tk JOIN claim_targets x ON x.target = tk.key JOIN claims k ON k.id = x.claim
+                 WHERE tk.claim = c.id AND k.kind = 'tomb' AND ", signed_for!("k"), ")) END)"
         )
     };
 }
 
-/// The keys the user has authorized: its root, and devices the root has
+/// The acting user's id, by `acting_user()`, the multihash its catalog
+/// set: NULL when it acts for everyone.
+macro_rules! acting {
+    () => {
+        "(SELECT id FROM multihashes WHERE multihash = acting_user())"
+    };
+}
+
+/// Whether the claims row `c` counts for the acting user, or for anyone
+/// when it acts for everyone: what it sees.
+pub(super) const LIVE: &str = live!("(acting_user() IS NULL OR u.key = (SELECT id FROM multihashes WHERE multihash = acting_user()))");
+
+/// Whether the claims row `c` counts for anyone: what collecting must
+/// respect, whoever's acting.
+pub(super) const LIVE_ANY: &str = live!("1");
+
+/// The keys each user has authorized: itself, and devices it has
 /// certified and not revoked.
-const AUTHORIZE: &str = concat!(
-    "DELETE FROM authorized;
-     INSERT OR IGNORE INTO authorized (key) SELECT key FROM users;
-     INSERT OR IGNORE INTO authorized (key)
-         SELECT t.target FROM claims d JOIN claim_targets t ON t.claim = d.id JOIN claim_keys dk ON dk.claim = d.id
-         WHERE d.kind = 'device' AND ", rooted!("dk"), " AND NOT EXISTS (
-             SELECT 1 FROM claim_targets tt JOIN claims tb ON tb.id = tt.claim JOIN claim_keys tbk ON tbk.claim = tb.id
-             WHERE tt.target = dk.key AND tb.kind = 'tomb' AND ", rooted!("tbk"), "
-         );"
-);
+const AUTHORIZE: &str = "
+    DELETE FROM authorized;
+    INSERT OR IGNORE INTO authorized (user, key) SELECT key, key FROM users;
+    INSERT OR IGNORE INTO authorized (user, key)
+        SELECT rs.by, t.target FROM claims d JOIN claim_targets t ON t.claim = d.id JOIN claim_keys dk ON dk.claim = d.id
+        JOIN claim_targets rt ON rt.target = dk.key JOIN sign_claims rs ON rs.id = rt.claim
+        WHERE d.kind = 'device' AND rs.by IN (SELECT key FROM users) AND NOT EXISTS (
+            SELECT 1 FROM claim_targets tt JOIN claims tb ON tb.id = tt.claim JOIN claim_keys tbk ON tbk.claim = tb.id
+            JOIN claim_targets rt2 ON rt2.target = tbk.key JOIN sign_claims rs2 ON rs2.id = rt2.claim
+            WHERE tt.target = dk.key AND tb.kind = 'tomb' AND rs2.by = rs.by
+        );";
 
 /// Who signed what, and who may: see the module's documentation.
 const AUTH_TABLES: &str = "
@@ -104,20 +114,76 @@ const AUTH_TABLES: &str = "
              prev INTEGER REFERENCES multihashes (id)
          );
          CREATE INDEX IF NOT EXISTS sign_claims_by ON sign_claims (by);
-         -- The user's root key, by its name's multihash: once there is
-         -- one, claims count only if a key it authorized signs them.
-         CREATE TABLE IF NOT EXISTS users (
-             key INTEGER PRIMARY KEY REFERENCES multihashes (id)
+         -- The host's users who keep things here, by uid: the key this
+         -- repo signs with for each, and the user's root key, once it has
+         -- one. Until then an account's device key is its user.
+         CREATE TABLE IF NOT EXISTS accounts (
+             uid INTEGER PRIMARY KEY,
+             device INTEGER REFERENCES multihashes (id),
+             user INTEGER REFERENCES multihashes (id)
          );
-         -- The keys the user has authorized, kept up to date as
+         -- Every user claims count for: once there are any, a claim
+         -- counts only for a user one of whose keys signs it.
+         CREATE VIEW IF NOT EXISTS users (key) AS
+             SELECT DISTINCT coalesce(user, device) FROM accounts WHERE coalesce(user, device) IS NOT NULL;
+         -- The keys each user has authorized, kept up to date as
          -- certificates and revocations arrive.
          CREATE TABLE IF NOT EXISTS authorized (
-             key INTEGER PRIMARY KEY
-         );";
+             user INTEGER NOT NULL,
+             key INTEGER NOT NULL,
+             PRIMARY KEY (user, key)
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS authorized_key ON authorized (key);";
 
-/// The tables and views, made if they're not there.
-fn schema() -> String {
+/// The views, made afresh each time, since what counts changes.
+fn views() -> String {
     format!(
+        "DROP VIEW IF EXISTS tags;
+         DROP VIEW IF EXISTS anchor_values;
+         DROP VIEW IF EXISTS anchor_values_any;
+         -- Every block's tags that count for the acting user. A simple
+         -- tag's name is its identity digest, after the multihash's code
+         -- and length varint (one byte, or two from 128).
+         CREATE VIEW tags (target, tag, name) AS
+             SELECT DISTINCT t.target, g.into_,
+                 CASE WHEN g.into_prefix = x'0155' AND substr(i.multihash, 1, 1) = x'00' THEN
+                     CAST(substr(i.multihash, CASE WHEN length(i.multihash) <= 129 THEN 3 ELSE 4 END) AS TEXT)
+                 END
+             FROM claim_targets t
+             JOIN claims c ON c.id = t.claim
+             JOIN group_claims g ON g.id = c.id
+             JOIN multihashes i ON i.id = g.into_
+             WHERE {LIVE};
+         {acting}
+         {any}",
+        acting = anchor_values("anchor_values", LIVE),
+        any = anchor_values("anchor_values_any", LIVE_ANY),
+    )
+}
+
+/// A view of what each anchor is now: its latest set that counts, by
+/// `at` and then the value's multihash.
+fn anchor_values(name: &str, live: &str) -> String {
+    let live2 = live.replace("c.id", "c2.id");
+    format!(
+        "CREATE VIEW {name} (anchor, value, prefix, claim) AS
+             SELECT t.target, s.value, s.value_prefix, c.id FROM set_claims s
+             JOIN claims c ON c.id = s.id
+             JOIN claim_targets t ON t.claim = c.id
+             JOIN multihashes v ON v.id = s.value
+             WHERE {live} AND NOT EXISTS (
+                 SELECT 1 FROM set_claims s2
+                 JOIN claims c2 ON c2.id = s2.id
+                 JOIN claim_targets t2 ON t2.claim = c2.id
+                 JOIN multihashes v2 ON v2.id = s2.value
+                 WHERE t2.target = t.target AND {live2}
+                     AND (s2.at > s.at OR (s2.at = s.at AND v2.multihash > v.multihash))
+             );"
+    )
+}
+
+/// The tables, made if they're not there.
+const SCHEMA: &str =
         "-- Every claim, of any type. `claim` is a precipitated claim's
          -- multihash, NULL for a dissolved one, which has none; `kind` is
          -- its type, as the claim's own `claim` key says it.
@@ -161,38 +227,7 @@ fn schema() -> String {
              target INTEGER NOT NULL REFERENCES multihashes (id),
              prefix BLOB NOT NULL,
              PRIMARY KEY (claim, target, prefix)
-         ) WITHOUT ROWID;
-         -- Every block's tags that still count. A simple tag's name is its
-         -- identity digest, after the multihash's code and length varint
-         -- (one byte, or two from 128).
-         CREATE VIEW IF NOT EXISTS tags (target, tag, name) AS
-             SELECT DISTINCT t.target, g.into_,
-                 CASE WHEN g.into_prefix = x'0155' AND substr(i.multihash, 1, 1) = x'00' THEN
-                     CAST(substr(i.multihash, CASE WHEN length(i.multihash) <= 129 THEN 3 ELSE 4 END) AS TEXT)
-                 END
-             FROM claim_targets t
-             JOIN claims c ON c.id = t.claim
-             JOIN group_claims g ON g.id = c.id
-             JOIN multihashes i ON i.id = g.into_
-             WHERE {LIVE};
-         -- What each anchor is now: its latest set that counts, by `at`
-         -- and then the value's multihash.
-         CREATE VIEW IF NOT EXISTS anchor_values (anchor, value, prefix, claim) AS
-             SELECT t.target, s.value, s.value_prefix, c.id FROM set_claims s
-             JOIN claims c ON c.id = s.id
-             JOIN claim_targets t ON t.claim = c.id
-             JOIN multihashes v ON v.id = s.value
-             WHERE {LIVE} AND NOT EXISTS (
-                 SELECT 1 FROM set_claims s2
-                 JOIN claims c2 ON c2.id = s2.id
-                 JOIN claim_targets t2 ON t2.claim = c2.id
-                 JOIN multihashes v2 ON v2.id = s2.value
-                 WHERE t2.target = t.target AND {live2}
-                     AND (s2.at > s.at OR (s2.at = s.at AND v2.multihash > v.multihash))
-             );",
-        live2 = live("c2"),
-    )
-}
+         ) WITHOUT ROWID;";
 
 /// One of a key's signs, as a chain has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +244,27 @@ pub struct Signed {
 /// Admits canonical claims, keeping them as rows.
 pub struct ClaimStore {
     db: Db,
+    /// The multihash of the user the catalog acts as, which SQL reads as
+    /// `acting_user()`: None for everyone.
+    acting: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+}
+
+/// One of the host's users, as this repo knows them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    pub uid: u32,
+    /// The key the repo signs with for it, if it's said anything yet.
+    pub device: Option<Link>,
+    /// Its user's root key, once it's in a mesh.
+    pub user: Option<Link>,
+}
+
+impl Account {
+    /// Who claims count for when it acts: its user, or until it has one,
+    /// its device.
+    pub fn acts_for(&self) -> Option<&Link> {
+        self.user.as_ref().or(self.device.as_ref())
+    }
 }
 
 /// A sign's CID, from its multihash: it's never dissolved.
@@ -244,16 +300,41 @@ fn pair(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Vec<u8>, Vec<u8>)> {
 
 impl ClaimStore {
     pub fn open(db: Db) -> Result<Self> {
-        db.conn().execute_batch(&schema())?;
+        let acting = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let state = std::sync::Arc::clone(&acting);
+        db.conn().create_scalar_function("acting_user", 0, rusqlite::functions::FunctionFlags::SQLITE_UTF8, move |_| {
+            Ok(state.lock().ok().and_then(|acting| acting.clone()))
+        })?;
+        db.conn().execute_batch(SCHEMA)?;
+        // From when a repo had one user, in a table, and authorized keys
+        // weren't anyone's in particular
+        let single: Option<Id> = if db.conn().prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'users'")?.exists([])? {
+            let user = db.conn().query_row("SELECT key FROM users", [], |row| row.get(0)).optional()?;
+            db.conn().execute_batch("DROP TABLE users")?;
+            user
+        } else {
+            None
+        };
+        if !db.conn().prepare("SELECT 1 FROM pragma_table_info('authorized') WHERE name = 'user'")?.exists([])? {
+            db.conn().execute_batch("DROP TABLE IF EXISTS authorized")?;
+        }
         db.conn().execute_batch(AUTH_TABLES)?;
+        if let Some(user) = single {
+            db.conn().execute(
+                "INSERT INTO accounts (uid, user) VALUES (?1, ?2) ON CONFLICT (uid) DO UPDATE SET user = excluded.user",
+                params![rustix::process::getuid().as_raw(), user],
+            )?;
+        }
+        db.conn().execute_batch(&views())?;
         let chained = db.conn().prepare("SELECT 1 FROM pragma_table_info('sign_claims') WHERE name = 'prev'")?.exists([])?;
         if !chained {
             db.conn().execute_batch("ALTER TABLE sign_claims ADD COLUMN prev INTEGER REFERENCES multihashes (id)")?;
         }
         db.conn().execute_batch("CREATE INDEX IF NOT EXISTS sign_claims_prev ON sign_claims (prev)")?;
         widen_kinds(&db)?;
-        let store = Self { db };
+        let store = Self { db, acting };
         store.key_claims()?;
+        store.authorize()?;
         Ok(store)
     }
 
@@ -282,43 +363,91 @@ impl ClaimStore {
         Ok(())
     }
 
-    /// The user's root key, if the database has a user.
-    pub fn user(&self) -> Result<Option<Link>> {
-        let row: Option<Vec<u8>> = self.db.conn()
-            .prepare_cached("SELECT m.multihash FROM users u JOIN multihashes m ON m.id = u.key")?
-            .query_row([], |row| row.get(0))
-            .optional()?;
-        row.map(|multihash| link(&KEY_PREFIX, &multihash)).transpose()
+    /// Act as a user, so what's seen is what counts for it, or with
+    /// None, for everyone.
+    pub fn act_as(&self, user: Option<&Link>) {
+        if let Ok(mut acting) = self.acting.lock() {
+            *acting = user.map(|user| user.multihash().to_bytes());
+        }
     }
 
-    /// Make `root` the user, in place of any other.
-    pub fn set_user(&self, root: &Link) -> Result<()> {
-        if !crate::keys::is_key(root) {
-            return Err(Error::Invalid { store: NAME, reason: format!("{root} isn't a key") });
+    /// An account by uid, if it's here.
+    pub fn account(&self, uid: u32) -> Result<Option<Account>> {
+        type Keys = (Option<Vec<u8>>, Option<Vec<u8>>);
+        let row: Option<Keys> = self.db.conn()
+            .prepare_cached(
+                "SELECT d.multihash, u.multihash FROM accounts a
+                 LEFT JOIN multihashes d ON d.id = a.device LEFT JOIN multihashes u ON u.id = a.user WHERE a.uid = ?1",
+            )?
+            .query_row([uid], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        row.map(|(device, user)| Ok(Account {
+            uid,
+            device: device.map(|key| link(&KEY_PREFIX, &key)).transpose()?,
+            user: user.map(|key| link(&KEY_PREFIX, &key)).transpose()?,
+        }))
+        .transpose()
+    }
+
+    /// Every account here, by uid.
+    pub fn accounts(&self) -> Result<Vec<Account>> {
+        let uids: Vec<u32> = self.db.conn()
+            .prepare_cached("SELECT uid FROM accounts ORDER BY uid")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        uids.into_iter().filter_map(|uid| self.account(uid).transpose()).collect()
+    }
+
+    /// The key an account signs with here.
+    pub fn set_device(&self, uid: u32, device: &Link) -> Result<()> {
+        self.set_account(uid, "device", device)
+    }
+
+    /// Make `root` an account's user, in place of any other: joining a
+    /// user's mesh.
+    pub fn set_user(&self, uid: u32, root: &Link) -> Result<()> {
+        self.set_account(uid, "user", root)
+    }
+
+    fn set_account(&self, uid: u32, column: &str, key: &Link) -> Result<()> {
+        if !crate::keys::is_key(key) {
+            return Err(Error::Invalid { store: NAME, reason: format!("{key} isn't a key") });
         }
         self.db.atomically(|| {
-            let key = self.db.intern(root.multihash())?;
-            self.db.conn().execute("DELETE FROM users", [])?;
-            self.db.conn().execute("INSERT INTO users (key) VALUES (?1)", [key])?;
+            let key = self.db.intern(key.multihash())?;
+            self.db.conn().execute(
+                &format!("INSERT INTO accounts (uid, {column}) VALUES (?1, ?2) ON CONFLICT (uid) DO UPDATE SET {column} = excluded.{column}"),
+                params![uid, key],
+            )?;
             self.authorize()
         })
     }
 
-    /// Whether a key is the user's root or a device it's authorized.
+    /// Whether the acting user, or with none, anyone, has authorized a
+    /// key.
     pub fn authorized(&self, key: &Link) -> Result<bool> {
         Ok(self.db.conn()
-            .prepare_cached("SELECT 1 FROM authorized a JOIN multihashes m ON m.id = a.key WHERE m.multihash = ?1")?
+            .prepare_cached(concat!(
+                "SELECT 1 FROM authorized a JOIN multihashes m ON m.id = a.key
+                 WHERE m.multihash = ?1 AND (acting_user() IS NULL OR a.user = ", acting!(), ")",
+            ))?
             .exists([key.multihash().to_bytes()])?)
     }
 
-    /// Every key a device claim names, and whether it's authorized now.
+    /// Every key the acting user has certified, or anyone has, with
+    /// none, and whether it's authorized now.
     pub fn devices(&self) -> Result<Vec<(Link, bool)>> {
         let rows: Vec<(Vec<u8>, Vec<u8>, bool)> = self.db.conn()
-            .prepare_cached(
-                "SELECT DISTINCT t.prefix, m.multihash, t.target IN (SELECT key FROM authorized) FROM claims d
-                 JOIN claim_targets t ON t.claim = d.id JOIN multihashes m ON m.id = t.target
-                 WHERE d.kind = 'device' ORDER BY m.multihash",
-            )?
+            .prepare_cached(concat!(
+                "SELECT DISTINCT t.prefix, m.multihash, t.target IN (
+                     SELECT key FROM authorized WHERE acting_user() IS NULL OR user = ", acting!(), "
+                 ) FROM claims d
+                 JOIN claim_targets t ON t.claim = d.id JOIN multihashes m ON m.id = t.target JOIN claim_keys dk ON dk.claim = d.id
+                 WHERE d.kind = 'device' AND EXISTS (
+                     SELECT 1 FROM claim_targets rt JOIN sign_claims rs ON rs.id = rt.claim
+                     WHERE rt.target = dk.key AND (acting_user() IS NULL OR rs.by = ", acting!(), ")
+                 ) ORDER BY m.multihash",
+            ))?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
         rows.into_iter().map(|(prefix, multihash, ok)| Ok((link(&prefix, &multihash)?, ok))).collect()
@@ -339,7 +468,8 @@ impl ClaimStore {
              AND NOT EXISTS (
                  SELECT 1 FROM claim_targets st JOIN sign_claims sg ON sg.id = st.claim JOIN multihashes b ON b.id = sg.by
                  JOIN authorized au ON au.key = sg.by
-                 WHERE st.target = ck.key AND b.multihash != ?1)",
+                 WHERE st.target = ck.key AND b.multihash != ?1
+                     AND (acting_user() IS NULL OR au.user = (SELECT id FROM multihashes WHERE multihash = acting_user())))",
             &[&key.multihash().to_bytes(), &chain],
         )
     }

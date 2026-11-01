@@ -41,7 +41,7 @@ mod shards;
 mod unixfs;
 mod volume;
 
-pub use claims::{ClaimStore, Signed};
+pub use claims::{Account, ClaimStore, Signed};
 pub use ipld::IpldStore;
 pub use offset::{ExternalFile, OffsetStore};
 use offset::{Fingerprint, Location, Whole};
@@ -360,6 +360,9 @@ pub struct Catalog {
     claims: Option<Rc<ClaimStore>>,
     /// This device's key, which signs the claims made here, if it has one.
     signer: Option<crate::keys::Key>,
+    /// The account, by the host's uid, the catalog acts for: whose key
+    /// signs, and whose user's claims it sees.
+    uid: u32,
     /// Claims made in a batch, which its end signs at once.
     unsigned: std::cell::RefCell<Vec<Link>>,
     /// How deep in batches this is.
@@ -515,18 +518,30 @@ impl Catalog {
         Ok(catalog)
     }
 
-    /// Sign claims made here with this node's key, made if there's none
-    /// yet. A repo has no user until it makes or joins a mesh: until then
-    /// it takes every claim at its word, and when it has one, what this
-    /// node signed counts once the user certifies it.
+    /// Act for the user running this, signing with this node's key, made
+    /// if there's none yet. Until the account makes or joins a mesh, its
+    /// device key is its user; once it has one, what this node signed
+    /// counts once the user certifies it.
     fn sign_as(&mut self, dir: &Path) -> Result<()> {
-        self.signer = Some(crate::keys::Key::load_or_make(&dir.join(crate::keys::NODE_KEY))?);
-        Ok(())
+        let key = crate::keys::Key::load_or_make(&dir.join(crate::keys::NODE_KEY))?;
+        self.act_for(rustix::process::getuid().as_raw(), key)
     }
 
-    /// Sign claims with this key from now on.
-    pub fn set_signer(&mut self, key: crate::keys::Key) {
+    /// Act for one of the host's users, signing with its key here: what
+    /// it says is signed with it, and what's seen is what counts for its
+    /// user.
+    pub fn act_for(&mut self, uid: u32, key: crate::keys::Key) -> Result<()> {
+        self.uid = uid;
+        if let Some(claims) = &self.claims {
+            claims.set_device(uid, &key.id())?;
+        }
         self.signer = Some(key);
+        self.refresh_acting()
+    }
+
+    /// Sign claims with this key from now on, as this account's.
+    pub fn set_signer(&mut self, key: crate::keys::Key) -> Result<()> {
+        self.act_for(self.uid, key)
     }
 
     /// The key claims made here are signed with, if any.
@@ -534,14 +549,35 @@ impl Catalog {
         self.signer.as_ref()
     }
 
-    /// The user's root key, if the repo has a user.
-    pub fn user(&self) -> Result<Option<Link>> {
-        self.claims.as_ref().map_or(Ok(None), |claims| claims.user())
+    /// The uid of the account this acts for.
+    pub const fn uid(&self) -> u32 {
+        self.uid
     }
 
-    /// Make `root` the user, in place of any other: joining a user's mesh.
+    /// The account this acts for, if it's said anything yet.
+    pub fn account(&self) -> Result<Option<claims::Account>> {
+        self.claims.as_ref().map_or(Ok(None), |claims| claims.account(self.uid))
+    }
+
+    /// The root key of the user this acts for, if its account is in a mesh.
+    pub fn user(&self) -> Result<Option<Link>> {
+        Ok(self.account()?.and_then(|account| account.user))
+    }
+
+    /// Make `root` the user of the account this acts for, in place of any
+    /// other: joining a user's mesh.
     pub fn set_user(&self, root: &Link) -> Result<()> {
-        self.claims.as_ref().ok_or(Error::NoClaims)?.set_user(root)
+        self.claims.as_ref().ok_or(Error::NoClaims)?.set_user(self.uid, root)?;
+        self.refresh_acting()
+    }
+
+    /// See what counts for the account's user.
+    fn refresh_acting(&self) -> Result<()> {
+        if let Some(claims) = &self.claims {
+            let account = claims.account(self.uid)?;
+            claims.act_as(account.as_ref().and_then(claims::Account::acts_for));
+        }
+        Ok(())
     }
 
     /// Put a claim, signed with this device's key if it has one: at once,
@@ -789,7 +825,7 @@ impl Catalog {
         if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
             return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
         }
-        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, unsigned: std::cell::RefCell::default(), batching: 0 };
+        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), unsigned: std::cell::RefCell::default(), batching: 0 };
         for volume in volumes {
             catalog.attach(volume)?;
         }
@@ -1438,13 +1474,13 @@ impl Catalog {
         if self.claims.is_some() {
             sources.push(format!(
                 "SELECT 1 FROM claim_targets t JOIN claims c ON c.id = t.claim WHERE t.target = ?1 AND c.kind = 'keep' AND {}",
-                claims::LIVE,
+                claims::LIVE_ANY,
             ));
             // What a kept anchor is now; what it was isn't referenced
             sources.push(format!(
-                "SELECT 1 FROM anchor_values a JOIN claim_targets t ON t.target = a.anchor JOIN claims c ON c.id = t.claim
+                "SELECT 1 FROM anchor_values_any a JOIN claim_targets t ON t.target = a.anchor JOIN claims c ON c.id = t.claim
                  WHERE a.value = ?1 AND c.kind = 'keep' AND {}",
-                claims::LIVE,
+                claims::LIVE_ANY,
             ));
         }
         let query = sources.iter().map(|source| format!("EXISTS ({source})")).collect::<Vec<_>>().join(" OR ");
@@ -1855,13 +1891,13 @@ impl Catalog {
                 "WITH RECURSIVE up (id) AS (
                      SELECT id FROM multihashes WHERE multihash = ?1
                      UNION SELECT l.source FROM links l JOIN up ON l.target = up.id
-                     UNION SELECT a.anchor FROM anchor_values a JOIN up ON a.value = up.id
+                     UNION SELECT a.anchor FROM anchor_values_any a JOIN up ON a.value = up.id
                  )
                  SELECT 1 FROM up
                  JOIN claim_targets t ON t.target = up.id
                  JOIN claims c ON c.id = t.claim
                  WHERE c.kind = 'keep' AND {} LIMIT 1",
-                claims::LIVE,
+                claims::LIVE_ANY,
             ))?
             .exists([key.to_bytes()])?)
     }
