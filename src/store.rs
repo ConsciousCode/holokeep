@@ -1442,6 +1442,35 @@ impl Catalog {
         Ok(claim.cid())
     }
 
+    /// What isn't here of the DAG under a root: each block linked to,
+    /// the root included, which isn't held or can't be read. What's
+    /// missing isn't walked into, so it's only the edge of what's here.
+    ///
+    /// A node only keeps what it holds all of: whatever else is
+    /// collecting what a keep links to, the keeper's copy survives, and
+    /// is replicated again from there.
+    pub fn missing_under(&self, root: &Link) -> Result<Vec<Link>> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut queue = vec![root.clone()];
+        let mut missing = Vec::new();
+        while let Some(cid) = queue.pop() {
+            if !seen.insert(cid.to_bytes()) {
+                continue;
+            }
+            let data = if cid.hashcode() == IDENTITY {
+                self.holds(&cid)?.then(|| cid.digest_ref().to_vec())
+            }
+            else {
+                self.get_block(&cid).ok().flatten().map(|block| block.data().to_vec())
+            };
+            match data {
+                Some(data) => queue.extend(crate::links::links(cid.codec(), &data).unwrap_or_default()),
+                None => missing.push(cid),
+            }
+        }
+        Ok(missing)
+    }
+
     /// Stop keeping a block, tombing every keep of it. Returns the tombs'
     /// CIDs.
     pub fn unkeep(&self, target: &Link) -> Result<Vec<Link>> {

@@ -204,7 +204,8 @@ enum BlockCommand {
 
 #[derive(Subcommand, Debug)]
 enum KeepCommand {
-    /// Keep blocks, printing the claim keeping each
+    /// Keep DAGs, printing the claim keeping each. All of each must be
+    /// here, or fetched through the running node
     Add {
         #[arg(required = true)]
         cids: Vec<Link>,
@@ -355,7 +356,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Refs { cid, back } => refs(&open_repo(args.repo)?, &cid, back),
         Command::Dag(command) => dag(args.repo, command),
         Command::Tag(command) => tag(open_repo(args.repo)?, command),
-        Command::Keep(command) => keep(open_repo(args.repo)?, command),
+        Command::Keep(command) => keep(&args.repo, open_repo(args.repo.clone())?, command),
         Command::Block(BlockCommand::Get { cid }) => {
             let repo = open_repo(args.repo)?;
             let block = repo.get_block(&cid)?.with_context(|| format!("block {cid} not found"))?;
@@ -601,15 +602,39 @@ fn tag_cid(name: &str) -> anyhow::Result<Link> {
 }
 
 /// Tag blocks or find them by tag.
-fn keep(mut repo: Catalog, command: KeepCommand) -> anyhow::Result<()> {
+/// Make sure all of each DAG is here, fetching what isn't if the node's
+/// running: a keep is only added by a node holding everything it links
+/// to, so its copy outlives anything collecting it elsewhere meanwhile.
+fn hold_all(dir: &Option<PathBuf>, repo: &Catalog, cids: &[Link]) -> anyhow::Result<()> {
+    for cid in cids {
+        if repo.missing_under(cid)?.is_empty() {
+            continue;
+        }
+        fetch_first(dir, cid)?;
+        let missing = repo.missing_under(cid)?;
+        if let Some(first) = missing.first() {
+            anyhow::bail!(
+                "{} blocks under {cid} aren't here or on any connected member, {first} among them; a keep needs all of what it keeps{}",
+                missing.len(),
+                if cfg!(feature = "net") { " (is `hk node run` running?)" } else { "" },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn keep(dir: &Option<PathBuf>, mut repo: Catalog, command: KeepCommand) -> anyhow::Result<()> {
     let mut out = io::BufWriter::new(io::stdout().lock());
     match command {
-        KeepCommand::Add { cids } => repo.batch(|repo| {
-            for cid in cids {
-                writeln!(out, "{}", repo.keep(&cid)?)?;
-            }
-            anyhow::Ok(())
-        })?,
+        KeepCommand::Add { cids } => {
+            hold_all(dir, &repo, &cids)?;
+            repo.batch(|repo| {
+                for cid in cids {
+                    writeln!(out, "{}", repo.keep(&cid)?)?;
+                }
+                anyhow::Ok(())
+            })?;
+        },
         KeepCommand::Rm { cids } => repo.batch(|repo| {
             for cid in cids {
                 for tomb in repo.unkeep(&cid)? {

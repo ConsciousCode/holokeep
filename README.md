@@ -348,7 +348,7 @@ Checklist:
   - [x] Trimming surplus copies between free-space watermarks, confirmed with members first, lowest-ranked first (`hk node run --low-water/--high-water`, `hk node trim`)
   - [x] Advertising what's let go of, so sightings of members connected since needn't expire
   - [x] Trimming leaves of kept files: a file goes whole, or is split into blocks of its own once any leaf goes
-  - [ ] Holding what's referenced: a keep or a link is only added by a node holding what it links to, fetching it first, so a reference added while what it links to is being collected keeps a copy alive, and the trickle replicates it. Slippage then needs no timeout to be safe, only to be prompt
+  - [x] Holding what's kept: a keep is only added by a node holding all of what it keeps, fetching what isn't here first (`hk keep add`), so a keep added while what it keeps is being collected keeps a copy alive, and the trickle replicates it. Slippage then needs no timeout to be safe, only to be prompt
   - [ ] Frontier claims: where a keep's reach stops, for DAGs too large to hold (`--shallow` writes what couldn't be fetched as the frontier, rather than failing)
   - [ ] Collecting garbage: what nothing kept links to, judged by backrefs. Condemned blocks are advertised and dropped after a grace period, unless a keep or link revives them; a node never takes not having heard of a keep as there being none for what it keeps itself
   - [ ] Noticing files imported in place which have gone or changed, in the trickle, so their blocks are re-replicated

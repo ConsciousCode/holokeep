@@ -676,6 +676,27 @@ fn keeps_are_claims_and_can_be_let_go_of() {
 }
 
 #[test]
+fn whats_missing_under_a_root_is_the_edge_of_whats_here() {
+    let router = router();
+    let (a, b, c) = (raw(b"a"), raw(b"b"), raw(b"c"));
+    let inner = ipld_block(DAG_CBOR_CODEC, &crate::model::Ipld::List(vec![crate::model::Ipld::Link(link(&b)), crate::model::Ipld::Link(link(&c))]));
+    let root = ipld_block(DAG_CBOR_CODEC, &crate::model::Ipld::List(vec![crate::model::Ipld::Link(link(&a)), crate::model::Ipld::Link(link(&inner))]));
+    assert_eq!(router.missing_under(&link(&root)).expect("missing"), [link(&root)]);
+    for block in [&root, &a, &b] {
+        router.put_block(block, CidVersion::V1).expect("put");
+    }
+    // What's under what's missing isn't known to be missing
+    assert_eq!(router.missing_under(&link(&root)).expect("missing"), [link(&inner)]);
+    router.put_block(&inner, CidVersion::V1).expect("put");
+    assert_eq!(router.missing_under(&link(&root)).expect("missing"), [link(&c)]);
+    router.put_block(&c, CidVersion::V1).expect("put");
+    assert!(router.missing_under(&link(&root)).expect("missing").is_empty());
+    // A keep is a dissolved claim, walked into from its own CID
+    let keep = router.keep(&link(&root)).expect("keep");
+    assert!(router.missing_under(&keep).expect("missing").is_empty());
+}
+
+#[test]
 fn claims_tables_from_before_keeps_take_them() {
     let db = Db::memory().expect("db");
     db.conn()
