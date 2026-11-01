@@ -129,12 +129,11 @@ enum NodeCommand {
         /// ...until it's back above this; nor take others' copies past it
         #[arg(long, default_value = "4G", value_parser = holokeep::net::daemon::parse_size)]
         high_water: u64,
-        /// Collect garbage: let go of leaves nothing keeps, a week after
-        /// they're condemned and once every member's said it doesn't keep
-        /// them. Off unless asked, since what was added before keeps
-        /// existed isn't kept (`hk keep add` it first)
+        /// Don't collect garbage. Otherwise leaves nothing keeps are let go
+        /// of a week after they're condemned, once every member's said it
+        /// doesn't keep them
         #[arg(long)]
-        collect: bool,
+        no_collect: bool,
     },
     /// Let go now of every copy here the mesh can spare, short of space or
     /// not
@@ -423,10 +422,10 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
             daemon::ask(dir, "reload")?;
             eprintln!("joined the mesh of {}; `hk node run` to connect", ticket.inviter);
         },
-        NodeCommand::Run { listen, copies, low_water, high_water, collect } => {
+        NodeCommand::Run { listen, copies, low_water, high_water, no_collect } => {
             let listen = listen.parse().context("not a multiaddr")?;
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            runtime.block_on(daemon::run(dir, listen, copies, (low_water, high_water), collect))?;
+            runtime.block_on(daemon::run(dir, listen, copies, (low_water, high_water), !no_collect))?;
         },
         NodeCommand::Collect => {
             let report = daemon::collect(dir)?.context("this node isn't running: start `hk node run`")?;
