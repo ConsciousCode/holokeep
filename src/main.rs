@@ -302,8 +302,27 @@ enum RepoCommand {
     Reindex,
 }
 
+/// Print a line to stdout, like `println!`, except that a reader which has
+/// stopped reading (`hk ls | head`) isn't an error: the command carries on
+/// and finishes what it was doing, just without saying so.
+macro_rules! out {
+    ($($arg:tt)*) => { say(format_args!($($arg)*)) };
+}
+
+fn say(line: std::fmt::Arguments) {
+    let mut stdout = io::stdout().lock();
+    match stdout.write_fmt(line).and_then(|()| stdout.write_all(b"\n")) {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => panic!("failed printing to stdout: {e}"),
+        _ => {}
+    }
+}
+
 fn main() {
     if let Err(e) = run(Args::parse()) {
+        // Streaming into a closed pipe (`hk cat big | head`) ends quietly
+        if e.chain().any(|cause| cause.downcast_ref::<io::Error>().is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe)) {
+            return;
+        }
         eprintln!("Error: {e:#}");
         std::process::exit(1);
     }
@@ -364,12 +383,12 @@ fn run(args: Args) -> anyhow::Result<()> {
                     let base = canonical.parent().unwrap_or_else(|| Path::new("")).to_owned();
                     let mut report = |p: &Path, link: &dag::DagLink| {
                         if !quiet {
-                            println!("added {} {}", link.cid, p.strip_prefix(&base).unwrap_or(p).display());
+                            out!("added {} {}", link.cid, p.strip_prefix(&base).unwrap_or(p).display());
                         }
                     };
                     let (mount, root) = repo.import_mounted(&importer, &path, &mut report)?;
                     if quiet {
-                        println!("{root}");
+                        out!("{root}");
                     } else {
                         eprintln!("mounted on {}", mount.anchor);
                     }
@@ -410,13 +429,13 @@ fn run(args: Args) -> anyhow::Result<()> {
         },
         Command::Repo(RepoCommand::Stat) => {
             for (volume, form, blocks) in open_repo(args.repo)?.stats()? {
-                println!("{volume}\t{form}\t{blocks}");
+                out!("{volume}\t{form}\t{blocks}");
             }
             Ok(())
         },
         Command::Repo(RepoCommand::Reindex) => {
             let blocks = open_repo(args.repo)?.reindex()?;
-            println!("indexed {blocks} blocks");
+            out!("indexed {blocks} blocks");
             Ok(())
         },
         Command::Volume(command) => volume(open_repo(args.repo)?, command),
@@ -429,7 +448,7 @@ fn run(args: Args) -> anyhow::Result<()> {
 fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
     use holokeep::net::{daemon, mesh};
     match command {
-        NodeCommand::Id => println!("{}", mesh::node_key(dir)?.public().to_peer_id()),
+        NodeCommand::Id => out!("{}", mesh::node_key(dir)?.public().to_peer_id()),
         NodeCommand::Invite { peer } => {
             let peer: libp2p::PeerId = peer.parse().context("not a peer id")?;
             let me = mesh::node_key(dir)?.public().to_peer_id();
@@ -442,7 +461,7 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
             let listening = daemon::ask(dir, "listeners")?.unwrap_or_default();
             list.insert(me, listening.iter().filter_map(|addr| addr.parse().ok()).collect());
             daemon::ask(dir, "reload")?;
-            println!("{}", mesh::Ticket { swarm_key, inviter: me, members: list }.encode());
+            out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list }.encode());
             if listening.is_empty() {
                 eprintln!("note: this node isn't running, so the ticket says nowhere to find it; it'll be found on the LAN, or start `hk node run` and invite again");
             }
@@ -463,33 +482,33 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
         },
         NodeCommand::Collect => {
             let report = daemon::collect(dir)?.context("this node isn't running: start `hk node run`")?;
-            println!(
+            out!(
                 "condemned {}, pardoned {}, let go of {}, freeing {} bytes",
                 report.condemned, report.pardoned, report.collected, report.freed,
             );
         },
         NodeCommand::Trim => {
             let report = daemon::trim(dir)?.context("this node isn't running: start `hk node run`")?;
-            println!("let go of {} of {} spare blocks, freeing {} bytes", report.dropped, report.considered, report.freed);
+            out!("let go of {} of {} spare blocks, freeing {} bytes", report.dropped, report.considered, report.freed);
         },
         NodeCommand::Status => {
             let lines = daemon::ask(dir, "status")?.context("this node isn't running: start `hk node run`")?;
-            lines.iter().for_each(|line| println!("{line}"));
+            lines.iter().for_each(|line| out!("{line}"));
         },
         NodeCommand::Audit { copies } => {
             let report = daemon::audit(dir, copies)?.context("this node isn't running: start `hk node run`")?;
-            println!("advertised {}, copied {}", report.advertised, report.copied);
+            out!("advertised {}, copied {}", report.advertised, report.copied);
             if report.short > 0 {
                 eprintln!("{} blocks are still short, with no connected member to raise them", report.short);
             }
         },
         NodeCommand::Peers => match daemon::ask(dir, "peers")? {
-            Some(lines) => lines.iter().for_each(|line| println!("{line}")),
+            Some(lines) => lines.iter().for_each(|line| out!("{line}")),
             None => {
                 eprintln!("this node isn't running; members it knows of:");
                 for (peer, addrs) in daemon::members(dir)?.list()? {
                     let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
-                    println!("{peer}\t-\t{}", addrs.join(" "));
+                    out!("{peer}\t-\t{}", addrs.join(" "));
                 }
             },
         },
@@ -514,12 +533,12 @@ fn volume(mut repo: Catalog, command: VolumeCommand) -> anyhow::Result<()> {
                 });
                 let path = volume.path.map(|path| path.display().to_string()).unwrap_or_default();
                 let state = if volume.attached { "attached" } else { "detached" };
-                println!("{}\t{}\t{label}\t{state}\t{}\t{path}", volume.name, volume.kind, volume.blocks);
+                out!("{}\t{}\t{label}\t{state}\t{}\t{path}", volume.name, volume.kind, volume.blocks);
             }
         },
         VolumeCommand::Replicate { copies } => {
             let report = repo.batch(|repo| repo.replicate(copies))?;
-            println!("copied {} blocks and {} dissolved claims", report.copied, report.claims);
+            out!("copied {} blocks and {} dissolved claims", report.copied, report.claims);
             if !report.short.is_empty() {
                 eprintln!("{} blocks would take fewer than {copies} failures to lose; attach volumes which risk less in common", report.short.len());
             }
@@ -536,12 +555,12 @@ fn volume(mut repo: Catalog, command: VolumeCommand) -> anyhow::Result<()> {
         },
         VolumeCommand::Risk(RiskCommand::Ls) => {
             for (name, risk, found) in repo.risk_list()? {
-                println!("{name}\t{risk}\t{}", if found { "found" } else { "said" });
+                out!("{name}\t{risk}\t{}", if found { "found" } else { "said" });
             }
         },
         VolumeCommand::Copy { name, cids } => {
             let report = repo.batch(|repo| repo.copy_to(&name, &cids))?;
-            println!("copied {} blocks and {} dissolved claims", report.copied, report.claims);
+            out!("copied {} blocks and {} dissolved claims", report.copied, report.claims);
             if !report.unreadable.is_empty() {
                 eprintln!("{} blocks couldn't be read to be copied", report.unreadable.len());
             }
@@ -554,7 +573,7 @@ fn volume(mut repo: Catalog, command: VolumeCommand) -> anyhow::Result<()> {
 fn add(importer: &Importer, path: &Path, quiet: bool, sink: &mut impl BlockSink) -> anyhow::Result<Link> {
     if path == Path::new("-") {
         let root = importer.add_file(std::io::stdin().lock(), sink)?;
-        println!("{}", root.cid);
+        out!("{}", root.cid);
         return Ok(root.cid.into());
     }
 
@@ -563,14 +582,14 @@ fn add(importer: &Importer, path: &Path, quiet: bool, sink: &mut impl BlockSink)
     let mut report = |p: &Path, link: &dag::DagLink| {
         if !quiet {
             let rel = p.strip_prefix(base).unwrap_or(p);
-            println!("added {} {}", link.cid, rel.display());
+            out!("added {} {}", link.cid, rel.display());
         }
     };
     let Some(root) = importer.add_path(path, sink, &mut report)? else {
         anyhow::bail!("unsupported file type: {}", path.display());
     };
     if quiet {
-        println!("{}", root.cid);
+        out!("{}", root.cid);
     }
     Ok(root.cid.into())
 }
@@ -603,9 +622,9 @@ fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {
         DagCommand::Fetch { cid } => {
             let dir = repo_dir(repo)?;
             let (fetched, missing) = holokeep::net::daemon::fetch(&dir, &cid)?.context("this node isn't running: start `hk node run`")?;
-            println!("fetched {fetched}");
+            out!("fetched {fetched}");
             for cid in &missing {
-                println!("missing {cid}");
+                out!("missing {cid}");
             }
             anyhow::ensure!(missing.is_empty(), "{} blocks aren't here or on any connected member", missing.len());
             Ok(())
@@ -623,7 +642,7 @@ fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {
                         .with_context(|| format!("importing {}", path.display()))?;
                     for root in roots {
                         let present = if repo.get_block(&root)?.is_some() { "" } else { " (not in the CAR)" };
-                        println!("root {root}{present}");
+                        out!("root {root}{present}");
                     }
                     eprintln!("imported {blocks} blocks from {}", path.display());
                 }
@@ -690,21 +709,21 @@ fn hold_all(dir: &Option<PathBuf>, repo: &Catalog, cids: &[Link], shallow: bool)
 
 fn anchor(dir: &Option<PathBuf>, mut repo: Catalog, command: AnchorCommand) -> anyhow::Result<()> {
     match command {
-        AnchorCommand::New => println!("{}", repo.new_anchor()?),
+        AnchorCommand::New => out!("{}", repo.new_anchor()?),
         AnchorCommand::Set { anchor, cid } => {
             anyhow::ensure!(holokeep::claim::is_anchor(&anchor), "{anchor} isn't an anchor");
             hold_all(dir, &repo, std::slice::from_ref(&cid), false)?;
             let set = repo.batch(|repo| repo.set_anchor(&anchor, &cid))?;
-            println!("{set}");
+            out!("{set}");
         },
         AnchorCommand::Show { anchor } => {
             anyhow::ensure!(holokeep::claim::is_anchor(&anchor), "{anchor} isn't an anchor");
             match repo.anchor_value(&anchor)? {
-                Some(value) => println!("{value}"),
-                None => println!("unset"),
+                Some(value) => out!("{value}"),
+                None => out!("unset"),
             }
             for (at, value) in repo.anchor_history(&anchor)? {
-                println!("{at}\t{value}");
+                out!("{at}\t{value}");
             }
         },
     }
