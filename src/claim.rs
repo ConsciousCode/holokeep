@@ -50,6 +50,10 @@ pub struct Keep {
     target: Vec<Link>,
     /// Sorted by CID bytes and distinct.
     beyond: Vec<Link>,
+    /// Which time the targets are kept, from 0, left out when 0: keeping
+    /// them again once a keep's been tombed takes a new claim, since a
+    /// tomb is forever.
+    n: u64,
 }
 
 /// Any claim this understands.
@@ -92,8 +96,17 @@ impl Keep {
     /// A keep of the targets short of a frontier, if there are any.
     pub fn bounded(target: impl IntoIterator<Item = Link>, beyond: impl IntoIterator<Item = Link>) -> Option<Self> {
         let target = set(target);
-        (!target.is_empty()).then_some(Self { target, beyond: set(beyond) })
+        (!target.is_empty()).then_some(Self { target, beyond: set(beyond), n: 0 })
     }
+
+    /// The same keep, but the `n`th time.
+    #[must_use]
+    pub const fn again(mut self, n: u64) -> Self {
+        self.n = n;
+        self
+    }
+
+    pub const fn n(&self) -> u64 { self.n }
 
     pub fn target(&self) -> &[Link] { &self.target }
 
@@ -123,8 +136,16 @@ impl Claim {
     fn to_ipld(&self) -> Ipld {
         let (kind, mut map) = match self {
             Self::Group(group) => ("group", BTreeMap::from([("into".to_owned(), Ipld::Link(group.into.clone()))])),
-            Self::Keep(keep) if keep.beyond.is_empty() => ("keep", BTreeMap::new()),
-            Self::Keep(keep) => ("keep", BTreeMap::from([("beyond".to_owned(), links(&keep.beyond))])),
+            Self::Keep(keep) => {
+                let mut map = BTreeMap::new();
+                if !keep.beyond.is_empty() {
+                    map.insert("beyond".to_owned(), links(&keep.beyond));
+                }
+                if keep.n > 0 {
+                    map.insert("n".to_owned(), Ipld::Integer(keep.n.into()));
+                }
+                ("keep", map)
+            },
             Self::Tomb(_) => ("tomb", BTreeMap::new()),
         };
         map.insert("claim".to_owned(), Ipld::String(kind.to_owned()));
@@ -187,7 +208,12 @@ impl Claim {
                     Some(_) => return None,
                     None => Vec::new(),
                 };
-                Self::Keep(Keep::bounded(target.clone(), beyond)?)
+                let n = match map.remove("n") {
+                    Some(Ipld::Integer(n)) => u64::try_from(n).ok().filter(|&n| n > 0)?,
+                    Some(_) => return None,
+                    None => 0,
+                };
+                Self::Keep(Keep::bounded(target.clone(), beyond)?.again(n))
             },
             "tomb" => Self::Tomb(Tomb::new(target.clone())?),
             _ => return None,
@@ -341,5 +367,15 @@ mod tests {
         ])))
         .expect("encode");
         assert_eq!(Claim::parse(&empty), None);
+    }
+
+    #[test]
+    fn keeps_again_are_new_claims() {
+        let first = Claim::Keep(Keep::new([cid(b"a")]).expect("keep"));
+        let again = Claim::Keep(Keep::new([cid(b"a")]).expect("keep").again(1));
+        assert_ne!(first.cid(), again.cid());
+        assert!(again.dissolves());
+        assert_eq!(dissolved(&again.cid()), Some(again));
+        assert_eq!(Claim::Keep(Keep::new([cid(b"a")]).expect("keep").again(0)).cid(), first.cid(), "0 is left out");
     }
 }

@@ -1443,7 +1443,18 @@ impl Catalog {
     /// Keep a block and what it links to, short of a frontier: links the
     /// keep's reach stops at. Returns the keep's CID.
     pub fn keep_short_of(&self, target: &Link, beyond: &[Link]) -> Result<Link> {
-        let claim = Claim::Keep(crate::claim::Keep::bounded([target.clone()], beyond.iter().cloned()).ok_or(Error::NoClaims)?);
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let keep = crate::claim::Keep::bounded([target.clone()], beyond.iter().cloned()).ok_or(Error::NoClaims)?;
+        // A tomb is forever, so keeping again once a keep's been tombed takes
+        // the next time that hasn't been
+        let mut n = 0u64;
+        let claim = loop {
+            let claim = Claim::Keep(keep.clone().again(n));
+            if !claims.retracted(&claim.cid())? {
+                break claim;
+            }
+            n = n.saturating_add(1);
+        };
         self.put_block(&claim.block(), CidVersion::V1)?;
         Ok(claim.cid())
     }

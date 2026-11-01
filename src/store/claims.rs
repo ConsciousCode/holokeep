@@ -84,6 +84,11 @@ impl ClaimStore {
                  PRIMARY KEY (claim, target, prefix)
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS claim_targets_target ON claim_targets (target);
+             -- Which time a keep keeps its targets, if not the first.
+             CREATE TABLE IF NOT EXISTS keep_n (
+                 claim INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
+                 n INTEGER NOT NULL
+             );
              -- What's particular to each type; a tomb has nothing but targets.
              CREATE TABLE IF NOT EXISTS group_claims (
                  id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
@@ -132,6 +137,19 @@ impl ClaimStore {
         links(stmt.query_map([id], pair)?)
     }
 
+    fn keep_n(&self, id: Id) -> Result<u64> {
+        let n: Option<i64> = self.db.conn()
+            .prepare_cached("SELECT n FROM keep_n WHERE claim = ?1")?
+            .query_row([id], |row| row.get(0))
+            .optional()?;
+        Ok(n.and_then(|n| u64::try_from(n).ok()).unwrap_or_default())
+    }
+
+    /// Whether a tomb retracts a claim, by its CID.
+    pub fn retracted(&self, claim: &Link) -> Result<bool> {
+        self.tombstoned(claim.multihash())
+    }
+
     fn beyond(&self, id: Id) -> Result<Vec<Link>> {
         let mut stmt = self.db.conn().prepare_cached(
             "SELECT b.prefix, m.multihash FROM keep_beyond b JOIN multihashes m ON m.id = b.target WHERE b.claim = ?1",
@@ -144,7 +162,7 @@ impl ClaimStore {
         match kind {
             "group" => self.group(id).map(Claim::Group),
             "keep" => Keep::bounded(self.targets(id)?, self.beyond(id)?)
-                .map(Claim::Keep)
+                .map(|keep| Claim::Keep(keep.again(self.keep_n(id).unwrap_or_default())))
                 .ok_or_else(|| Error::Invalid { store: NAME, reason: "a keep with no targets".into() }),
             "tomb" => self.tomb(id).map(Claim::Tomb),
             _ => Err(Error::Invalid { store: NAME, reason: format!("a claim of kind {kind}") }),
@@ -192,13 +210,17 @@ impl ClaimStore {
                     .optional()?
             },
             Claim::Keep(_) | Claim::Tomb(_) => {
-                let kind = if matches!(claim, Claim::Keep(_)) { "keep" } else { "tomb" };
+                let (kind, n) = match claim {
+                    Claim::Keep(keep) => ("keep", keep.n()),
+                    _ => ("tomb", 0),
+                };
                 self.db.conn()
                     .prepare_cached(
                         "SELECT c.id FROM claims c JOIN claim_targets t ON t.claim = c.id
-                         WHERE c.claim IS NULL AND c.kind = ?3 AND t.target = ?1 AND t.prefix = ?2",
+                         WHERE c.claim IS NULL AND c.kind = ?3 AND t.target = ?1 AND t.prefix = ?2
+                             AND coalesce((SELECT n FROM keep_n k WHERE k.claim = c.id), 0) = ?4",
                     )?
-                    .query_row(params![target, prefix, kind], |r| r.get(0))
+                    .query_row(params![target, prefix, kind, i64::try_from(n).unwrap_or(i64::MAX)], |r| r.get(0))
                     .optional()?
             },
         })
@@ -257,6 +279,12 @@ impl ClaimStore {
         for target in claim.target() {
             let (prefix, multihash) = split(target)?;
             stmt.execute(params![row, self.db.intern(multihash.as_ref())?, prefix])?;
+        }
+        if let Claim::Keep(keep) = claim
+            && keep.n() > 0
+        {
+            conn.prepare_cached("INSERT INTO keep_n (claim, n) VALUES (?1, ?2)")?
+                .execute(params![row, i64::try_from(keep.n()).unwrap_or(i64::MAX)])?;
         }
         if let Claim::Keep(keep) = claim {
             let mut stmt = conn.prepare_cached("INSERT OR IGNORE INTO keep_beyond (claim, target, prefix) VALUES (?1, ?2, ?3)")?;

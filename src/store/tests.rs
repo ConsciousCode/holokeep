@@ -716,6 +716,29 @@ fn keeps_stop_at_their_frontier() {
 }
 
 #[test]
+fn whats_let_go_of_can_be_kept_again() {
+    let router = router();
+    let a = raw(b"kept twice");
+    let claims = router.claims().expect("claims");
+    let first = router.keep(&link(&a)).expect("keep");
+    router.unkeep(&link(&a)).expect("unkeep");
+    assert!(!claims.kept(a.cid().multihash()).expect("kept"));
+    // The same keep is tombed for good, so it's kept a second time
+    let second = router.keep(&link(&a)).expect("keep");
+    assert_ne!(second, first);
+    assert!(claims.kept(a.cid().multihash()).expect("kept"));
+    let Some(Claim::Keep(keep)) = crate::claim::dissolved(&second) else { panic!("a dissolved keep") };
+    assert_eq!(keep.n(), 1);
+    assert_eq!(claims.keeping(a.cid().multihash()).expect("keeping"), std::slice::from_ref(&second));
+    // And again
+    router.unkeep(&link(&a)).expect("unkeep");
+    assert!(!claims.kept(a.cid().multihash()).expect("kept"));
+    let third = router.keep(&link(&a)).expect("keep");
+    assert!(claims.kept(a.cid().multihash()).expect("kept"));
+    assert_eq!(claims.keeping(a.cid().multihash()).expect("keeping"), [third]);
+}
+
+#[test]
 fn claims_tables_from_before_keeps_take_them() {
     let db = Db::memory().expect("db");
     db.conn()
