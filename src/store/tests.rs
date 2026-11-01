@@ -1739,3 +1739,139 @@ fn replicas_keep_dissolved_claims() {
     b.add_sqlite_volume("shared", &scratch.path().join("shared.db")).expect("add");
     assert_eq!(b.claims().expect("claims").tagged(tag("kept").multihash()).expect("tagged"), [link(&block)]);
 }
+
+/// A catalog whose user is `root`, signing as a device `root` certified.
+fn signed_router(root: &crate::keys::Key) -> (Catalog, crate::keys::Key) {
+    let mut router = router();
+    let device = crate::keys::Key::generate().expect("key");
+    router.set_user(&root.id()).expect("user");
+    router.certify(root, &device.id()).expect("certify");
+    router.set_signer(device.clone());
+    (router, device)
+}
+
+/// Sign a claim with a key, as another device would.
+fn sign(router: &Catalog, key: &crate::keys::Key, claim: &crate::model::Link) {
+    let sign = Claim::Sign(crate::claim::Sign::new(key, claim.clone(), 1));
+    router.put_block(&sign.block(), CidVersion::V1).expect("put");
+}
+
+#[test]
+fn a_repo_is_its_own_user_and_signs_what_it_says() {
+    let scratch = Scratch::new("own-user");
+    let block = raw(b"kept");
+    let repo = Catalog::open_repo(scratch.path()).expect("open");
+    let device = repo.signer().expect("signer").id();
+    assert!(repo.user().expect("user").is_some());
+    assert_eq!(repo.devices().expect("devices"), [(device.clone(), true)]);
+    let keep = repo.keep(&link(&block)).expect("keep");
+    assert!(repo.claims().expect("claims").signed_by(&keep, &device).expect("signed"));
+    assert!(repo.claims().expect("claims").kept(block.cid().multihash()).expect("kept"));
+    drop(repo);
+    // The same user, and the same device, next time
+    let repo = Catalog::open_repo(scratch.path()).expect("open");
+    assert_eq!(repo.signer().expect("signer").id(), device);
+    assert_eq!(repo.devices().expect("devices").len(), 1);
+}
+
+#[test]
+fn claims_count_only_when_an_authorized_key_signs_them() {
+    let root = crate::keys::Key::generate().expect("key");
+    let (router, _) = signed_router(&root);
+    let claims = router.claims().expect("claims");
+    let block = raw(b"kept");
+    let kept = || claims.kept(block.cid().multihash()).expect("kept");
+
+    // Unsigned, as from a CAR or another user's mesh
+    let keep = Claim::Keep(crate::claim::Keep::new([link(&block)]).expect("keep"));
+    router.put_block(&keep.block(), CidVersion::V1).expect("put");
+    assert!(!kept());
+    // Signed by a key nobody certified
+    let stranger = crate::keys::Key::generate().expect("key");
+    sign(&router, &stranger, &keep.cid());
+    assert!(!kept());
+    // Until the root certifies it
+    router.certify(&root, &stranger.id()).expect("certify");
+    assert!(kept());
+
+    // A device can't certify another
+    let other = crate::keys::Key::generate().expect("key");
+    let (device, _) = router.certify(&stranger, &other.id()).expect("certify");
+    assert!(!claims.authorized(&other.id()).expect("authorized"));
+    // Nor revoke one
+    let tomb = Claim::Tomb(crate::claim::Tomb::new([device]).expect("tomb"));
+    router.put_block(&tomb.block(), CidVersion::V1).expect("put");
+    sign(&router, &stranger, &tomb.cid());
+    assert!(claims.authorized(&stranger.id()).expect("authorized"));
+
+    // A tomb nobody authorized signed doesn't retract
+    let tomb = Claim::Tomb(crate::claim::Tomb::new([keep.cid()]).expect("tomb"));
+    router.put_block(&tomb.block(), CidVersion::V1).expect("put");
+    assert!(kept());
+    sign(&router, &crate::keys::Key::generate().expect("key"), &tomb.cid());
+    assert!(kept());
+    sign(&router, &stranger, &tomb.cid());
+    assert!(!kept());
+}
+
+#[test]
+fn a_tampered_signature_is_no_claim() {
+    let root = crate::keys::Key::generate().expect("key");
+    let (router, device) = signed_router(&root);
+    let keep = Claim::Keep(crate::claim::Keep::new([link(&raw(b"kept"))]).expect("keep"));
+    let sign = crate::claim::Sign::new(&device, keep.cid(), 1);
+    let forged = crate::claim::Sign::from_parts(keep.cid(), device.id(), 2, sign.sig().to_vec());
+    assert!(sign.verify() && !forged.verify());
+    // Just dag-cbor, to the claim store
+    assert_eq!(router.put_block(&Claim::Sign(forged).block(), CidVersion::V1).expect("put"), "ipld");
+    router.put_block(&keep.block(), CidVersion::V1).expect("put");
+    assert!(!router.claims().expect("claims").kept(keep.target()[0].multihash()).expect("kept"));
+}
+
+#[test]
+fn revoking_a_device_unsigns_what_it_alone_said_after() {
+    let root = crate::keys::Key::generate().expect("key");
+    let (router, _) = signed_router(&root);
+    let claims = router.claims().expect("claims");
+    let lost = crate::keys::Key::generate().expect("key");
+    router.certify(&root, &lost.id()).expect("certify");
+    let (before, after, both) = (raw(b"before"), raw(b"after"), raw(b"both"));
+    let keep = |block: &Block| Claim::Keep(crate::claim::Keep::new([link(block)]).expect("keep"));
+    for block in [&before, &after, &both] {
+        router.put_block(&keep(block).block(), CidVersion::V1).expect("put");
+    }
+    let at = |time, block: &Block| {
+        let sign = Claim::Sign(crate::claim::Sign::new(&lost, keep(block).cid(), time));
+        router.put_block(&sign.block(), CidVersion::V1).expect("put");
+    };
+    at(10, &before);
+    at(30, &after);
+    at(10, &both);
+    router.put_claim(&keep(&both)).expect("signed here too");
+    let kept = |block: &Block| claims.kept(block.cid().multihash()).expect("kept");
+    assert!(kept(&before) && kept(&after) && kept(&both));
+
+    // Lost at 20: what it said before is signed again here, what after isn't
+    assert_eq!(router.revoke(&root, &lost.id(), 20).expect("revoke"), 1);
+    assert!(!claims.authorized(&lost.id()).expect("authorized"));
+    assert!(kept(&before) && !kept(&after) && kept(&both));
+    assert_eq!(router.devices().expect("devices").iter().filter(|(_, ok)| *ok).count(), 1);
+}
+
+#[test]
+fn claims_from_before_a_user_are_adopted() {
+    let mut router = router();
+    let block = raw(b"kept");
+    router.keep(&link(&block)).expect("keep");
+    let claims = router.claims().expect("claims");
+    assert!(claims.kept(block.cid().multihash()).expect("kept"), "no user, so taken at its word");
+    let root = crate::keys::Key::generate().expect("key");
+    let device = crate::keys::Key::generate().expect("key");
+    router.set_user(&root.id()).expect("user");
+    router.certify(&root, &device.id()).expect("certify");
+    assert!(!router.claims().expect("claims").kept(block.cid().multihash()).expect("kept"));
+    router.set_signer(device);
+    assert_eq!(router.adopt().expect("adopt"), 1);
+    assert!(router.claims().expect("claims").kept(block.cid().multihash()).expect("kept"));
+    assert_eq!(router.adopt().expect("adopt"), 0);
+}

@@ -24,7 +24,7 @@ fn invite(inviter: &Node, joiner: &Node, swarm_key: PreSharedKey) {
     inviter.members().add(&joiner.peer_id()).expect("add");
     let mut members = inviter.members().list().expect("list");
     members.insert(inviter.peer_id(), inviter.listeners());
-    let ticket = Ticket { swarm_key, inviter: inviter.peer_id(), members };
+    let ticket = Ticket { swarm_key, inviter: inviter.peer_id(), members, user: None };
     let ticket = Ticket::decode(&ticket.encode()).expect("round trip");
     joiner.members().merge(&ticket.members).expect("join");
 }
@@ -462,6 +462,60 @@ async fn fetching_takes_tags_along() {
     a.catalog().tag(&link(leaf), &link(&tag)).expect("tag");
     assert_eq!(fetch(&mut a, &mut b, link(leaf)).await, (1, vec![]));
     assert!(until(&mut [&mut a, &mut b], |n| tags(n[1], leaf) == [link(&tag)]).await);
+}
+
+#[tokio::test]
+async fn fetching_takes_tombs_along() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    let leaf = blocks.get(2).expect("leaf");
+    let tag = raw(b"retracted");
+    a.catalog().put_block(&tag, CidVersion::V1).expect("put");
+    a.catalog().tag(&link(leaf), &link(&tag)).expect("tag");
+    let tombs = a.catalog().untag(&link(leaf), &link(&tag)).expect("untag");
+    assert_eq!(fetch(&mut a, &mut b, link(leaf)).await, (1, vec![]));
+    let tomb = tombs.first().expect("tomb").clone();
+    assert!(until(&mut [&mut a, &mut b], |n| holds(n[1], &tomb)).await);
+    assert!(tags(&b, leaf).is_empty());
+}
+
+/// Make nodes devices of one user, its root certifying each.
+fn one_user(nodes: &mut [&mut Node]) -> crate::keys::Key {
+    let root = crate::keys::Key::generate().expect("key");
+    let devices: Vec<crate::keys::Key> = nodes.iter().map(|_| crate::keys::Key::generate().expect("key")).collect();
+    for node in nodes.iter_mut() {
+        node.catalog().set_user(&root.id()).expect("user");
+        for device in &devices {
+            node.catalog().certify(&root, &device.id()).expect("certify");
+        }
+    }
+    for (node, device) in nodes.iter_mut().zip(devices) {
+        node.catalog_mut().set_signer(device);
+    }
+    root
+}
+
+#[tokio::test]
+async fn a_devices_claims_count_where_they_go_and_a_strangers_dont() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    one_user(&mut [&mut a, &mut b]);
+    let (signed, unsigned) = (blocks.get(2).expect("leaf"), blocks.get(3).expect("leaf"));
+    let (tag, other) = (raw(b"from a device"), raw(b"from a stranger"));
+    for block in [&tag, &other] {
+        a.catalog().put_block(block, CidVersion::V1).expect("put");
+    }
+    a.catalog().tag(&link(signed), &link(&tag)).expect("tag");
+    // A key the user never certified, as a stranger's
+    a.catalog_mut().set_signer(crate::keys::Key::generate().expect("key"));
+    a.catalog().tag(&link(unsigned), &link(&other)).expect("tag");
+    assert!(tags(&a, unsigned).is_empty(), "not even where it was made");
+
+    assert_eq!(fetch(&mut a, &mut b, link(signed)).await.0, 1);
+    assert_eq!(fetch(&mut a, &mut b, link(unsigned)).await.0, 1);
+    assert!(until(&mut [&mut a, &mut b], |n| tags(n[1], signed) == [link(&tag)]).await);
+    // The stranger's tag arrived along with its leaf, but doesn't count
+    let claims = b.catalog().claims().expect("claims");
+    assert!(!claims.backrefs(unsigned.cid().multihash()).expect("backrefs").is_empty());
+    assert!(tags(&b, unsigned).is_empty());
 }
 
 //-------------//

@@ -120,6 +120,20 @@ fn public(id: &Link) -> Option<VerifyingKey> {
     VerifyingKey::from_bytes(bytes).ok()
 }
 
+/// A key's name as a libp2p peer ID: its multihash, in base58.
+pub fn peer_id(id: &Link) -> String {
+    let encoded = multibase::encode(multibase::Base::Base58Btc, id.multihash().to_bytes());
+    encoded.strip_prefix('z').map_or_else(|| encoded.clone(), str::to_owned)
+}
+
+/// The key a peer ID names, if it's an ed25519 key's.
+pub fn from_peer_id(peer: &str) -> Option<Link> {
+    let (_, multihash) = multibase::decode(format!("z{peer}")).ok()?;
+    Some(Multihash::<Vec<u8>>::decode(&multihash).ok()?)
+        .map(|hash| AnyCid::V1(Cidv1::new(LIBP2P_KEY_CODEC, Multihash::new(hash.code(), crate::multihash::Spill::Heap(hash.into_digest().into())))))
+        .filter(is_key)
+}
+
 /// Whether a CID names a key.
 pub fn is_key(id: &Link) -> bool {
     public(id).is_some()
@@ -168,6 +182,10 @@ mod tests {
         let key = Key::generate().unwrap();
         let pair = libp2p::identity::Keypair::from_protobuf_encoding(&key.to_protobuf()).unwrap();
         assert_eq!(pair.public().to_peer_id().to_bytes(), key.id().multihash().to_bytes());
+        let peer = pair.public().to_peer_id().to_string();
+        assert_eq!(peer_id(&key.id()), peer);
+        assert_eq!(from_peer_id(&peer), Some(key.id()));
+        assert_eq!(from_peer_id("not a peer"), None);
         let back = Key::from_protobuf(&pair.to_protobuf_encoding().unwrap()).unwrap();
         assert_eq!(back.id(), key.id());
     }

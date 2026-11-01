@@ -86,6 +86,9 @@ enum Command {
     /// last set to
     #[command(subcommand)]
     Anchor(AnchorCommand),
+    /// The user's devices: the nodes its root key certified
+    #[command(subcommand)]
+    Device(DeviceCommand),
     /// Work with raw blocks
     #[command(subcommand)]
     Block(BlockCommand),
@@ -236,6 +239,22 @@ enum KeepCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum DeviceCommand {
+    /// Print the user's root key, then each device by peer ID, and
+    /// whether it counts
+    List,
+    /// Revoke a device, with the user's root key, which must be here.
+    /// What it alone signed as of `--until` is signed again here, so it
+    /// still counts; what it signed after doesn't
+    Revoke {
+        peer: String,
+        /// Seconds since the epoch [default: now]
+        #[arg(long)]
+        until: Option<u64>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum AnchorCommand {
     /// Make a new anchor, printing it
     New,
@@ -345,6 +364,8 @@ fn repo_dir(repo: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 
 /// Fetch what isn't here of a DAG about to be read, if the node's running
 /// to fetch it. What can't be is reported by the reading.
+// Without the mesh there's nothing to fetch through
+#[cfg_attr(not(feature = "net"), allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn))]
 fn fetch_first(repo: Option<&PathBuf>, cid: &Link) -> anyhow::Result<()> {
     #[cfg(feature = "net")]
     {
@@ -429,6 +450,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Dag(command) => dag(args.repo, command),
         Command::Tag(command) => tag(open_repo(args.repo)?, command),
         Command::Keep(command) => keep(args.repo.as_ref(), open_repo(args.repo.clone())?, command),
+        Command::Device(command) => device(&repo_dir(args.repo.clone())?, command),
         Command::Anchor(command) => anchor(args.repo.as_ref(), open_repo(args.repo.clone())?, command),
         Command::Block(BlockCommand::Get { cid }) => {
             let repo = open_repo(args.repo)?;
@@ -452,6 +474,31 @@ fn run(args: Args) -> anyhow::Result<()> {
     }
 }
 
+/// Become a device of the user a ticket's for: its root key is the user,
+/// with this node's certificate, and what's here is the user's.
+#[cfg(feature = "net")]
+fn join_user(dir: &Path, user: &Link, certificate: &[Vec<u8>]) -> anyhow::Result<()> {
+    let mut repo = Catalog::open_repo(dir)?;
+    let me = repo.signer().context("no key to sign with")?.id();
+    repo.batch(|repo| {
+        for data in certificate {
+            let claim = claim::Claim::parse(data).context("not a certificate")?;
+            repo.put_block(&claim.block(), holokeep::cid::CidVersion::V1)?;
+        }
+        repo.set_user(user)?;
+        anyhow::ensure!(repo.claims().is_some_and(|claims| claims.authorized(&me).unwrap_or(false)), "the ticket doesn't certify this node");
+        repo.adopt()?;
+        Ok(())
+    })?;
+    // This repo's own root key, which made it a user of its own until now,
+    // is no one's
+    let own = dir.join(holokeep::keys::USER_KEY);
+    if own.exists() {
+        std::fs::rename(&own, own.with_extension("key.before-join"))?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "net")]
 fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
     use holokeep::net::{daemon, mesh};
@@ -468,8 +515,18 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
             // Where this node listens, if it's running
             let listening = daemon::ask(dir, "listeners")?.unwrap_or_default();
             list.insert(me, listening.iter().filter_map(|addr| addr.parse().ok()).collect());
+            // The joiner's certificate, which only the user's root key signs
+            let root = holokeep::keys::Key::load(&dir.join(holokeep::keys::USER_KEY))?
+                .context("only the machine with the user's root key can certify a device: invite from that one")?;
+            let device = holokeep::keys::from_peer_id(&peer.to_string()).context("not an ed25519 peer")?;
+            let mut repo = Catalog::open_repo(dir)?;
+            let user = repo.user()?.context("this repo has no user")?;
+            let certified: [Link; 2] = repo.batch(|repo| repo.certify(&root, &device))?.into();
+            let certificate = certified.iter()
+                .map(|cid| Ok(repo.get_block(cid)?.context("the certificate went missing")?.into_data().into_vec()))
+                .collect::<anyhow::Result<_>>()?;
             daemon::ask(dir, "reload")?;
-            out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list }.encode());
+            out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: Some((user, certificate)) }.encode());
             if listening.is_empty() {
                 eprintln!("note: this node isn't running, so the ticket says nowhere to find it; it'll be found on the LAN, or start `hk node run` and invite again");
             }
@@ -480,6 +537,9 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
             anyhow::ensure!(ticket.members.remove(&me).is_some(), "the ticket isn't for this node, {me}");
             mesh::set_swarm_key(dir, ticket.swarm_key)?;
             daemon::members(dir)?.merge(&ticket.members)?;
+            if let Some((user, certificate)) = &ticket.user {
+                join_user(dir, user, certificate)?;
+            }
             daemon::ask(dir, "reload")?;
             eprintln!("joined the mesh of {}; `hk node run` to connect", ticket.inviter);
         },
@@ -575,6 +635,34 @@ fn volume(mut repo: Catalog, command: VolumeCommand) -> anyhow::Result<()> {
             if !report.unreadable.is_empty() {
                 eprintln!("{} blocks couldn't be read to be copied", report.unreadable.len());
             }
+        },
+    }
+    Ok(())
+}
+
+fn device(dir: &Path, command: DeviceCommand) -> anyhow::Result<()> {
+    use holokeep::keys::{self, Key};
+    let repo = Catalog::open_repo(dir)?;
+    let root = Key::load(&dir.join(keys::USER_KEY))?;
+    match command {
+        DeviceCommand::List => {
+            let user = repo.user()?.context("this repo has no user")?;
+            let here = if root.is_some() { "\troot key here" } else { "" };
+            out!("user\t{}{here}", keys::peer_id(&user));
+            let me = repo.signer().map(Key::id);
+            for (device, ok) in repo.devices()? {
+                let this = if me.as_ref() == Some(&device) { "\tthis node" } else { "" };
+                out!("{}\t{}{this}", keys::peer_id(&device), if ok { "certified" } else { "revoked" });
+            }
+        },
+        DeviceCommand::Revoke { peer, until } => {
+            let root = root.context("only the machine with the user's root key can revoke a device")?;
+            let device = keys::from_peer_id(&peer).context("not an ed25519 peer ID")?;
+            anyhow::ensure!(repo.signer().is_some_and(|key| key.id() != device), "a node can't revoke itself");
+            let until = until.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs()));
+            let mut repo = repo;
+            let resigned = repo.batch(|repo| repo.revoke(&root, &device, until))?;
+            out!("revoked {peer}; signed {resigned} of its claims again");
         },
     }
     Ok(())

@@ -84,26 +84,50 @@ pub fn notices(catalog: &Catalog, structure: &[Link]) -> Result<Vec<Notice>> {
     Ok(notices)
 }
 
-/// The structure here linking to any of these blocks.
+/// The structure here linking to any of these blocks, with the claims
+/// about any claims among it, however deep.
+///
+/// A claim goes with its signatures and its tombs, and theirs, since
+/// without them it's not what it says.
 pub fn backrefs<'a>(catalog: &Catalog, keys: impl IntoIterator<Item = &'a [u8]>) -> Result<Vec<Link>> {
     let mut seen = std::collections::BTreeSet::new();
     let mut structure = Vec::new();
-    for key in keys {
-        let Ok(key) = Multihash::<Vec<u8>>::decode(key) else {
-            continue;
-        };
-        for source in catalog.backrefs(key.as_ref())? {
-            if !seen.insert(source.to_bytes()) {
-                continue;
-            }
-            if let Some(cid) = catalog.cid_of(source.as_ref())?
-                && catalog.holds(&cid)?
-            {
-                structure.push(cid);
+    let mut pending: Vec<Multihash<Vec<u8>>> = keys.into_iter().filter_map(|key| Multihash::decode(key).ok()).collect();
+    let mut first = true;
+    while !pending.is_empty() {
+        let mut claims = Vec::new();
+        for key in pending {
+            for source in catalog.backrefs(key.as_ref())? {
+                if !seen.insert(source.to_bytes()) {
+                    continue;
+                }
+                if let Some(cid) = catalog.cid_of(source.as_ref())?
+                    && catalog.holds(&cid)?
+                {
+                    if is_claim(catalog, &cid)? {
+                        claims.push(Multihash::<Vec<u8>>::decode(&cid.multihash().to_bytes()).map_err(|e| super::mesh::Error::Invalid(format!("{e:?}")))?);
+                    } else if !first {
+                        continue;
+                    }
+                    structure.push(cid);
+                }
             }
         }
+        pending = claims;
+        first = false;
     }
     Ok(structure)
+}
+
+/// Whether a block here is a claim.
+fn is_claim(catalog: &Catalog, cid: &Link) -> Result<bool> {
+    if crate::claim::dissolved(cid).is_some() {
+        return Ok(true);
+    }
+    Ok(match catalog.claims() {
+        Some(claims) => claims.has(cid.multihash())?,
+        None => false,
+    })
 }
 
 /// Want what's noticed which isn't here and links to something that is.

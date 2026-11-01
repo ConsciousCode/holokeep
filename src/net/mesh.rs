@@ -30,7 +30,7 @@ use libp2p::pnet::PreSharedKey;
 use libp2p::{Multiaddr, PeerId};
 use rusqlite::params;
 
-use crate::model::Ipld;
+use crate::model::{Ipld, Link};
 use crate::store::Db;
 
 /// The file holding a node's own key.
@@ -201,6 +201,9 @@ pub struct Ticket {
     /// Every member the inviter knows of, itself included, and where each
     /// listens.
     pub members: BTreeMap<PeerId, Vec<Multiaddr>>,
+    /// The user's root key, and the blocks certifying the joiner as one
+    /// of its devices: a device claim and the root's signature of it.
+    pub user: Option<(Link, Vec<Vec<u8>>)>,
 }
 
 impl Ticket {
@@ -212,11 +215,16 @@ impl Ticket {
                 Ipld::List(addrs.iter().map(|addr| Ipld::Bytes(addr.to_vec())).collect()),
             ])
         });
-        let ticket = Ipld::Map(BTreeMap::from([
+        let mut ticket = BTreeMap::from([
             ("inviter".to_owned(), Ipld::Bytes(self.inviter.to_bytes())),
             ("key".to_owned(), Ipld::String(self.swarm_key.to_string())),
             ("members".to_owned(), Ipld::List(members.collect())),
-        ]));
+        ]);
+        if let Some((user, certificate)) = &self.user {
+            ticket.insert("user".to_owned(), Ipld::Link(user.clone()));
+            ticket.insert("certificate".to_owned(), Ipld::List(certificate.iter().cloned().map(Ipld::Bytes).collect()));
+        }
+        let ticket = Ipld::Map(ticket);
         multibase::encode(multibase::Base::Base32Lower, crate::dagcbor::to_vec(&ticket).unwrap_or_default())
     }
 
@@ -254,6 +262,17 @@ impl Ticket {
             });
             members.insert(id, addrs.collect::<Result<_>>()?);
         }
-        Ok(Self { swarm_key, inviter, members })
+        let user = match (map.remove("user"), map.remove("certificate")) {
+            (Some(Ipld::Link(user)), Some(Ipld::List(blocks))) => {
+                let blocks = blocks.into_iter().map(|block| match block {
+                    Ipld::Bytes(bytes) => Ok(bytes),
+                    _ => Err(invalid("certificate")),
+                });
+                Some((user, blocks.collect::<Result<_>>()?))
+            },
+            (None, None) => None,
+            _ => return Err(invalid("user")),
+        };
+        Ok(Self { swarm_key, inviter, members, user })
     }
 }

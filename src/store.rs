@@ -354,6 +354,8 @@ pub struct Catalog {
     shards: Option<Rc<ShardStore>>,
     /// The claim store, for its index of tags.
     claims: Option<Rc<ClaimStore>>,
+    /// This device's key, which signs the claims made here, if it has one.
+    signer: Option<crate::keys::Key>,
 }
 
 /// Where a block is: an attached volume, by index, and the form it's in.
@@ -468,6 +470,11 @@ fn path_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_bytes()
 }
 
+/// Seconds since the epoch.
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs())
+}
+
 fn path_from(bytes: &[u8]) -> PathBuf {
     PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
 }
@@ -485,7 +492,120 @@ impl Catalog {
         catalog.locate(0, &path)?;
         catalog.attach_known()?;
         catalog.catch_up()?;
+        catalog.sign_as(dir)?;
         Ok(catalog)
+    }
+
+    /// Sign claims made here with this node's key. A repo with no user yet
+    /// becomes its own: it makes a root key, which certifies this node, and
+    /// the claims already here are adopted as the user's.
+    fn sign_as(&mut self, dir: &Path) -> Result<()> {
+        let device = crate::keys::Key::load_or_make(&dir.join(crate::keys::NODE_KEY))?;
+        let Some(claims) = self.claims.clone() else {
+            return Ok(());
+        };
+        let fresh = claims.user()?.is_none();
+        if fresh {
+            let root = crate::keys::Key::load_or_make(&dir.join(crate::keys::USER_KEY))?;
+            self.batch(|catalog| {
+                claims.set_user(&root.id())?;
+                catalog.certify(&root, &device.id())
+            })?;
+        }
+        self.signer = Some(device);
+        if fresh {
+            self.batch(|catalog| catalog.adopt())?;
+        }
+        Ok(())
+    }
+
+    /// Sign claims with this key from now on.
+    pub fn set_signer(&mut self, key: crate::keys::Key) {
+        self.signer = Some(key);
+    }
+
+    /// The key claims made here are signed with, if any.
+    pub const fn signer(&self) -> Option<&crate::keys::Key> {
+        self.signer.as_ref()
+    }
+
+    /// The user's root key, if the repo has a user.
+    pub fn user(&self) -> Result<Option<Link>> {
+        self.claims.as_ref().map_or(Ok(None), |claims| claims.user())
+    }
+
+    /// Make `root` the user, in place of any other: joining a user's mesh.
+    pub fn set_user(&self, root: &Link) -> Result<()> {
+        self.claims.as_ref().ok_or(Error::NoClaims)?.set_user(root)
+    }
+
+    /// Put a claim, signed with this device's key if it has one. Returns
+    /// the claim's CID.
+    pub fn put_claim(&self, claim: &Claim) -> Result<Link> {
+        self.put_block(&claim.block(), CidVersion::V1)?;
+        let cid = claim.cid();
+        if let Some(key) = &self.signer {
+            self.sign_with(key, &cid)?;
+        }
+        Ok(cid)
+    }
+
+    /// Sign a claim with a key, unless it's signed it already.
+    fn sign_with(&self, key: &crate::keys::Key, claim: &Link) -> Result<()> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        if !claims.signed_by(claim, &key.id())? {
+            let sign = Claim::Sign(crate::claim::Sign::new(key, claim.clone(), now()));
+            self.put_block(&sign.block(), CidVersion::V1)?;
+        }
+        Ok(())
+    }
+
+    /// Sign every claim no authorized key has: what was here before this
+    /// device had a user, or joined one, is the user's. Returns how many.
+    pub fn adopt(&self) -> Result<usize> {
+        let (Some(claims), Some(key)) = (&self.claims, &self.signer) else {
+            return Ok(0);
+        };
+        let unsigned = claims.unsigned()?;
+        for claim in &unsigned {
+            self.sign_with(key, claim)?;
+        }
+        Ok(unsigned.len())
+    }
+
+    /// Certify a device's key with the user's root key: a device claim the
+    /// root signs. Returns the claim's CID, and the sign's.
+    pub fn certify(&self, root: &crate::keys::Key, device: &Link) -> Result<(Link, Link)> {
+        let claim = Claim::Device(crate::claim::Device::new([device.clone()]).ok_or(Error::NoClaims)?);
+        self.put_block(&claim.block(), CidVersion::V1)?;
+        let sign = Claim::Sign(crate::claim::Sign::new(root, claim.cid(), now()));
+        self.put_block(&sign.block(), CidVersion::V1)?;
+        Ok((claim.cid(), sign.cid()))
+    }
+
+    /// Revoke a device with the user's root key: a tomb of its certificate,
+    /// which the root signs. What it signed as of `until` and nothing else
+    /// authorized has is signed again, with this device's key, so it still
+    /// counts; what it signed after doesn't. Returns how many were signed
+    /// again.
+    pub fn revoke(&self, root: &crate::keys::Key, device: &Link, until: u64) -> Result<usize> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let key = self.signer.as_ref().filter(|key| key.id() != *device).ok_or(Error::NoClaims)?;
+        let orphans = claims.signed_only_by(device, until)?;
+        let certificate = Claim::Device(crate::claim::Device::new([device.clone()]).ok_or(Error::NoClaims)?);
+        let tomb = Claim::Tomb(Tomb::new([certificate.cid()]).ok_or(Error::NoClaims)?);
+        self.put_block(&tomb.block(), CidVersion::V1)?;
+        let sign = Claim::Sign(crate::claim::Sign::new(root, tomb.cid(), now()));
+        self.put_block(&sign.block(), CidVersion::V1)?;
+        for claim in &orphans {
+            self.sign_with(key, claim)?;
+        }
+        Ok(orphans.len())
+    }
+
+    /// Every device a certificate names, and whether it counts now.
+    pub fn devices(&self) -> Result<Vec<(Link, bool)>> {
+        self.claims.as_ref().map_or(Ok(Vec::new()), |claims| claims.devices())
     }
 
     /// The standard stores in one database, with no shards.
@@ -563,7 +683,7 @@ impl Catalog {
         if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
             return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
         }
-        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None };
+        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None };
         for volume in volumes {
             catalog.attach(volume)?;
         }
@@ -1581,8 +1701,7 @@ impl Catalog {
     /// Returns the claim's CID.
     pub fn tag(&self, target: &Link, tag: &Link) -> Result<Link> {
         let claim = Claim::Group(Group::new([target.clone()], tag.clone()).ok_or(Error::NoClaims)?);
-        self.put_block(&claim.block(), CidVersion::V1)?;
-        Ok(claim.cid())
+        self.put_claim(&claim)
     }
 
     /// Keep a block, and what it links to, with a claim of its own so it
@@ -1606,8 +1725,7 @@ impl Catalog {
             }
             n = n.saturating_add(1);
         };
-        self.put_block(&claim.block(), CidVersion::V1)?;
-        Ok(claim.cid())
+        self.put_claim(&claim)
     }
 
     /// Whether a keep that counts reaches a block, by its backrefs: the
@@ -1758,13 +1876,11 @@ impl Catalog {
 
     /// Say an anchor is `value` now, returning the set's CID.
     pub fn set_anchor(&self, anchor: &Link, value: &Link) -> Result<Link> {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
         // After the latest, so it's what the anchor is even within a second
         let latest = self.anchor_history(anchor)?.last().map_or(0, |&(at, _)| at.saturating_add(1));
-        let at = now.max(latest);
+        let at = now().max(latest);
         let claim = Claim::Set(crate::claim::Set::new([anchor.clone()], value.clone(), at).ok_or(Error::NoClaims)?);
-        self.put_block(&claim.block(), CidVersion::V1)?;
-        Ok(claim.cid())
+        self.put_claim(&claim)
     }
 
     /// What an anchor is now, if any set says.
@@ -1784,8 +1900,7 @@ impl Catalog {
         let mut tombs = Vec::new();
         for keep in claims.keeping(target.multihash())? {
             let tomb = Claim::Tomb(Tomb::new([keep]).ok_or(Error::NoClaims)?);
-            self.put_block(&tomb.block(), CidVersion::V1)?;
-            tombs.push(tomb.cid());
+            tombs.push(self.put_claim(&tomb)?);
         }
         Ok(tombs)
     }
@@ -1798,8 +1913,7 @@ impl Catalog {
         let mut tombs = Vec::new();
         for (claim, group) in claims.tagging(target.multihash(), tag.multihash())? {
             let tomb = Claim::Tomb(Tomb::new([claim]).ok_or(Error::NoClaims)?);
-            self.put_block(&tomb.block(), CidVersion::V1)?;
-            tombs.push(tomb.cid());
+            tombs.push(self.put_claim(&tomb)?);
             for other in group.target().iter().filter(|other| other.multihash() != target.multihash()) {
                 self.tag(other, tag)?;
             }
