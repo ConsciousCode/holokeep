@@ -60,6 +60,13 @@ pub struct Grant {
     refused: Vec<ByteBuf>,
 }
 
+impl Grant {
+    /// Say nothing of holding whichever blocks these are.
+    pub fn withhold(&mut self, mut withheld: impl FnMut(&[u8]) -> bool) {
+        self.held.retain(|(key, _)| !withheld(key));
+    }
+}
+
 /// Blocks a node has let go of.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Dropped {

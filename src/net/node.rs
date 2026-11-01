@@ -35,6 +35,7 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport, identify, kad,
 use serde::{Deserialize, Serialize};
 
 use super::blocks::{self, Blocks, Fetch, Want};
+use super::collect::{self, Condemn, Condemned, Verdict};
 use super::durability::{self, Advert, Audit, Haves, Kept, Push, Report, Sightings, Trickle};
 use crate::multihash::Multihash;
 use crate::store::BlockIndex;
@@ -88,6 +89,7 @@ pub struct Behaviour {
     notices: request_response::cbor::Behaviour<Notice, Wants>,
     trim: request_response::cbor::Behaviour<Intent, Grant>,
     dropped: request_response::cbor::Behaviour<Dropped, Ack>,
+    condemn: request_response::cbor::Behaviour<Condemn, Verdict>,
 }
 
 /// A fetch, as the node knows it.
@@ -163,6 +165,9 @@ pub struct Node {
     notices: HashMap<request_response::OutboundRequestId, (PeerId, Option<i64>)>,
     /// Members with a notice from their cursor unanswered.
     noticing: HashSet<PeerId>,
+    condemned: Condemned,
+    /// Condemnations asked of members and unanswered: whom, and of what.
+    condemning: HashMap<request_response::OutboundRequestId, (PeerId, Vec<Vec<u8>>)>,
     /// Events which happened outside `next`, for it to return first.
     ready: VecDeque<Event>,
 }
@@ -211,11 +216,16 @@ impl Node {
                 [(trim::DROPPED, ProtocolSupport::Full)],
                 request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
             ),
+            condemn: request_response::cbor::Behaviour::new(
+                [(collect::PROTOCOL, ProtocolSupport::Full)],
+                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
+            ),
         };
         let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(IDLE);
         let swarm = Swarm::new(transport, behaviour, peer, config);
         let sightings = Sightings::open(catalog.db().clone())?;
         let cursors = Cursors::open(catalog.db().clone())?;
+        let condemned = Condemned::open(catalog.db().clone())?;
         let mut node = Self {
             swarm,
             members,
@@ -234,6 +244,8 @@ impl Node {
             cursors,
             notices: HashMap::new(),
             noticing: HashSet::new(),
+            condemned,
+            condemning: HashMap::new(),
             ready: VecDeque::new(),
         };
         node.reload()?;
@@ -452,7 +464,9 @@ impl Node {
             request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
                 let me = self.peer_id();
                 let mut trims: Vec<&mut Trim> = self.trims.values_mut().collect();
-                let grant = trim::answer(&self.catalog, &me, &peer, &request, &mut trims)?;
+                let mut grant = trim::answer(&self.catalog, &me, &peer, &request, &mut trims)?;
+                // Copies about to be collected aren't worth trimming others for
+                grant.withhold(|key| <Multihash>::decode(key).is_ok_and(|key| self.condemned.is_condemned(key.as_ref()).unwrap_or(true)));
                 // The asker may be gone already
                 let _ = self.swarm.behaviour_mut().trim.send_response(channel, grant);
             },
@@ -490,6 +504,98 @@ impl Node {
         Ok(())
     }
 
+    pub const fn condemned(&self) -> &Condemned {
+        &self.condemned
+    }
+
+    /// Wait this long before letting go of what's condemned instead.
+    pub fn set_grace(&mut self, grace: Duration) -> Result<()> {
+        self.condemned = Condemned::open(self.catalog.db().clone())?.with_grace(grace);
+        Ok(())
+    }
+
+    /// Whether members are still to say whether they keep what was asked.
+    pub fn condemning(&self) -> bool {
+        !self.condemning.is_empty()
+    }
+
+    /// One round of collecting garbage, of a sample of what's here or of
+    /// everything: condemn what nothing here keeps, ask connected members
+    /// whether they keep what's condemned, and let go of what's due. See
+    /// `collect`.
+    pub fn collect(&mut self, all: bool) -> Result<collect::Report> {
+        let keys = if all { self.catalog.keys()? } else { self.catalog.sample(durability::FRESH)? };
+        let (condemned, pardoned) = collect::judge(&self.catalog, &self.condemned, &keys)?;
+        let mut report = collect::Report { condemned, pardoned, ..collect::Report::default() };
+        let asking: HashSet<PeerId> = self.condemning.values().map(|&(peer, _)| peer).collect();
+        for peer in self.connected() {
+            if asking.contains(&peer) {
+                continue;
+            }
+            let keys = self.condemned.unasked(&peer, collect::BATCH)?;
+            if !keys.is_empty() {
+                let request = self.swarm.behaviour_mut().condemn.send_request(&peer, collect::ask(&keys));
+                self.condemning.insert(request, (peer, keys.iter().map(Multihash::to_bytes).collect()));
+            }
+        }
+        let me = self.peer_id();
+        let members: Vec<PeerId> = self.members.list()?.into_keys().filter(|&peer| peer != me).collect();
+        let due = self.condemned.due(&members)?;
+        // Kept since, by something that's arrived, or no longer here
+        let (due, kept) = {
+            let mut still = Vec::new();
+            let mut kept = 0usize;
+            for key in due {
+                if self.catalog.can_drop(key.as_ref())? && !self.catalog.kept_under(key.as_ref())? {
+                    still.push(key);
+                } else {
+                    kept = kept.saturating_add(usize::from(self.condemned.pardon(key.as_ref())?));
+                }
+            }
+            (still, kept)
+        };
+        report.pardoned = report.pardoned.saturating_add(kept);
+        let dropping = self.catalog.drop_all(&due)?;
+        for key in &due {
+            self.condemned.pardon(key.as_ref())?;
+        }
+        for key in &dropping.dropped {
+            if !self.catalog.has(key.as_ref())? {
+                self.sightings.forget(key.as_ref())?;
+            }
+        }
+        report.collected = dropping.dropped.len();
+        report.freed = dropping.freed;
+        if !dropping.dropped.is_empty() {
+            let dropped = trim::dropped(&dropping.dropped);
+            for peer in self.connected() {
+                self.swarm.behaviour_mut().dropped.send_request(&peer, dropped.clone());
+            }
+        }
+        Ok(report)
+    }
+
+    fn on_condemn(&mut self, event: request_response::Event<Condemn, Verdict>) -> Result<()> {
+        match event {
+            request_response::Event::Message { message: request_response::Message::Request { request, channel, .. }, .. } => {
+                let verdict = collect::answer(&self.catalog, &request)?;
+                // The asker may be gone already
+                let _ = self.swarm.behaviour_mut().condemn.send_response(channel, verdict);
+            },
+            request_response::Event::Message { message: request_response::Message::Response { request_id, response }, .. } => {
+                if let Some((peer, asked)) = self.condemning.remove(&request_id) {
+                    collect::heard(&self.condemned, &peer, &asked, &response)?;
+                }
+            },
+            request_response::Event::OutboundFailure { request_id, .. } => {
+                // Asked again next round
+                self.condemning.remove(&request_id);
+            },
+            _ => {},
+        }
+        Ok(())
+    }
+
     /// How long until the trickle's next tick.
     pub fn trickle_delay(&self) -> Duration {
         self.trickle.delay()
@@ -500,7 +606,9 @@ impl Node {
         self.trickle.interval()
     }
 
-    fn audit_of_keys(&mut self, copies: usize, keys: Vec<Multihash>) -> Result<AuditId> {
+    fn audit_of_keys(&mut self, copies: usize, mut keys: Vec<Multihash>) -> Result<AuditId> {
+        // What's to be collected isn't worth more copies
+        keys.retain(|key| !self.condemned.is_condemned(key.as_ref()).unwrap_or(false));
         let id = self.next_audit;
         self.next_audit = id.wrapping_add(1);
         let mut peers = self.connected();
@@ -843,6 +951,10 @@ impl Node {
             },
             SwarmEvent::Behaviour(BehaviourEvent::Dropped(event)) => {
                 self.on_dropped(event)?;
+                None
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Condemn(event)) => {
+                self.on_condemn(event)?;
                 None
             },
             _ => None,

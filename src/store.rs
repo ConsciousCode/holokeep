@@ -1448,6 +1448,28 @@ impl Catalog {
         Ok(claim.cid())
     }
 
+    /// Whether a keep that counts reaches a block, by its backrefs: the
+    /// block, or anything linking to it however indirectly, is a keep's
+    /// target. Without claims to keep, everything is kept.
+    pub fn kept_under(&self, key: Key<'_>) -> Result<bool> {
+        if self.claims.is_none() {
+            return Ok(true);
+        }
+        Ok(self.db.conn()
+            .prepare_cached(&format!(
+                "WITH RECURSIVE up (id) AS (
+                     SELECT id FROM multihashes WHERE multihash = ?1
+                     UNION SELECT l.source FROM links l JOIN up ON l.target = up.id
+                 )
+                 SELECT 1 FROM up
+                 JOIN claim_targets t ON t.target = up.id
+                 JOIN claims c ON c.id = t.claim
+                 WHERE c.kind = 'keep' AND {} LIMIT 1",
+                claims::LIVE,
+            ))?
+            .exists([key.to_bytes()])?)
+    }
+
     /// What isn't here of the DAG under a root: each block linked to,
     /// the root included, which isn't held or can't be read. What's
     /// missing isn't walked into, so it's only the edge of what's here;

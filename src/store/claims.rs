@@ -30,7 +30,7 @@ const NAME: &str = "claims";
 
 /// Whether a group counts: dissolved claims are deleted when they're
 /// tombstoned, precipitated ones have to be checked.
-const LIVE: &str = "(c.claim IS NULL OR NOT EXISTS (
+pub(super) const LIVE: &str = "(c.claim IS NULL OR NOT EXISTS (
     SELECT 1 FROM claim_targets x JOIN claims k ON k.id = x.claim WHERE x.target = c.claim AND k.kind = 'tomb'
 ))";
 

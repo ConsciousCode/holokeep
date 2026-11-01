@@ -129,10 +129,19 @@ enum NodeCommand {
         /// ...until it's back above this; nor take others' copies past it
         #[arg(long, default_value = "4G", value_parser = holokeep::net::daemon::parse_size)]
         high_water: u64,
+        /// Collect garbage: let go of leaves nothing keeps, a week after
+        /// they're condemned and once every member's said it doesn't keep
+        /// them. Off unless asked, since what was added before keeps
+        /// existed isn't kept (`hk keep add` it first)
+        #[arg(long)]
+        collect: bool,
     },
     /// Let go now of every copy here the mesh can spare, short of space or
     /// not
     Trim,
+    /// Have the running node condemn everything here nothing keeps now,
+    /// ask members whether they keep it, and let go of what's due
+    Collect,
     /// List the mesh's members, and which are connected
     Peers,
     /// How the running node is: connected members, blocks, and the
@@ -414,10 +423,17 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
             daemon::ask(dir, "reload")?;
             eprintln!("joined the mesh of {}; `hk node run` to connect", ticket.inviter);
         },
-        NodeCommand::Run { listen, copies, low_water, high_water } => {
+        NodeCommand::Run { listen, copies, low_water, high_water, collect } => {
             let listen = listen.parse().context("not a multiaddr")?;
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            runtime.block_on(daemon::run(dir, listen, copies, (low_water, high_water)))?;
+            runtime.block_on(daemon::run(dir, listen, copies, (low_water, high_water), collect))?;
+        },
+        NodeCommand::Collect => {
+            let report = daemon::collect(dir)?.context("this node isn't running: start `hk node run`")?;
+            println!(
+                "condemned {}, pardoned {}, let go of {}, freeing {} bytes",
+                report.condemned, report.pardoned, report.collected, report.freed,
+            );
         },
         NodeCommand::Trim => {
             let report = daemon::trim(dir)?.context("this node isn't running: start `hk node run`")?;

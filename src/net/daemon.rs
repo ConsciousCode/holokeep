@@ -46,6 +46,10 @@ const SETTLE: Duration = Duration::from_secs(5);
 /// How often to look at free space, to trim between the watermarks.
 const PRESSURE: Duration = Duration::from_secs(30);
 
+/// How often to collect garbage from a sample of what's here, when
+/// collecting.
+const COLLECT: Duration = Duration::from_mins(1);
+
 /// Someone on the control socket waiting for something to finish.
 #[derive(Debug, Clone, Copy)]
 enum Waiter {
@@ -179,6 +183,30 @@ pub fn trim(dir: &Path) -> Result<Option<super::trim::Report>> {
     Err(Error::Invalid("the node hung up without saying what it trimmed".into()))
 }
 
+/// Have the running daemon collect garbage from everything here now: what
+/// it did, or None if it isn't running.
+///
+/// What it condemns is let go of only once its grace is up and every
+/// member's said it doesn't keep it.
+pub fn collect(dir: &Path) -> Result<Option<super::collect::Report>> {
+    let Some(lines) = ask_patiently(dir, "collect")? else {
+        return Ok(None);
+    };
+    for line in lines {
+        let mut words = line.split_whitespace();
+        if words.next() == Some("collected") {
+            let mut number = || words.next().and_then(|n| n.parse::<u64>().ok()).unwrap_or_default();
+            let (condemned, pardoned, collected, freed) = (number(), number(), number(), number());
+            let count = |n: u64| usize::try_from(n).unwrap_or_default();
+            return Ok(Some(super::collect::Report { condemned: count(condemned), pardoned: count(pardoned), collected: count(collected), freed }));
+        }
+        if line.starts_with("unknown command") {
+            return Err(Error::Invalid("the running node is older than this hk: restart `hk node run`".into()));
+        }
+    }
+    Err(Error::Invalid("the node hung up without saying what it collected".into()))
+}
+
 fn ask_within(dir: &Path, command: &str, time: Option<Duration>) -> Result<Option<Vec<String>>> {
     let Ok(mut stream) = UnixStream::connect(socket(dir)) else {
         return Ok(None);
@@ -194,8 +222,8 @@ fn ask_within(dir: &Path, command: &str, time: Option<Duration>) -> Result<Optio
 ///
 /// Free space is kept between watermarks, `(low, high)`: below the low,
 /// the node lets go of copies the mesh can spare until it's above the
-/// high.
-pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64, u64)) -> Result<()> {
+/// high. If `collecting`, garbage is collected too, a sample at a time.
+pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64, u64), collecting: bool) -> Result<()> {
     let key = mesh::node_key(dir)?;
     let swarm_key = mesh::swarm_key(dir)?.ok_or_else(|| Error::Invalid("this node isn't in a mesh: invite another, or join one".into()))?;
     let catalog = crate::store::Catalog::open_repo(dir)?;
@@ -218,6 +246,7 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
     let mut trickle = later(SETTLE);
     let mut announce = tokio::time::interval(ANNOUNCE);
     let mut pressure = later(SETTLE);
+    let mut collect = later(SETTLE);
     let mut waiting = Waiting::default();
     let result = loop {
         tokio::select! {
@@ -237,7 +266,7 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
                 let Ok((stream, _)) = accepted else {
                     continue;
                 };
-                match answer(&mut node, stream, copies).await {
+                match answer(&mut node, stream, copies, collecting).await {
                     Ok(Some((waiter, write))) => waiting.wait(waiter, write),
                     Ok(None) => {},
                     Err(e) => eprintln!("control: {e}"),
@@ -263,6 +292,13 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
                     node.trim_some(copies, false)?;
                 }
                 pressure = later(PRESSURE);
+            },
+            () = tokio::time::sleep_until(collect), if collecting => {
+                let report = node.collect(false)?;
+                if report.collected > 0 {
+                    eprintln!("collected: {} let go of, {} bytes freed", report.collected, report.freed);
+                }
+                collect = later(COLLECT);
             },
             _ = tokio::signal::ctrl_c() => break Ok(()),
         }
@@ -344,7 +380,7 @@ fn report(event: &Event) {
 
 /// Answer one command on the control socket, or say which fetch it waits
 /// on, to be answered when that finishes.
-async fn answer(node: &mut Node, stream: tokio::net::UnixStream, copies: usize) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
+async fn answer(node: &mut Node, stream: tokio::net::UnixStream, copies: usize, collecting: bool) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
     tokio::time::timeout(Duration::from_secs(1), tokio::io::BufReader::new(read).read_line(&mut line))
@@ -371,6 +407,8 @@ async fn answer(node: &mut Node, stream: tokio::net::UnixStream, copies: usize) 
             let marks = node.watermarks();
             let _ = writeln!(out, "watermarks\t{} MiB to {} MiB", marks.low >> 20, marks.high >> 20);
             let _ = writeln!(out, "pressed\t{}", if marks.pressed() { "yes" } else { "no" });
+            let _ = writeln!(out, "collecting\t{}", if collecting { "yes" } else { "no" });
+            let _ = writeln!(out, "condemned\t{}", node.condemned().count()?);
         },
         "listeners" => {
             for addr in node.listeners() {
@@ -392,6 +430,10 @@ async fn answer(node: &mut Node, stream: tokio::net::UnixStream, copies: usize) 
         },
         "audit" => return Ok(Some((Waiter::Audit(node.audit(copies)?), write))),
         "trim" => return Ok(Some((Waiter::Trim(node.trim_some(copies, true)?), write))),
+        "collect" => {
+            let report = node.collect(true)?;
+            let _ = writeln!(out, "collected {} {} {} {}", report.condemned, report.pardoned, report.collected, report.freed);
+        },
         command if command.starts_with("audit ") => match command.trim_start_matches("audit ").trim().parse() {
             Ok(copies) => return Ok(Some((Waiter::Audit(node.audit(copies)?), write))),
             Err(_) => {
