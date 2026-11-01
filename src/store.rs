@@ -43,7 +43,7 @@ mod volume;
 
 pub use claims::ClaimStore;
 pub use ipld::IpldStore;
-pub use offset::OffsetStore;
+pub use offset::{ExternalFile, OffsetStore};
 use offset::{Fingerprint, Location, Whole};
 pub use raw::RawStore;
 pub use shards::ShardStore;
@@ -1252,6 +1252,42 @@ impl Catalog {
                 }
             }
             Ok(Dropping { dropped: going.values().map(|&(key, _)| key.clone()).collect(), freed })
+        })
+    }
+
+    /// Files imported in place, a random sample of them or all.
+    pub fn external_files(&self, sample: Option<usize>) -> Result<Vec<ExternalFile>> {
+        self.offsets.as_ref().map_or_else(|| Ok(Vec::new()), |offsets| offsets.external_files(sample))
+    }
+
+    /// The files imported in place from a path, one for each version
+    /// recorded.
+    pub fn external_at(&self, path: &Path) -> Result<Vec<ExternalFile>> {
+        self.offsets.as_ref().map_or_else(|| Ok(Vec::new()), |offsets| offsets.external_at(path))
+    }
+
+    /// Forget whichever of these files imported in place have gone or
+    /// changed since, returning the blocks that leaves no longer here.
+    pub fn forget_changed(&self, files: &[ExternalFile]) -> Result<Vec<Multihash>> {
+        let Some(offsets) = &self.offsets else {
+            return Ok(Vec::new());
+        };
+        self.db.atomically(|| {
+            let mut lost = Vec::new();
+            for file in files.iter().filter(|file| file.changed()) {
+                for key in offsets.forget_external(file)? {
+                    let Some(id) = self.db.lookup(key.as_ref())? else {
+                        continue;
+                    };
+                    for (volume, _) in self.placements(key.as_ref())?.into_iter().filter(|(_, form)| form == "offset") {
+                        self.unrecord(id, volume)?;
+                    }
+                    if !self.has(key.as_ref())? {
+                        lost.push(key);
+                    }
+                }
+            }
+            Ok(lost)
         })
     }
 

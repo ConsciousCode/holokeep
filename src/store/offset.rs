@@ -166,6 +166,7 @@ pub(super) fn schema(db: &Db) -> Result<()> {
              inode INTEGER NOT NULL,
              PRIMARY KEY (blob, path)
          ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS external_files_path ON external_files (path);
          -- Sharded directories, by their labels as volumes.
          CREATE TABLE IF NOT EXISTS shard_dirs (
              id INTEGER PRIMARY KEY,
@@ -302,6 +303,88 @@ impl OffsetStore {
             ))
         })
         .collect()
+    }
+}
+
+/// A file imported in place, as recorded when it was.
+#[derive(Debug, Clone)]
+pub struct ExternalFile {
+    pub blob: Multihash,
+    pub path: PathBuf,
+    fingerprint: Fingerprint,
+}
+
+impl ExternalFile {
+    /// Whether the file's gone or changed since, by its fingerprint.
+    pub fn changed(&self) -> bool {
+        Fingerprint::read(&self.path) != Some(self.fingerprint)
+    }
+}
+
+/// Noticing files imported in place which have gone or changed: the user's
+/// to change, so what was imported from them may stop being here.
+impl OffsetStore {
+    /// Files imported in place, a random sample of them or all.
+    pub fn external_files(&self, sample: Option<usize>) -> Result<Vec<ExternalFile>> {
+        let limit = sample.map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX));
+        let order = if sample.is_some() { "ORDER BY random()" } else { "" };
+        self.query_external(&format!("{order} LIMIT {limit}"), params![])
+    }
+
+    /// The files imported in place from a path, one for each version
+    /// recorded.
+    pub fn external_at(&self, path: &Path) -> Result<Vec<ExternalFile>> {
+        self.query_external("AND e.path = ?1", params![path_bytes(path)])
+    }
+
+    fn query_external(&self, tail: &str, args: impl rusqlite::Params) -> Result<Vec<ExternalFile>> {
+        let sql = format!(
+            "SELECT m.multihash, e.path, e.size, e.mtime, e.inode FROM external_files e
+             JOIN multihashes m ON m.id = e.blob WHERE 1 {tail}"
+        );
+        let mut stmt = self.db.conn().prepare(&sql)?;
+        let rows = stmt.query_map(args, |row| Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            Fingerprint { size: row.get(2)?, mtime: row.get(3)?, inode: row.get(4)? },
+        )))?;
+        rows.map(|row| {
+            let (blob, path, fingerprint) = row?;
+            Ok(ExternalFile { blob: super::decode_key(NAME, &blob)?, path: PathBuf::from(std::ffi::OsStr::from_bytes(&path)), fingerprint })
+        })
+        .collect()
+    }
+
+    /// Forget a file imported in place, as it's gone or changed. Its
+    /// ranges go too unless its blob's somewhere else still; returns the
+    /// blocks no longer ranges of anything.
+    pub fn forget_external(&self, file: &ExternalFile) -> Result<Vec<Multihash>> {
+        let Some(blob) = self.db.lookup(file.blob.as_ref())? else {
+            return Ok(Vec::new());
+        };
+        let conn = self.db.conn();
+        conn.prepare_cached("DELETE FROM external_files WHERE blob = ?1 AND path = ?2")?.execute(params![blob, path_bytes(&file.path)])?;
+        let elsewhere = conn.prepare_cached("SELECT 1 FROM external_files WHERE blob = ?1")?.exists([blob])?
+            || self.shards.as_ref().is_some_and(|shards| {
+                conn.prepare_cached("SELECT 1 FROM shard_files WHERE blob = ?1 AND dir = ?2")
+                    .and_then(|mut stmt| stmt.exists(params![blob, shards.id()]))
+                    .unwrap_or(true)
+            });
+        if elsewhere {
+            return Ok(Vec::new());
+        }
+        let blocks: Vec<Vec<u8>> = conn
+            .prepare_cached("DELETE FROM offset_ranges WHERE blob = ?1 RETURNING (SELECT multihash FROM multihashes WHERE id = block)")?
+            .query_map([blob], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut lost = Vec::new();
+        for block in blocks {
+            let block = super::decode_key(NAME, &block)?;
+            if !self.ranged(block.as_ref())? {
+                lost.push(block);
+            }
+        }
+        Ok(lost)
     }
 }
 

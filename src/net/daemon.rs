@@ -11,7 +11,7 @@
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -24,7 +24,7 @@ use tokio::net::unix::OwnedWriteHalf;
 use super::mesh::{self, Error, Members, Result};
 use super::durability::Report;
 use super::node::{AuditId, Event, FetchId, Node, TrimId};
-use crate::store::Db;
+use crate::store::{Db, ExternalFile};
 
 /// The daemon's socket, in the repo.
 const SOCKET: &str = "node.sock";
@@ -49,6 +49,48 @@ const PRESSURE: Duration = Duration::from_secs(30);
 /// How often to collect garbage from a sample of what's here, when
 /// collecting.
 const COLLECT: Duration = Duration::from_mins(1);
+
+/// Watches the directories of files imported in place, sending the path of
+/// whatever changes in them; a file is watched through its directory since
+/// editors often replace rather than write. What a watch misses, the
+/// trickle's sample notices in time.
+struct Watch {
+    watcher: Option<notify::RecommendedWatcher>,
+    dirs: HashSet<PathBuf>,
+}
+
+impl Watch {
+    fn new(changes: tokio::sync::mpsc::UnboundedSender<PathBuf>) -> Self {
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            // Reads, ours included, change nothing
+            if let Ok(event) = event
+                && !matches!(event.kind, notify::EventKind::Access(_))
+            {
+                for path in event.paths {
+                    let _ = changes.send(path);
+                }
+            }
+        });
+        let watcher = watcher.map_err(|e| eprintln!("not watching files imported in place: {e}")).ok();
+        Self { watcher, dirs: HashSet::new() }
+    }
+
+    /// Watch the directories of these files too.
+    fn add(&mut self, files: &[ExternalFile]) {
+        let Some(watcher) = &mut self.watcher else {
+            return;
+        };
+        for dir in files.iter().filter_map(|file| file.path.parent()) {
+            if self.dirs.insert(dir.to_owned()) {
+                use notify::Watcher as _;
+                // Tried once; the trickle covers it otherwise
+                if let Err(e) = watcher.watch(dir, notify::RecursiveMode::NonRecursive) {
+                    eprintln!("not watching {}: {e}", dir.display());
+                }
+            }
+        }
+    }
+}
 
 /// Someone on the control socket waiting for something to finish.
 #[derive(Debug, Clone, Copy)]
@@ -248,6 +290,17 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
     let mut pressure = later(SETTLE);
     let mut collect = later(SETTLE);
     let mut waiting = Waiting::default();
+    // Files imported in place: watched from now, and looked at once in the
+    // background for what changed while the node wasn't running
+    let (notify, mut changes) = tokio::sync::mpsc::unbounded_channel();
+    let mut watch = Watch::new(notify.clone());
+    let files = node.catalog().external_files(None)?;
+    watch.add(&files);
+    tokio::task::spawn_blocking(move || {
+        for file in files.into_iter().filter(ExternalFile::changed) {
+            let _ = notify.send(file.path);
+        }
+    });
     let result = loop {
         tokio::select! {
             event = node.next() => match event {
@@ -277,8 +330,12 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
                 node.announce()?;
                 // What's been added since is copied without waiting out a
                 // calm interval
-                if node.arrived()? && !node.connected().is_empty() {
-                    trickle = tokio::time::Instant::now();
+                if node.arrived()? {
+                    // Perhaps files imported in place, to watch
+                    watch.add(&node.catalog().external_files(None)?);
+                    if !node.connected().is_empty() {
+                        trickle = tokio::time::Instant::now();
+                    }
                 }
             },
             () = tokio::time::sleep_until(trickle) => {
@@ -299,6 +356,13 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
                     eprintln!("collected: {} let go of, {} bytes freed", report.collected, report.freed);
                 }
                 collect = later(COLLECT);
+            },
+            Some(path) = changes.recv() => {
+                let files = node.catalog().external_at(&path)?;
+                let lost = node.forget_changed(&files)?;
+                if lost > 0 {
+                    eprintln!("{} changed: {lost} blocks imported from it are no longer here", path.display());
+                }
             },
             _ = tokio::signal::ctrl_c() => break Ok(()),
         }

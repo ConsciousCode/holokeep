@@ -817,6 +817,41 @@ fn content(len: usize, seed: u8) -> Vec<u8> {
 }
 
 #[test]
+fn files_imported_in_place_which_change_are_forgotten() {
+    let scratch = Scratch::new("offset-changed");
+    let (file, other) = (scratch.path().join("file"), scratch.path().join("other"));
+    std::fs::write(&file, content(1000, 0)).expect("write");
+    std::fs::write(&other, content(1000, 7)).expect("write");
+    let mut router = router();
+    import_in_place(&mut router, &file);
+    import_in_place(&mut router, &other);
+    // Nothing's changed yet
+    assert!(router.forget_changed(&router.external_files(None).expect("files")).expect("forget").is_empty());
+    assert_eq!(router.external_files(Some(1)).expect("sample").len(), 1);
+
+    std::fs::write(&file, content(1000, 1)).expect("change");
+    let lost = router.forget_changed(&router.external_at(&file.canonicalize().expect("path")).expect("files")).expect("forget");
+    assert_eq!(lost.len(), 16);
+    assert!(lost.iter().all(|leaf| !router.has(leaf.as_ref()).expect("has")));
+    assert_eq!(router.external_files(None).expect("files").len(), 1, "the other's unchanged");
+    assert_eq!(count(&router.db, "offset_ranges"), 16);
+}
+
+#[test]
+fn whats_kept_too_isnt_lost_with_the_original() {
+    let scratch = Scratch::new("shards-changed");
+    let file = scratch.path().join("file");
+    std::fs::write(&file, content(1000, 0)).expect("write");
+    let mut router = sharded(&scratch);
+    import_copying(&mut router, &file);
+    import_in_place(&mut router, &file);
+    std::fs::remove_file(&file).expect("remove");
+    assert!(router.forget_changed(&router.external_files(None).expect("files")).expect("forget").is_empty());
+    assert!(router.external_files(None).expect("files").is_empty());
+    assert_eq!(forms(&router), [("offset".to_owned(), 16), ("unixfs".to_owned(), 1)]);
+}
+
+#[test]
 fn keeps_leaves_in_place() {
     let scratch = Scratch::new("offset-in-place");
     let file = scratch.path().join("file");

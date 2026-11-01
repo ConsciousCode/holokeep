@@ -690,3 +690,26 @@ async fn condemned_copies_dont_count_to_a_trimmer() {
     assert_eq!(reports[0].dropped, 0, "{reports:?}");
     assert!(has(&a, leaf));
 }
+
+#[tokio::test]
+async fn files_imported_in_place_which_change_are_let_go_of_and_said_so() {
+    let (mut a, mut b, _) = Box::pin(holding()).await;
+    let scratch = crate::testutil::Scratch::new("node-in-place");
+    let file = scratch.path().join("file");
+    std::fs::write(&file, vec![9u8; 3000]).expect("write");
+    let importer = crate::import::Importer { chunk_size: 1000, ..crate::import::Importer::default() };
+    importer.add_path(&file, &mut crate::store::InPlace::new(a.catalog_mut()), &mut |_, _| {}).expect("import");
+    let leaf = raw(&[9u8; 1000]);
+    assert!(has(&a, &leaf));
+    // b has a copy, and knows a has one
+    let id = a.audit(2).expect("audit");
+    audited(&mut [&mut a, &mut b], &[(0, id)]).await;
+    assert!(has(&b, &leaf));
+    assert_eq!(b.sightings().of(leaf.cid().multihash()).expect("of").len(), 1);
+
+    // The user changes it, which the trickle notices
+    std::fs::write(&file, vec![8u8; 3000]).expect("change");
+    a.trickle(2).expect("trickle");
+    assert!(!has(&a, &leaf));
+    assert!(until(&mut [&mut a, &mut b], |n| n[1].sightings().of(leaf.cid().multihash()).expect("of").is_empty()).await, "b's told");
+}

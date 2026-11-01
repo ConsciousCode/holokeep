@@ -678,6 +678,10 @@ pub const CALM: Duration = Duration::from_mins(1);
 /// The interval it keeps when there is.
 pub const ALERT: Duration = Duration::from_secs(2);
 
+/// How many files imported in place the trickle looks at each tick, to
+/// notice any gone or changed which no watch did.
+pub const EXTERNAL: usize = 64;
+
 /// About how often, while calm, each block is sampled: often enough that a
 /// sighting is usually refreshed in the second half of its time, before
 /// it's forgotten.

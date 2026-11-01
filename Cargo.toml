@@ -10,11 +10,12 @@ path = "src/main.rs"
 [features]
 default = ["net"]
 # The private mesh: libp2p, and a daemon to run it
-net = ["dep:libp2p", "dep:tokio"]
+net = ["dep:libp2p", "dep:tokio", "dep:notify"]
 
 [dependencies]
 libp2p = { version = "0.56", optional = true, features = ["tokio", "tcp", "noise", "yamux", "pnet", "macros", "identify", "ping", "mdns", "kad", "request-response", "cbor", "ed25519"] }
 tokio = { version = "1", optional = true, features = ["rt", "net", "macros", "time", "io-util", "sync", "signal"] }
+notify = { version = "8", optional = true, default-features = false }
 thiserror = "2.0"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 anyhow = { version = "1.0.104", features = ["backtrace"] }

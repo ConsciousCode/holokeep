@@ -43,7 +43,7 @@ use super::mesh::{Error, Members, Result};
 use super::structure::{self, Cursors, Notice, Wants};
 use super::trim::{self, Ack, Dropped, Grant, Intent, Trim, Watermarks};
 use crate::model::Link;
-use crate::store::Catalog;
+use crate::store::{Catalog, ExternalFile};
 
 const IDENTIFY: &str = "/holokeep/id/1.0.0";
 const KAD: StreamProtocol = StreamProtocol::new("/holokeep/kad/1.0.0");
@@ -266,6 +266,11 @@ impl Node {
         &self.catalog
     }
 
+    #[cfg(test)]
+    pub const fn catalog_mut(&mut self) -> &mut Catalog {
+        &mut self.catalog
+    }
+
     pub const fn sightings(&self) -> &Sightings {
         &self.sightings
     }
@@ -361,6 +366,10 @@ impl Node {
     /// sample of the rest. Nothing, while no member's connected to send
     /// copies to; what's arrived waits. See `Trickle`.
     pub fn trickle(&mut self, copies: usize) -> Result<Option<AuditId>> {
+        // Files imported in place are the user's to change, and nothing may
+        // read them to notice
+        let files = self.catalog.external_files(Some(durability::EXTERNAL))?;
+        self.forget_changed(&files)?;
         if self.connected().is_empty() {
             return Ok(None);
         }
@@ -373,6 +382,24 @@ impl Node {
         // Before it starts, since one with nothing to ask finishes at once
         self.trickling = Some((self.next_audit, more));
         self.audit_of_keys(copies, keys).map(Some)
+    }
+
+    /// Forget whichever of these files imported in place have gone or
+    /// changed, telling members what that leaves no longer here, so they
+    /// make up the copies. Returns how many blocks that was.
+    pub fn forget_changed(&mut self, files: &[ExternalFile]) -> Result<usize> {
+        let lost = self.catalog.forget_changed(files)?;
+        for key in &lost {
+            self.sightings.forget(key.as_ref())?;
+            self.condemned.pardon(key.as_ref())?;
+        }
+        if !lost.is_empty() {
+            let dropped = trim::dropped(&lost);
+            for peer in self.connected() {
+                self.swarm.behaviour_mut().dropped.send_request(&peer, dropped.clone());
+            }
+        }
+        Ok(lost.len())
     }
 
     /// Whether blocks have arrived which the trickle's yet to audit, as from
