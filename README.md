@@ -356,7 +356,8 @@ Checklist:
   - [x] Collecting top down: roots first, then what they leave unreferenced as of when they were condemned, structure too, in batches
   - [ ] Following frontiers exactly when answering for keeps, rather than counting what's beyond them as kept
   - [x] Noticing files imported in place which have gone or changed: watched while the node runs, sampled by the trickle, swept in the background at startup; members are told, and make up the copies
-  - [ ] Anchors: empty identities with claims hung on them, and files imported in place as mounts on anchors, kept through them
+  - [x] Anchors: empty identities (identity CIDs of 16 random bytes) which are whatever their latest `Set` claim says; a kept anchor references only what it is now, so what it was is collected after the grace period (`hk anchor new/set/show`)
+  - [ ] Files imported in place as mounts on anchors, kept through them, the path known only to the node with the file
   - [ ] Kademlia provider records, once broadcast wants don't scale
 - [ ] Public Amino DHT
 - [ ] BitTorrent bridging
@@ -408,6 +409,9 @@ $hk tag ls <cid>                    # a block's tags
 $hk tag find <name>                 # the blocks with a tag
 $hk keep add|rm <cid>...            # keep blocks and what they link to, or stop
 $hk keep add --shallow <cid>...     # keep as much as can be had, short of what can't
+$hk anchor new                      # an empty identity to hang claims on
+$hk anchor set <anchor> <cid>       # say what an anchor is now
+$hk anchor show <anchor>            # what it is, and its history
 $hk keep ls                         # what's kept
 $hk tag rm <name> <cid>...          # untag blocks, with tombs
 $hk dag export <cid> -o <file.car>  # a DAG as a CARv1, like `ipfs dag export`

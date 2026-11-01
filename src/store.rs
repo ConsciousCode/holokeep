@@ -1160,7 +1160,7 @@ impl Catalog {
     }
 
     /// Whether anything here references a block: structure linking to it,
-    /// or a keep that counts. Tags don't keep what they tag, and a tomb's
+    /// a keep that counts, or a kept anchor being it now. Tags don't keep what they tag, and a tomb's
     /// link to what it retracts is the opposite of a reference.
     pub fn referenced(&self, key: Key<'_>) -> Result<bool> {
         let Some(id) = self.db.lookup(key)? else {
@@ -1176,6 +1176,12 @@ impl Catalog {
         if self.claims.is_some() {
             sources.push(format!(
                 "SELECT 1 FROM claim_targets t JOIN claims c ON c.id = t.claim WHERE t.target = ?1 AND c.kind = 'keep' AND {}",
+                claims::LIVE,
+            ));
+            // What a kept anchor is now; what it was isn't referenced
+            sources.push(format!(
+                "SELECT 1 FROM anchor_values a JOIN claim_targets t ON t.target = a.anchor JOIN claims c ON c.id = t.claim
+                 WHERE a.value = ?1 AND c.kind = 'keep' AND {}",
                 claims::LIVE,
             ));
         }
@@ -1570,7 +1576,8 @@ impl Catalog {
 
     /// Whether a keep that counts reaches a block, by its backrefs: the
     /// block, or anything linking to it however indirectly, is a keep's
-    /// target. Without claims to keep, everything is kept.
+    /// target; an anchor links to what it is now. Without claims to keep,
+    /// everything is kept.
     pub fn kept_under(&self, key: Key<'_>) -> Result<bool> {
         if self.claims.is_none() {
             return Ok(true);
@@ -1580,6 +1587,7 @@ impl Catalog {
                 "WITH RECURSIVE up (id) AS (
                      SELECT id FROM multihashes WHERE multihash = ?1
                      UNION SELECT l.source FROM links l JOIN up ON l.target = up.id
+                     UNION SELECT a.anchor FROM anchor_values a JOIN up ON a.value = up.id
                  )
                  SELECT 1 FROM up
                  JOIN claim_targets t ON t.target = up.id
@@ -1616,6 +1624,11 @@ impl Catalog {
                 missing.push(cid);
                 continue;
             };
+            // An anchor is what it is now
+            if crate::claim::is_anchor(&cid) {
+                queue.extend(self.anchor_value(&cid)?);
+                continue;
+            }
             if cid.codec() == crate::cid::DAG_CBOR_CODEC
                 && let Some(Claim::Keep(keep)) = Claim::parse(&data)
             {
@@ -1626,6 +1639,32 @@ impl Catalog {
             queue.extend(crate::links::links(cid.codec(), &data).unwrap_or_default());
         }
         Ok(missing)
+    }
+
+    /// A new anchor, an empty identity to hang claims on.
+    pub fn new_anchor(&self) -> Result<Link> {
+        Ok(crate::claim::anchor()?)
+    }
+
+    /// Say an anchor is `value` now, returning the set's CID.
+    pub fn set_anchor(&self, anchor: &Link, value: &Link) -> Result<Link> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+        // After the latest, so it's what the anchor is even within a second
+        let latest = self.anchor_history(anchor)?.last().map_or(0, |&(at, _)| at.saturating_add(1));
+        let at = now.max(latest);
+        let claim = Claim::Set(crate::claim::Set::new([anchor.clone()], value.clone(), at).ok_or(Error::NoClaims)?);
+        self.put_block(&claim.block(), CidVersion::V1)?;
+        Ok(claim.cid())
+    }
+
+    /// What an anchor is now, if any set says.
+    pub fn anchor_value(&self, anchor: &Link) -> Result<Option<Link>> {
+        self.claims.as_ref().ok_or(Error::NoClaims)?.value_of(anchor.multihash())
+    }
+
+    /// Every set of an anchor that counts, as (at, value), oldest first.
+    pub fn anchor_history(&self, anchor: &Link) -> Result<Vec<(u64, Link)>> {
+        self.claims.as_ref().ok_or(Error::NoClaims)?.history(anchor.multihash())
     }
 
     /// Stop keeping a block, tombing every keep of it. Returns the tombs'

@@ -82,6 +82,10 @@ enum Command {
     /// adds, or stop
     #[command(subcommand)]
     Keep(KeepCommand),
+    /// Work with anchors: empty identities, which are whatever they were
+    /// last set to
+    #[command(subcommand)]
+    Anchor(AnchorCommand),
     /// Work with raw blocks
     #[command(subcommand)]
     Block(BlockCommand),
@@ -232,6 +236,18 @@ enum KeepCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum AnchorCommand {
+    /// Make a new anchor, printing it
+    New,
+    /// Say an anchor is a DAG now, which must all be here or fetched
+    /// through the running node; prints the set
+    Set { anchor: Link, cid: Link },
+    /// Print what an anchor is now, then every value it's had, oldest
+    /// first, with when
+    Show { anchor: Link },
+}
+
+#[derive(Subcommand, Debug)]
 enum TagCommand {
     /// Tag blocks with a name, printing the claim tagging each
     Add {
@@ -369,6 +385,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Dag(command) => dag(args.repo, command),
         Command::Tag(command) => tag(open_repo(args.repo)?, command),
         Command::Keep(command) => keep(&args.repo, open_repo(args.repo.clone())?, command),
+        Command::Anchor(command) => anchor(&args.repo, open_repo(args.repo.clone())?, command),
         Command::Block(BlockCommand::Get { cid }) => {
             let repo = open_repo(args.repo)?;
             let block = repo.get_block(&cid)?.with_context(|| format!("block {cid} not found"))?;
@@ -652,6 +669,29 @@ fn hold_all(dir: &Option<PathBuf>, repo: &Catalog, cids: &[Link], shallow: bool)
         frontiers.push(Vec::new());
     }
     Ok(frontiers)
+}
+
+fn anchor(dir: &Option<PathBuf>, mut repo: Catalog, command: AnchorCommand) -> anyhow::Result<()> {
+    match command {
+        AnchorCommand::New => println!("{}", repo.new_anchor()?),
+        AnchorCommand::Set { anchor, cid } => {
+            anyhow::ensure!(holokeep::claim::is_anchor(&anchor), "{anchor} isn't an anchor");
+            hold_all(dir, &repo, std::slice::from_ref(&cid), false)?;
+            let set = repo.batch(|repo| repo.set_anchor(&anchor, &cid))?;
+            println!("{set}");
+        },
+        AnchorCommand::Show { anchor } => {
+            anyhow::ensure!(holokeep::claim::is_anchor(&anchor), "{anchor} isn't an anchor");
+            match repo.anchor_value(&anchor)? {
+                Some(value) => println!("{value}"),
+                None => println!("unset"),
+            }
+            for (at, value) in repo.anchor_history(&anchor)? {
+                println!("{at}\t{value}");
+            }
+        },
+    }
+    Ok(())
 }
 
 fn keep(dir: &Option<PathBuf>, mut repo: Catalog, command: KeepCommand) -> anyhow::Result<()> {

@@ -1,6 +1,12 @@
 //! Claims: sidecar blocks about their targets, which the README describes.
+//!
 //! So far `Group`, which is what a tag is, `Keep`, which says to keep its
-//! targets, and `Tomb`, which retracts.
+//! targets, `Set`, which says what an anchor is now, and `Tomb`, which
+//! retracts.
+//!
+//! An anchor is an empty identity, in the manner of Perkeep's permanodes:
+//! claims hung on it are its state. It's an identity CID of `{anchor:
+//! <16 random bytes>}`, so it's named without being stored anywhere.
 //!
 //! A claim is dag-cbor with its type inline, under the key `claim`. Its
 //! `target` is a set, written as an array sorted by CID bytes, so equal
@@ -56,11 +62,26 @@ pub struct Keep {
     n: u64,
 }
 
+/// "The targets, anchors, are `value` as of `at`", in seconds since the
+/// epoch.
+///
+/// An anchor is whatever its latest set says that counts, by `at`
+/// and then CID bytes, so it's mutable while every claim stays put: what
+/// it was is the history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Set {
+    /// Sorted by CID bytes and distinct.
+    target: Vec<Link>,
+    value: Link,
+    at: u64,
+}
+
 /// Any claim this understands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
     Group(Group),
     Keep(Keep),
+    Set(Set),
     Tomb(Tomb),
 }
 
@@ -114,6 +135,20 @@ impl Keep {
     pub fn beyond(&self) -> &[Link] { &self.beyond }
 }
 
+impl Set {
+    /// A set of the anchors, if there are any.
+    pub fn new(target: impl IntoIterator<Item = Link>, value: Link, at: u64) -> Option<Self> {
+        let target = set(target);
+        (!target.is_empty()).then_some(Self { target, value, at })
+    }
+
+    pub fn target(&self) -> &[Link] { &self.target }
+
+    pub const fn value(&self) -> &Link { &self.value }
+
+    pub const fn at(&self) -> u64 { self.at }
+}
+
 impl Tomb {
     /// A tomb for the targets, if there are any.
     pub fn new(target: impl IntoIterator<Item = Link>) -> Option<Self> {
@@ -129,6 +164,7 @@ impl Claim {
         match self {
             Self::Group(group) => group.target(),
             Self::Keep(keep) => keep.target(),
+            Self::Set(set) => set.target(),
             Self::Tomb(tomb) => tomb.target(),
         }
     }
@@ -146,6 +182,10 @@ impl Claim {
                 }
                 ("keep", map)
             },
+            Self::Set(set) => ("set", BTreeMap::from([
+                ("value".to_owned(), Ipld::Link(set.value.clone())),
+                ("at".to_owned(), Ipld::Integer(set.at.into())),
+            ])),
             Self::Tomb(_) => ("tomb", BTreeMap::new()),
         };
         map.insert("claim".to_owned(), Ipld::String(kind.to_owned()));
@@ -215,6 +255,12 @@ impl Claim {
                 };
                 Self::Keep(Keep::bounded(target.clone(), beyond)?.again(n))
             },
+            "set" => {
+                let (Ipld::Link(value), Ipld::Integer(at)) = (map.remove("value")?, map.remove("at")?) else {
+                    return None;
+                };
+                Self::Set(Set::new(target.clone(), value, u64::try_from(at).ok()?)?)
+            },
             "tomb" => Self::Tomb(Tomb::new(target.clone())?),
             _ => return None,
         };
@@ -230,6 +276,25 @@ fn link_list(list: Vec<Ipld>) -> Option<Vec<Link>> {
             _ => None,
         })
         .collect()
+}
+
+/// A new anchor: an identity CID of 16 random bytes, marked as an anchor.
+pub fn anchor() -> std::io::Result<Link> {
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(std::io::Error::other)?;
+    let value = Ipld::Map(BTreeMap::from([("anchor".to_owned(), Ipld::Bytes(nonce.to_vec()))]));
+    let data = dagcbor::to_vec(&value).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+    Block::identity(DAG_CBOR_CODEC, data.into())
+        .map(|block| AnyCid::V1(block.cid().clone()))
+        .ok_or_else(|| std::io::Error::other("an anchor too large to be an identity"))
+}
+
+/// Whether a CID is an anchor.
+pub fn is_anchor(cid: &Link) -> bool {
+    if cid.codec() != DAG_CBOR_CODEC || cid.hashcode() != IDENTITY {
+        return false;
+    }
+    matches!(dagcbor::from_slice(cid.digest_ref()), Ok(Ipld::Map(map)) if map.len() == 1 && matches!(map.get("anchor"), Some(Ipld::Bytes(nonce)) if nonce.len() == 16))
 }
 
 /// The CID of a simple tag: its name, as a raw identity CID.
@@ -367,6 +432,16 @@ mod tests {
         ])))
         .expect("encode");
         assert_eq!(Claim::parse(&empty), None);
+    }
+
+    #[test]
+    fn sets_round_trip_and_dissolve() {
+        let anchor = super::anchor().expect("anchor");
+        let set = Claim::Set(Set::new([anchor], cid(b"v"), 1_800_000_000).expect("set"));
+        assert!(set.dissolves(), "an anchor and a value fit");
+        assert_eq!(dissolved(&set.cid()), Some(set.clone()));
+        assert_eq!(Claim::parse(set.block().data()), Some(set));
+        assert!(Set::new([], cid(b"v"), 0).is_none());
     }
 
     #[test]

@@ -20,7 +20,7 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::block::{Block, IDENTITY};
 use crate::cid::{BaseCid, Cid, CidRef, Cidv1, DAG_CBOR_CODEC};
-use crate::claim::{self, Claim, Group, Keep, Tomb};
+use crate::claim::{self, Claim, Group, Keep, Set, Tomb};
 use crate::model::Link;
 use crate::multihash::Multihash;
 
@@ -30,6 +30,11 @@ const NAME: &str = "claims";
 
 /// Whether a group counts: dissolved claims are deleted when they're
 /// tombstoned, precipitated ones have to be checked.
+/// `LIVE`, of a claims row by another alias than `c`.
+pub(super) fn live(alias: &str) -> String {
+    LIVE.replace("c.claim", &format!("{alias}.claim"))
+}
+
 pub(super) const LIVE: &str = "(c.claim IS NULL OR NOT EXISTS (
     SELECT 1 FROM claim_targets x JOIN claims k ON k.id = x.claim WHERE x.target = c.claim AND k.kind = 'tomb'
 ))";
@@ -74,7 +79,7 @@ impl ClaimStore {
              CREATE TABLE IF NOT EXISTS claims (
                  id INTEGER PRIMARY KEY,
                  claim INTEGER UNIQUE REFERENCES multihashes (id),
-                 kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'tomb'))
+                 kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb'))
              );
              -- Every claim's targets, which every type has.
              CREATE TABLE IF NOT EXISTS claim_targets (
@@ -84,6 +89,14 @@ impl ClaimStore {
                  PRIMARY KEY (claim, target, prefix)
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS claim_targets_target ON claim_targets (target);
+             -- What a set says its anchors are, and as of when.
+             CREATE TABLE IF NOT EXISTS set_claims (
+                 id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
+                 value INTEGER NOT NULL REFERENCES multihashes (id),
+                 value_prefix BLOB NOT NULL,
+                 at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS set_claims_value ON set_claims (value);
              -- Which time a keep keeps its targets, if not the first.
              CREATE TABLE IF NOT EXISTS keep_n (
                  claim INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
@@ -116,7 +129,23 @@ impl ClaimStore {
                  JOIN claims c ON c.id = t.claim
                  JOIN group_claims g ON g.id = c.id
                  JOIN multihashes i ON i.id = g.into_
-                 WHERE {LIVE};"
+                 WHERE {LIVE};
+             -- What each anchor is now: its latest set that counts, by `at`
+             -- and then the value's multihash.
+             CREATE VIEW IF NOT EXISTS anchor_values (anchor, value, prefix, claim) AS
+                 SELECT t.target, s.value, s.value_prefix, c.id FROM set_claims s
+                 JOIN claims c ON c.id = s.id
+                 JOIN claim_targets t ON t.claim = c.id
+                 JOIN multihashes v ON v.id = s.value
+                 WHERE {LIVE} AND NOT EXISTS (
+                     SELECT 1 FROM set_claims s2
+                     JOIN claims c2 ON c2.id = s2.id
+                     JOIN claim_targets t2 ON t2.claim = c2.id
+                     JOIN multihashes v2 ON v2.id = s2.value
+                     WHERE t2.target = t.target AND {live2}
+                         AND (s2.at > s.at OR (s2.at = s.at AND v2.multihash > v.multihash))
+                 );",
+            live2 = live("c2"),
         ))?;
         widen_kinds(&db)?;
         Ok(Self { db })
@@ -164,9 +193,50 @@ impl ClaimStore {
             "keep" => Keep::bounded(self.targets(id)?, self.beyond(id)?)
                 .map(|keep| Claim::Keep(keep.again(self.keep_n(id).unwrap_or_default())))
                 .ok_or_else(|| Error::Invalid { store: NAME, reason: "a keep with no targets".into() }),
+            "set" => self.set(id).map(Claim::Set),
             "tomb" => self.tomb(id).map(Claim::Tomb),
             _ => Err(Error::Invalid { store: NAME, reason: format!("a claim of kind {kind}") }),
         }
+    }
+
+    fn set(&self, id: Id) -> Result<Set> {
+        let (prefix, value, at): (Vec<u8>, Vec<u8>, i64) = self.db.conn()
+            .prepare_cached("SELECT s.value_prefix, v.multihash, s.at FROM set_claims s JOIN multihashes v ON v.id = s.value WHERE s.id = ?1")?
+            .query_row([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Set::new(self.targets(id)?, link(&prefix, &value)?, u64::try_from(at).unwrap_or_default())
+            .ok_or_else(|| Error::Invalid { store: NAME, reason: "a set with no targets".into() })
+    }
+
+    /// What an anchor is now, if any set says.
+    pub fn value_of(&self, anchor: Key<'_>) -> Result<Option<Link>> {
+        let row: Option<(Vec<u8>, Vec<u8>)> = self.db.conn()
+            .prepare_cached(
+                "SELECT a.prefix, v.multihash FROM multihashes m
+                 JOIN anchor_values a ON a.anchor = m.id JOIN multihashes v ON v.id = a.value
+                 WHERE m.multihash = ?1",
+            )?
+            .query_row([anchor.to_bytes()], pair)
+            .optional()?;
+        row.map(|(prefix, value)| link(&prefix, &value)).transpose()
+    }
+
+    /// Every set of an anchor that counts, as (at, value), oldest first.
+    pub fn history(&self, anchor: Key<'_>) -> Result<Vec<(u64, Link)>> {
+        let mut stmt = self.db.conn().prepare_cached(&format!(
+            "SELECT s.at, s.value_prefix, v.multihash FROM multihashes m
+             JOIN claim_targets t ON t.target = m.id
+             JOIN claims c ON c.id = t.claim
+             JOIN set_claims s ON s.id = c.id
+             JOIN multihashes v ON v.id = s.value
+             WHERE m.multihash = ?1 AND {LIVE}
+             ORDER BY s.at, v.multihash"
+        ))?;
+        let rows = stmt.query_map([anchor.to_bytes()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?)))?;
+        rows.map(|row| {
+            let (at, prefix, value) = row?;
+            Ok((u64::try_from(at).unwrap_or_default(), link(&prefix, &value)?))
+        })
+        .collect()
     }
 
     fn tomb(&self, id: Id) -> Result<Tomb> {
@@ -207,6 +277,19 @@ impl ClaimStore {
                          WHERE c.claim IS NULL AND g.into_ = ?1 AND g.into_prefix = ?2 AND t.target = ?3 AND t.prefix = ?4",
                     )?
                     .query_row(params![into, into_prefix, target, prefix], |r| r.get(0))
+                    .optional()?
+            },
+            Claim::Set(set) => {
+                let (value_prefix, value) = split(set.value())?;
+                let Some(value) = self.db.lookup(value.as_ref())? else {
+                    return Ok(None);
+                };
+                self.db.conn()
+                    .prepare_cached(
+                        "SELECT c.id FROM claims c JOIN set_claims s ON s.id = c.id JOIN claim_targets t ON t.claim = c.id
+                         WHERE c.claim IS NULL AND s.value = ?1 AND s.value_prefix = ?2 AND s.at = ?3 AND t.target = ?4 AND t.prefix = ?5",
+                    )?
+                    .query_row(params![value, value_prefix, i64::try_from(set.at()).unwrap_or(i64::MAX), target, prefix], |r| r.get(0))
                     .optional()?
             },
             Claim::Keep(_) | Claim::Tomb(_) => {
@@ -266,10 +349,16 @@ impl ClaimStore {
         let kind = match claim {
             Claim::Group(_) => "group",
             Claim::Keep(_) => "keep",
+            Claim::Set(_) => "set",
             Claim::Tomb(_) => "tomb",
         };
         conn.prepare_cached("INSERT INTO claims (claim, kind) VALUES (?1, ?2)")?.execute(params![id, kind])?;
         let row = conn.last_insert_rowid();
+        if let Claim::Set(set) = claim {
+            let (value_prefix, value) = split(set.value())?;
+            conn.prepare_cached("INSERT INTO set_claims (id, value, value_prefix, at) VALUES (?1, ?2, ?3, ?4)")?
+                .execute(params![row, self.db.intern(value.as_ref())?, value_prefix, i64::try_from(set.at()).unwrap_or(i64::MAX)])?;
+        }
         if let Claim::Group(group) = claim {
             let (into_prefix, into) = split(group.group())?;
             conn.prepare_cached("INSERT INTO group_claims (id, into_, into_prefix) VALUES (?1, ?2, ?3)")?
@@ -299,7 +388,7 @@ impl ClaimStore {
     /// Retract the dissolved claims a tomb targets.
     fn bury(&self, tomb: &Tomb) -> Result<()> {
         for target in tomb.target() {
-            if let Some(claim @ (Claim::Group(_) | Claim::Keep(_))) = claim::dissolved(target)
+            if let Some(claim @ (Claim::Group(_) | Claim::Keep(_) | Claim::Set(_))) = claim::dissolved(target)
                 && let Some(id) = self.find_dissolved(&claim)?
             {
                 self.db.conn().prepare_cached("DELETE FROM claims WHERE id = ?1")?.execute([id])?;
@@ -405,21 +494,30 @@ impl ClaimStore {
     }
 }
 
-/// Let a claims table made before keeps hold them: its CHECK constraint,
-/// which doesn't touch how rows are stored, is rewritten in place, as
-/// `SQLite` documents for such changes.
+/// Let a claims table made before some kinds of claim hold them: its CHECK
+/// constraint, which doesn't touch how rows are stored, is rewritten in
+/// place, as `SQLite` documents for such changes.
 fn widen_kinds(db: &Db) -> Result<()> {
-    const OLD: &str = "CHECK (kind IN ('group', 'tomb'))";
+    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb'))";
     let conn = db.conn();
     let sql: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'claims'", [], |row| row.get(0))?;
-    if !sql.contains(OLD) {
+    if sql.contains(KINDS) {
         return Ok(());
     }
+    let Some(start) = sql.find("CHECK (kind IN (") else {
+        return Ok(());
+    };
+    let Some(len) = sql.get(start..).and_then(|rest| rest.find("))")) else {
+        return Ok(());
+    };
+    let Some(old) = sql.get(start..start.saturating_add(len).saturating_add(2)) else {
+        return Ok(());
+    };
     let version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
     conn.execute_batch("PRAGMA writable_schema = ON")?;
     let widened = conn.execute(
         "UPDATE sqlite_schema SET sql = replace(sql, ?1, ?2) WHERE type = 'table' AND name = 'claims'",
-        params![OLD, "CHECK (kind IN ('group', 'keep', 'tomb'))"],
+        params![old, KINDS],
     );
     let bumped = conn.execute_batch(&format!("PRAGMA schema_version = {}", version.saturating_add(1)));
     conn.execute_batch("PRAGMA writable_schema = OFF")?;
@@ -493,15 +591,18 @@ impl BlockStore for ClaimStore {
 }
 
 impl RefIndex for ClaimStore {
-    /// Claims with a link to the multihash, as a target or what they're
-    /// into.
+    /// Claims with a link to the multihash, as a target, what they're
+    /// into, or what they set an anchor to.
     fn backrefs(&self, key: Key<'_>) -> Result<Vec<Multihash>> {
         let mut stmt = self.db.conn().prepare_cached(
             "SELECT c.id, c.kind, k.multihash FROM multihashes m JOIN claim_targets t ON t.target = m.id
              JOIN claims c ON c.id = t.claim LEFT JOIN multihashes k ON k.id = c.claim WHERE m.multihash = ?1
              UNION
              SELECT c.id, c.kind, k.multihash FROM multihashes m JOIN group_claims g ON g.into_ = m.id
-             JOIN claims c ON c.id = g.id LEFT JOIN multihashes k ON k.id = c.claim WHERE m.multihash = ?1",
+             JOIN claims c ON c.id = g.id LEFT JOIN multihashes k ON k.id = c.claim WHERE m.multihash = ?1
+             UNION
+             SELECT c.id, c.kind, k.multihash FROM multihashes m JOIN set_claims s ON s.value = m.id
+             JOIN claims c ON c.id = s.id LEFT JOIN multihashes k ON k.id = c.claim WHERE m.multihash = ?1",
         )?;
         let rows: Vec<(Id, String, Option<Vec<u8>>)> = stmt
             .query_map([key.to_bytes()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?

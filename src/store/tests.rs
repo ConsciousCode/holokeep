@@ -739,6 +739,48 @@ fn whats_let_go_of_can_be_kept_again() {
 }
 
 #[test]
+fn anchors_are_what_they_were_last_set_to() {
+    let router = router();
+    let anchor = router.new_anchor().expect("anchor");
+    assert!(crate::claim::is_anchor(&anchor));
+    assert!(!crate::claim::is_anchor(&crate::claim::tag("anchor").expect("tag")));
+    assert_ne!(router.new_anchor().expect("anchor"), anchor, "each its own");
+    assert_eq!(router.anchor_value(&anchor).expect("value"), None);
+
+    let (leaf1, leaf2) = (raw(b"first leaf"), raw(b"second leaf"));
+    let v1 = ipld_block(DAG_CBOR_CODEC, &crate::model::Ipld::List(vec![crate::model::Ipld::Link(link(&leaf1))]));
+    let v2 = ipld_block(DAG_CBOR_CODEC, &crate::model::Ipld::List(vec![crate::model::Ipld::Link(link(&leaf2))]));
+    for block in [&leaf1, &leaf2, &v1, &v2] {
+        router.put_block(block, CidVersion::V1).expect("put");
+    }
+    router.set_anchor(&anchor, &link(&v1)).expect("set");
+    router.keep(&anchor).expect("keep");
+    assert_eq!(router.anchor_value(&anchor).expect("value"), Some(link(&v1)));
+    assert!(router.referenced(v1.cid().multihash()).expect("referenced"), "what a kept anchor is");
+    assert!(router.kept_under(leaf1.cid().multihash()).expect("kept"));
+    assert!(router.missing_under(&anchor).expect("missing").is_empty());
+
+    // Set again within the second, it's still the latest
+    let second = router.set_anchor(&anchor, &link(&v2)).expect("set");
+    assert_eq!(router.anchor_value(&anchor).expect("value"), Some(link(&v2)));
+    assert!(!router.referenced(v1.cid().multihash()).expect("referenced"), "what it was isn't");
+    assert!(!router.kept_under(leaf1.cid().multihash()).expect("kept"));
+    assert!(router.kept_under(leaf2.cid().multihash()).expect("kept"));
+    let history: Vec<Link> = router.anchor_history(&anchor).expect("history").into_iter().map(|(_, value)| value).collect();
+    assert_eq!(history, [link(&v1), link(&v2)]);
+
+    // Retracting the latest set makes it what it was
+    let tomb = Claim::Tomb(Tomb::new([second]).expect("tomb"));
+    router.put_block(&tomb.block(), CidVersion::V1).expect("tomb");
+    assert_eq!(router.anchor_value(&anchor).expect("value"), Some(link(&v1)));
+
+    // An anchor nothing keeps references nothing
+    let loose = router.new_anchor().expect("anchor");
+    router.set_anchor(&loose, &link(&v2)).expect("set");
+    assert!(!router.referenced(v2.cid().multihash()).expect("referenced"));
+}
+
+#[test]
 fn claims_tables_from_before_keeps_take_them() {
     let db = Db::memory().expect("db");
     db.conn()
