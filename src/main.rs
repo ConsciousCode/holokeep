@@ -209,6 +209,10 @@ enum KeepCommand {
     Add {
         #[arg(required = true)]
         cids: Vec<Link>,
+        /// Keep as much as can be had, stopping where blocks can't: the
+        /// keep's frontier, for DAGs too large to hold
+        #[arg(long)]
+        shallow: bool,
     },
     /// Stop keeping blocks, printing the tombs which retract their keeps
     Rm {
@@ -605,32 +609,44 @@ fn tag_cid(name: &str) -> anyhow::Result<Link> {
 /// Make sure all of each DAG is here, fetching what isn't if the node's
 /// running: a keep is only added by a node holding everything it links
 /// to, so its copy outlives anything collecting it elsewhere meanwhile.
-fn hold_all(dir: &Option<PathBuf>, repo: &Catalog, cids: &[Link]) -> anyhow::Result<()> {
+/// Returns each DAG's frontier: what's still missing, if `shallow`.
+fn hold_all(dir: &Option<PathBuf>, repo: &Catalog, cids: &[Link], shallow: bool) -> anyhow::Result<Vec<Vec<Link>>> {
+    let mut frontiers = Vec::new();
     for cid in cids {
         if repo.missing_under(cid)?.is_empty() {
+            frontiers.push(Vec::new());
             continue;
         }
         fetch_first(dir, cid)?;
         let missing = repo.missing_under(cid)?;
+        anyhow::ensure!(!missing.contains(cid), "{cid} isn't here or on any connected member");
+        if shallow {
+            if !missing.is_empty() {
+                eprintln!("keeping {cid} short of {} blocks which couldn't be had", missing.len());
+            }
+            frontiers.push(missing);
+            continue;
+        }
         if let Some(first) = missing.first() {
             anyhow::bail!(
                 "{} blocks under {cid} aren't here or on any connected member, {first} among them; a keep needs all of what it keeps{}",
                 missing.len(),
-                if cfg!(feature = "net") { " (is `hk node run` running?)" } else { "" },
+                if cfg!(feature = "net") { " (is `hk node run` running? or keep it --shallow)" } else { " (or keep it --shallow)" },
             );
         }
+        frontiers.push(Vec::new());
     }
-    Ok(())
+    Ok(frontiers)
 }
 
 fn keep(dir: &Option<PathBuf>, mut repo: Catalog, command: KeepCommand) -> anyhow::Result<()> {
     let mut out = io::BufWriter::new(io::stdout().lock());
     match command {
-        KeepCommand::Add { cids } => {
-            hold_all(dir, &repo, &cids)?;
+        KeepCommand::Add { cids, shallow } => {
+            let frontiers = hold_all(dir, &repo, &cids, shallow)?;
             repo.batch(|repo| {
-                for cid in cids {
-                    writeln!(out, "{}", repo.keep(&cid)?)?;
+                for (cid, beyond) in cids.iter().zip(&frontiers) {
+                    writeln!(out, "{}", repo.keep_short_of(cid, beyond)?)?;
                 }
                 anyhow::Ok(())
             })?;

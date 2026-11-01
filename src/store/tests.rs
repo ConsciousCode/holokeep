@@ -697,6 +697,25 @@ fn whats_missing_under_a_root_is_the_edge_of_whats_here() {
 }
 
 #[test]
+fn keeps_stop_at_their_frontier() {
+    let router = router();
+    let (a, far) = (raw(b"a"), raw(b"far away"));
+    let root = ipld_block(DAG_CBOR_CODEC, &crate::model::Ipld::List(vec![crate::model::Ipld::Link(link(&a)), crate::model::Ipld::Link(link(&far))]));
+    for block in [&root, &a] {
+        router.put_block(block, CidVersion::V1).expect("put");
+    }
+    let beyond = router.missing_under(&link(&root)).expect("missing");
+    assert_eq!(beyond, [link(&far)]);
+    let keep = router.keep_short_of(&link(&root), &beyond).expect("keep");
+    assert!(router.missing_under(&keep).expect("missing").is_empty(), "nothing short of the frontier is missing");
+    assert!(router.missing_under(&router.keep(&link(&root)).expect("keep")).expect("missing").contains(&link(&far)));
+    // Rows, and back out as the same block
+    assert_eq!(count(&router.db, "keep_beyond"), 1);
+    assert_eq!(router.get_block(&keep).expect("get").map(|block| link(&block)), Some(keep.clone()));
+    assert!(router.claims().expect("claims").kept(root.cid().multihash()).expect("kept"));
+}
+
+#[test]
 fn claims_tables_from_before_keeps_take_them() {
     let db = Db::memory().expect("db");
     db.conn()

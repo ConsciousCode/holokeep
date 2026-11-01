@@ -1437,14 +1437,21 @@ impl Catalog {
     /// Keep a block, and what it links to, with a claim of its own so it
     /// can be let go of alone. Returns the claim's CID.
     pub fn keep(&self, target: &Link) -> Result<Link> {
-        let claim = Claim::Keep(crate::claim::Keep::new([target.clone()]).ok_or(Error::NoClaims)?);
+        self.keep_short_of(target, &[])
+    }
+
+    /// Keep a block and what it links to, short of a frontier: links the
+    /// keep's reach stops at. Returns the keep's CID.
+    pub fn keep_short_of(&self, target: &Link, beyond: &[Link]) -> Result<Link> {
+        let claim = Claim::Keep(crate::claim::Keep::bounded([target.clone()], beyond.iter().cloned()).ok_or(Error::NoClaims)?);
         self.put_block(&claim.block(), CidVersion::V1)?;
         Ok(claim.cid())
     }
 
     /// What isn't here of the DAG under a root: each block linked to,
     /// the root included, which isn't held or can't be read. What's
-    /// missing isn't walked into, so it's only the edge of what's here.
+    /// missing isn't walked into, so it's only the edge of what's here;
+    /// nor is what a keep walked through has beyond its frontier.
     ///
     /// A node only keeps what it holds all of: whatever else is
     /// collecting what a keep links to, the keeper's copy survives, and
@@ -1463,10 +1470,18 @@ impl Catalog {
             else {
                 self.get_block(&cid).ok().flatten().map(|block| block.data().to_vec())
             };
-            match data {
-                Some(data) => queue.extend(crate::links::links(cid.codec(), &data).unwrap_or_default()),
-                None => missing.push(cid),
+            let Some(data) = data else {
+                missing.push(cid);
+                continue;
+            };
+            if cid.codec() == crate::cid::DAG_CBOR_CODEC
+                && let Some(Claim::Keep(keep)) = Claim::parse(&data)
+            {
+                seen.extend(keep.beyond().iter().map(Link::to_bytes));
+                queue.extend(keep.target().iter().cloned());
+                continue;
             }
+            queue.extend(crate::links::links(cid.codec(), &data).unwrap_or_default());
         }
         Ok(missing)
     }

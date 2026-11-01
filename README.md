@@ -349,7 +349,7 @@ Checklist:
   - [x] Advertising what's let go of, so sightings of members connected since needn't expire
   - [x] Trimming leaves of kept files: a file goes whole, or is split into blocks of its own once any leaf goes
   - [x] Holding what's kept: a keep is only added by a node holding all of what it keeps, fetching what isn't here first (`hk keep add`), so a keep added while what it keeps is being collected keeps a copy alive, and the trickle replicates it. Slippage then needs no timeout to be safe, only to be prompt
-  - [ ] Frontier claims: where a keep's reach stops, for DAGs too large to hold (`--shallow` writes what couldn't be fetched as the frontier, rather than failing)
+  - [x] Frontiers: a keep's `beyond`, where its reach stops, for DAGs too large to hold (`hk keep add --shallow` keeps what can be had, with what couldn't as the frontier, rather than failing)
   - [ ] Collecting garbage: what nothing kept links to, judged by backrefs. Condemned blocks are advertised and dropped after a grace period, unless a keep or link revives them; a node never takes not having heard of a keep as there being none for what it keeps itself
   - [ ] Noticing files imported in place which have gone or changed, in the trickle, so their blocks are re-replicated
   - [ ] Kademlia provider records, once broadcast wants don't scale
@@ -369,7 +369,6 @@ Checklist:
 - Stochastic placement raises safe-harbor questions: whose drive is holding what?
 
 **Claims**
-- Keep claims: signal "this is an object you probably don't want garbage-collected", importable from another repo. Is that a claim type, or covered by refcounts?
 - Pin claims: distinct from Kubo's pins, "pin to this particular node". These may work better out of band, since it doesn't make sense to transport claims about where an object should live.
 - Should mutations be administrative claims too? CRDTs and live shared editing eventually, but by a long shot the priority is repo curation.
 - Do claims need their hashes "just in case"? Only if something references them, which happens if the claim exists elsewhere in the DHT and someone wants to talk about it; but then they could ask for the block and match it to the object. At a few dozen bytes each, even millions of claims are only tens of megabytes.
@@ -403,6 +402,7 @@ $hk tag add <name> <cid>...         # tag blocks, with a Group claim
 $hk tag ls <cid>                    # a block's tags
 $hk tag find <name>                 # the blocks with a tag
 $hk keep add|rm <cid>...            # keep blocks and what they link to, or stop
+$hk keep add --shallow <cid>...     # keep as much as can be had, short of what can't
 $hk keep ls                         # what's kept
 $hk tag rm <name> <cid>...          # untag blocks, with tombs
 $hk dag export <cid> -o <file.car>  # a DAG as a CARv1, like `ipfs dag export`

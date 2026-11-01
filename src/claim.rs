@@ -39,12 +39,17 @@ pub struct Tomb {
     target: Vec<Link>,
 }
 
-/// "Keep the targets, and what they link to." What's added is kept unless
-/// said otherwise; what nothing kept links to is, in time, collectable.
+/// "Keep the targets, and what they link to", short of what's `beyond`.
+///
+/// `beyond` is the frontier where its reach stops, for DAGs too large to
+/// hold, left out when empty. What's added is kept unless said otherwise;
+/// what nothing kept links to is, in time, collectable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keep {
     /// Sorted by CID bytes and distinct.
     target: Vec<Link>,
+    /// Sorted by CID bytes and distinct.
+    beyond: Vec<Link>,
 }
 
 /// Any claim this understands.
@@ -81,11 +86,19 @@ impl Group {
 impl Keep {
     /// A keep of the targets, if there are any.
     pub fn new(target: impl IntoIterator<Item = Link>) -> Option<Self> {
+        Self::bounded(target, [])
+    }
+
+    /// A keep of the targets short of a frontier, if there are any.
+    pub fn bounded(target: impl IntoIterator<Item = Link>, beyond: impl IntoIterator<Item = Link>) -> Option<Self> {
         let target = set(target);
-        (!target.is_empty()).then_some(Self { target })
+        (!target.is_empty()).then_some(Self { target, beyond: set(beyond) })
     }
 
     pub fn target(&self) -> &[Link] { &self.target }
+
+    /// Where the keep's reach stops: what's linked to but not kept.
+    pub fn beyond(&self) -> &[Link] { &self.beyond }
 }
 
 impl Tomb {
@@ -110,7 +123,8 @@ impl Claim {
     fn to_ipld(&self) -> Ipld {
         let (kind, mut map) = match self {
             Self::Group(group) => ("group", BTreeMap::from([("into".to_owned(), Ipld::Link(group.into.clone()))])),
-            Self::Keep(_) => ("keep", BTreeMap::new()),
+            Self::Keep(keep) if keep.beyond.is_empty() => ("keep", BTreeMap::new()),
+            Self::Keep(keep) => ("keep", BTreeMap::from([("beyond".to_owned(), links(&keep.beyond))])),
             Self::Tomb(_) => ("tomb", BTreeMap::new()),
         };
         map.insert("claim".to_owned(), Ipld::String(kind.to_owned()));
@@ -123,9 +137,11 @@ impl Claim {
     }
 
     /// Whether the claim is dissolved: one target, and small enough to be
-    /// its own CID.
+    /// its own CID. A keep with a frontier never is, so a dissolved keep
+    /// is always of all of its target.
     pub fn dissolves(&self) -> bool {
-        self.target().len() == 1 && self.encode().len() <= IDENTITY_MAX
+        let bounded = matches!(self, Self::Keep(keep) if !keep.beyond.is_empty());
+        !bounded && self.target().len() == 1 && self.encode().len() <= IDENTITY_MAX
     }
 
     /// The claim as a dag-cbor block: an identity block if it dissolves,
@@ -157,13 +173,7 @@ impl Claim {
         let Ipld::List(target) = map.remove("target")? else {
             return None;
         };
-        let target = target
-            .into_iter()
-            .map(|link| match link {
-                Ipld::Link(link) => Some(link),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()?;
+        let target = link_list(target)?;
         let claim = match kind.as_str() {
             "group" => {
                 let Ipld::Link(into) = map.remove("into")? else {
@@ -171,13 +181,29 @@ impl Claim {
                 };
                 Self::Group(Group::new(target.clone(), into)?)
             },
-            "keep" => Self::Keep(Keep::new(target.clone())?),
+            "keep" => {
+                let beyond = match map.remove("beyond") {
+                    Some(Ipld::List(beyond)) if !beyond.is_empty() => link_list(beyond)?,
+                    Some(_) => return None,
+                    None => Vec::new(),
+                };
+                Self::Keep(Keep::bounded(target.clone(), beyond)?)
+            },
             "tomb" => Self::Tomb(Tomb::new(target.clone())?),
             _ => return None,
         };
         // Nothing else, sorted and distinct already, and canonical dag-cbor
         (map.is_empty() && claim.target() == target && claim.encode() == data).then_some(claim)
     }
+}
+
+fn link_list(list: Vec<Ipld>) -> Option<Vec<Link>> {
+    list.into_iter()
+        .map(|link| match link {
+            Ipld::Link(link) => Some(link),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The CID of a simple tag: its name, as a raw identity CID.
@@ -295,5 +321,25 @@ mod tests {
         assert!(one.dissolves());
         assert_eq!(dissolved(&one.cid()), Some(one));
         assert!(Keep::new([]).is_none());
+    }
+
+    #[test]
+    fn frontiers_bound_keeps_and_never_dissolve() {
+        let keep = Keep::bounded([cid(b"a")], [cid(b"z"), cid(b"y"), cid(b"z")]).expect("keep");
+        assert_eq!(keep.beyond().len(), 2, "a set");
+        let bounded = Claim::Keep(keep);
+        assert!(!bounded.dissolves(), "a dissolved keep is of everything");
+        assert_eq!(bounded.cid().hashcode(), 0x12);
+        assert_eq!(Claim::parse(bounded.block().data()), Some(bounded));
+        // No frontier is no field, so it's the same claim as an unbounded keep
+        assert_eq!(Claim::Keep(Keep::bounded([cid(b"a")], []).expect("keep")).cid(), Claim::Keep(Keep::new([cid(b"a")]).expect("keep")).cid());
+        // An empty frontier isn't canonical
+        let empty = dagcbor::to_vec(&Ipld::Map(BTreeMap::from([
+            ("beyond".to_owned(), Ipld::List(Vec::new())),
+            ("claim".to_owned(), Ipld::String("keep".into())),
+            ("target".to_owned(), Ipld::List(vec![Ipld::Link(cid(b"a"))])),
+        ])))
+        .expect("encode");
+        assert_eq!(Claim::parse(&empty), None);
     }
 }

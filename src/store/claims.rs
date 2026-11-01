@@ -91,6 +91,14 @@ impl ClaimStore {
                  into_prefix BLOB NOT NULL
              );
              CREATE INDEX IF NOT EXISTS group_claims_into ON group_claims (into_);
+             -- Where a keep's reach stops, if it does short of all its targets
+             -- link to.
+             CREATE TABLE IF NOT EXISTS keep_beyond (
+                 claim INTEGER NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
+                 target INTEGER NOT NULL REFERENCES multihashes (id),
+                 prefix BLOB NOT NULL,
+                 PRIMARY KEY (claim, target, prefix)
+             ) WITHOUT ROWID;
              -- Every block's tags that still count. A simple tag's name is its
              -- identity digest, after the multihash's code and length varint
              -- (one byte, or two from 128).
@@ -124,11 +132,18 @@ impl ClaimStore {
         links(stmt.query_map([id], pair)?)
     }
 
+    fn beyond(&self, id: Id) -> Result<Vec<Link>> {
+        let mut stmt = self.db.conn().prepare_cached(
+            "SELECT b.prefix, m.multihash FROM keep_beyond b JOIN multihashes m ON m.id = b.target WHERE b.claim = ?1",
+        )?;
+        links(stmt.query_map([id], pair)?)
+    }
+
     /// The claim in a row, by its type.
     fn claim(&self, id: Id, kind: &str) -> Result<Claim> {
         match kind {
             "group" => self.group(id).map(Claim::Group),
-            "keep" => Keep::new(self.targets(id)?)
+            "keep" => Keep::bounded(self.targets(id)?, self.beyond(id)?)
                 .map(Claim::Keep)
                 .ok_or_else(|| Error::Invalid { store: NAME, reason: "a keep with no targets".into() }),
             "tomb" => self.tomb(id).map(Claim::Tomb),
@@ -242,6 +257,13 @@ impl ClaimStore {
         for target in claim.target() {
             let (prefix, multihash) = split(target)?;
             stmt.execute(params![row, self.db.intern(multihash.as_ref())?, prefix])?;
+        }
+        if let Claim::Keep(keep) = claim {
+            let mut stmt = conn.prepare_cached("INSERT OR IGNORE INTO keep_beyond (claim, target, prefix) VALUES (?1, ?2, ?3)")?;
+            for beyond in keep.beyond() {
+                let (prefix, multihash) = split(beyond)?;
+                stmt.execute(params![row, self.db.intern(multihash.as_ref())?, prefix])?;
+            }
         }
         Ok(())
     }
