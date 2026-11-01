@@ -894,6 +894,37 @@ fn whats_kept_too_isnt_lost_with_the_original() {
 }
 
 #[test]
+fn files_imported_in_place_are_mounted_on_anchors() {
+    let scratch = Scratch::new("offset-mounted");
+    let file = scratch.path().join("file");
+    std::fs::write(&file, content(1000, 0)).expect("write");
+    let mut router = router();
+    let importer = Importer { chunk_size: 64, ..Importer::default() };
+    let (mount, first) = router.import_mounted(&importer, &file, &mut |_, _| {}).expect("import");
+    assert!(crate::claim::is_anchor(&mount.anchor));
+    assert_eq!(mount.path, file.canonicalize().expect("path"));
+    assert_eq!((mount.chunk_size, mount.hidden), (64, false));
+    router.keep(&mount.anchor).expect("keep");
+    assert_eq!(router.anchor_value(&mount.anchor).expect("value"), Some(first.clone()));
+    assert!(router.referenced(first.multihash()).expect("referenced"));
+
+    // Importing it again unchanged changes nothing
+    assert_eq!(router.remount(&mount).expect("remount"), first);
+    assert_eq!(router.anchor_history(&mount.anchor).expect("history").len(), 1);
+
+    // Changed, it's mounted on the same anchor, which is the new version
+    std::fs::write(&file, content(1000, 3)).expect("change");
+    let second = router.remount(&mount).expect("remount");
+    assert_ne!(second, first);
+    assert_eq!(router.mounts().expect("mounts"), std::slice::from_ref(&mount));
+    assert_eq!(router.anchor_value(&mount.anchor).expect("value"), Some(second.clone()));
+    assert!(router.referenced(second.multihash()).expect("referenced"));
+    assert!(!router.referenced(first.multihash()).expect("referenced"), "what it was is collectable");
+    assert_eq!(router.mounts_over(&mount.path).expect("over"), std::slice::from_ref(&mount));
+    assert!(router.mounts_over(scratch.path()).expect("over").is_empty(), "a parent isn't under it");
+}
+
+#[test]
 fn keeps_leaves_in_place() {
     let scratch = Scratch::new("offset-in-place");
     let file = scratch.path().join("file");

@@ -17,6 +17,7 @@
 //! - Members let go of copies the mesh can spare when space runs short;
 //!   see `trim`.
 
+use std::path::PathBuf;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::time::Duration;
@@ -168,6 +169,9 @@ pub struct Node {
     /// Members with a notice from their cursor unanswered.
     noticing: HashSet<PeerId>,
     condemned: Condemned,
+    /// Files imported in place found changed, for whoever runs the node
+    /// to import again if they're mounted.
+    changed: Vec<PathBuf>,
     /// Condemnations asked of members and unanswered: whom, and of what.
     condemning: HashMap<request_response::OutboundRequestId, (PeerId, collect::BatchId)>,
     /// Events which happened outside `next`, for it to return first.
@@ -247,6 +251,7 @@ impl Node {
             notices: HashMap::new(),
             noticing: HashSet::new(),
             condemned,
+            changed: Vec::new(),
             condemning: HashMap::new(),
             ready: VecDeque::new(),
         };
@@ -388,6 +393,7 @@ impl Node {
     /// changed, telling members what that leaves no longer here, so they
     /// make up the copies. Returns how many blocks that was.
     pub fn forget_changed(&mut self, files: &[ExternalFile]) -> Result<usize> {
+        self.changed.extend(files.iter().filter(|file| file.changed()).map(|file| file.path.clone()));
         let lost = self.catalog.forget_changed(files)?;
         for key in &lost {
             self.sightings.forget(key.as_ref())?;
@@ -400,6 +406,11 @@ impl Node {
             }
         }
         Ok(lost.len())
+    }
+
+    /// The files imported in place found changed since this was last asked.
+    pub fn take_changed(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.changed)
     }
 
     /// Whether blocks have arrived which the trickle's yet to audit, as from

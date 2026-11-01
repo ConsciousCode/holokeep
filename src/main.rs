@@ -357,13 +357,30 @@ fn run(args: Args) -> anyhow::Result<()> {
                 return add(&importer, &path, quiet, &mut NullSink).map(drop);
             }
             open_repo(args.repo)?.batch(|repo| {
-                let root = if nocopy {
+                // What's imported in place is mounted on an anchor, which is
+                // what's kept, so it's kept through its changes
+                let kept = if nocopy && path != Path::new("-") {
+                    let canonical = std::fs::canonicalize(&path).with_context(|| format!("adding {}", path.display()))?;
+                    let base = canonical.parent().unwrap_or_else(|| Path::new("")).to_owned();
+                    let mut report = |p: &Path, link: &dag::DagLink| {
+                        if !quiet {
+                            println!("added {} {}", link.cid, p.strip_prefix(&base).unwrap_or(p).display());
+                        }
+                    };
+                    let (mount, root) = repo.import_mounted(&importer, &path, &mut report)?;
+                    if quiet {
+                        println!("{root}");
+                    } else {
+                        eprintln!("mounted on {}", mount.anchor);
+                    }
+                    mount.anchor
+                } else if nocopy {
                     add(&importer, &path, quiet, &mut InPlace::new(repo))?
                 } else {
                     add(&importer, &path, quiet, &mut Copying::new(repo))?
                 };
                 if !no_keep {
-                    repo.keep(&root)?;
+                    repo.keep(&kept)?;
                 }
                 anyhow::Ok(())
             })

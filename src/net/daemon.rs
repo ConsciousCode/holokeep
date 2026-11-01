@@ -24,7 +24,8 @@ use tokio::net::unix::OwnedWriteHalf;
 use super::mesh::{self, Error, Members, Result};
 use super::durability::Report;
 use super::node::{AuditId, Event, FetchId, Node, TrimId};
-use crate::store::{Db, ExternalFile};
+use crate::cid::CidRef as _;
+use crate::store::{Db, ExternalFile, Mount};
 
 /// The daemon's socket, in the repo.
 const SOCKET: &str = "node.sock";
@@ -88,6 +89,54 @@ impl Watch {
                     eprintln!("not watching {}: {e}", dir.display());
                 }
             }
+        }
+    }
+}
+
+/// How long after a mount's changed to import it again, so a write in
+/// progress can finish.
+const SETTLE_WRITE: Duration = Duration::from_secs(2);
+
+/// What's mounted being imported again as it changes, each on a blocking
+/// thread with its own connection to the repo, so the node carries on.
+struct Remounts {
+    dir: PathBuf,
+    /// Anchors being imported again.
+    pending: HashSet<Vec<u8>>,
+    done: tokio::sync::mpsc::UnboundedSender<(Mount, std::result::Result<crate::model::Link, String>)>,
+}
+
+impl Remounts {
+    /// Import again whatever's mounted over these paths, unless it's on its
+    /// way already.
+    fn changed(&mut self, node: &Node, paths: &[PathBuf]) -> Result<()> {
+        for path in paths {
+            for mount in node.catalog().mounts_over(path)? {
+                if !self.pending.insert(mount.anchor.to_bytes()) {
+                    continue;
+                }
+                let (dir, done) = (self.dir.clone(), self.done.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(SETTLE_WRITE).await;
+                    let importing = mount.clone();
+                    let root = tokio::task::spawn_blocking(move || {
+                        let mut catalog = crate::store::Catalog::open_repo(&dir).map_err(|e| e.to_string())?;
+                        catalog.remount(&importing).map_err(|e| e.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
+                    let _ = done.send((mount, root));
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn finished(&mut self, mount: &Mount, root: &std::result::Result<crate::model::Link, String>) {
+        self.pending.remove(&mount.anchor.to_bytes());
+        match root {
+            Ok(root) => eprintln!("{} is {root} now, as {} says", mount.path.display(), mount.anchor),
+            Err(e) => eprintln!("{} couldn't be imported again, so {} stays as it was: {e}", mount.path.display(), mount.anchor),
         }
     }
 }
@@ -290,17 +339,10 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
     let mut pressure = later(SETTLE);
     let mut collect = later(SETTLE);
     let mut waiting = Waiting::default();
-    // Files imported in place: watched from now, and looked at once in the
-    // background for what changed while the node wasn't running
     let (notify, mut changes) = tokio::sync::mpsc::unbounded_channel();
-    let mut watch = Watch::new(notify.clone());
-    let files = node.catalog().external_files(None)?;
-    watch.add(&files);
-    tokio::task::spawn_blocking(move || {
-        for file in files.into_iter().filter(ExternalFile::changed) {
-            let _ = notify.send(file.path);
-        }
-    });
+    let mut watch = watch_external(&node, notify)?;
+    let (done, mut remounted) = tokio::sync::mpsc::unbounded_channel();
+    let mut remounts = Remounts { dir: dir.to_owned(), pending: HashSet::new(), done };
     let result = loop {
         tokio::select! {
             event = node.next() => match event {
@@ -342,6 +384,8 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
                 if !node.auditing() {
                     node.trickle(copies)?;
                 }
+                let paths = node.take_changed();
+                remounts.changed(&node, &paths)?;
                 trickle = later(node.trickle_delay());
             },
             () = tokio::time::sleep_until(pressure) => {
@@ -357,18 +401,44 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
                 }
                 collect = later(COLLECT);
             },
-            Some(path) = changes.recv() => {
-                let files = node.catalog().external_at(&path)?;
-                let lost = node.forget_changed(&files)?;
-                if lost > 0 {
-                    eprintln!("{} changed: {lost} blocks imported from it are no longer here", path.display());
-                }
-            },
+            Some(path) = changes.recv() => on_change(&mut node, &mut remounts, path)?,
+            Some((mount, root)) = remounted.recv() => remounts.finished(&mount, &root),
             _ = tokio::signal::ctrl_c() => break Ok(()),
         }
     };
     std::fs::remove_file(&path)?;
     result
+}
+
+/// Files imported in place: watched from now, and looked at once in the
+/// background for what changed while the node wasn't running, so it needn't
+/// wait.
+fn watch_external(node: &Node, notify: tokio::sync::mpsc::UnboundedSender<PathBuf>) -> Result<Watch> {
+    let mut watch = Watch::new(notify.clone());
+    let files = node.catalog().external_files(None)?;
+    watch.add(&files);
+    tokio::task::spawn_blocking(move || {
+        for file in files.into_iter().filter(ExternalFile::changed) {
+            let _ = notify.send(file.path);
+        }
+    });
+    Ok(watch)
+}
+
+/// Something changed at a path: forget what was imported from it, if that
+/// was, and import again whatever's mounted over it.
+fn on_change(node: &mut Node, remounts: &mut Remounts, path: PathBuf) -> Result<()> {
+    let files = node.catalog().external_at(&path)?;
+    let lost = node.forget_changed(&files)?;
+    if lost > 0 {
+        eprintln!("{} changed: {lost} blocks imported from it are no longer here", path.display());
+    }
+    let mut paths = node.take_changed();
+    // Something new in a mounted directory
+    if files.is_empty() {
+        paths.push(path);
+    }
+    remounts.changed(node, &paths)
 }
 
 /// Those on the control socket waiting on fetches, audits and trims, to be

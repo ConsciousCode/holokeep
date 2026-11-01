@@ -383,6 +383,29 @@ pub struct Replication {
     pub claims: usize,
 }
 
+/// A file or directory imported in place, mounted on an anchor which is
+/// set to whatever it was last imported as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mount {
+    pub anchor: Link,
+    pub path: PathBuf,
+    pub chunk_size: usize,
+    pub width: usize,
+    pub hidden: bool,
+}
+
+impl Mount {
+    /// How to import it again.
+    pub fn importer(&self) -> crate::import::Importer {
+        crate::import::Importer {
+            chunk_size: self.chunk_size,
+            layout: crate::dag::BalancedLayout { width: self.width },
+            hidden: self.hidden,
+            ..crate::import::Importer::default()
+        }
+    }
+}
+
 /// What `drop_all` let go of.
 #[derive(Debug, Default)]
 pub struct Dropping {
@@ -505,6 +528,19 @@ impl Catalog {
                  UNION SELECT c.claim, g.into_ FROM group_claims g JOIN claims c ON c.id = g.id
                      WHERE c.claim IS NOT NULL
                  UNION SELECT source, target FROM refs;",
+        )?;
+        catalog.db.conn().execute_batch(
+            "-- Files and directories imported in place, by the anchor each is
+             -- mounted on, and how they were imported, to import them again
+             -- the same way when they change. Known only here: a path never
+             -- enters the soup.
+             CREATE TABLE IF NOT EXISTS mounts (
+                 anchor BLOB PRIMARY KEY,
+                 path BLOB UNIQUE NOT NULL,
+                 chunk_size INTEGER NOT NULL,
+                 width INTEGER NOT NULL,
+                 hidden INTEGER NOT NULL
+             );",
         )?;
         catalog.offsets = Some(offsets);
         catalog.claims = Some(claims);
@@ -1639,6 +1675,80 @@ impl Catalog {
             queue.extend(crate::links::links(cid.codec(), &data).unwrap_or_default());
         }
         Ok(missing)
+    }
+
+    /// The mount at a path, if there's one.
+    pub fn mount_at(&self, path: &Path) -> Result<Option<Mount>> {
+        Ok(self.mounts()?.into_iter().find(|mount| mount.path == path))
+    }
+
+    /// The mounts a path is, or is under.
+    pub fn mounts_over(&self, path: &Path) -> Result<Vec<Mount>> {
+        Ok(self.mounts()?.into_iter().filter(|mount| path.starts_with(&mount.path)).collect())
+    }
+
+    pub fn mounts(&self) -> Result<Vec<Mount>> {
+        let mut stmt = self.db.conn().prepare_cached("SELECT anchor, path, chunk_size, width, hidden FROM mounts ORDER BY path")?;
+        let rows = stmt.query_map([], |row| Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, bool>(4)?,
+        )))?;
+        rows.map(|row| {
+            let (anchor, path, chunk_size, width, hidden) = row?;
+            Ok(Mount {
+                anchor: Link::decode(&anchor).map_err(|e| Error::Invalid { store: "router", reason: format!("anchor: {e:?}") })?,
+                path: path_from(&path),
+                chunk_size: usize::try_from(chunk_size).unwrap_or_default(),
+                width: usize::try_from(width).unwrap_or_default(),
+                hidden,
+            })
+        })
+        .collect()
+    }
+
+    /// Record a mount, replacing whatever was at its path.
+    pub fn mount(&self, mount: &Mount) -> Result<()> {
+        self.db.conn()
+            .prepare_cached("INSERT OR REPLACE INTO mounts (anchor, path, chunk_size, width, hidden) VALUES (?1, ?2, ?3, ?4, ?5)")?
+            .execute(params![
+                mount.anchor.to_bytes(),
+                path_bytes(&mount.path),
+                i64::try_from(mount.chunk_size).unwrap_or(i64::MAX),
+                i64::try_from(mount.width).unwrap_or(i64::MAX),
+                mount.hidden,
+            ])?;
+        Ok(())
+    }
+
+    /// Import a path in place, mounted on its anchor, or a new one: the
+    /// anchor's set to what it's imported as, if that's new. Returns the
+    /// mount and what it's now.
+    pub fn import_mounted(&mut self, importer: &crate::import::Importer, path: &Path, report: &mut dyn FnMut(&Path, &crate::dag::DagLink)) -> Result<(Mount, Link)> {
+        let path = std::fs::canonicalize(path)?;
+        let root = importer
+            .add_path(&path, &mut InPlace::new(self), &mut |p: &Path, link: &crate::dag::DagLink| report(p, link))?
+            .ok_or_else(|| Error::Invalid { store: "router", reason: format!("unsupported file type: {}", path.display()) })?;
+        let root: Link = root.cid.into();
+        let anchor = match self.mount_at(&path)? {
+            Some(mount) => mount.anchor,
+            None => self.new_anchor()?,
+        };
+        let mount = Mount { anchor, path, chunk_size: importer.chunk_size, width: importer.layout.width, hidden: importer.hidden };
+        self.mount(&mount)?;
+        if self.anchor_value(&mount.anchor)?.as_ref() != Some(&root) {
+            self.set_anchor(&mount.anchor, &root)?;
+        }
+        Ok((mount, root))
+    }
+
+    /// Import a mount again, as it's changed. Returns what it's now.
+    pub fn remount(&mut self, mount: &Mount) -> Result<Link> {
+        let importer = mount.importer();
+        let path = mount.path.clone();
+        self.batch(|catalog| catalog.import_mounted(&importer, &path, &mut |_, _| {}).map(|(_, root)| root))
     }
 
     /// A new anchor, an empty identity to hang claims on.
