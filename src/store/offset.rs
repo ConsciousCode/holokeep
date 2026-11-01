@@ -305,6 +305,92 @@ impl OffsetStore {
     }
 }
 
+/// Letting go of kept files, which exist for the files they were imported
+/// as: once any of one's leaves goes, so has its file, and what's left of
+/// it is blocks other DAGs share, which the catalog moves out to be
+/// blocks of their own before the kept file goes.
+impl OffsetStore {
+    /// Whether a block is only ranges of files the repo keeps, which it
+    /// can let go of, rather than of files the user's imported in place.
+    pub fn only_kept(&self, key: Key<'_>) -> Result<bool> {
+        let Some(shards) = &self.shards else {
+            return Ok(false);
+        };
+        let Some(id) = self.db.lookup(key)? else {
+            return Ok(false);
+        };
+        let conn = self.db.conn();
+        let ranged = conn.prepare_cached("SELECT 1 FROM offset_ranges WHERE block = ?1")?.exists([id])?;
+        let elsewhere = conn
+            .prepare_cached(
+                "SELECT 1 FROM offset_ranges r WHERE r.block = ?1 AND (
+                     r.blob IN (SELECT blob FROM external_files)
+                     OR r.blob NOT IN (SELECT blob FROM shard_files WHERE dir = ?2))",
+            )?
+            .exists(params![id, shards.id()])?;
+        Ok(ranged && !elsewhere)
+    }
+
+    /// The kept files a block is a range of.
+    pub fn kept_blobs(&self, key: Key<'_>) -> Result<Vec<Multihash>> {
+        let Some(shards) = &self.shards else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.db.conn().prepare_cached(
+            "SELECT b.multihash FROM multihashes m
+             JOIN offset_ranges r ON r.block = m.id
+             JOIN multihashes b ON b.id = r.blob
+             JOIN shard_files s ON s.blob = r.blob AND s.dir = ?2
+             WHERE m.multihash = ?1",
+        )?;
+        let rows = stmt.query_map(params![key.to_bytes(), shards.id()], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.map(|bytes| super::decode_key(NAME, &bytes?)).collect()
+    }
+
+    /// The blocks a blob's ranges are, and whether each is a range of
+    /// any other blob too.
+    pub fn ranges_of(&self, blob: Key<'_>) -> Result<Vec<(Multihash, bool)>> {
+        let Some(id) = self.db.lookup(blob)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.db.conn().prepare_cached(
+            "SELECT m.multihash, EXISTS (SELECT 1 FROM offset_ranges o WHERE o.block = r.block AND o.blob != r.blob)
+             FROM offset_ranges r JOIN multihashes m ON m.id = r.block
+             WHERE r.blob = ?1 ORDER BY r.offset",
+        )?;
+        let rows = stmt.query_map([id], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, bool>(1)?)))?;
+        rows.map(|row| {
+            let (block, elsewhere) = row?;
+            Ok((super::decode_key(NAME, &block)?, elsewhere))
+        })
+        .collect()
+    }
+
+    /// Whether a block is still a range of anything.
+    pub fn ranged(&self, key: Key<'_>) -> Result<bool> {
+        Ok(self.db.conn()
+            .prepare_cached("SELECT 1 FROM multihashes m JOIN offset_ranges r ON r.block = m.id WHERE m.multihash = ?1")?
+            .exists([key.to_bytes()])?)
+    }
+
+    /// Forget a kept file: its ranges, the roots it was imported as, and
+    /// the file. Returns its size.
+    pub fn unkeep(&self, blob: Key<'_>) -> Result<u64> {
+        let (Some(shards), Some(id)) = (&self.shards, self.db.lookup(blob)?) else {
+            return Ok(0);
+        };
+        let conn = self.db.conn();
+        let size: Option<i64> = conn
+            .prepare_cached("SELECT size FROM shard_files WHERE dir = ?1 AND blob = ?2")?
+            .query_row(params![shards.id(), id], |row| row.get(0))
+            .optional()?;
+        conn.prepare_cached("DELETE FROM offset_ranges WHERE blob = ?1")?.execute([id])?;
+        conn.prepare_cached("DELETE FROM shard_roots WHERE blob = ?1")?.execute([id])?;
+        shards.forget(blob)?;
+        Ok(size.map_or(0, |size| u64::try_from(size).unwrap_or_default()))
+    }
+}
+
 impl Store for OffsetStore {
     fn name(&self) -> &'static str { NAME }
 }

@@ -1017,6 +1017,71 @@ fn missing_kept_files_are_reported() {
     assert!(err.to_string().contains("which is missing"), "{err}");
 }
 
+/// A kept file's leaves, in order.
+fn kept_leaves(router: &Catalog, data: &[u8]) -> Vec<Multihash> {
+    let offsets = router.offsets.as_ref().expect("offsets");
+    offsets.ranges_of(raw(data).cid().multihash()).expect("ranges").into_iter().map(|(leaf, _)| leaf).collect()
+}
+
+#[test]
+fn kept_files_go_whole_when_their_leaves_all_do() {
+    let scratch = Scratch::new("shards-drop-whole");
+    let file = scratch.path().join("file");
+    std::fs::write(&file, content(1000, 0)).expect("write");
+    let mut router = sharded(&scratch);
+    import_copying(&mut router, &file);
+    let leaves = kept_leaves(&router, &content(1000, 0));
+    assert_eq!(leaves.len(), 16);
+    assert!(leaves.iter().all(|leaf| router.can_drop(leaf.as_ref()).expect("can")));
+
+    let dropping = router.drop_all(&leaves).expect("drop");
+    assert_eq!((dropping.dropped.len(), dropping.freed), (16, 1000), "nothing moved");
+    assert!(kept_files(&scratch).is_empty());
+    assert_eq!((count(&router.db, "offset_ranges"), count(&router.db, "shard_roots"), count(&router.db, "raw_blocks")), (0, 0, 0));
+    assert!(leaves.iter().all(|leaf| !router.has(leaf.as_ref()).expect("has")));
+    assert_eq!(forms(&router), [("unixfs".to_owned(), 1)]);
+}
+
+#[test]
+fn a_leaf_going_splits_its_kept_file() {
+    let scratch = Scratch::new("shards-split");
+    let file = scratch.path().join("file");
+    std::fs::write(&file, content(1000, 0)).expect("write");
+    let mut router = sharded(&scratch);
+    import_copying(&mut router, &file);
+    let leaves = kept_leaves(&router, &content(1000, 0));
+    let (gone, rest) = leaves.split_first().expect("leaves");
+
+    // The rest are 64 bytes but the last, and become raw blocks
+    assert_eq!(router.drop_copies(gone.as_ref()).expect("drop"), Some(1000 - 936));
+    assert!(kept_files(&scratch).is_empty(), "the kept file's gone");
+    assert!(!router.has(gone.as_ref()).expect("has"));
+    assert_eq!(forms(&router), [("raw".to_owned(), 15), ("unixfs".to_owned(), 1)]);
+    for (leaf, start) in rest.iter().zip((64..).step_by(64)) {
+        let cid = router.cid_of(leaf.as_ref()).expect("cid").expect("known");
+        let block = router.get_block(&cid).expect("get").expect("still here");
+        assert_eq!(block.data(), &content(1000, 0)[start..(start + 64).min(1000)]);
+    }
+
+    // And what's left survives a reopen of the shards
+    router.reindex().expect("reindex");
+    assert_eq!(forms(&router), [("raw".to_owned(), 15), ("unixfs".to_owned(), 1)]);
+}
+
+#[test]
+fn leaves_of_files_imported_in_place_stay() {
+    let scratch = Scratch::new("shards-drop-in-place");
+    let file = scratch.path().join("file");
+    std::fs::write(&file, content(1000, 0)).expect("write");
+    let mut router = sharded(&scratch);
+    import_copying(&mut router, &file);
+    import_in_place(&mut router, &file);
+    let leaves = kept_leaves(&router, &content(1000, 0));
+    assert!(leaves.iter().all(|leaf| !router.can_drop(leaf.as_ref()).expect("can")), "they're the user's");
+    assert_eq!(router.drop_all(&leaves).expect("drop").dropped.len(), 0);
+    assert_eq!(kept_files(&scratch).len(), 1);
+}
+
 //----------//
 //-[ IPLD ]-//
 //----------//

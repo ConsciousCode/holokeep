@@ -383,6 +383,15 @@ pub struct Replication {
     pub claims: usize,
 }
 
+/// What `drop_all` let go of.
+#[derive(Debug, Default)]
+pub struct Dropping {
+    /// The leaves whose copies here were let go of.
+    pub dropped: Vec<Multihash>,
+    /// The bytes freed, less any moved out of kept files.
+    pub freed: u64,
+}
+
 /// What `copy_to` did.
 #[derive(Debug, Default)]
 pub struct CopyReport {
@@ -1086,15 +1095,18 @@ impl Catalog {
 
     /// Where a leaf is in the repo's own volumes, if every copy there can
     /// be let go of: a block with no links, under every CID it's had, in
-    /// stores which can remove it. Structure stays, being small and what's
-    /// queried.
+    /// stores which can remove it, or as ranges only of files the repo
+    /// keeps. Structure stays, being small and what's queried.
     fn droppable(&self, key: Key<'_>) -> Result<Option<Vec<Placement>>> {
         if key.code() == IDENTITY || self.cids(key)?.iter().any(|cid| cid.codec() != crate::cid::RAW_CODEC) {
             return Ok(None);
         }
         let own: Vec<usize> = self.placement.iter().map(|&(v, _)| v).collect();
         let placed: Vec<Placement> = self.placements(key)?.into_iter().filter(|(v, _)| own.contains(v)).collect();
-        if placed.is_empty() || placed.iter().any(|(_, form)| form == "offset") {
+        if placed.is_empty() {
+            return Ok(None);
+        }
+        if placed.iter().any(|(_, form)| form == "offset") && !self.offsets.as_ref().is_some_and(|offsets| offsets.only_kept(key).unwrap_or(false)) {
             return Ok(None);
         }
         Ok(Some(placed))
@@ -1106,27 +1118,83 @@ impl Catalog {
     }
 
     /// Let go of a leaf's copies in the repo's own volumes, returning the
-    /// bytes freed, or None if they can't all be let go of. Copies on
-    /// other volumes stay. Whether the mesh can spare them is for the
-    /// caller to know.
+    /// bytes freed, or None if they can't all be let go of. See
+    /// `drop_all`.
     pub fn drop_copies(&self, key: Key<'_>) -> Result<Option<u64>> {
-        let Some(placed) = self.droppable(key)? else {
-            return Ok(None);
-        };
-        let Some(id) = self.db.lookup(key)? else {
-            return Ok(None);
-        };
+        let dropping = self.drop_all(&[owned(key)?])?;
+        Ok((!dropping.dropped.is_empty()).then_some(dropping.freed))
+    }
+
+    /// Let go of the copies in the repo's own volumes of whichever of
+    /// these leaves can all be let go of. Copies on other volumes stay.
+    /// Whether the mesh can spare them is for the caller to know.
+    ///
+    /// A kept file exists for the file it was imported as, which a leaf
+    /// going means is gone: so the kept file goes, and what's left of it,
+    /// which other DAGs share, becomes blocks of their own first. Leaves
+    /// let go of together cost nothing to move.
+    pub fn drop_all(&self, keys: &[Multihash]) -> Result<Dropping> {
+        let mut going: std::collections::BTreeMap<Vec<u8>, (&Multihash, Vec<Placement>)> = std::collections::BTreeMap::new();
+        for key in keys {
+            if let Some(placed) = self.droppable(key.as_ref())? {
+                going.insert(key.to_bytes(), (key, placed));
+            }
+        }
         self.db.atomically(|| {
             let mut freed = 0u64;
-            for placement in &placed {
-                let Some(bytes) = self.named(placement)?.remove(key)? else {
-                    return Err(Error::Volume(format!("{} can't let {key:?} go", placement.1)));
-                };
-                freed = freed.saturating_add(bytes);
-                self.unrecord(id, placement.0)?;
+            let mut kept: std::collections::BTreeMap<Vec<u8>, Multihash> = std::collections::BTreeMap::new();
+            for &(key, ref placed) in going.values() {
+                let id = self.db.lookup(key.as_ref())?.ok_or_else(|| Error::Volume(format!("{key:?} isn't here")))?;
+                for placement in placed {
+                    if placement.1 == "offset" {
+                        for blob in self.offsets.as_ref().map(|offsets| offsets.kept_blobs(key.as_ref())).transpose()?.unwrap_or_default() {
+                            kept.insert(blob.to_bytes(), blob);
+                        }
+                        continue;
+                    }
+                    let Some(bytes) = self.named(placement)?.remove(key.as_ref())? else {
+                        return Err(Error::Volume(format!("{} can't let {key:?} go", placement.1)));
+                    };
+                    freed = freed.saturating_add(bytes);
+                    self.unrecord(id, placement.0)?;
+                }
             }
-            Ok(Some(freed))
+            if let Some(offsets) = &self.offsets {
+                for blob in kept.values() {
+                    let mut moved = 0u64;
+                    for (block, elsewhere) in offsets.ranges_of(blob.as_ref())? {
+                        if !elsewhere && !going.contains_key(&block.to_bytes()) {
+                            moved = moved.saturating_add(self.move_out(block.as_ref())?);
+                        }
+                    }
+                    freed = freed.saturating_add(offsets.unkeep(blob.as_ref())?.saturating_sub(moved));
+                }
+                for &(key, ref placed) in going.values() {
+                    if let Some((volume, _)) = placed.iter().find(|(_, form)| form == "offset")
+                        && !offsets.ranged(key.as_ref())?
+                        && let Some(id) = self.db.lookup(key.as_ref())?
+                    {
+                        self.unrecord(id, *volume)?;
+                    }
+                }
+            }
+            Ok(Dropping { dropped: going.values().map(|&(key, _)| key.clone()).collect(), freed })
         })
+    }
+
+    /// Move a block out of the kept file it's a range of, to be a block of
+    /// its own, returning its size.
+    fn move_out(&self, key: Key<'_>) -> Result<u64> {
+        let (Some(block), Some(id)) = (self.readable(key)?, self.db.lookup(key)?) else {
+            return Err(Error::Volume(format!("{key:?} can't be read out of its kept file")));
+        };
+        for (volume, _) in self.placements(key)?.into_iter().filter(|(_, form)| form == "offset") {
+            let &volume = self.ids.get(volume).ok_or_else(|| Error::UnknownStore("offset".into()))?;
+            self.db.conn().prepare_cached("DELETE FROM blocks WHERE block = ?1 AND volume = ?2")?.execute([id, volume])?;
+        }
+        let placed = self.place(&block, Provenance::Unknown)?;
+        self.record(id, &placed)?;
+        Ok(crate::dag::len64(block.data()))
     }
 
     /// Whether a block is here: as `has`, but a dissolved claim's identity

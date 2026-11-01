@@ -427,18 +427,14 @@ impl Node {
         if trim.waiting() {
             return Ok(());
         }
-        let mut gone = Vec::new();
-        let mut freed = 0u64;
-        for key in trim.decide() {
-            if let Some(bytes) = self.catalog.drop_copies(key.as_ref())? {
-                if !self.catalog.has(key.as_ref())? {
-                    self.sightings.forget(key.as_ref())?;
-                }
-                freed = freed.saturating_add(bytes);
-                gone.push(key);
+        let dropping = self.catalog.drop_all(&trim.decide())?;
+        for key in &dropping.dropped {
+            if !self.catalog.has(key.as_ref())? {
+                self.sightings.forget(key.as_ref())?;
             }
         }
-        trim.dropped(gone.len(), freed);
+        let gone = dropping.dropped;
+        trim.dropped(gone.len(), dropping.freed);
         let report = trim.report();
         self.trims.remove(&id);
         if !gone.is_empty() {
