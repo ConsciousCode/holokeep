@@ -309,16 +309,24 @@ macro_rules! out {
     ($($arg:tt)*) => { say(format_args!($($arg)*)) };
 }
 
+/// The first failure writing to stdout other than a closed pipe, such as a
+/// full disk, which the command fails with once it's done
+static UNSAID: std::sync::OnceLock<io::Error> = std::sync::OnceLock::new();
+
 fn say(line: std::fmt::Arguments) {
     let mut stdout = io::stdout().lock();
-    match stdout.write_fmt(line).and_then(|()| stdout.write_all(b"\n")) {
-        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => panic!("failed printing to stdout: {e}"),
-        _ => {}
+    if let Err(e) = stdout.write_fmt(line).and_then(|()| stdout.write_all(b"\n"))
+        && e.kind() != io::ErrorKind::BrokenPipe
+    {
+        let _ = UNSAID.set(e);
     }
 }
 
 fn main() {
-    if let Err(e) = run(Args::parse()) {
+    let result = run(Args::parse()).and_then(|()| {
+        UNSAID.get().map_or(Ok(()), |e| Err(anyhow::anyhow!("writing to stdout: {e}")))
+    });
+    if let Err(e) = result {
         // Streaming into a closed pipe (`hk cat big | head`) ends quietly
         if e.chain().any(|cause| cause.downcast_ref::<io::Error>().is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe)) {
             return;
@@ -337,10 +345,10 @@ fn repo_dir(repo: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 
 /// Fetch what isn't here of a DAG about to be read, if the node's running
 /// to fetch it. What can't be is reported by the reading.
-fn fetch_first(repo: &Option<PathBuf>, cid: &Link) -> anyhow::Result<()> {
+fn fetch_first(repo: Option<&PathBuf>, cid: &Link) -> anyhow::Result<()> {
     #[cfg(feature = "net")]
     {
-        let dir = repo_dir(repo.clone())?;
+        let dir = repo_dir(repo.cloned())?;
         if let Some((_, missing)) = holokeep::net::daemon::fetch(&dir, cid)?
             && !missing.is_empty()
         {
@@ -405,14 +413,14 @@ fn run(args: Args) -> anyhow::Result<()> {
             })
         },
         Command::Cat { cid } => {
-            fetch_first(&args.repo, &cid)?;
+            fetch_first(args.repo.as_ref(), &cid)?;
             let repo = open_repo(args.repo)?;
             let mut out = io::BufWriter::new(io::stdout().lock());
             export::cat(&repo, &cid, &mut out)?;
             Ok(out.flush()?)
         },
         Command::Get { cid, output } => {
-            fetch_first(&args.repo, &cid)?;
+            fetch_first(args.repo.as_ref(), &cid)?;
             let repo = open_repo(args.repo)?;
             let dest = output.unwrap_or_else(|| PathBuf::from(cid.to_string()));
             export::get(&repo, &cid, &dest).with_context(|| format!("writing {}", dest.display()))
@@ -420,8 +428,8 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Refs { cid, back } => refs(&open_repo(args.repo)?, &cid, back),
         Command::Dag(command) => dag(args.repo, command),
         Command::Tag(command) => tag(open_repo(args.repo)?, command),
-        Command::Keep(command) => keep(&args.repo, open_repo(args.repo.clone())?, command),
-        Command::Anchor(command) => anchor(&args.repo, open_repo(args.repo.clone())?, command),
+        Command::Keep(command) => keep(args.repo.as_ref(), open_repo(args.repo.clone())?, command),
+        Command::Anchor(command) => anchor(args.repo.as_ref(), open_repo(args.repo.clone())?, command),
         Command::Block(BlockCommand::Get { cid }) => {
             let repo = open_repo(args.repo)?;
             let block = repo.get_block(&cid)?.with_context(|| format!("block {cid} not found"))?;
@@ -493,7 +501,9 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
         },
         NodeCommand::Status => {
             let lines = daemon::ask(dir, "status")?.context("this node isn't running: start `hk node run`")?;
-            lines.iter().for_each(|line| out!("{line}"));
+            for line in &lines {
+                out!("{line}");
+            }
         },
         NodeCommand::Audit { copies } => {
             let report = daemon::audit(dir, copies)?.context("this node isn't running: start `hk node run`")?;
@@ -502,7 +512,11 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
                 eprintln!("{} blocks are still short, with no connected member to raise them", report.short);
             }
         },
-        NodeCommand::Peers => if let Some(lines) = daemon::ask(dir, "peers")? { lines.iter().for_each(|line| out!("{line}")) } else {
+        NodeCommand::Peers => if let Some(lines) = daemon::ask(dir, "peers")? {
+            for line in &lines {
+                out!("{line}");
+            }
+        } else {
             eprintln!("this node isn't running; members it knows of:");
             for (peer, addrs) in daemon::members(dir)?.list()? {
                 let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
@@ -647,7 +661,7 @@ fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {
             })
         },
         DagCommand::Export { cid, output } => {
-            fetch_first(&repo, &cid)?;
+            fetch_first(repo.as_ref(), &cid)?;
             let repo = open_repo(repo)?;
             if let Some(path) = output {
                 // Written aside and renamed, so a failed export leaves nothing
@@ -675,7 +689,7 @@ fn tag_cid(name: &str) -> anyhow::Result<Link> {
 /// running: a keep is only added by a node holding everything it links
 /// to, so its copy outlives anything collecting it elsewhere meanwhile.
 /// Returns each DAG's frontier: what's still missing, if `shallow`.
-fn hold_all(dir: &Option<PathBuf>, repo: &Catalog, cids: &[Link], shallow: bool) -> anyhow::Result<Vec<Vec<Link>>> {
+fn hold_all(dir: Option<&PathBuf>, repo: &Catalog, cids: &[Link], shallow: bool) -> anyhow::Result<Vec<Vec<Link>>> {
     let mut frontiers = Vec::new();
     for cid in cids {
         if repo.missing_under(cid)?.is_empty() {
@@ -704,7 +718,7 @@ fn hold_all(dir: &Option<PathBuf>, repo: &Catalog, cids: &[Link], shallow: bool)
     Ok(frontiers)
 }
 
-fn anchor(dir: &Option<PathBuf>, mut repo: Catalog, command: AnchorCommand) -> anyhow::Result<()> {
+fn anchor(dir: Option<&PathBuf>, mut repo: Catalog, command: AnchorCommand) -> anyhow::Result<()> {
     match command {
         AnchorCommand::New => out!("{}", repo.new_anchor()?),
         AnchorCommand::Set { anchor, cid } => {
@@ -727,7 +741,7 @@ fn anchor(dir: &Option<PathBuf>, mut repo: Catalog, command: AnchorCommand) -> a
     Ok(())
 }
 
-fn keep(dir: &Option<PathBuf>, mut repo: Catalog, command: KeepCommand) -> anyhow::Result<()> {
+fn keep(dir: Option<&PathBuf>, mut repo: Catalog, command: KeepCommand) -> anyhow::Result<()> {
     let mut out = io::BufWriter::new(io::stdout().lock());
     match command {
         KeepCommand::Add { cids, shallow } => {

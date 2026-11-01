@@ -183,7 +183,7 @@ pub trait Decoder<'de>: Sized {
                 let mut ls = Vec::with_capacity(remain.unwrap_or(0));
                 while remain != Some(0) && dec.has_next(self)? {
                     ls.push(self.decode_any()?);
-                    remain = remain.map(|r| r - 1);
+                    remain = remain.map(|r| r.saturating_sub(1));
                 }
                 dec.end(self)?;
                 Any::List(ls)
@@ -194,7 +194,7 @@ pub trait Decoder<'de>: Sized {
                 let mut map = Vec::with_capacity(remain.unwrap_or(0));
                 while remain != Some(0) && let Some(key) = dec.key(self)? {
                     map.push((key, self.decode_any()?));
-                    remain = remain.map(|r| r - 1);
+                    remain = remain.map(|r| r.saturating_sub(1));
                 }
                 dec.end(self)?;
                 Any::Map(map)

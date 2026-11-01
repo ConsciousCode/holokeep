@@ -47,8 +47,6 @@ pub enum UnixfsError {
     EntryNotFound(String),
 }
 
-type UnixfsResult<T> = Result<T, UnixfsError>;
-
 pub trait Chunker {
     /// Feed more input, emitting any chunks which are now complete.
     fn push(&mut self, input: &[u8], emit: impl FnMut(Bytes));
@@ -58,6 +56,7 @@ pub trait Chunker {
 }
 
 /// Size-based chunker that splits data at fixed intervals.
+#[derive(Default)]
 pub struct SizeChunker {
     chunk_size: usize,
     buffer: BytesMut,
@@ -98,9 +97,12 @@ impl Chunker for SizeChunker {
     }
 }
 
-/// Constants and tables for implementing rabin rolling hash window
+/// Constants and tables for implementing rabin rolling hash window.
+// Evaluated at compile time, where a bad index or overflow is a compile
+// error rather than a panic, and where `From` isn't callable yet
+#[allow(clippy::as_conversions, clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 mod rabin_const {
-    const POLY: u64 = 0x3DA3358B4DC173;
+    const POLY: u64 = 0x003D_A335_8B4D_C173;
 
     pub const TABLE: [u64; 256] = {
         let mut table = [0u64; 256];
@@ -162,8 +164,8 @@ impl RabinWindow {
     fn new(avg_size: usize) -> Self {
         // Calculate mask for average chunk size
         // We want mask such that (hash & mask) == 0 with probability 1/avg_size
-        let bits = (avg_size as f64).log2().floor() as u32;
-        let mask = (1u64 << bits) - 1;
+        let bits = avg_size.checked_ilog2().unwrap_or(0);
+        let mask = 1u64.checked_shl(bits).map_or(u64::MAX, |bit| bit.wrapping_sub(1));
 
         Self {
             window: [0u8; rabin_const::WINDOW],
@@ -180,15 +182,13 @@ impl RabinWindow {
     }
 
     fn slide(&mut self, byte: u8) -> u64 {
-        let out = self.window[self.wpos];
-        self.window[self.wpos] = byte;
-        self.wpos = (self.wpos + 1) % rabin_const::WINDOW;
+        let out = self.window.get_mut(self.wpos).map_or(0, |slot| std::mem::replace(slot, byte));
+        self.wpos = self.wpos.wrapping_add(1) % rabin_const::WINDOW;
 
         // Rolling CRC: shift the new byte in, cancel the one leaving, so
         // the hash depends only on the window's contents
-        self.hash = (self.hash >> 8)
-            ^ rabin_const::TABLE[(self.hash ^ u64::from(byte)) as u8 as usize]
-            ^ rabin_const::OUT_TABLE[out as usize];
+        let [low, ..] = self.hash.to_le_bytes();
+        self.hash = (self.hash >> 8) ^ entry(&rabin_const::TABLE, low ^ byte) ^ entry(&rabin_const::OUT_TABLE, out);
 
         self.hash
     }
@@ -196,6 +196,11 @@ impl RabinWindow {
     const fn is_boundary(&self) -> bool {
         (self.hash & self.mask) == 0
     }
+}
+
+/// A table's entry for a byte; every byte has one, so the check folds away
+fn entry(table: &[u64; 256], byte: u8) -> u64 {
+    table.get(usize::from(byte)).copied().unwrap_or_default()
 }
 
 /// Rabin fingerprint chunker for content-defined chunking.
@@ -210,6 +215,12 @@ pub struct RabinChunker {
     window: RabinWindow,
     buffer: BytesMut,
     chunk_len: usize,
+}
+
+impl Default for RabinChunker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RabinChunker {
@@ -239,7 +250,7 @@ impl Chunker for RabinChunker {
 
         for &byte in input {
             self.window.slide(byte);
-            self.chunk_len += 1;
+            self.chunk_len = self.chunk_len.saturating_add(1);
 
             if (self.window.is_boundary() || self.chunk_len >= self.max_size)
                 && self.chunk_len >= self.min_size {
@@ -369,7 +380,7 @@ mod tests {
         // Create data with some patterns
         let mut data = Vec::new();
         for i in 0..100 {
-            data.extend_from_slice(&[i as u8; 1000]);
+            data.extend_from_slice(&[u8::try_from(i).unwrap(); 1000]);
         }
         let dlen = data.len();
 
@@ -400,24 +411,24 @@ mod tests {
     fn test_chunker_type_parse() {
         assert_eq!(
             ChunkerType::parse("size-262144"),
-            Some(ChunkerType::Size(262144))
+            Some(ChunkerType::Size(262_144))
         );
 
         assert_eq!(
             ChunkerType::parse("rabin-131072-262144-1048576"),
             Some(ChunkerType::Rabin {
-                min: 131072,
-                avg: 262144,
-                max: 1048576
+                min: 131_072,
+                avg: 262_144,
+                max: 1_048_576
             })
         );
 
         assert_eq!(
             ChunkerType::parse("rabin-262144"),
             Some(ChunkerType::Rabin {
-                min: 87381,
-                avg: 262144,
-                max: 393216
+                min: 87_381,
+                avg: 262_144,
+                max: 393_216
             })
         );
 
@@ -429,7 +440,7 @@ mod tests {
         // boxo/chunker: rabin-<avg> means min avg/3, max avg*1.5
         assert_eq!(
             ChunkerType::parse("rabin"),
-            Some(ChunkerType::Rabin { min: 87381, avg: 262144, max: 393216 })
+            Some(ChunkerType::Rabin { min: 87_381, avg: 262_144, max: 393_216 })
         );
         assert_eq!(
             ChunkerType::parse("rabin-min:16-avg:32-max:64"),

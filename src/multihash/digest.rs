@@ -72,7 +72,7 @@ pub struct Inline<const S: usize> {
 }
 impl<const S: usize> AsRef<[u8]> for Inline<S> {
     fn as_ref(&self) -> &[u8] {
-        &self.digest[..self.len as usize]
+        self.digest.get(..usize::from(self.len)).unwrap_or(&self.digest)
     }
 }
 impl<const S: usize> DigestBuf for Inline<S> {
@@ -85,7 +85,7 @@ impl<const S: usize> DigestBuf for Inline<S> {
         }
         else {
             Ok(Self {
-                len: len as u8,
+                len: u8::try_from(len).map_err(|_| SizeError::Overflow)?,
                 digest: {
                     let mut tmp = [0u8; S];
                     tmp[..len].copy_from_slice(digest);

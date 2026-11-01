@@ -40,17 +40,16 @@ pub trait MultihashDigest: MultihashCodec {
 pub struct UnsupportedName;
 
 fn sha2_256_trunc254_padded(src: &[u8]) -> [u8; 32] {
-    let mut digest = sha2::Sha256::digest(src);
-    let digest = digest
-        .as_mut_array()
-        .expect("sha2-256-trunc254-padded");
-    digest[0] &= 0b0011_1111;
-    *digest
+    let mut digest: [u8; 32] = sha2::Sha256::digest(src).into();
+    if let Some(first) = digest.first_mut() {
+        *first &= 0b0011_1111;
+    }
+    digest
 }
 
 fn murmur3_x64_64(src: &[u8]) -> [u8; 8] {
-    let digest = murmur3_x64_128(&mut io::Cursor::new(src), 0)
-        .expect("no error for io::Cursor Read");
+    // Reading from memory can't fail
+    let digest = murmur3_x64_128(&mut io::Cursor::new(src), 0).unwrap_or_default();
     // The crate returns (h2 << 64) | h1, but murmur3-x64-64 is h1 alone
     // (what Go's murmur3.Sum64 returns), big-endian
     let mut buf = [0u8; _];
@@ -68,6 +67,11 @@ macro_rules! build_codec_enum {
         pub enum MultihashFunc { $( $name = $code, )* }
 
         impl MultihashFunc {
+            /// The multicodec code, usable in constants
+            pub const fn value(self) -> u64 {
+                match self { $( Self::$name => $code, )* }
+            }
+
             const fn size_name(&self) -> (usize, &'static str) {
                 match self { $( Self::$name => ($size, $str), )* }
             }

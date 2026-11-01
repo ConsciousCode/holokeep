@@ -22,7 +22,6 @@ use bytes::BufMut;
 
 const CONT_BIT: u8 = 1 << 7;
 const PAYLOAD: u8 = CONT_BIT - 1;
-const SIGN_BIT: u8 = 1 << 6;
 
 /// An error type for reading LEB128-encoded values.
 #[derive(Debug, thiserror::Error)]
@@ -38,10 +37,19 @@ pub enum Error {
     NonMinimal,
 }
 
+/// How many bytes `value` takes: one per seven bits it needs.
 pub const fn size(value: u64) -> usize {
-    if value <= 127 { 1 }
-    else {
-        ((value.ilog2() + 7)/7) as usize
+    match value.checked_ilog2() {
+        None | Some(0..=6) => 1,
+        Some(7..=13) => 2,
+        Some(14..=20) => 3,
+        Some(21..=27) => 4,
+        Some(28..=34) => 5,
+        Some(35..=41) => 6,
+        Some(42..=48) => 7,
+        Some(49..=55) => 8,
+        Some(56..=62) => 9,
+        Some(_) => 10,
     }
 }
 
@@ -49,7 +57,8 @@ fn payload_u8(byte: u8) -> u64 {
     u64::from(byte & PAYLOAD)
 }
 const fn payload_u64(value: u64) -> u8 {
-    value as u8 & PAYLOAD
+    let [low, ..] = value.to_le_bytes();
+    low & PAYLOAD
 }
 
 /// Read an unsigned LEB128-encoded number from the `std::io::Read` stream
@@ -82,7 +91,7 @@ pub fn read(buf: &mut &[u8]) -> Result<u64, Error> {
             return Ok(result);
         }
 
-        shift += 7;
+        shift = shift.saturating_add(7);
     }
 }
 
@@ -132,19 +141,17 @@ mod tests {
     #[test]
     fn test_payload_u8() {
         for i in 0..127 {
-            assert_eq!(i as u64, payload_u8(i));
-            assert_eq!(i as u64, payload_u8(i | CONT_BIT));
+            assert_eq!(u64::from(i), payload_u8(i));
+            assert_eq!(u64::from(i), payload_u8(i | CONT_BIT));
         }
     }
 
     #[test]
     fn test_payload_u64() {
         for i in 0u64..127 {
-            assert_eq!(i as u8, payload_u64(1 << 16 | i));
-            assert_eq!(
-                i as u8,
-                payload_u64(i << 16 | i | (CONT_BIT as u64))
-            );
+            let byte = u8::try_from(i).unwrap();
+            assert_eq!(byte, payload_u64(1 << 16 | i));
+            assert_eq!(byte, payload_u64(i << 16 | i | u64::from(CONT_BIT)));
         }
     }
 
@@ -186,7 +193,7 @@ mod tests {
             read(&mut readable).expect("Should read number")
         );
 
-        let buf = [57u8 | CONT_BIT, 100];
+        let buf = [0b11_1001 | CONT_BIT, 100];
         let mut readable = &buf[..];
         assert_eq!(
             12857,
@@ -200,7 +207,7 @@ mod tests {
         let mut readable = &buf[..];
         match read(&mut readable) {
             Err(Error::Truncated) => (),
-            otherwise => panic!("Unexpected: {:?}", otherwise),
+            otherwise => panic!("Unexpected: {otherwise:?}"),
         }
     }
 
@@ -337,13 +344,7 @@ mod tests {
         ];
         let mut readable = &buf[..];
 
-        assert!(if let Error::Overflow =
-            read(&mut readable).expect_err("Should fail with Error::Overflow")
-        {
-            true
-        } else {
-            false
-        });
+        assert!(matches!(read(&mut readable), Err(Error::Overflow)));
         assert_eq!(
             read(&mut readable).expect("Should succeed with correct value"),
             45156
@@ -360,7 +361,7 @@ mod tests {
         // 2^63 - 1 is the most 9 bytes hold, and all multiformats allows
         let mut max = vec![0xff; 8];
         max.push(0x7f);
-        assert_eq!(read_minimal(&mut &max[..]).ok(), Some(i64::MAX as u64));
+        assert_eq!(read_minimal(&mut &max[..]).ok(), Some(u64::MAX >> 1));
         let mut over = Vec::new();
         write(&mut over, 1 << 63);
         assert!(matches!(read_minimal(&mut &over[..]), Err(Error::Overflow)));

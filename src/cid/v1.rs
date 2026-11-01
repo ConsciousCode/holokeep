@@ -21,8 +21,6 @@ pub struct Cidv1<D=DefaultDigest> {
     hash: Multihash<D>,
 }
 
-type X = Box<Cidv1<[u8]>>;
-
 //--------------------//
 //-[ Inherent impls ]-//
 //--------------------//
@@ -52,7 +50,7 @@ impl<D> BaseCid for Cidv1<D> {
 
 impl<D: AsRef<[u8]>> CidRef for Cidv1<D> {
     fn digest_ref(&self) -> &[u8] { self.hash.digest_ref() }
-    fn size(&self) -> usize { 1 + varint::size(self.codec) + self.hash.size() }
+    fn size(&self) -> usize { varint::size(self.codec).saturating_add(self.hash.size()).saturating_add(1) }
     fn multihash(&self) -> Multihash<&[u8]> { self.hash.as_ref() }
 
     /// Write the CID to an arbitrary buffer.
@@ -114,7 +112,7 @@ impl<D: DigestBuf> TryFrom<Cidv1<D>> for Cidv0<D> {
     type Error = Cidv1<D>;
 
     fn try_from(value: Cidv1<D>) -> Result<Self, Self::Error> {
-        if value.codec() == DAG_PB_CODEC && value.hashcode() == v0::HASH_CODEC as u64 {
+        if value.codec() == DAG_PB_CODEC && value.hashcode() == v0::HASH_CODE {
             Ok(Self::new(value.hash.into_digest()))
         }
         else {
@@ -157,6 +155,11 @@ impl<H: MultihashDigest> Cidv1Spec<H> {
     pub const fn codec(&self) -> u64 { self.codec }
     pub fn hashcode(&self) -> u64 { self.hash.code() }
 
+    /// # Panics
+    ///
+    /// If `D` can't hold the digest, which is a choice of types rather than
+    /// of data: the largest the codetable makes is 64 bytes.
+    #[allow(clippy::expect_used)]
     pub fn hash<D: DigestBuf>(&self, data: &[u8]) -> Cidv1<D> {
         Cidv1::new(self.codec,
             self.hash.digest(data)
@@ -265,7 +268,7 @@ mod tests {
     fn display_and_parse() {
         let cid = hello();
         assert_eq!(cid.to_string(), HELLO);
-        for s in [HELLO].iter().chain(&HELLO_BASES) {
+        for s in std::iter::once(&HELLO).chain(&HELLO_BASES) {
             assert_eq!(s.parse::<Cidv1>().expect(s), cid, "{s}");
         }
         assert!("not a cid".parse::<Cidv1>().is_err());
@@ -290,7 +293,7 @@ mod tests {
         assert!(matches!(decode(&bytes[..bytes.len() - 1]), Err(DecodeError::Truncated)));
         // A CIDv0 is a bare multihash, not a CIDv1
         assert!(matches!(decode(&bytes[2..]), Err(DecodeError::Version)));
-        let mut v2 = bytes.clone();
+        let mut v2 = bytes;
         v2[0] = 0x02;
         assert!(matches!(decode(&v2), Err(DecodeError::Version)));
     }

@@ -1,15 +1,12 @@
 //! Module implementing IPLD CID.
 
-use std::borrow::Cow;
-use std::marker::PhantomData;
 use std::str::FromStr;
 use std::fmt;
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-use serde::de;
 
 use crate::varint;
-use crate::multihash::{self, DigestBuf, Multihash, SizeError};
+use crate::multihash::{self, Multihash, SizeError};
 
 mod v0;
 mod v1;
@@ -156,88 +153,6 @@ pub trait Cid<D>:
 //-----------//
 //-[ Serde ]-//
 //-----------//
-
-// DigestBuf //
-
-struct DigestBufVisitor<C, D>(PhantomData<(C, D)>);
-
-impl<'de, D: DigestBuf, C: Cid<D>> de::Visitor<'de> for DigestBufVisitor<C, D> {
-    type Value = C;
-
-    fn expecting(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "a valid CID in bytes")
-    }
-
-    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
-    where E: de::Error
-    {
-        Self::Value::decode(value)
-            .map_err(|err| E::custom(
-                format!("Failed to deserialize CID: {err}")
-            ))
-    }
-
-    fn visit_borrowed_bytes<E>(self, v: &'de [u8]) -> Result<Self::Value, E>
-    where E: de::Error
-    {
-        self.visit_bytes(v)
-    }
-
-    /// Some Serde data formats interpret a byte stream as a sequence of bytes (e.g. `serde_json`).
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-    where A: de::SeqAccess<'de>
-    {
-        let mut bytes = Vec::new();
-        while let Some(byte) = seq.next_element()? {
-            bytes.push(byte);
-        }
-        Self::Value::decode(&bytes)
-            .map_err(|err| de::Error::custom(
-                format!("Failed to deserialize CID: {err}")
-            ))
-    }
-}
-
-// Cow //
-
-struct CowVisitor;
-
-impl<'de> de::Visitor<'de> for CowVisitor {
-    type Value = Cidv0<Cow<'de, [u8]>>;
-
-    fn expecting(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "a valid CID in bytes")
-    }
-
-    fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
-    where E: de::Error,
-    {
-        Ok(Self::Value::new(Cow::Owned(v.to_vec())))
-    }
-
-    fn visit_borrowed_bytes<E>(self, v: &'de [u8]) -> Result<Self::Value, E>
-    where E: de::Error,
-    {
-        Ok(Self::Value::new(Cow::Borrowed(v)))
-    }
-
-    fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
-    where E: de::Error,
-    {
-        Ok(Self::Value::new(Cow::Owned(v)))
-    }
-
-    /// Some Serde data formats interpret a byte stream as a sequence of bytes (e.g. `serde_json`).
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-    where A: de::SeqAccess<'de>,
-    {
-        let mut bytes = Vec::new();
-        while let Some(byte) = seq.next_element()? {
-            bytes.push(byte);
-        }
-        Ok(Self::Value::new(Cow::Owned(bytes)))
-    }
-}
 
 /// An object with a canonical serialization, enabling content addressing.
 pub trait CanonicalBytes {

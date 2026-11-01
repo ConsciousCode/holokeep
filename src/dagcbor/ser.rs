@@ -4,22 +4,34 @@ use super::{CID_TAG, Major, marker};
 
 use crate::{dagcbor::Size, serde::{Encoder, Error, ListEncoder, MapEncoder}};
 
-/// Encode a length as an array.
-fn encode_len(major: Major, v: u64) -> (usize, [u8; 9]) {
-    let mut buf = [0u8; 9];
-    let size = Size::from_payload(v);
-    buf[0] = major.initial(size.to_ai());
-    match size {
-        Size::Count1 => buf[1] = v as u8,
-        Size::Count2 => buf[1..3].copy_from_slice(&(v as u16).to_be_bytes()),
-        Size::Count4 => buf[1..5].copy_from_slice(&(v as u32).to_be_bytes()),
-        Size::Count8 => buf[1..9].copy_from_slice(&v.to_be_bytes()),
-        Size::Inline(_) => (),
+/// A head: the initial byte, then the payload in as few bytes as hold it.
+struct Head {
+    buf: [u8; 9],
+    len: usize,
+}
+
+impl Head {
+    fn new(major: Major, v: u64) -> Self {
+        let size = Size::from_payload(v);
+        let extra = size.extra_size();
+        let mut buf = [0u8; 9];
+        let [initial, rest @ ..] = &mut buf;
+        *initial = major.initial(size.to_ai());
+        // The payload's last `extra` big-endian bytes, the rest being zeros
+        let payload = v.to_be_bytes();
+        if let (Some(to), Some(from)) = (rest.get_mut(..extra), payload.get(payload.len().saturating_sub(extra)..)) {
+            to.copy_from_slice(from);
+        }
+        Self { buf, len: extra.saturating_add(1) }
     }
-    (1 + size.extra_size(), buf)
+
+    fn bytes(&self) -> &[u8] {
+        self.buf.get(..self.len).unwrap_or(&self.buf)
+    }
 }
 
 /// Cursor used to insert head bytes before containers.
+#[derive(Clone, Copy)]
 struct Cursor {
     index: usize,
     size: u64,
@@ -60,8 +72,7 @@ impl Serializer {
 
     /// Encode a length given a major value. All composites use this format.
     fn write_len(&mut self, major: Major, value: u64) {
-        let (len, buf) = encode_len(major, value);
-        self.write_slice(&buf[..len]);
+        self.write_slice(Head::new(major, value).bytes());
     }
 
     fn write_payload(&mut self, major: Major, value: &[u8]) -> Result<(), Error> {
@@ -82,8 +93,7 @@ impl Serializer {
 
     fn exit_container(&mut self, major: Major, cur: Cursor) {
         let Cursor { index, size } = cur;
-        let (len, buf) = encode_len(major, size);
-        self.output.splice(index..index, buf[..len].iter().copied());
+        self.output.splice(index..index, Head::new(major, size).bytes().iter().copied());
     }
 
     /// The value of the current map entry is complete.
@@ -112,19 +122,16 @@ impl Encoder for Serializer {
 
     fn encode_int(&mut self, value: i128) -> Result<(), Error> {
         let (major, value) = if value < 0 {
-            (Major::Negative, -value - 1)
+            // -1 - value, which can't overflow
+            (Major::Negative, !value)
         }
         else {
             (Major::Positive, value)
         };
 
-        match value.try_into() {
-            Ok(value) => {
-                self.write_len(major, value);
-                Ok(())
-            },
-            Err(_) => Err(Error::custom("out of range")),
-        }
+        let value = value.try_into().map_err(|_| Error::custom("out of range"))?;
+        self.write_len(major, value);
+        Ok(())
     }
 
     fn encode_float(&mut self, value: f64) -> Result<(), Error> {
@@ -184,9 +191,9 @@ impl ListEncoder<Serializer> for List {
     }
 
     fn element(&mut self, _enc: &mut Serializer) -> Result<(), Error> {
-        let _: () = if let Some(cur) = self.cur.as_mut() {
-            cur.size += 1;
-        };
+        if let Some(cur) = self.cur.as_mut() {
+            cur.size = cur.size.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -228,7 +235,10 @@ impl MapEncoder<Serializer> for Map {
         // Sorting the encoded keys bytewise sorts them by length first,
         // since the length comes first in the head
         entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-        if let Some([(key, _), _]) = entries.windows(2).find(|w| w[0].0 == w[1].0) {
+        if let Some(key) = entries.windows(2).find_map(|pair| match pair {
+            [(a, _), (b, _)] if a == b => Some(a),
+            _ => None,
+        }) {
             return Err(Error::custom(format_args!(
                 "duplicate map key {:?}", String::from_utf8_lossy(key)
             )));

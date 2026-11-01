@@ -86,7 +86,7 @@ impl<'de, D: Decoder<'de>> de::Deserializer<'de> for &mut Deserializer<D> {
         }
 
         fn bool(self, v) { v.visit_bool(self.dec.decode_bool()?) }
-        fn f32(self, v) { v.visit_f32(self.dec.decode_float()? as f32) }
+        fn f32(self, v) { v.visit_f64(self.dec.decode_float()?) }
         fn f64(self, v) { v.visit_f64(self.dec.decode_float()?) }
         fn char(self, v) { self.deserialize_str(v) }
         fn bytes(self, v) {
@@ -282,7 +282,7 @@ impl<'de, 'a, D, C> Accessor<'a, D, C>
         match self.remain.as_mut() {
             Some(0) => false,
             Some(r) => {
-                *r -= 1;
+                *r = r.saturating_sub(1);
                 true
             },
             None => true,

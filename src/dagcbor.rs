@@ -94,19 +94,20 @@ impl Size {
     /// Construct a size from the payload it would signal.
     const fn from_payload(payload: u64) -> Self {
         if payload < 24 {
-            Self::Inline(payload as u8)
+            let [.., low] = payload.to_be_bytes();
+            Self::Inline(low)
         }
         else {
             match payload.bit_width() {
-                ..=8 => Self::Count1,
-                ..=16 => Self::Count2,
-                ..=32 => Self::Count4,
+                0..=8 => Self::Count1,
+                9..=16 => Self::Count2,
+                17..=32 => Self::Count4,
                 _ => Self::Count8,
             }
         }
     }
 
-    const fn extra_size(&self) -> usize {
+    const fn extra_size(self) -> usize {
         match self {
             Self::Count1 => 1,
             Self::Count2 => 2,
@@ -116,13 +117,13 @@ impl Size {
         }
     }
 
-    const fn to_ai(&self) -> u8 {
+    const fn to_ai(self) -> u8 {
         match self {
             Self::Count1 => marker::COUNT1,
             Self::Count2 => marker::COUNT2,
             Self::Count4 => marker::COUNT4,
             Self::Count8 => marker::COUNT8,
-            Self::Inline(sz) => *sz,
+            Self::Inline(sz) => sz,
         }
     }
 }
@@ -152,19 +153,22 @@ impl Major {
             4 => Self::Array,
             5 => Self::Map,
             6 => Self::Tag,
-            7 => Self::Simple,
-            _ => unreachable!() // upper 3 bits in [0, 7]
+            // 7, all that's left of three bits
+            _ => Self::Simple,
         }
     }
 
     /// Get the initial byte with this major type and the provided additional
     /// information field.
+    // `From` isn't const yet, and a fieldless repr(u8) enum's discriminant
+    // is exactly its byte
+    #[allow(clippy::as_conversions)]
     const fn initial(self, ai: u8) -> u8 {
         (self as u8)<<5 | ai
     }
 
     /// Get the initial byte to begin an indefinite length container.
-    const fn start(&self) -> u8 { self.initial(marker::START) }
+    const fn start(self) -> u8 { self.initial(marker::START) }
 }
 
 /// Markers needed to parse sub types.
@@ -335,7 +339,7 @@ mod tests {
             ("long length", "780161", Ipld::String("a".into())),
             ("unsorted keys", "a262626201616102", from_slice::<Ipld>(&hex("a261610262626201")).expect("map")),
         ] {
-            let decoded = from_slice_canon::<Ipld>(&hex(&input)).expect(label);
+            let decoded = from_slice_canon::<Ipld>(&hex(input)).expect(label);
             assert!(!decoded.is_canon(), "{label} should be non-canonical");
             assert_eq!(decoded.into_inner(), value, "{label}");
         }

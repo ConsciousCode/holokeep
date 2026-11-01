@@ -224,9 +224,10 @@ fn disks_under(block: &Path, disks: &mut Vec<Disk>) {
     }
 }
 
-/// How many risks would have to fail to lose every copy, where each copy
-/// is lost if any of its risks fail: the smallest set of risks touching
-/// every copy, counted up to `cap`. Copies with no risks in common need
+/// How many risks would have to fail to lose every copy, counted up to `cap`.
+///
+/// Each copy is lost if any of its risks fail, so it's the smallest set of
+/// risks touching every copy. Copies with no risks in common need
 /// one failure each; a risk they all share loses them all at once.
 pub fn tolerance(copies: &[Vec<String>], cap: usize) -> usize {
     let mut all: Vec<&String> = copies.iter().flatten().collect();

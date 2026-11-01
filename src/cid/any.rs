@@ -94,7 +94,7 @@ impl<D: DigestBuf> Cid<D> for AnyCid<D> {
     }
 
     fn decode(buf: &[u8]) -> Result<Self, DecodeError> {
-        const HASH_CODE: u8 = v0::HASH_CODEC as u8;
+        const HASH_CODE: u8 = v0::HASH_BYTE;
 
         // Peek first byte to branch between V0 (0x12) and V1 (0x01)
         match buf.first() {
@@ -189,7 +189,7 @@ pub enum CidSpec<H: MultihashDigest=MultihashFunc> {
 impl<H: MultihashDigest> CidSpec<H> {
     /// Create a new CID specification.
     pub fn new(version: CidVersion, codec: u64, hashcode: H) -> Option<Self> {
-        const HASH_CODE: u64 = v0::HASH_CODEC as u64;
+        const HASH_CODE: u64 = v0::HASH_CODE;
         match (version, codec, hashcode.code()) {
             (CidVersion::V0, v0::CODEC, HASH_CODE) => Some(Self::V0),
             (CidVersion::V0, ..) => None,
@@ -200,6 +200,12 @@ impl<H: MultihashDigest> CidSpec<H> {
     }
 
     /// Create a CID from the spec and data.
+    ///
+    /// # Panics
+    ///
+    /// If `D` can't hold the digest, which is a choice of types rather than
+    /// of data: the largest the codetable makes is 64 bytes.
+    #[allow(clippy::expect_used)]
     pub fn hash<D: DigestBuf>(&self, data: &[u8]) -> AnyCid<D> {
         match self {
             Self::V0 => AnyCid::V0(Cidv0::new(
@@ -219,7 +225,7 @@ impl<H: MultihashDigest> CidSpec<H> {
     }
 
     /// Get the CID's codec.
-    pub fn codec(&self) -> u64 {
+    pub const fn codec(&self) -> u64 {
         match self {
             Self::V0 => v0::CODEC,
             Self::V1(spec, ..) => spec.codec(),
@@ -229,7 +235,7 @@ impl<H: MultihashDigest> CidSpec<H> {
     /// Get the CID's hash code.
     pub fn hashcode(&self) -> u64 {
         match self {
-            Self::V0 => v0::HASH_CODEC as u64,
+            Self::V0 => v0::HASH_CODE,
             Self::V1(spec) => spec.hashcode(),
         }
     }

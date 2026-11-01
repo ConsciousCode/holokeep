@@ -17,6 +17,13 @@ use super::{CidVersion, CidRef, Cid, Cidv1, DecodeError, FromStrError, DAG_PB_CO
 
 pub const CODEC: u64 = DAG_PB_CODEC;
 pub const HASH_CODEC: MultihashFunc = MultihashFunc::Sha2_256;
+pub const HASH_CODE: u64 = HASH_CODEC.value();
+/// The byte a CIDv0 starts with: its hash code, which fits in one
+pub const HASH_BYTE: u8 = {
+    assert!(HASH_CODE < 0x80, "a one-byte varint");
+    let [byte, ..] = HASH_CODE.to_le_bytes();
+    byte
+};
 
 /// A concrete CIDv0 implemenetation.
 #[derive(PartialEq, Eq, Debug, Clone)]
@@ -47,7 +54,7 @@ impl<D: AsRef<[u8]>> Cidv0<D> {
 impl<D> BaseCid for Cidv0<D> {
     fn version(&self) -> CidVersion { CidVersion::V0 }
     fn codec(&self) -> u64 { CODEC }
-    fn hashcode(&self) -> u64 { HASH_CODEC as u64 }
+    fn hashcode(&self) -> u64 { HASH_CODE }
 }
 
 impl<D: AsRef<[u8]>> CidRef for Cidv0<D> {
@@ -63,8 +70,8 @@ impl<D: AsRef<[u8]>> CidRef for Cidv0<D> {
 
     fn encode(&self, buf: &mut Vec<u8>) {
         // CIDv0 is just a bare sha2-256 multihash
-        buf.push(HASH_CODEC as u8);
-        varint::write(buf, HASH_CODEC.size() as u64);
+        buf.push(HASH_BYTE);
+        varint::write(buf, 32);
         buf.extend(self.digest.as_ref());
     }
 }
@@ -79,14 +86,13 @@ impl<D: DigestBuf> Cid<D> for Cidv0<D> {
     }
 
     fn decode(mut buf: &[u8]) -> Result<Self, DecodeError> {
-        const CIDV0_HASH_U8: u8 = HASH_CODEC as u8;
         match buf.split_off_first() {
-            Some(&CIDV0_HASH_U8) if varint::read_minimal(&mut buf)? == 32 => match buf.len() {
+            Some(&HASH_BYTE) if varint::read_minimal(&mut buf)? == 32 => match buf.len() {
                 32 => Ok(Self { digest: D::decode(buf)? }),
                 0..32 => Err(DecodeError::Truncated),
                 _ => Err(DecodeError::Parse),
             },
-            Some(&CIDV0_HASH_U8) => Err(DecodeError::Parse),
+            Some(&HASH_BYTE) => Err(DecodeError::Parse),
             Some(_) => Err(DecodeError::Version),
             None => Err(DecodeError::Truncated),
         }

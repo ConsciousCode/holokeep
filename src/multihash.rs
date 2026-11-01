@@ -76,6 +76,9 @@ impl<D: AsRef<[u8]>> Multihash<D> {
     /// Returns the size of the digest.
     pub fn len(&self) -> usize { self.digest.as_ref().len() }
 
+    /// Whether the digest is empty, as an identity hash of nothing is.
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+
     /// Borrow the multihash.
     pub fn as_ref(&self) -> Multihash<&[u8]> {
         Multihash { code: self.code, digest: self.digest.as_ref() }
@@ -87,15 +90,15 @@ impl<D: AsRef<[u8]>> Multihash<D> {
     /// Returns the number of bytes needed to encode this multihash.
     pub fn size(&self) -> usize {
         let len = self.len();
-        varint::size(self.code()) +
-        varint::size(len as u64) +
-        len
+        varint::size(self.code())
+            .saturating_add(varint::size(u64::try_from(len).unwrap_or(u64::MAX)))
+            .saturating_add(len)
     }
 
     /// Writes a multihash to a byte stream, returning the written size.
     pub fn encode(&self, buf: &mut Vec<u8>) {
         varint::write(buf, self.code());
-        varint::write(buf, self.len() as u64);
+        varint::write(buf, u64::try_from(self.len()).unwrap_or(u64::MAX));
         buf.extend(self.digest().as_ref());
     }
 
@@ -183,7 +186,7 @@ mod tests {
     /// Check a function's digest of "abc" against an independent
     /// implementation (Python's hashlib and mmh3).
     fn check<const N: usize>(func: MultihashFunc, input: &[u8], expected: [u8; N]) {
-        let mh: Multihash<[u8; N]> = func.digest(input).expect(func.name());
+        let mh: Multihash<[u8; N]> = func.digest(input).unwrap_or_else(|_| panic!("{}", func.name()));
         assert_eq!(mh.code(), u64::from(func));
         assert_eq!(*mh.digest(), expected, "{}", func.name());
         assert_eq!(func.size(), N, "{}", func.name());

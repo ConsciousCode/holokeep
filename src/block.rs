@@ -88,6 +88,9 @@ impl<D: DigestBuf> Block<D> {
     /// Get the length of this block's data
     pub const fn len(&self) -> usize { self.data.len() }
 
+    /// Whether the block has no bytes.
+    pub const fn is_empty(&self) -> bool { self.data.is_empty() }
+
     /// Consume the block and return its data
     pub fn into_data(self) -> Box<[u8]> { self.data }
 }

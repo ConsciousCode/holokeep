@@ -78,7 +78,7 @@ impl<'de> Deserializer<'de> {
     }
 
     fn check_minimal<T>(&mut self, min: T, count: T) -> u64
-        where T: Ord + Into<u64>
+        where T: Copy + Ord + Into<u64>
     {
         if count < min {
             self.noncanonical();
@@ -227,7 +227,7 @@ impl<'de> Decoder<'de> for Deserializer<'de> {
         let byte = self.peek()?;
         Ok(match Major::from_byte(byte) {
             Major::Positive => self.decode_count()?.into(),
-            Major::Negative => -i128::from(self.decode_count()?) - 1,
+            Major::Negative => !i128::from(self.decode_count()?), // -1 - count
             _ => return Err(Error::custom(format_args!(
                 "invalid type: {}, expected int", tag_name(byte)
             ))),
@@ -249,7 +249,7 @@ impl<'de> Decoder<'de> for Deserializer<'de> {
                     0x1f => if frac == 0.0 { f64::INFINITY } else { f64::NAN },
                     exp => // Ordinary float
                         (1.0 + frac / 1024.0)
-                        * 2.0f64.powi(i32::from(exp) - 15),
+                        * 2.0f64.powi(i32::from(exp).wrapping_sub(15)),
                 }
             },
             marker::F32 => {
@@ -275,10 +275,8 @@ impl<'de> Decoder<'de> for Deserializer<'de> {
     }
 
     fn decode_string(&mut self) -> Result<Cow<'de, str>, Error> {
-        match str::from_utf8(self.decode_payload(Major::String)?) {
-            Ok(s) => Ok(Cow::Borrowed(s)),
-            Err(_) => Err(Error::custom("utf-8 parsing")),
-        }
+        str::from_utf8(self.decode_payload(Major::String)?)
+            .map_or_else(|_| Err(Error::custom("utf-8 parsing")), |s| Ok(Cow::Borrowed(s)))
     }
 
     fn decode_bytes(&mut self) -> Result<Cow<'de, [u8]>, Error> {

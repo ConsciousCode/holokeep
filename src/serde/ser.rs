@@ -23,7 +23,7 @@ macro_rules! serialize_primitive {
         ),* $(,)?
     ) => {paste!{$($(
         fn [<serialize_ $ty>](self, v: $ty) -> Result<(), Error> {
-            self.enc.[<encode_ $kind>](v as $cast)
+            self.enc.[<encode_ $kind>]($cast::from(v))
         }
     )*)*}};
 }
