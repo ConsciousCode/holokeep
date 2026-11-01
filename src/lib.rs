@@ -9,6 +9,7 @@ pub mod cid;
 pub mod car;
 pub mod claim;
 pub mod keys;
+pub mod account;
 pub mod block;
 pub mod chunker;
 pub mod varint;

@@ -271,7 +271,6 @@ impl Node {
         &self.catalog
     }
 
-    #[cfg(test)]
     pub const fn catalog_mut(&mut self) -> &mut Catalog {
         &mut self.catalog
     }

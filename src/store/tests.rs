@@ -2005,3 +2005,31 @@ fn a_repo_from_when_there_was_one_user_keeps_it() {
     assert_eq!(repo.user().expect("user"), Some(root.id()));
     assert!(repo.claims().expect("claims").authorized(&root.id()).expect("authorized"));
 }
+
+#[test]
+fn what_another_account_says_isnt_for_this_ones_mesh() {
+    let scratch = Scratch::new("withheld");
+    let mut repo = Catalog::open_repo(scratch.path()).expect("open");
+    let block = raw(b"both");
+    repo.put_block(&block, CidVersion::V1).expect("put");
+    let owner = repo.signer().expect("signer").clone();
+    let me = repo.uid();
+    let other = crate::keys::Key::generate().expect("key");
+    repo.act_for(me.wrapping_add(1), other.clone()).expect("act");
+    let theirs = repo.tag(&link(&block), &tag("theirs")).expect("tag");
+    let shared = repo.keep(&link(&block)).expect("keep");
+    repo.act_for(me, owner.clone()).expect("act");
+    let mine = repo.tag(&link(&block), &tag("mine")).expect("tag");
+    repo.keep(&link(&block)).expect("keep");
+
+    let signs = |key: &crate::keys::Key| repo.claims().expect("claims").signs_by(&key.id()).expect("signs");
+    assert!(repo.withheld(&theirs).expect("withheld"));
+    assert!(signs(&other).iter().all(|signed| repo.withheld(&signed.sign).expect("withheld")));
+    assert!(!repo.withheld(&mine).expect("withheld"));
+    assert!(!repo.withheld(&shared).expect("withheld"), "this account signed it too");
+    assert!(signs(&owner).iter().all(|signed| !repo.withheld(&signed.sign).expect("withheld")));
+    assert!(!repo.withheld(&link(&block)).expect("withheld"), "blocks are anyone's");
+    // And the other way about
+    repo.act_for(me.wrapping_add(1), other).expect("act");
+    assert!(repo.withheld(&mine).expect("withheld") && !repo.withheld(&theirs).expect("withheld"));
+}

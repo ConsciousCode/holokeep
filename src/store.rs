@@ -559,6 +559,12 @@ impl Catalog {
         self.claims.as_ref().map_or(Ok(None), |claims| claims.account(self.uid))
     }
 
+    /// Whether a block is a claim another of the host's accounts made
+    /// here, which isn't for this account's mesh to hear of.
+    pub fn withheld(&self, cid: &Link) -> Result<bool> {
+        self.claims.as_ref().map_or(Ok(false), |claims| claims.withheld(cid.multihash(), self.uid))
+    }
+
     /// The root key of the user this acts for, if its account is in a mesh.
     pub fn user(&self) -> Result<Option<Link>> {
         Ok(self.account()?.and_then(|account| account.user))

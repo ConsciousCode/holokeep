@@ -82,6 +82,11 @@ enum Command {
     /// adds, or stop
     #[command(subcommand)]
     Keep(KeepCommand),
+    /// Print the account this acts for: the host's uid, the key the repo
+    /// signs with for it, and its user, if it's in a mesh. In a repo
+    /// another user owns, `hk keep` and `hk tag` act for an account of
+    /// your own, through its running node
+    Whoami,
     /// Work with anchors: empty identities, which are whatever they were
     /// last set to
     #[command(subcommand)]
@@ -141,6 +146,11 @@ enum NodeCommand {
         /// doesn't keep them
         #[arg(long)]
         no_collect: bool,
+        /// Let the host's other users connect, to keep and tag things here
+        /// as accounts of their own, which this repo signs for with keys of
+        /// their own (the repo's directory must let them reach the socket)
+        #[arg(long)]
+        shared: bool,
     },
     /// Let go now of every copy here the mesh can spare, short of space or
     /// not
@@ -387,6 +397,88 @@ fn fetch_first(repo: Option<&PathBuf>, cid: &Link) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether the repo is another of the host's users', so this one's to ask
+/// its running node to act for it, rather than open it.
+fn foreign(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let me = rustix::process::getuid().as_raw();
+    me != 0 && std::fs::metadata(dir.join("blocks.db")).is_ok_and(|meta| meta.uid() != me)
+}
+
+/// Ask the running node of a repo another user owns to act for this one,
+/// printing what it answers.
+#[cfg(feature = "net")]
+fn as_account(dir: &Path, words: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(!words.iter().any(|word| word.contains(['\t', '\n'])), "what an account asks can't have tabs or newlines in it");
+    let lines = holokeep::net::daemon::ask(dir, &format!("as\t{}", words.join("\t")))?
+        .context("this repo is another user's, and its node isn't running to act for you: its owner can `hk node run --shared`")?;
+    for line in lines {
+        if let Some(error) = line.strip_prefix("error: ") {
+            anyhow::bail!("{error}");
+        }
+        out!("{line}");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "net"))]
+fn as_account(_: &Path, _: &[String]) -> anyhow::Result<()> {
+    anyhow::bail!("this repo is another user's, and this hk has no node to ask to act for you")
+}
+
+/// `hk tag`, in a repo of one's own, or one another user owns.
+fn tag_here_or_there(repo: Option<PathBuf>, command: TagCommand) -> anyhow::Result<()> {
+    let dir = repo_dir(repo)?;
+    if foreign(&dir) {
+        return as_account(&dir, &tag_words(command));
+    }
+    tag(open_repo(Some(dir))?, command)
+}
+
+/// `hk keep`, in a repo of one's own, or one another user owns.
+fn keep_here_or_there(repo: Option<PathBuf>, command: KeepCommand) -> anyhow::Result<()> {
+    let dir = repo_dir(repo)?;
+    if foreign(&dir) {
+        if let KeepCommand::Add { cids, .. } = &command {
+            for cid in cids {
+                fetch_first(Some(&dir), cid)?;
+            }
+        }
+        return as_account(&dir, &keep_words(command));
+    }
+    keep(Some(&dir), open_repo(Some(dir.clone()))?, command)
+}
+
+fn whoami(repo: Option<PathBuf>) -> anyhow::Result<()> {
+    let dir = repo_dir(repo)?;
+    if foreign(&dir) {
+        return as_account(&dir, &["whoami".to_owned()]);
+    }
+    for line in holokeep::account::answer(&mut open_repo(Some(dir))?, "whoami") {
+        out!("{line}");
+    }
+    Ok(())
+}
+
+fn tag_words(command: TagCommand) -> Vec<String> {
+    let cids = |cids: Vec<Link>| cids.into_iter().map(|cid| cid.to_string());
+    match command {
+        TagCommand::Add { name, cids: list } => ["tag".to_owned(), "add".to_owned(), name].into_iter().chain(cids(list)).collect(),
+        TagCommand::Rm { name, cids: list } => ["tag".to_owned(), "rm".to_owned(), name].into_iter().chain(cids(list)).collect(),
+        TagCommand::Ls { cid } => vec!["tag".to_owned(), "ls".to_owned(), cid.to_string()],
+        TagCommand::Find { name } => vec!["tag".to_owned(), "find".to_owned(), name],
+    }
+}
+
+fn keep_words(command: KeepCommand) -> Vec<String> {
+    let cids = |cids: Vec<Link>| cids.into_iter().map(|cid| cid.to_string());
+    match command {
+        KeepCommand::Add { cids: list, shallow } => ["keep", "add"].into_iter().chain(shallow.then_some("--shallow")).map(str::to_owned).chain(cids(list)).collect(),
+        KeepCommand::Rm { cids: list } => ["keep".to_owned(), "rm".to_owned()].into_iter().chain(cids(list)).collect(),
+        KeepCommand::Ls => vec!["keep".to_owned(), "ls".to_owned()],
+    }
+}
+
 fn open_repo(repo: Option<PathBuf>) -> anyhow::Result<Catalog> {
     let dir = repo_dir(repo)?;
     Catalog::open_repo(&dir).with_context(|| format!("opening repo {}", dir.display()))
@@ -454,8 +546,9 @@ fn run(args: Args) -> anyhow::Result<()> {
         },
         Command::Refs { cid, back } => refs(&open_repo(args.repo)?, &cid, back),
         Command::Dag(command) => dag(args.repo, command),
-        Command::Tag(command) => tag(open_repo(args.repo)?, command),
-        Command::Keep(command) => keep(args.repo.as_ref(), open_repo(args.repo.clone())?, command),
+        Command::Tag(command) => tag_here_or_there(args.repo, command),
+        Command::Keep(command) => keep_here_or_there(args.repo, command),
+        Command::Whoami => whoami(args.repo),
         Command::Device(command) => device(&repo_dir(args.repo.clone())?, command),
         Command::Anchor(command) => anchor(args.repo.as_ref(), open_repo(args.repo.clone())?, command),
         Command::Block(BlockCommand::Get { cid }) => {
@@ -604,10 +697,10 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
             daemon::ask(dir, "reload")?;
             eprintln!("joined the mesh of {}; `hk node run` to connect", ticket.inviter);
         },
-        NodeCommand::Run { listen, copies, low_water, high_water, no_collect } => {
+        NodeCommand::Run { listen, copies, low_water, high_water, no_collect, shared } => {
             let listen = listen.parse().context("not a multiaddr")?;
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            runtime.block_on(daemon::run(dir, listen, copies, (low_water, high_water), !no_collect))?;
+            runtime.block_on(daemon::run(dir, listen, copies, (low_water, high_water), !no_collect, shared))?;
         },
         NodeCommand::Collect => {
             let report = daemon::collect(dir)?.context("this node isn't running: start `hk node run`")?;

@@ -7,6 +7,12 @@
 //!
 //! Everything runs on one thread, the catalog's database included, so the
 //! storage code stays synchronous.
+//!
+//! The socket knows who's asking, by uid. The repo's owner, whose the
+//! daemon is, may ask anything, as may root; with `--shared`, the host's
+//! other users may connect too, to fetch and to say and see things as
+//! their own accounts (`as` and a command, see `account`), the repo
+//! signing for each with a key of its own, kept in `accounts/`.
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write as _};
@@ -314,7 +320,7 @@ fn ask_within(dir: &Path, command: &str, time: Option<Duration>) -> Result<Optio
 /// Free space is kept between watermarks, `(low, high)`: below the low,
 /// the node lets go of copies the mesh can spare until it's above the
 /// high. If `collecting`, garbage is collected too, a sample at a time.
-pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64, u64), collecting: bool) -> Result<()> {
+pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64, u64), collecting: bool, shared: bool) -> Result<()> {
     let key = mesh::node_key(dir)?;
     let swarm_key = mesh::swarm_key(dir)?.ok_or_else(|| Error::Invalid("this node isn't in a mesh: invite another, or join one".into()))?;
     let catalog = crate::store::Catalog::open_repo(dir)?;
@@ -331,6 +337,10 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
         std::fs::remove_file(&path)?;
     }
     let control = UnixListener::bind(&path)?;
+    if shared {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
+    }
     eprintln!("node {} in mesh {}", node.peer_id(), swarm_key.fingerprint());
     let mut redial = tokio::time::interval(REDIAL);
     let later = |delay| tokio::time::Instant::now().checked_add(delay).unwrap_or_else(tokio::time::Instant::now);
@@ -361,7 +371,7 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
                 let Ok((stream, _)) = accepted else {
                     continue;
                 };
-                match answer(&mut node, stream, copies, collecting).await {
+                match answer(&mut node, dir, stream, copies, collecting).await {
                     Ok(Some((waiter, write))) => waiting.wait(waiter, write),
                     Ok(None) => {},
                     Err(e) => eprintln!("control: {e}"),
@@ -513,15 +523,44 @@ fn report(event: &Event) {
     }
 }
 
+/// Answer a command as one of the host's users' accounts, signing with
+/// its key here, made the first time it asks, then act for the owner
+/// again.
+fn as_account(node: &mut Node, dir: &Path, uid: u32, command: &str) -> Result<Vec<String>> {
+    let me = rustix::process::getuid().as_raw();
+    if uid == me {
+        return Ok(crate::account::answer(node.catalog_mut(), command));
+    }
+    let key = crate::keys::Key::load_or_make(&dir.join("accounts").join(format!("{uid}.key")))?;
+    let owner = crate::keys::Key::load_or_make(&dir.join(crate::keys::NODE_KEY))?;
+    node.catalog_mut().act_for(uid, key)?;
+    let lines = crate::account::answer(node.catalog_mut(), command);
+    node.catalog_mut().act_for(me, owner)?;
+    Ok(lines)
+}
+
 /// Answer one command on the control socket, or say which fetch it waits
 /// on, to be answered when that finishes.
-async fn answer(node: &mut Node, stream: tokio::net::UnixStream, copies: usize, collecting: bool) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
+async fn answer(node: &mut Node, dir: &Path, stream: tokio::net::UnixStream, copies: usize, collecting: bool) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
+    let uid = stream.peer_cred()?.uid();
+    let me = rustix::process::getuid().as_raw();
     let (read, mut write) = stream.into_split();
     let mut line = String::new();
     tokio::time::timeout(Duration::from_secs(1), tokio::io::BufReader::new(read).read_line(&mut line))
         .await
         .map_err(|_| Error::Invalid("no command".into()))??;
     let mut out = String::new();
+    if let Some(command) = line.trim_end_matches(['\r', '\n']).strip_prefix("as\t") {
+        for line in as_account(node, dir, uid, command)? {
+            let _ = writeln!(out, "{line}");
+        }
+        write.write_all(out.as_bytes()).await?;
+        return Ok(None);
+    }
+    if uid != me && uid != 0 && !line.starts_with("fetch ") {
+        write.write_all(format!("error: only the repo's owner, uid {me}, may ask that\n").as_bytes()).await?;
+        return Ok(None);
+    }
     match line.trim() {
         "peers" => {
             let connected = node.connected();

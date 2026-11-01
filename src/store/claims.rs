@@ -423,6 +423,36 @@ impl ClaimStore {
         })
     }
 
+    /// Whether a claim, by multihash, is another account's to tell, not
+    /// the account `uid`'s mesh: a sign by another account's keys here, or
+    /// a claim signed, but only by them. What the host's users say through
+    /// one node stays theirs.
+    pub fn withheld(&self, key: Key<'_>, uid: u32) -> Result<bool> {
+        Ok(self.db.conn()
+            .prepare_cached(
+                "WITH others (key) AS (
+                     SELECT device FROM accounts WHERE uid != ?2 AND device IS NOT NULL
+                     UNION SELECT user FROM accounts WHERE uid != ?2 AND user IS NOT NULL
+                     EXCEPT SELECT device FROM accounts WHERE uid = ?2 AND device IS NOT NULL
+                     EXCEPT SELECT user FROM accounts WHERE uid = ?2 AND user IS NOT NULL
+                 ),
+                 this (id, kind, key) AS (
+                     SELECT c.id, c.kind, ck.key FROM claims c JOIN claim_keys ck ON ck.claim = c.id
+                     JOIN multihashes m ON m.id = ck.key WHERE m.multihash = ?1
+                 )
+                 SELECT EXISTS (SELECT 1 FROM this JOIN sign_claims s ON s.id = this.id WHERE s.by IN others)
+                     OR EXISTS (
+                         SELECT 1 FROM this WHERE this.kind != 'sign'
+                         AND EXISTS (SELECT 1 FROM claim_targets st JOIN sign_claims sg ON sg.id = st.claim WHERE st.target = this.key)
+                         AND NOT EXISTS (
+                             SELECT 1 FROM claim_targets st JOIN sign_claims sg ON sg.id = st.claim
+                             WHERE st.target = this.key AND sg.by NOT IN others
+                         )
+                     )",
+            )?
+            .query_row(params![key.to_bytes(), uid], |row| row.get(0))?)
+    }
+
     /// Whether the acting user, or with none, anyone, has authorized a
     /// key.
     pub fn authorized(&self, key: &Link) -> Result<bool> {
