@@ -2,7 +2,12 @@
 //!
 //! So far `Group`, which is what a tag is, `Keep`, which says to keep its
 //! targets, `Set`, which says what an anchor is now, and `Tomb`, which
-//! retracts.
+//! retracts; and, for who may say so, `Sign`, a key's signature of a
+//! claim, and `Device`, which a user's root key signs to say a node's key
+//! acts for it (see `keys`).
+//!
+//! Signatures are claims about claims, rather than inside them, so equal
+//! claims stay equal blocks whoever makes them, and small ones dissolve.
 //!
 //! An anchor is an empty identity, in the manner of Perkeep's permanodes:
 //! claims hung on it are its state. It's an identity CID of `{anchor:
@@ -76,6 +81,24 @@ pub struct Set {
     at: u64,
 }
 
+/// "`by` vouches for the target, a claim, as of `at`": `sig` is the key's
+/// signature of the sign's own encoding without it. Never dissolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sign {
+    target: Link,
+    by: Link,
+    at: u64,
+    sig: Vec<u8>,
+}
+
+/// "The targets, keys, act for whoever signs this": a certificate, when
+/// a user's root key signs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
+    /// Sorted by CID bytes and distinct.
+    target: Vec<Link>,
+}
+
 /// Any claim this understands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
@@ -83,6 +106,8 @@ pub enum Claim {
     Keep(Keep),
     Set(Set),
     Tomb(Tomb),
+    Sign(Sign),
+    Device(Device),
 }
 
 /// Sort links by their bytes and drop repeats, making them a set.
@@ -159,6 +184,61 @@ impl Tomb {
     pub fn target(&self) -> &[Link] { &self.target }
 }
 
+impl Sign {
+    /// A key's signature of a claim, as of `at`.
+    pub fn new(key: &crate::keys::Key, claim: Link, at: u64) -> Self {
+        let mut sign = Self { target: claim, by: key.id(), at, sig: Vec::new() };
+        sign.sig = key.sign(&sign.message());
+        sign
+    }
+
+    /// What's signed: the sign's encoding without the signature.
+    fn message(&self) -> Vec<u8> {
+        let mut map = self.fields();
+        map.remove("sig");
+        dagcbor::to_vec(&Ipld::Map(map)).unwrap_or_default()
+    }
+
+    fn fields(&self) -> BTreeMap<String, Ipld> {
+        BTreeMap::from([
+            ("at".to_owned(), Ipld::Integer(self.at.into())),
+            ("by".to_owned(), Ipld::Link(self.by.clone())),
+            ("claim".to_owned(), Ipld::String("sign".to_owned())),
+            ("sig".to_owned(), Ipld::Bytes(self.sig.clone())),
+            ("target".to_owned(), links(std::slice::from_ref(&self.target))),
+        ])
+    }
+
+    /// A sign with the given parts, as stored, checked or not.
+    pub const fn from_parts(target: Link, by: Link, at: u64, sig: Vec<u8>) -> Self {
+        Self { target, by, at, sig }
+    }
+
+    /// Whether the signature is `by`'s.
+    pub fn verify(&self) -> bool {
+        crate::keys::verify(&self.by, &self.message(), &self.sig)
+    }
+
+    /// The claim signed.
+    pub const fn signs(&self) -> &Link { &self.target }
+
+    pub const fn by(&self) -> &Link { &self.by }
+
+    pub const fn at(&self) -> u64 { self.at }
+
+    pub fn sig(&self) -> &[u8] { &self.sig }
+}
+
+impl Device {
+    /// A certificate for the targets, if there are any and they're all keys.
+    pub fn new(target: impl IntoIterator<Item = Link>) -> Option<Self> {
+        let target = set(target);
+        (!target.is_empty() && target.iter().all(crate::keys::is_key)).then_some(Self { target })
+    }
+
+    pub fn target(&self) -> &[Link] { &self.target }
+}
+
 impl Claim {
     pub fn target(&self) -> &[Link] {
         match self {
@@ -166,6 +246,20 @@ impl Claim {
             Self::Keep(keep) => keep.target(),
             Self::Set(set) => set.target(),
             Self::Tomb(tomb) => tomb.target(),
+            Self::Sign(sign) => std::slice::from_ref(&sign.target),
+            Self::Device(device) => device.target(),
+        }
+    }
+
+    /// The claim's type, as its `claim` key says.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Group(_) => "group",
+            Self::Keep(_) => "keep",
+            Self::Set(_) => "set",
+            Self::Tomb(_) => "tomb",
+            Self::Sign(_) => "sign",
+            Self::Device(_) => "device",
         }
     }
 
@@ -187,6 +281,8 @@ impl Claim {
                 ("at".to_owned(), Ipld::Integer(set.at.into())),
             ])),
             Self::Tomb(_) => ("tomb", BTreeMap::new()),
+            Self::Sign(sign) => return Ipld::Map(sign.fields()),
+            Self::Device(_) => ("device", BTreeMap::new()),
         };
         map.insert("claim".to_owned(), Ipld::String(kind.to_owned()));
         map.insert("target".to_owned(), links(self.target()));
@@ -202,7 +298,7 @@ impl Claim {
     /// is always of all of its target.
     pub fn dissolves(&self) -> bool {
         let bounded = matches!(self, Self::Keep(keep) if !keep.beyond.is_empty());
-        !bounded && self.target().len() == 1 && self.encode().len() <= IDENTITY_MAX
+        !bounded && !matches!(self, Self::Sign(_)) && self.target().len() == 1 && self.encode().len() <= IDENTITY_MAX
     }
 
     /// The claim as a dag-cbor block: an identity block if it dissolves,
@@ -262,6 +358,16 @@ impl Claim {
                 Self::Set(Set::new(target.clone(), value, u64::try_from(at).ok()?)?)
             },
             "tomb" => Self::Tomb(Tomb::new(target.clone())?),
+            "sign" => {
+                let (Ipld::Link(by), Ipld::Integer(at), Ipld::Bytes(sig)) = (map.remove("by")?, map.remove("at")?, map.remove("sig")?) else {
+                    return None;
+                };
+                let [signs] = target.as_slice() else {
+                    return None;
+                };
+                Self::Sign(Sign::from_parts(signs.clone(), by, u64::try_from(at).ok()?, sig))
+            },
+            "device" => Self::Device(Device::new(target.clone())?),
             _ => return None,
         };
         // Nothing else, sorted and distinct already, and canonical dag-cbor

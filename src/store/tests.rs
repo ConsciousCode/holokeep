@@ -560,9 +560,10 @@ fn tags_are_rows() {
         assert_eq!(router.get_block(&link(claim)).expect("get").as_ref(), Some(claim));
     }
     assert_eq!(count(&router.db, "ipld_blocks"), 0);
-    // Only the pair was hashed: the dissolved claims have no multihash
+    // Only the pair was hashed: the dissolved claims have no multihash but
+    // their identities, which is what claims about them target
     assert_eq!(claims.iter().filter(|c| c.cid().hashcode() == 0x12).count(), 1);
-    assert_eq!(count(&router.db, "multihashes"), 3 + 2 + 1);
+    assert_eq!(count(&router.db, "multihashes"), 3 + 2 + 1 + 2);
 
     // Claims with the same tag combine their targets
     assert_eq!(tagged(&router, "music"), by_multihash(vec![link(&a), link(&b), link(&c)]));
@@ -667,7 +668,8 @@ fn keeps_are_claims_and_can_be_let_go_of() {
     let tombs = router.unkeep(&link(&a)).expect("unkeep");
     assert_eq!(tombs.len(), 1);
     assert!(!claims.kept(a.cid().multihash()).expect("kept"));
-    assert!(!router.holds(&keep).expect("holds"), "retracted at once, being dissolved");
+    // Its rows stay, in case the tomb stops counting, but it doesn't count
+    assert!(router.holds(&keep).expect("holds"));
     assert_eq!(claims.keeps().expect("keeps"), [link(&b)]);
     assert!(router.unkeep(&link(&a)).expect("unkeep").is_empty());
     // And it isn't brought back

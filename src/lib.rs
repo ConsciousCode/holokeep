@@ -8,6 +8,7 @@
 pub mod cid;
 pub mod car;
 pub mod claim;
+pub mod keys;
 pub mod block;
 pub mod chunker;
 pub mod varint;

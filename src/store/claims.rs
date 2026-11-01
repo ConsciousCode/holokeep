@@ -12,15 +12,19 @@
 //! its CID is its bytes, so it's found by what it says. A precipitated one
 //! is rows under its multihash, like any block.
 //!
-//! A tomb retracts a dissolved claim at once, deleting its rows, and keeps
-//! it from being put again. A precipitated claim it targets stays until
-//! it's collected, but no longer counts as a tag.
+//! A claim counts unless a tomb that counts targets it. Once the database
+//! has a user, a claim counts only if it's signed, by a `sign` claim,
+//! with a key the user has authorized: its root key, or a key a `device`
+//! claim certifies, signed by the root and not tombed by a tomb the root
+//! signed. A database with no user, such as a test's, takes every claim
+//! at its word. Tombed claims keep their rows, dissolved or not, since
+//! the tomb may not count for long: its signer can be revoked.
 
 use rusqlite::{OptionalExtension, params};
 
 use crate::block::{Block, IDENTITY};
 use crate::cid::{BaseCid, Cid, CidRef, Cidv1, DAG_CBOR_CODEC};
-use crate::claim::{self, Claim, Group, Keep, Set, Tomb};
+use crate::claim::{Claim, Group, Keep, Set, Tomb};
 use crate::model::Link;
 use crate::multihash::Multihash;
 
@@ -28,16 +32,166 @@ use super::{BlockIndex, BlockSource, BlockStore, Db, Error, Id, Key, Put, RefInd
 
 const NAME: &str = "claims";
 
-/// Whether a group counts: dissolved claims are deleted when they're
-/// tombstoned, precipitated ones have to be checked.
-/// `LIVE`, of a claims row by another alias than `c`.
-pub(super) fn live(alias: &str) -> String {
-    LIVE.replace("c.claim", &format!("{alias}.claim"))
+/// A key's CID prefix: CIDv1, `libp2p-key`.
+const KEY_PREFIX: [u8; 2] = [0x01, 0x72];
+
+/// Whether a claims row, by its alias, is signed by a key the user has
+/// authorized, or there's no user to say.
+macro_rules! signed {
+    ($alias:literal) => {
+        concat!(
+            "(NOT EXISTS (SELECT 1 FROM users) OR EXISTS (
+                SELECT 1 FROM claim_keys sk JOIN claim_targets st ON st.target = sk.key
+                JOIN sign_claims sg ON sg.id = st.claim JOIN authorized au ON au.key = sg.by
+                WHERE sk.claim = ", $alias, ".id))"
+        )
+    };
 }
 
-pub(super) const LIVE: &str = "(c.claim IS NULL OR NOT EXISTS (
-    SELECT 1 FROM claim_targets x JOIN claims k ON k.id = x.claim WHERE x.target = c.claim AND k.kind = 'tomb'
-))";
+/// `LIVE`, of a claims row by another alias than `c`.
+pub(super) fn live(alias: &str) -> String {
+    LIVE.replace("c.id", &format!("{alias}.id"))
+}
+
+/// Whether the claims row `c` counts: it's signed, if it has to be, and
+/// no tomb that counts targets it.
+pub(super) const LIVE: &str = concat!(
+    "(", signed!("c"), " AND NOT EXISTS (
+        SELECT 1 FROM claim_keys tk JOIN claim_targets x ON x.target = tk.key JOIN claims k ON k.id = x.claim
+        WHERE tk.claim = c.id AND k.kind = 'tomb' AND ", signed!("k"), "))"
+);
+
+/// What the user's root key signed, by its alias in `claim_keys`.
+macro_rules! rooted {
+    ($alias:literal) => {
+        concat!(
+            "EXISTS (SELECT 1 FROM claim_targets rt JOIN sign_claims rs ON rs.id = rt.claim
+                WHERE rt.target = ", $alias, ".key AND rs.by IN (SELECT key FROM users))"
+        )
+    };
+}
+
+/// The keys the user has authorized: its root, and devices the root has
+/// certified and not revoked.
+const AUTHORIZE: &str = concat!(
+    "DELETE FROM authorized;
+     INSERT OR IGNORE INTO authorized (key) SELECT key FROM users;
+     INSERT OR IGNORE INTO authorized (key)
+         SELECT t.target FROM claims d JOIN claim_targets t ON t.claim = d.id JOIN claim_keys dk ON dk.claim = d.id
+         WHERE d.kind = 'device' AND ", rooted!("dk"), " AND NOT EXISTS (
+             SELECT 1 FROM claim_targets tt JOIN claims tb ON tb.id = tt.claim JOIN claim_keys tbk ON tbk.claim = tb.id
+             WHERE tt.target = dk.key AND tb.kind = 'tomb' AND ", rooted!("tbk"), "
+         );"
+);
+
+/// Who signed what, and who may: see the module's documentation.
+const AUTH_TABLES: &str = "
+         -- The multihash every claim is known by: its own, or for a
+         -- dissolved one its identity, which is what claims about it
+         -- target.
+         CREATE TABLE IF NOT EXISTS claim_keys (
+             claim INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
+             key INTEGER NOT NULL REFERENCES multihashes (id)
+         );
+         CREATE INDEX IF NOT EXISTS claim_keys_key ON claim_keys (key);
+         -- Who signed a claim, when they say, and the signature, checked
+         -- before it's put.
+         CREATE TABLE IF NOT EXISTS sign_claims (
+             id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
+             by INTEGER NOT NULL REFERENCES multihashes (id),
+             at INTEGER NOT NULL,
+             sig BLOB NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS sign_claims_by ON sign_claims (by);
+         -- The user's root key, by its name's multihash: once there is
+         -- one, claims count only if a key it authorized signs them.
+         CREATE TABLE IF NOT EXISTS users (
+             key INTEGER PRIMARY KEY REFERENCES multihashes (id)
+         );
+         -- The keys the user has authorized, kept up to date as
+         -- certificates and revocations arrive.
+         CREATE TABLE IF NOT EXISTS authorized (
+             key INTEGER PRIMARY KEY
+         );";
+
+/// The tables and views, made if they're not there.
+fn schema() -> String {
+    format!(
+        "-- Every claim, of any type. `claim` is a precipitated claim's
+         -- multihash, NULL for a dissolved one, which has none; `kind` is
+         -- its type, as the claim's own `claim` key says it.
+         CREATE TABLE IF NOT EXISTS claims (
+             id INTEGER PRIMARY KEY,
+             claim INTEGER UNIQUE REFERENCES multihashes (id),
+             kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device'))
+         );
+         -- Every claim's targets, which every type has.
+         CREATE TABLE IF NOT EXISTS claim_targets (
+             claim INTEGER NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
+             target INTEGER NOT NULL REFERENCES multihashes (id),
+             prefix BLOB NOT NULL,
+             PRIMARY KEY (claim, target, prefix)
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS claim_targets_target ON claim_targets (target);
+         -- What a set says its anchors are, and as of when.
+         CREATE TABLE IF NOT EXISTS set_claims (
+             id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
+             value INTEGER NOT NULL REFERENCES multihashes (id),
+             value_prefix BLOB NOT NULL,
+             at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS set_claims_value ON set_claims (value);
+         -- Which time a keep keeps its targets, if not the first.
+         CREATE TABLE IF NOT EXISTS keep_n (
+             claim INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
+             n INTEGER NOT NULL
+         );
+         -- What's particular to each type; a tomb has nothing but targets.
+         CREATE TABLE IF NOT EXISTS group_claims (
+             id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
+             into_ INTEGER NOT NULL REFERENCES multihashes (id),
+             into_prefix BLOB NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS group_claims_into ON group_claims (into_);
+         -- Where a keep's reach stops, if it does short of all its targets
+         -- link to.
+         CREATE TABLE IF NOT EXISTS keep_beyond (
+             claim INTEGER NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
+             target INTEGER NOT NULL REFERENCES multihashes (id),
+             prefix BLOB NOT NULL,
+             PRIMARY KEY (claim, target, prefix)
+         ) WITHOUT ROWID;
+         -- Every block's tags that still count. A simple tag's name is its
+         -- identity digest, after the multihash's code and length varint
+         -- (one byte, or two from 128).
+         CREATE VIEW IF NOT EXISTS tags (target, tag, name) AS
+             SELECT DISTINCT t.target, g.into_,
+                 CASE WHEN g.into_prefix = x'0155' AND substr(i.multihash, 1, 1) = x'00' THEN
+                     CAST(substr(i.multihash, CASE WHEN length(i.multihash) <= 129 THEN 3 ELSE 4 END) AS TEXT)
+                 END
+             FROM claim_targets t
+             JOIN claims c ON c.id = t.claim
+             JOIN group_claims g ON g.id = c.id
+             JOIN multihashes i ON i.id = g.into_
+             WHERE {LIVE};
+         -- What each anchor is now: its latest set that counts, by `at`
+         -- and then the value's multihash.
+         CREATE VIEW IF NOT EXISTS anchor_values (anchor, value, prefix, claim) AS
+             SELECT t.target, s.value, s.value_prefix, c.id FROM set_claims s
+             JOIN claims c ON c.id = s.id
+             JOIN claim_targets t ON t.claim = c.id
+             JOIN multihashes v ON v.id = s.value
+             WHERE {LIVE} AND NOT EXISTS (
+                 SELECT 1 FROM set_claims s2
+                 JOIN claims c2 ON c2.id = s2.id
+                 JOIN claim_targets t2 ON t2.claim = c2.id
+                 JOIN multihashes v2 ON v2.id = s2.value
+                 WHERE t2.target = t.target AND {live2}
+                     AND (s2.at > s.at OR (s2.at = s.at AND v2.multihash > v.multihash))
+             );",
+        live2 = live("c2"),
+    )
+}
 
 /// Admits canonical claims, keeping them as rows.
 pub struct ClaimStore {
@@ -72,83 +226,146 @@ fn pair(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Vec<u8>, Vec<u8>)> {
 
 impl ClaimStore {
     pub fn open(db: Db) -> Result<Self> {
-        db.conn().execute_batch(&format!(
-            "-- Every claim, of any type. `claim` is a precipitated claim's
-             -- multihash, NULL for a dissolved one, which has none; `kind` is
-             -- its type, as the claim's own `claim` key says it.
-             CREATE TABLE IF NOT EXISTS claims (
-                 id INTEGER PRIMARY KEY,
-                 claim INTEGER UNIQUE REFERENCES multihashes (id),
-                 kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb'))
-             );
-             -- Every claim's targets, which every type has.
-             CREATE TABLE IF NOT EXISTS claim_targets (
-                 claim INTEGER NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
-                 target INTEGER NOT NULL REFERENCES multihashes (id),
-                 prefix BLOB NOT NULL,
-                 PRIMARY KEY (claim, target, prefix)
-             ) WITHOUT ROWID;
-             CREATE INDEX IF NOT EXISTS claim_targets_target ON claim_targets (target);
-             -- What a set says its anchors are, and as of when.
-             CREATE TABLE IF NOT EXISTS set_claims (
-                 id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
-                 value INTEGER NOT NULL REFERENCES multihashes (id),
-                 value_prefix BLOB NOT NULL,
-                 at INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS set_claims_value ON set_claims (value);
-             -- Which time a keep keeps its targets, if not the first.
-             CREATE TABLE IF NOT EXISTS keep_n (
-                 claim INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
-                 n INTEGER NOT NULL
-             );
-             -- What's particular to each type; a tomb has nothing but targets.
-             CREATE TABLE IF NOT EXISTS group_claims (
-                 id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
-                 into_ INTEGER NOT NULL REFERENCES multihashes (id),
-                 into_prefix BLOB NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS group_claims_into ON group_claims (into_);
-             -- Where a keep's reach stops, if it does short of all its targets
-             -- link to.
-             CREATE TABLE IF NOT EXISTS keep_beyond (
-                 claim INTEGER NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
-                 target INTEGER NOT NULL REFERENCES multihashes (id),
-                 prefix BLOB NOT NULL,
-                 PRIMARY KEY (claim, target, prefix)
-             ) WITHOUT ROWID;
-             -- Every block's tags that still count. A simple tag's name is its
-             -- identity digest, after the multihash's code and length varint
-             -- (one byte, or two from 128).
-             CREATE VIEW IF NOT EXISTS tags (target, tag, name) AS
-                 SELECT DISTINCT t.target, g.into_,
-                     CASE WHEN g.into_prefix = x'0155' AND substr(i.multihash, 1, 1) = x'00' THEN
-                         CAST(substr(i.multihash, CASE WHEN length(i.multihash) <= 129 THEN 3 ELSE 4 END) AS TEXT)
-                     END
-                 FROM claim_targets t
-                 JOIN claims c ON c.id = t.claim
-                 JOIN group_claims g ON g.id = c.id
-                 JOIN multihashes i ON i.id = g.into_
-                 WHERE {LIVE};
-             -- What each anchor is now: its latest set that counts, by `at`
-             -- and then the value's multihash.
-             CREATE VIEW IF NOT EXISTS anchor_values (anchor, value, prefix, claim) AS
-                 SELECT t.target, s.value, s.value_prefix, c.id FROM set_claims s
-                 JOIN claims c ON c.id = s.id
-                 JOIN claim_targets t ON t.claim = c.id
-                 JOIN multihashes v ON v.id = s.value
-                 WHERE {LIVE} AND NOT EXISTS (
-                     SELECT 1 FROM set_claims s2
-                     JOIN claims c2 ON c2.id = s2.id
-                     JOIN claim_targets t2 ON t2.claim = c2.id
-                     JOIN multihashes v2 ON v2.id = s2.value
-                     WHERE t2.target = t.target AND {live2}
-                         AND (s2.at > s.at OR (s2.at = s.at AND v2.multihash > v.multihash))
-                 );",
-            live2 = live("c2"),
-        ))?;
+        db.conn().execute_batch(&schema())?;
+        db.conn().execute_batch(AUTH_TABLES)?;
         widen_kinds(&db)?;
-        Ok(Self { db })
+        let store = Self { db };
+        store.key_claims()?;
+        Ok(store)
+    }
+
+    /// Give every claim its row in `claim_keys`, for claims put before
+    /// there was the table.
+    fn key_claims(&self) -> Result<()> {
+        let rows: Vec<(Id, Option<Id>, String)> = self.db.conn()
+            .prepare_cached("SELECT id, claim, kind FROM claims WHERE id NOT IN (SELECT claim FROM claim_keys)")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, claim, kind) in rows {
+            let key = match (claim, self.claim(id, &kind)) {
+                (Some(key), _) => key,
+                (None, Ok(claim)) => self.db.intern(claim.cid().multihash())?,
+                // Rows which aren't a whole claim have nothing to be about
+                (None, Err(_)) => continue,
+            };
+            self.db.conn().prepare_cached("INSERT INTO claim_keys (claim, key) VALUES (?1, ?2)")?.execute([id, key])?;
+        }
+        Ok(())
+    }
+
+    /// Recompute the keys the user has authorized.
+    fn authorize(&self) -> Result<()> {
+        self.db.conn().execute_batch(AUTHORIZE)?;
+        Ok(())
+    }
+
+    /// The user's root key, if the database has a user.
+    pub fn user(&self) -> Result<Option<Link>> {
+        let row: Option<Vec<u8>> = self.db.conn()
+            .prepare_cached("SELECT m.multihash FROM users u JOIN multihashes m ON m.id = u.key")?
+            .query_row([], |row| row.get(0))
+            .optional()?;
+        row.map(|multihash| link(&KEY_PREFIX, &multihash)).transpose()
+    }
+
+    /// Make `root` the user, in place of any other.
+    pub fn set_user(&self, root: &Link) -> Result<()> {
+        if !crate::keys::is_key(root) {
+            return Err(Error::Invalid { store: NAME, reason: format!("{root} isn't a key") });
+        }
+        self.db.atomically(|| {
+            let key = self.db.intern(root.multihash())?;
+            self.db.conn().execute("DELETE FROM users", [])?;
+            self.db.conn().execute("INSERT INTO users (key) VALUES (?1)", [key])?;
+            self.authorize()
+        })
+    }
+
+    /// Whether a key is the user's root or a device it's authorized.
+    pub fn authorized(&self, key: &Link) -> Result<bool> {
+        Ok(self.db.conn()
+            .prepare_cached("SELECT 1 FROM authorized a JOIN multihashes m ON m.id = a.key WHERE m.multihash = ?1")?
+            .exists([key.multihash().to_bytes()])?)
+    }
+
+    /// Every key a device claim names, and whether it's authorized now.
+    pub fn devices(&self) -> Result<Vec<(Link, bool)>> {
+        let rows: Vec<(Vec<u8>, Vec<u8>, bool)> = self.db.conn()
+            .prepare_cached(
+                "SELECT DISTINCT t.prefix, m.multihash, t.target IN (SELECT key FROM authorized) FROM claims d
+                 JOIN claim_targets t ON t.claim = d.id JOIN multihashes m ON m.id = t.target
+                 WHERE d.kind = 'device' ORDER BY m.multihash",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter().map(|(prefix, multihash, ok)| Ok((link(&prefix, &multihash)?, ok))).collect()
+    }
+
+    /// The CIDs of claims, other than signs and certificates, which no
+    /// authorized key has signed: what a device adopts as the user's when
+    /// it first has a key to sign with.
+    pub fn unsigned(&self) -> Result<Vec<Link>> {
+        self.claims_where(
+            "c.kind NOT IN ('sign', 'device') AND NOT EXISTS (
+                SELECT 1 FROM claim_targets st JOIN sign_claims sg ON sg.id = st.claim JOIN authorized au ON au.key = sg.by
+                WHERE st.target = ck.key)",
+            &[],
+        )
+    }
+
+    /// The CIDs of claims, other than signs and certificates, which a key
+    /// signed as of no later than `until`, and which no other authorized
+    /// key has signed: what revoking it would leave unsigned, unless it's
+    /// signed again.
+    pub fn signed_only_by(&self, key: &Link, until: u64) -> Result<Vec<Link>> {
+        let until = i64::try_from(until).unwrap_or(i64::MAX);
+        self.claims_where(
+            "c.kind NOT IN ('sign', 'device')
+             AND EXISTS (
+                 SELECT 1 FROM claim_targets st JOIN sign_claims sg ON sg.id = st.claim JOIN multihashes b ON b.id = sg.by
+                 WHERE st.target = ck.key AND b.multihash = ?1 AND sg.at <= ?2)
+             AND NOT EXISTS (
+                 SELECT 1 FROM claim_targets st JOIN sign_claims sg ON sg.id = st.claim JOIN multihashes b ON b.id = sg.by
+                 JOIN authorized au ON au.key = sg.by
+                 WHERE st.target = ck.key AND b.multihash != ?1)",
+            &[&key.multihash().to_bytes(), &until],
+        )
+    }
+
+    /// The CIDs of the claims matching a condition on `c` and its key `ck`.
+    fn claims_where(&self, condition: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<Link>> {
+        let rows: Vec<(Id, String, Option<Vec<u8>>)> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT c.id, c.kind, m.multihash FROM claims c JOIN claim_keys ck ON ck.claim = c.id
+                 LEFT JOIN multihashes m ON m.id = c.claim WHERE {condition} ORDER BY c.id"
+            ))?
+            .query_map(params, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter()
+            .map(|(id, kind, multihash)| match multihash {
+                Some(multihash) => Ok(crate::cid::AnyCid::V1(Cidv1::new(DAG_CBOR_CODEC, super::decode_key(NAME, &multihash)?))),
+                None => Ok(self.claim(id, &kind)?.cid()),
+            })
+            .collect()
+    }
+
+    /// Whether a key has signed a claim, by the claim's CID.
+    pub fn signed_by(&self, claim: &Link, key: &Link) -> Result<bool> {
+        Ok(self.db.conn()
+            .prepare_cached(
+                "SELECT 1 FROM multihashes c JOIN claim_targets st ON st.target = c.id JOIN sign_claims sg ON sg.id = st.claim
+                 JOIN multihashes b ON b.id = sg.by WHERE c.multihash = ?1 AND b.multihash = ?2",
+            )?
+            .exists([claim.multihash().to_bytes(), key.multihash().to_bytes()])?)
+    }
+
+    fn sign(&self, id: Id) -> Result<crate::claim::Sign> {
+        let (by, at, sig): (Vec<u8>, i64, Vec<u8>) = self.db.conn()
+            .prepare_cached("SELECT b.multihash, s.at, s.sig FROM sign_claims s JOIN multihashes b ON b.id = s.by WHERE s.id = ?1")?
+            .query_row([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let [target] = <[Link; 1]>::try_from(self.targets(id)?)
+            .map_err(|_| Error::Invalid { store: NAME, reason: "a sign of other than one claim".into() })?;
+        Ok(crate::claim::Sign::from_parts(target, link(&KEY_PREFIX, &by)?, u64::try_from(at).unwrap_or_default(), sig))
     }
 
     fn group(&self, id: Id) -> Result<Group> {
@@ -195,6 +412,10 @@ impl ClaimStore {
                 .ok_or_else(|| Error::Invalid { store: NAME, reason: "a keep with no targets".into() }),
             "set" => self.set(id).map(Claim::Set),
             "tomb" => self.tomb(id).map(Claim::Tomb),
+            "sign" => self.sign(id).map(Claim::Sign),
+            "device" => crate::claim::Device::new(self.targets(id)?)
+                .map(Claim::Device)
+                .ok_or_else(|| Error::Invalid { store: NAME, reason: "a device claim of no keys".into() }),
             _ => Err(Error::Invalid { store: NAME, reason: format!("a claim of kind {kind}") }),
         }
     }
@@ -292,11 +513,13 @@ impl ClaimStore {
                     .query_row(params![value, value_prefix, i64::try_from(set.at()).unwrap_or(i64::MAX), target, prefix], |r| r.get(0))
                     .optional()?
             },
-            Claim::Keep(_) | Claim::Tomb(_) => {
-                let (kind, n) = match claim {
-                    Claim::Keep(keep) => ("keep", keep.n()),
-                    _ => ("tomb", 0),
+            Claim::Sign(_) => None,
+            Claim::Keep(_) | Claim::Tomb(_) | Claim::Device(_) => {
+                let n = match claim {
+                    Claim::Keep(keep) => keep.n(),
+                    _ => 0,
                 };
+                let kind = claim.kind();
                 self.db.conn()
                     .prepare_cached(
                         "SELECT c.id FROM claims c JOIN claim_targets t ON t.claim = c.id
@@ -346,14 +569,17 @@ impl ClaimStore {
     fn insert(&self, claim: &Claim, multihash: Option<Key<'_>>) -> Result<()> {
         let id = multihash.map(|key| self.db.intern(key)).transpose()?;
         let conn = self.db.conn();
-        let kind = match claim {
-            Claim::Group(_) => "group",
-            Claim::Keep(_) => "keep",
-            Claim::Set(_) => "set",
-            Claim::Tomb(_) => "tomb",
-        };
-        conn.prepare_cached("INSERT INTO claims (claim, kind) VALUES (?1, ?2)")?.execute(params![id, kind])?;
+        conn.prepare_cached("INSERT INTO claims (claim, kind) VALUES (?1, ?2)")?.execute(params![id, claim.kind()])?;
         let row = conn.last_insert_rowid();
+        let key = match id {
+            Some(id) => id,
+            None => self.db.intern(claim.cid().multihash())?,
+        };
+        conn.prepare_cached("INSERT INTO claim_keys (claim, key) VALUES (?1, ?2)")?.execute([row, key])?;
+        if let Claim::Sign(sign) = claim {
+            conn.prepare_cached("INSERT INTO sign_claims (id, by, at, sig) VALUES (?1, ?2, ?3, ?4)")?
+                .execute(params![row, self.db.intern(sign.by().multihash())?, i64::try_from(sign.at()).unwrap_or(i64::MAX), sign.sig()])?;
+        }
         if let Claim::Set(set) = claim {
             let (value_prefix, value) = split(set.value())?;
             conn.prepare_cached("INSERT INTO set_claims (id, value, value_prefix, at) VALUES (?1, ?2, ?3, ?4)")?
@@ -380,18 +606,6 @@ impl ClaimStore {
             for beyond in keep.beyond() {
                 let (prefix, multihash) = split(beyond)?;
                 stmt.execute(params![row, self.db.intern(multihash.as_ref())?, prefix])?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Retract the dissolved claims a tomb targets.
-    fn bury(&self, tomb: &Tomb) -> Result<()> {
-        for target in tomb.target() {
-            if let Some(claim @ (Claim::Group(_) | Claim::Keep(_) | Claim::Set(_))) = claim::dissolved(target)
-                && let Some(id) = self.find_dissolved(&claim)?
-            {
-                self.db.conn().prepare_cached("DELETE FROM claims WHERE id = ?1")?.execute([id])?;
             }
         }
         Ok(())
@@ -498,7 +712,7 @@ impl ClaimStore {
 /// constraint, which doesn't touch how rows are stored, is rewritten in
 /// place, as `SQLite` documents for such changes.
 fn widen_kinds(db: &Db) -> Result<()> {
-    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb'))";
+    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device'))";
     let conn = db.conn();
     let sql: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'claims'", [], |row| row.get(0))?;
     if sql.contains(KINDS) {
@@ -575,15 +789,20 @@ impl BlockStore for ClaimStore {
         if dissolved && !claim.dissolves() {
             return Ok(Put::Declined);
         }
+        // A signature that isn't its key's is no claim at all
+        if let Claim::Sign(sign) = &claim
+            && !sign.verify()
+        {
+            return Ok(Put::Declined);
+        }
         let present = if dissolved { self.has_dissolved(&claim)? } else { self.has(key)? };
-        // A retracted dissolved claim isn't brought back
-        if present || (dissolved && self.tombstoned(key)?) {
+        if present {
             return Ok(Put::Stored);
         }
         self.db.atomically(|| {
             self.insert(&claim, (!dissolved).then_some(key))?;
-            if let Claim::Tomb(tomb) = &claim {
-                self.bury(tomb)?;
+            if matches!(claim, Claim::Sign(_) | Claim::Device(_) | Claim::Tomb(_)) {
+                self.authorize()?;
             }
             Ok(Put::Stored)
         })

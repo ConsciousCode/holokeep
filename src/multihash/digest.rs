@@ -95,9 +95,10 @@ impl<const S: usize> DigestBuf for Inline<S> {
         }
     }
 }
-/// A digest kept inline up to `S` bytes, and on the heap beyond, so the
-/// common case (32-byte digests) never allocates while identity digests can
-/// still be as long as IPIP-0512 allows. A digest is only ever on the heap
+/// A digest kept inline up to `S` bytes, and on the heap beyond.
+///
+/// So the common case (32-byte digests) never allocates while identity
+/// digests can still be as long as IPIP-0512 allows. A digest is only ever on the heap
 /// when it's longer than `S`, but equality, ordering and hashing go by the
 /// bytes regardless.
 #[derive(Clone, Debug)]

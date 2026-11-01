@@ -5,7 +5,7 @@ use crate::varint;
 
 mod digest;
 mod codec;
-pub use digest::{DefaultDigest, DigestBuf, Inline};
+pub use digest::{DefaultDigest, DigestBuf, Inline, Spill};
 pub use codec::{MultihashCodec, MultihashDigest, MultihashFunc};
 
 #[derive(Debug, thiserror::Error)]
