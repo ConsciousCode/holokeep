@@ -7,24 +7,33 @@
 //! identity multihash of its public key, protobuf-encoded, under the
 //! `libp2p-key` codec, so a node's key and its peer ID are one.
 //!
-//! Secrets are kept as libp2p keeps them, a protobuf-encoded ed25519
-//! keypair, readable only by their owner.
+//! A node's secret is kept as libp2p keeps it, a protobuf-encoded ed25519
+//! keypair, readable only by its owner. The user's root key is kept on no
+//! machine: it's sealed with the user's passphrase, as a block the mesh
+//! keeps like any other (see `Sealed`), and opened only to certify or
+//! revoke a device. A device that's stolen has no more of the root than
+//! anyone else.
 
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use std::collections::BTreeMap;
 
-use crate::cid::{AnyCid, BaseCid, CidRef, Cidv1, LIBP2P_KEY_CODEC};
-use crate::block::IDENTITY;
-use crate::model::Link;
-use crate::multihash::Multihash;
+use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{KeyInit, XChaCha20Poly1305};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use zeroize::Zeroizing;
+
+use crate::block::{Block, IDENTITY};
+use crate::cid::{AnyCid, BaseCid, CidRef, Cidv1, Cidv1Spec, DAG_CBOR_CODEC, LIBP2P_KEY_CODEC};
+use crate::model::{Ipld, Link};
+use crate::multihash::{Multihash, MultihashFunc};
 
 /// This node's key, as libp2p keeps it.
 pub const NODE_KEY: &str = "node.key";
-/// The user's root key, on whichever machine keeps it.
+/// Where a user's root key was kept, unsealed, before it was sealed.
 pub const USER_KEY: &str = "user.key";
 
 /// A public key's protobuf encoding: type ed25519, then 32 bytes.
@@ -147,6 +156,126 @@ pub fn verify(id: &Link, message: &[u8], signature: &[u8]) -> bool {
     key.verify(message, &signature).is_ok()
 }
 
+/// How costly a passphrase is to guess at: argon2id's memory, in KiB,
+/// its passes, and its lanes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cost {
+    pub memory: u32,
+    pub passes: u32,
+    pub lanes: u32,
+}
+
+impl Cost {
+    /// RFC 9106's second recommendation: 64 MiB, three passes, four lanes.
+    pub const RECOMMENDED: Self = Self { memory: 64 * 1024, passes: 3, lanes: 4 };
+    /// As cheap as argon2id goes, for tests: no protection at all.
+    pub const NONE: Self = Self { memory: 8, passes: 1, lanes: 1 };
+}
+
+/// A key sealed with a passphrase: a block anyone may hold, which only
+/// someone with the passphrase can open. The key's name is bound to it,
+/// so it opens only as the key it says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sealed {
+    key: Link,
+    cost: Cost,
+    salt: Vec<u8>,
+    nonce: [u8; 24],
+    ciphertext: Vec<u8>,
+}
+
+const KDF: &str = "argon2id";
+const CIPHER: &str = "xchacha20poly1305";
+
+/// A passphrase stretched into a key to seal with.
+fn stretch(passphrase: &[u8], salt: &[u8], cost: Cost) -> Option<Zeroizing<[u8; 32]>> {
+    let params = argon2::Params::new(cost.memory, cost.passes, cost.lanes, Some(32)).ok()?;
+    let mut key = Zeroizing::new([0u8; 32]);
+    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+        .hash_password_into(passphrase, salt, key.as_mut())
+        .ok()?;
+    Some(key)
+}
+
+fn random<const N: usize>() -> io::Result<[u8; N]> {
+    let mut bytes = [0u8; N];
+    getrandom::getrandom(&mut bytes).map_err(io::Error::other)?;
+    Ok(bytes)
+}
+
+impl Sealed {
+    /// Seal a key with a passphrase, at a cost to anyone guessing it.
+    pub fn seal(key: &Key, passphrase: &[u8], cost: Cost) -> io::Result<Self> {
+        let salt = random::<16>()?.to_vec();
+        let nonce = random::<24>()?;
+        let secret = stretch(passphrase, &salt, cost).ok_or_else(|| io::Error::other("argon2id won't take that cost"))?;
+        let cipher = XChaCha20Poly1305::new_from_slice(secret.as_ref()).map_err(io::Error::other)?;
+        let id = key.id();
+        let plain = Zeroizing::new(key.to_protobuf());
+        let ciphertext = cipher
+            .encrypt(&nonce.into(), Payload { msg: &plain, aad: &id.to_bytes() })
+            .map_err(|_| io::Error::other("sealing failed"))?;
+        Ok(Self { key: id, cost, salt, nonce, ciphertext })
+    }
+
+    /// The key, if the passphrase is the one it was sealed with.
+    pub fn open(&self, passphrase: &[u8]) -> Option<Key> {
+        let secret = stretch(passphrase, &self.salt, self.cost)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(secret.as_ref()).ok()?;
+        let plain = Zeroizing::new(cipher.decrypt(&self.nonce.into(), Payload { msg: &self.ciphertext, aad: &self.key.to_bytes() }).ok()?);
+        Key::from_protobuf(&plain).filter(|key| key.id() == self.key)
+    }
+
+    /// Which key it is.
+    pub const fn key(&self) -> &Link {
+        &self.key
+    }
+
+    fn to_ipld(&self) -> Ipld {
+        Ipld::Map(BTreeMap::from([
+            ("cipher".to_owned(), Ipld::String(CIPHER.to_owned())),
+            ("kdf".to_owned(), Ipld::String(KDF.to_owned())),
+            ("key".to_owned(), Ipld::Link(self.key.clone())),
+            ("lanes".to_owned(), Ipld::Integer(self.cost.lanes.into())),
+            ("memory".to_owned(), Ipld::Integer(self.cost.memory.into())),
+            ("nonce".to_owned(), Ipld::Bytes(self.nonce.to_vec())),
+            ("passes".to_owned(), Ipld::Integer(self.cost.passes.into())),
+            ("salt".to_owned(), Ipld::Bytes(self.salt.clone())),
+            ("sealed".to_owned(), Ipld::Bytes(self.ciphertext.clone())),
+        ]))
+    }
+
+    /// The sealed key as a dag-cbor block.
+    pub fn block(&self) -> Block {
+        let data = crate::dagcbor::to_vec(&self.to_ipld()).unwrap_or_default();
+        Block::hash(Cidv1Spec::new(DAG_CBOR_CODEC, MultihashFunc::Sha2_256), data.into())
+    }
+
+    /// The sealed key a dag-cbor block is, if it's one.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        let Ipld::Map(mut map) = crate::dagcbor::from_slice(data).ok()? else {
+            return None;
+        };
+        let mut take = |name: &str| map.remove(name);
+        let integer = |value: Option<Ipld>| match value {
+            Some(Ipld::Integer(n)) => u32::try_from(n).ok(),
+            _ => None,
+        };
+        let bytes = |value: Option<Ipld>| match value {
+            Some(Ipld::Bytes(bytes)) => Some(bytes),
+            _ => None,
+        };
+        let (Some(Ipld::String(kdf)), Some(Ipld::String(cipher)), Some(Ipld::Link(key))) = (take("kdf"), take("cipher"), take("key")) else {
+            return None;
+        };
+        (kdf == KDF && cipher == CIPHER && is_key(&key)).then_some(())?;
+        let cost = Cost { memory: integer(take("memory"))?, passes: integer(take("passes"))?, lanes: integer(take("lanes"))? };
+        let (salt, nonce, ciphertext) = (bytes(take("salt"))?, bytes(take("nonce"))?, bytes(take("sealed"))?);
+        let sealed = Self { key, cost, salt, nonce: nonce.as_slice().try_into().ok()?, ciphertext };
+        map.is_empty().then_some(sealed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -174,6 +303,22 @@ mod tests {
         assert!(is_key(&key.id()));
         assert!(!is_key(&crate::claim::tag("not a key").unwrap()));
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_sealed_key_opens_only_with_its_passphrase() {
+        let key = Key::generate().unwrap();
+        let sealed = Sealed::seal(&key, b"correct horse", Cost::NONE).unwrap();
+        let block = sealed.block();
+        let parsed = Sealed::parse(block.data()).unwrap();
+        assert_eq!(parsed, sealed);
+        assert_eq!(parsed.open(b"correct horse").map(|key| key.id()), Some(key.id()));
+        assert!(parsed.open(b"battery staple").is_none());
+        // Bound to the key it says it is
+        let other = Key::generate().unwrap();
+        let swapped = Sealed { key: other.id(), ..sealed };
+        assert!(swapped.open(b"correct horse").is_none());
+        assert!(Sealed::parse(crate::claim::Claim::Tomb(crate::claim::Tomb::new([key.id()]).unwrap()).block().data()).is_none());
     }
 
     #[cfg(feature = "net")]

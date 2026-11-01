@@ -301,18 +301,6 @@ impl ClaimStore {
         rows.into_iter().map(|(prefix, multihash, ok)| Ok((link(&prefix, &multihash)?, ok))).collect()
     }
 
-    /// The CIDs of claims, other than signs and certificates, which no
-    /// authorized key has signed: what a device adopts as the user's when
-    /// it first has a key to sign with.
-    pub fn unsigned(&self) -> Result<Vec<Link>> {
-        self.claims_where(
-            "c.kind NOT IN ('sign', 'device') AND NOT EXISTS (
-                SELECT 1 FROM claim_targets st JOIN sign_claims sg ON sg.id = st.claim JOIN authorized au ON au.key = sg.by
-                WHERE st.target = ck.key)",
-            &[],
-        )
-    }
-
     /// The CIDs of claims, other than signs and certificates, which a key
     /// signed as of no later than `until`, and which no other authorized
     /// key has signed: what revoking it would leave unsigned, unless it's

@@ -474,24 +474,74 @@ fn run(args: Args) -> anyhow::Result<()> {
     }
 }
 
-/// Become a device of the user a ticket's for: its root key is the user,
-/// with this node's certificate, and what's here is the user's.
+/// The passphrase of the user's root key: `HK_PASSPHRASE` if it's set,
+/// otherwise asked for, twice if it's a new one.
+fn passphrase(new: bool) -> anyhow::Result<zeroize::Zeroizing<String>> {
+    if let Ok(passphrase) = std::env::var("HK_PASSPHRASE") {
+        return Ok(passphrase.into());
+    }
+    let ask = |prompt| rpassword::prompt_password(prompt).map(zeroize::Zeroizing::new);
+    let passphrase = ask(if new { "a new passphrase for this mesh's user: " } else { "passphrase of this mesh's user: " })?;
+    anyhow::ensure!(!passphrase.is_empty(), "the passphrase can't be empty");
+    if new {
+        anyhow::ensure!(*ask("again: ")? == *passphrase, "those didn't match");
+    }
+    Ok(passphrase)
+}
+
+/// The user's root key, unsealed: or, where it was kept unsealed, as it
+/// was before there were seals, sealed now and the file removed.
+fn root_key(repo: &Catalog, dir: &Path) -> anyhow::Result<holokeep::keys::Key> {
+    use holokeep::keys::{Cost, Key, USER_KEY};
+    let file = dir.join(USER_KEY);
+    if let Some(root) = Key::load(&file)?
+        && repo.user()?.as_ref() == Some(&root.id())
+        && repo.seals()?.is_empty()
+    {
+        eprintln!("sealing the user's root key, which was kept unsealed in {}", file.display());
+        repo.seal(&root, passphrase(true)?.as_bytes(), Cost::RECOMMENDED)?;
+        std::fs::remove_file(&file)?;
+        return Ok(root);
+    }
+    Ok(repo.root(passphrase(false)?.as_bytes())?)
+}
+
+/// The blocks a ticket brings a joiner: every certificate and revocation,
+/// signed, and the user's root key sealed, with what keeps it.
 #[cfg(feature = "net")]
-fn join_user(dir: &Path, user: &Link, certificate: &[Vec<u8>]) -> anyhow::Result<()> {
+fn user_blocks(repo: &Catalog) -> anyhow::Result<Vec<Vec<u8>>> {
+    let seals: Vec<Link> = repo.seals()?.into_iter().map(|(cid, _)| cid).collect();
+    let keys: Vec<Vec<u8>> = repo.devices()?.iter().map(|(device, _)| device.multihash().to_bytes())
+        .chain(seals.iter().map(|cid| cid.multihash().to_bytes()))
+        .collect();
+    let about = holokeep::net::structure::backrefs(repo, keys.iter().map(Vec::as_slice))?;
+    seals.iter().chain(&about)
+        .map(|cid| Ok(repo.get_block(cid)?.with_context(|| format!("{cid} went missing"))?.into_data().into_vec()))
+        .collect()
+}
+
+/// Become a device of the user a ticket's for: put what the ticket brings,
+/// and make its root key this repo's user, in place of any other. What
+/// this node signed before counts as the user's, since the ticket
+/// certifies it.
+#[cfg(feature = "net")]
+fn join_user(dir: &Path, user: &Link, blocks: &[Vec<u8>]) -> anyhow::Result<()> {
+    use holokeep::cid::{CidVersion, Cidv1Spec, DAG_CBOR_CODEC};
     let mut repo = Catalog::open_repo(dir)?;
     let me = repo.signer().context("no key to sign with")?.id();
     repo.batch(|repo| {
-        for data in certificate {
-            let claim = claim::Claim::parse(data).context("not a certificate")?;
-            repo.put_block(&claim.block(), holokeep::cid::CidVersion::V1)?;
+        for data in blocks {
+            let block = claim::Claim::parse(data).map_or_else(
+                || holokeep::block::Block::hash(Cidv1Spec::new(DAG_CBOR_CODEC, holokeep::multihash::MultihashFunc::Sha2_256), data.clone().into()),
+                |claim| claim.block(),
+            );
+            repo.put_block(&block, CidVersion::V1)?;
         }
         repo.set_user(user)?;
         anyhow::ensure!(repo.claims().is_some_and(|claims| claims.authorized(&me).unwrap_or(false)), "the ticket doesn't certify this node");
-        repo.adopt()?;
         Ok(())
     })?;
-    // This repo's own root key, which made it a user of its own until now,
-    // is no one's
+    // A root key kept unsealed, from before there were seals, is no one's
     let own = dir.join(holokeep::keys::USER_KEY);
     if own.exists() {
         std::fs::rename(&own, own.with_extension("key.before-join"))?;
@@ -515,18 +565,23 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
             // Where this node listens, if it's running
             let listening = daemon::ask(dir, "listeners")?.unwrap_or_default();
             list.insert(me, listening.iter().filter_map(|addr| addr.parse().ok()).collect());
-            // The joiner's certificate, which only the user's root key signs
-            let root = holokeep::keys::Key::load(&dir.join(holokeep::keys::USER_KEY))?
-                .context("only the machine with the user's root key can certify a device: invite from that one")?;
+            // The joiner's certificate, which the user's root key signs: the
+            // first invite makes the user, and so the mesh
             let device = holokeep::keys::from_peer_id(&peer.to_string()).context("not an ed25519 peer")?;
             let mut repo = Catalog::open_repo(dir)?;
-            let user = repo.user()?.context("this repo has no user")?;
-            let certified: [Link; 2] = repo.batch(|repo| repo.certify(&root, &device))?.into();
-            let certificate = certified.iter()
-                .map(|cid| Ok(repo.get_block(cid)?.context("the certificate went missing")?.into_data().into_vec()))
-                .collect::<anyhow::Result<_>>()?;
+            let root = if repo.user()?.is_some() {
+                root_key(&repo, dir)?
+            } else {
+                let passphrase = passphrase(true)?;
+                let root = repo.batch(|repo| repo.found_user(passphrase.as_bytes(), holokeep::keys::Cost::RECOMMENDED))?;
+                eprintln!("made a user for this mesh, {}: its root key is sealed with the passphrase, in the mesh", holokeep::keys::peer_id(&root.id()));
+                root
+            };
+            repo.batch(|repo| repo.certify(&root, &device))?;
+            let user = root.id();
+            let blocks = user_blocks(&repo)?;
             daemon::ask(dir, "reload")?;
-            out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: Some((user, certificate)) }.encode());
+            out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: Some((user, blocks)) }.encode());
             if listening.is_empty() {
                 eprintln!("note: this node isn't running, so the ticket says nowhere to find it; it'll be found on the LAN, or start `hk node run` and invite again");
             }
@@ -537,8 +592,8 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
             anyhow::ensure!(ticket.members.remove(&me).is_some(), "the ticket isn't for this node, {me}");
             mesh::set_swarm_key(dir, ticket.swarm_key)?;
             daemon::members(dir)?.merge(&ticket.members)?;
-            if let Some((user, certificate)) = &ticket.user {
-                join_user(dir, user, certificate)?;
+            if let Some((user, blocks)) = &ticket.user {
+                join_user(dir, user, blocks)?;
             }
             daemon::ask(dir, "reload")?;
             eprintln!("joined the mesh of {}; `hk node run` to connect", ticket.inviter);
@@ -642,13 +697,12 @@ fn volume(mut repo: Catalog, command: VolumeCommand) -> anyhow::Result<()> {
 
 fn device(dir: &Path, command: DeviceCommand) -> anyhow::Result<()> {
     use holokeep::keys::{self, Key};
-    let repo = Catalog::open_repo(dir)?;
-    let root = Key::load(&dir.join(keys::USER_KEY))?;
+    let mut repo = Catalog::open_repo(dir)?;
     match command {
         DeviceCommand::List => {
-            let user = repo.user()?.context("this repo has no user")?;
-            let here = if root.is_some() { "\troot key here" } else { "" };
-            out!("user\t{}{here}", keys::peer_id(&user));
+            let user = repo.user()?.context("this repo has no user: it makes one when it invites a node to its mesh")?;
+            let sealed = if repo.seals()?.is_empty() { "\tno sealed root here" } else { "" };
+            out!("user\t{}{sealed}", keys::peer_id(&user));
             let me = repo.signer().map(Key::id);
             for (device, ok) in repo.devices()? {
                 let this = if me.as_ref() == Some(&device) { "\tthis node" } else { "" };
@@ -656,11 +710,10 @@ fn device(dir: &Path, command: DeviceCommand) -> anyhow::Result<()> {
             }
         },
         DeviceCommand::Revoke { peer, until } => {
-            let root = root.context("only the machine with the user's root key can revoke a device")?;
             let device = keys::from_peer_id(&peer).context("not an ed25519 peer ID")?;
             anyhow::ensure!(repo.signer().is_some_and(|key| key.id() != device), "a node can't revoke itself");
             let until = until.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs()));
-            let mut repo = repo;
+            let root = root_key(&repo, dir)?;
             let resigned = repo.batch(|repo| repo.revoke(&root, &device, until))?;
             out!("revoked {peer}; signed {resigned} of its claims again");
         },

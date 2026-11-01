@@ -90,6 +90,10 @@ pub enum Error {
     #[error("this repo keeps no claims")]
     NoClaims,
 
+    /// The user, or its root key, isn't as asked.
+    #[error("{0}")]
+    User(String),
+
     /// A multihash too long to keep; see `MAX_DIGEST_LEN`.
     #[error("multihash digest of {0} bytes is too long to keep")]
     Oversized(usize),
@@ -496,26 +500,12 @@ impl Catalog {
         Ok(catalog)
     }
 
-    /// Sign claims made here with this node's key. A repo with no user yet
-    /// becomes its own: it makes a root key, which certifies this node, and
-    /// the claims already here are adopted as the user's.
+    /// Sign claims made here with this node's key, made if there's none
+    /// yet. A repo has no user until it makes or joins a mesh: until then
+    /// it takes every claim at its word, and when it has one, what this
+    /// node signed counts once the user certifies it.
     fn sign_as(&mut self, dir: &Path) -> Result<()> {
-        let device = crate::keys::Key::load_or_make(&dir.join(crate::keys::NODE_KEY))?;
-        let Some(claims) = self.claims.clone() else {
-            return Ok(());
-        };
-        let fresh = claims.user()?.is_none();
-        if fresh {
-            let root = crate::keys::Key::load_or_make(&dir.join(crate::keys::USER_KEY))?;
-            self.batch(|catalog| {
-                claims.set_user(&root.id())?;
-                catalog.certify(&root, &device.id())
-            })?;
-        }
-        self.signer = Some(device);
-        if fresh {
-            self.batch(|catalog| catalog.adopt())?;
-        }
+        self.signer = Some(crate::keys::Key::load_or_make(&dir.join(crate::keys::NODE_KEY))?);
         Ok(())
     }
 
@@ -560,17 +550,59 @@ impl Catalog {
         Ok(())
     }
 
-    /// Sign every claim no authorized key has: what was here before this
-    /// device had a user, or joined one, is the user's. Returns how many.
-    pub fn adopt(&self) -> Result<usize> {
-        let (Some(claims), Some(key)) = (&self.claims, &self.signer) else {
-            return Ok(0);
-        };
-        let unsigned = claims.unsigned()?;
-        for claim in &unsigned {
-            self.sign_with(key, claim)?;
+    /// Make a user for this repo, as a mesh is made: a new root key, which
+    /// certifies this device, sealed with a passphrase. Returns the root,
+    /// which is nowhere else unsealed.
+    pub fn found_user(&self, passphrase: &[u8], cost: crate::keys::Cost) -> Result<crate::keys::Key> {
+        let device = self.signer.as_ref().ok_or_else(|| Error::User("this repo has no key to sign with".into()))?.id();
+        if self.user()?.is_some() {
+            return Err(Error::User("this repo has a user already".into()));
         }
-        Ok(unsigned.len())
+        let root = crate::keys::Key::generate()?;
+        self.set_user(&root.id())?;
+        self.certify(&root, &device)?;
+        self.seal(&root, passphrase, cost)?;
+        Ok(root)
+    }
+
+    /// Seal the user's root key with a passphrase, as a block this repo
+    /// keeps, and so wherever the mesh keeps what it keeps. Returns its
+    /// CID.
+    pub fn seal(&self, root: &crate::keys::Key, passphrase: &[u8], cost: crate::keys::Cost) -> Result<Link> {
+        let block = crate::keys::Sealed::seal(root, passphrase, cost)?.block();
+        self.put_block(&block, CidVersion::V1)?;
+        let cid = crate::cid::AnyCid::V1(block.cid().clone());
+        self.keep(&cid)?;
+        Ok(cid)
+    }
+
+    /// The user's root key, sealed, wherever it's here, by CID.
+    pub fn seals(&self) -> Result<Vec<(Link, crate::keys::Sealed)>> {
+        let Some(user) = self.user()? else {
+            return Ok(Vec::new());
+        };
+        let mut found = Vec::new();
+        for source in self.backrefs(user.multihash())? {
+            if let Some(cid) = self.cid_of(source.as_ref())?
+                && let Some(block) = self.get_block(&cid)?
+                && let Some(sealed) = crate::keys::Sealed::parse(block.data())
+                && *sealed.key() == user
+            {
+                found.push((cid, sealed));
+            }
+        }
+        Ok(found)
+    }
+
+    /// The user's root key, unsealed with its passphrase.
+    pub fn root(&self, passphrase: &[u8]) -> Result<crate::keys::Key> {
+        let seals = self.seals()?;
+        if seals.is_empty() {
+            return Err(Error::User("this repo has no sealed root key for its user".into()));
+        }
+        seals.iter()
+            .find_map(|(_, sealed)| sealed.open(passphrase))
+            .ok_or_else(|| Error::User("that's not the passphrase of the user's root key".into()))
     }
 
     /// Certify a device's key with the user's root key: a device claim the

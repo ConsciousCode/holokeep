@@ -1757,21 +1757,36 @@ fn sign(router: &Catalog, key: &crate::keys::Key, claim: &crate::model::Link) {
 }
 
 #[test]
-fn a_repo_is_its_own_user_and_signs_what_it_says() {
-    let scratch = Scratch::new("own-user");
+fn a_repo_has_no_user_until_it_founds_one_with_a_sealed_root() {
+    use crate::keys::Cost;
+    let scratch = Scratch::new("found-user");
     let block = raw(b"kept");
     let repo = Catalog::open_repo(scratch.path()).expect("open");
     let device = repo.signer().expect("signer").id();
-    assert!(repo.user().expect("user").is_some());
-    assert_eq!(repo.devices().expect("devices"), [(device.clone(), true)]);
+    assert!(repo.user().expect("user").is_none());
+    assert!(repo.root(b"anything").is_err());
     let keep = repo.keep(&link(&block)).expect("keep");
-    assert!(repo.claims().expect("claims").signed_by(&keep, &device).expect("signed"));
-    assert!(repo.claims().expect("claims").kept(block.cid().multihash()).expect("kept"));
+    let claims = repo.claims().expect("claims");
+    assert!(claims.signed_by(&keep, &device).expect("signed"));
+    assert!(claims.kept(block.cid().multihash()).expect("kept"), "no user, so taken at its word");
+
+    let root = repo.found_user(b"correct horse", Cost::NONE).expect("found");
+    assert_eq!(repo.user().expect("user"), Some(root.id()));
+    assert_eq!(repo.devices().expect("devices"), [(device.clone(), true)]);
+    assert!(claims.kept(block.cid().multihash()).expect("kept"), "signed by a device the user certified");
+    // The root is kept sealed, and only sealed
+    let [(seal, _)] = <[_; 1]>::try_from(repo.seals().expect("seals")).expect("one seal");
+    assert!(claims.kept(seal.multihash()).expect("kept"));
+    assert_eq!(repo.root(b"correct horse").expect("root").id(), root.id());
+    assert!(repo.root(b"battery staple").is_err());
+    assert!(repo.found_user(b"again", Cost::NONE).is_err());
+    assert!(!scratch.path().join(crate::keys::USER_KEY).exists());
     drop(repo);
     // The same user, and the same device, next time
     let repo = Catalog::open_repo(scratch.path()).expect("open");
     assert_eq!(repo.signer().expect("signer").id(), device);
-    assert_eq!(repo.devices().expect("devices").len(), 1);
+    assert_eq!(repo.user().expect("user"), Some(root.id()));
+    assert_eq!(repo.root(b"correct horse").expect("root").id(), root.id());
 }
 
 #[test]
@@ -1859,19 +1874,24 @@ fn revoking_a_device_unsigns_what_it_alone_said_after() {
 }
 
 #[test]
-fn claims_from_before_a_user_are_adopted() {
+fn what_a_device_said_before_it_had_a_user_counts_once_the_user_certifies_it() {
     let mut router = router();
+    let device = crate::keys::Key::generate().expect("key");
+    router.set_signer(device.clone());
     let block = raw(b"kept");
     router.keep(&link(&block)).expect("keep");
-    let claims = router.claims().expect("claims");
-    assert!(claims.kept(block.cid().multihash()).expect("kept"), "no user, so taken at its word");
+    let kept = |router: &Catalog| router.claims().expect("claims").kept(block.cid().multihash()).expect("kept");
+    assert!(kept(&router));
+    // Joining a user that hasn't certified it yet
     let root = crate::keys::Key::generate().expect("key");
-    let device = crate::keys::Key::generate().expect("key");
     router.set_user(&root.id()).expect("user");
+    assert!(!kept(&router));
     router.certify(&root, &device.id()).expect("certify");
-    assert!(!router.claims().expect("claims").kept(block.cid().multihash()).expect("kept"));
-    router.set_signer(device);
-    assert_eq!(router.adopt().expect("adopt"), 1);
-    assert!(router.claims().expect("claims").kept(block.cid().multihash()).expect("kept"));
-    assert_eq!(router.adopt().expect("adopt"), 0);
+    assert!(kept(&router));
+    // Another user's, merging: certified by that one, it counts there too
+    let other = crate::keys::Key::generate().expect("key");
+    router.set_user(&other.id()).expect("user");
+    assert!(!kept(&router));
+    router.certify(&other, &device.id()).expect("certify");
+    assert!(kept(&router));
 }

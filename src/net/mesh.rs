@@ -201,8 +201,9 @@ pub struct Ticket {
     /// Every member the inviter knows of, itself included, and where each
     /// listens.
     pub members: BTreeMap<PeerId, Vec<Multiaddr>>,
-    /// The user's root key, and the blocks certifying the joiner as one
-    /// of its devices: a device claim and the root's signature of it.
+    /// The user's root key, and the blocks the joiner needs to be one of
+    /// its devices: every certificate and revocation, signed, the
+    /// joiner's among them, and the root key, sealed, with what keeps it.
     pub user: Option<(Link, Vec<Vec<u8>>)>,
 }
 
@@ -222,7 +223,7 @@ impl Ticket {
         ]);
         if let Some((user, certificate)) = &self.user {
             ticket.insert("user".to_owned(), Ipld::Link(user.clone()));
-            ticket.insert("certificate".to_owned(), Ipld::List(certificate.iter().cloned().map(Ipld::Bytes).collect()));
+            ticket.insert("blocks".to_owned(), Ipld::List(certificate.iter().cloned().map(Ipld::Bytes).collect()));
         }
         let ticket = Ipld::Map(ticket);
         multibase::encode(multibase::Base::Base32Lower, crate::dagcbor::to_vec(&ticket).unwrap_or_default())
@@ -262,11 +263,11 @@ impl Ticket {
             });
             members.insert(id, addrs.collect::<Result<_>>()?);
         }
-        let user = match (map.remove("user"), map.remove("certificate")) {
+        let user = match (map.remove("user"), map.remove("blocks")) {
             (Some(Ipld::Link(user)), Some(Ipld::List(blocks))) => {
                 let blocks = blocks.into_iter().map(|block| match block {
                     Ipld::Bytes(bytes) => Ok(bytes),
-                    _ => Err(invalid("certificate")),
+                    _ => Err(invalid("blocks")),
                 });
                 Some((user, blocks.collect::<Result<_>>()?))
             },
