@@ -1,34 +1,43 @@
 //! Collecting garbage: letting go of what nothing keeps, everywhere, after
 //! a grace period: `/holokeep/condemn/1.0.0`.
 //!
-//! A node condemns a leaf it holds when it knows of no keep reaching it,
-//! by backrefs up to a `Keep` claim. Not knowing of one isn't knowing
-//! there's none, so it asks every member whether they keep it, and only
-//! lets go once
+//! Collection is incremental, top down. A node condemns a block it holds
+//! when nothing here references it: no structure links to it, and no keep
+//! that counts targets it (tags don't keep what they tag, and a tomb's
+//! link is the opposite of a reference). Claims themselves are never
+//! collected; they're the history of what's kept.
+//!
+//! Not knowing of a reference isn't there being none, so the node asks
+//! every member whether it keeps what's condemned, by whether a keep it
+//! knows of reaches it. A member that keeps it pardons it, as does a
+//! reference arriving here. A condemned block goes once
 //!
 //! - it's been condemned for the grace period (a week, as long as a
-//!   sighting's believed), so what's let go of stops being kept a while
-//!   before it's gone, unlike `rm`;
-//! - every member has said since it was condemned that it doesn't keep
-//!   it: a member away holds collection up until it's back, or is no
-//!   longer a member;
-//! - and it's still kept by nothing this node knows of.
+//!   sighting's believed), so what stops being kept stays a while,
+//!   unlike `rm`;
+//! - every member has said since that it doesn't keep it: a member away
+//!   holds collection up until it's back, or is no longer a member;
+//! - and nothing here references it still.
 //!
-//! A member that keeps it says so, and that pardons it. So does a keep
-//! arriving here, noticed as structure is. A keep added elsewhere after
-//! its member said it kept nothing races collection, but a keep is only
-//! added by a node holding all of what it keeps, so that copy survives
-//! and is replicated again. Condemned blocks aren't audited, nor count as
-//! held to a member trimming, so a keeper's copy isn't let go of on the
-//! strength of copies about to be collected.
+//! What a block that went linked to may then have nothing referencing it.
+//! It's condemned as of when what linked to it was, so it's due as soon
+//! as members have answered for it: a DAG goes a level per round of
+//! answers, a week after its root was condemned, however deep it is.
 //!
-//! Only leaves are collected, as only leaves are trimmed; structure stays.
+//! Blocks condemned together are a batch, with one time and one answer
+//! from each member, so bookkeeping grows with batches, not blocks.
+//!
+//! A keep added elsewhere after its member said it kept nothing races
+//! collection, but a keep is only added by a node holding all of what it
+//! keeps, so that copy survives and is replicated again. Condemned blocks
+//! aren't audited, nor count as held to a member trimming, so a keeper's
+//! copy isn't let go of on the strength of copies about to be collected.
 
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use libp2p::{PeerId, StreamProtocol};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
@@ -42,19 +51,16 @@ pub const PROTOCOL: StreamProtocol = StreamProtocol::new("/holokeep/condemn/1.0.
 /// How long a block stays condemned before it may be let go of.
 pub const GRACE: Duration = super::durability::TTL;
 
-/// The most blocks asked of in one request.
+/// The most blocks in a batch, and so asked of in one request.
 pub const BATCH: usize = 512;
+
+/// A batch of condemned blocks, as this node knows it.
+pub type BatchId = i64;
 
 /// Blocks condemned, to ask a member whether it keeps them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Condemn {
     blocks: Vec<ByteBuf>,
-}
-
-impl Condemn {
-    pub fn keys(&self) -> Vec<Vec<u8>> {
-        self.blocks.iter().map(|key| key.to_vec()).collect()
-    }
 }
 
 /// Which of the blocks asked of the member keeps.
@@ -63,23 +69,26 @@ pub struct Verdict {
     kept: Vec<ByteBuf>,
 }
 
-impl Verdict {
-    pub fn kept(&self) -> impl Iterator<Item = &[u8]> {
-        self.kept.iter().map(|key| key.as_slice())
-    }
-}
-
 /// What collecting did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
     /// Blocks newly condemned.
     pub condemned: usize,
-    /// Blocks pardoned, being kept after all.
+    /// Blocks pardoned, being referenced after all.
     pub pardoned: usize,
     /// Blocks let go of.
     pub collected: usize,
     /// Bytes freed.
     pub freed: u64,
+}
+
+impl Report {
+    pub const fn add(&mut self, other: &Self) {
+        self.condemned = self.condemned.saturating_add(other.condemned);
+        self.pardoned = self.pardoned.saturating_add(other.pardoned);
+        self.collected = self.collected.saturating_add(other.collected);
+        self.freed = self.freed.saturating_add(other.freed);
+    }
 }
 
 fn now() -> i64 {
@@ -91,8 +100,8 @@ fn decode(bytes: &[u8]) -> Option<Multihash> {
     <Multihash>::decode(bytes).ok()
 }
 
-/// The blocks condemned here, since when, and which members have said
-/// since that they don't keep them.
+/// The blocks condemned here, in batches, each since when and which
+/// members have said since that they don't keep its blocks.
 pub struct Condemned {
     db: Db,
     grace: Duration,
@@ -101,17 +110,25 @@ pub struct Condemned {
 impl Condemned {
     pub fn open(db: Db) -> Result<Self> {
         db.conn().execute_batch(
-            "-- Blocks this node knows of nothing keeping, and since when.
-             CREATE TABLE IF NOT EXISTS condemned (
-                 block INTEGER PRIMARY KEY REFERENCES multihashes (id),
+            "-- Condemnation by block, from before batches.
+             DROP TABLE IF EXISTS condemned;
+             DROP TABLE IF EXISTS condemn_acks;
+             -- Blocks condemned together, and since when.
+             CREATE TABLE IF NOT EXISTS condemn_batches (
+                 id INTEGER PRIMARY KEY,
                  since INTEGER NOT NULL
              );
-             -- Members which have said they don't keep a condemned block,
-             -- since it was condemned.
-             CREATE TABLE IF NOT EXISTS condemn_acks (
-                 block INTEGER NOT NULL REFERENCES condemned (block) ON DELETE CASCADE,
+             -- Blocks this node knows of nothing referencing, by batch.
+             CREATE TABLE IF NOT EXISTS condemned_blocks (
+                 block INTEGER PRIMARY KEY REFERENCES multihashes (id),
+                 batch INTEGER NOT NULL REFERENCES condemn_batches (id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS condemned_blocks_batch ON condemned_blocks (batch);
+             -- Members which have said they keep none of a batch's blocks.
+             CREATE TABLE IF NOT EXISTS batch_acks (
+                 batch INTEGER NOT NULL REFERENCES condemn_batches (id) ON DELETE CASCADE,
                  peer TEXT NOT NULL,
-                 PRIMARY KEY (block, peer)
+                 PRIMARY KEY (batch, peer)
              ) WITHOUT ROWID;",
         )?;
         Ok(Self { db, grace: GRACE })
@@ -124,53 +141,63 @@ impl Condemned {
         self
     }
 
-    pub const fn grace(&self) -> Duration {
-        self.grace
+    /// Condemn whichever of these blocks aren't already, in batches, as of
+    /// `since` or now. Returns how many were newly condemned.
+    pub fn condemn(&self, keys: &[Multihash], since: Option<i64>) -> Result<usize> {
+        let since = since.unwrap_or_else(now);
+        let mut condemned = 0usize;
+        for chunk in keys.chunks(BATCH) {
+            self.db.atomically(|| {
+                let conn = self.db.conn();
+                conn.prepare_cached("INSERT INTO condemn_batches (since) VALUES (?1)")?.execute([since])?;
+                let batch = conn.last_insert_rowid();
+                let mut added = 0usize;
+                for key in chunk {
+                    let id = self.db.intern(key.as_ref())?;
+                    added = added.saturating_add(
+                        conn.prepare_cached("INSERT OR IGNORE INTO condemned_blocks (block, batch) VALUES (?1, ?2)")?.execute([id, batch])?,
+                    );
+                }
+                if added == 0 {
+                    conn.prepare_cached("DELETE FROM condemn_batches WHERE id = ?1")?.execute([batch])?;
+                }
+                condemned = condemned.saturating_add(added);
+                Ok::<_, crate::store::Error>(())
+            })?;
+        }
+        Ok(condemned)
     }
 
-    /// Condemn a block as of now, unless it already is. Returns whether
-    /// it's newly condemned.
-    pub fn condemn(&self, key: Key<'_>) -> Result<bool> {
-        let id = self.db.intern(key)?;
-        Ok(self.db.conn()
-            .prepare_cached("INSERT OR IGNORE INTO condemned (block, since) VALUES (?1, ?2)")?
-            .execute(params![id, now()])? > 0)
-    }
-
-    /// Pardon a block, returning whether it was condemned.
+    /// Pardon a block, returning whether it was condemned. A batch left
+    /// empty goes too.
     pub fn pardon(&self, key: Key<'_>) -> Result<bool> {
         let Some(id) = self.db.lookup(key)? else {
             return Ok(false);
         };
-        Ok(self.db.conn().prepare_cached("DELETE FROM condemned WHERE block = ?1")?.execute([id])? > 0)
+        let conn = self.db.conn();
+        let batch: Option<BatchId> = conn
+            .prepare_cached("DELETE FROM condemned_blocks WHERE block = ?1 RETURNING batch")?
+            .query_row([id], |row| row.get(0))
+            .optional()?;
+        if let Some(batch) = batch {
+            conn.prepare_cached("DELETE FROM condemn_batches WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM condemned_blocks WHERE batch = ?1)")?
+                .execute([batch])?;
+        }
+        Ok(batch.is_some())
     }
 
     pub fn is_condemned(&self, key: Key<'_>) -> Result<bool> {
         let Some(id) = self.db.lookup(key)? else {
             return Ok(false);
         };
-        Ok(self.db.conn().prepare_cached("SELECT 1 FROM condemned WHERE block = ?1")?.exists([id])?)
+        Ok(self.db.conn().prepare_cached("SELECT 1 FROM condemned_blocks WHERE block = ?1")?.exists([id])?)
     }
 
-    /// A member said it doesn't keep a condemned block.
-    pub fn ack(&self, key: Key<'_>, peer: &PeerId) -> Result<()> {
-        let Some(id) = self.db.lookup(key)? else {
-            return Ok(());
-        };
-        self.db.conn()
-            .prepare_cached("INSERT OR IGNORE INTO condemn_acks (block, peer) SELECT block, ?2 FROM condemned WHERE block = ?1")?
-            .execute(params![id, peer.to_string()])?;
-        Ok(())
-    }
-
-    /// Condemned blocks a member's yet to say it doesn't keep.
-    pub fn unasked(&self, peer: &PeerId, limit: usize) -> Result<Vec<Multihash>> {
+    fn blocks(&self, batch: BatchId) -> Result<Vec<Multihash>> {
         let mut stmt = self.db.conn().prepare_cached(
-            "SELECT m.multihash FROM condemned c JOIN multihashes m ON m.id = c.block
-             WHERE NOT EXISTS (SELECT 1 FROM condemn_acks a WHERE a.block = c.block AND a.peer = ?1)
-             ORDER BY c.since LIMIT ?2",
+            "SELECT m.multihash FROM condemned_blocks c JOIN multihashes m ON m.id = c.block WHERE c.batch = ?1",
         )?;
-        let rows = stmt.query_map(params![peer.to_string(), i64::try_from(limit).unwrap_or(i64::MAX)], |row| row.get::<_, Vec<u8>>(0))?;
+        let rows = stmt.query_map([batch], |row| row.get::<_, Vec<u8>>(0))?;
         let mut keys = Vec::new();
         for row in rows {
             keys.extend(decode(&row?));
@@ -178,25 +205,51 @@ impl Condemned {
         Ok(keys)
     }
 
-    /// Condemned blocks past their grace which every member has said it
-    /// doesn't keep.
-    pub fn due(&self, members: &[PeerId]) -> Result<Vec<Multihash>> {
+    /// Batches a member's yet to answer for, oldest first, with their
+    /// blocks.
+    pub fn unasked(&self, peer: &PeerId, limit: usize) -> Result<Vec<(BatchId, Vec<Multihash>)>> {
+        let batches: Vec<BatchId> = self.db.conn()
+            .prepare_cached(
+                "SELECT b.id FROM condemn_batches b
+                 WHERE NOT EXISTS (SELECT 1 FROM batch_acks a WHERE a.batch = b.id AND a.peer = ?1)
+                 ORDER BY b.since, b.id LIMIT ?2",
+            )?
+            .query_map(params![peer.to_string(), i64::try_from(limit).unwrap_or(i64::MAX)], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        batches.into_iter().map(|batch| Ok((batch, self.blocks(batch)?))).collect()
+    }
+
+    /// A member's answer for a batch: what it keeps is pardoned, and it's
+    /// said it keeps none of the rest. Returns how many were pardoned.
+    pub fn heard(&self, batch: BatchId, peer: &PeerId, verdict: &Verdict) -> Result<usize> {
+        let mut pardoned = 0usize;
+        for key in verdict.kept.iter().filter_map(|key| decode(key)) {
+            pardoned = pardoned.saturating_add(usize::from(self.pardon(key.as_ref())?));
+        }
+        self.db.conn()
+            .prepare_cached("INSERT OR IGNORE INTO batch_acks (batch, peer) SELECT id, ?2 FROM condemn_batches WHERE id = ?1")?
+            .execute(params![batch, peer.to_string()])?;
+        Ok(pardoned)
+    }
+
+    /// Batches past their grace which every member has answered for, with
+    /// when they were condemned and their blocks.
+    pub fn due(&self, members: &[PeerId]) -> Result<Vec<(i64, Vec<Multihash>)>> {
         let grace = i64::try_from(self.grace.as_secs()).unwrap_or(i64::MAX);
         let cutoff = now().saturating_sub(grace);
-        let rows: Vec<(Vec<u8>, String)> = {
-            let mut stmt = self.db.conn().prepare_cached(
-                "SELECT m.multihash, coalesce(group_concat(a.peer, ' '), '') FROM condemned c
-                 JOIN multihashes m ON m.id = c.block
-                 LEFT JOIN condemn_acks a ON a.block = c.block
-                 WHERE c.since <= ?1 GROUP BY c.block",
-            )?;
-            stmt.query_map([cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<_>>()?
-        };
+        let rows: Vec<(BatchId, i64, String)> = self.db.conn()
+            .prepare_cached(
+                "SELECT b.id, b.since, coalesce(group_concat(a.peer, ' '), '') FROM condemn_batches b
+                 LEFT JOIN batch_acks a ON a.batch = b.id
+                 WHERE b.since <= ?1 GROUP BY b.id",
+            )?
+            .query_map([cutoff], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
         let mut due = Vec::new();
-        for (key, acks) in rows {
+        for (batch, since, acks) in rows {
             let acked: Vec<PeerId> = acks.split(' ').filter_map(|peer| PeerId::from_str(peer).ok()).collect();
             if members.iter().all(|member| acked.contains(member)) {
-                due.extend(decode(&key));
+                due.push((since, self.blocks(batch)?));
             }
         }
         Ok(due)
@@ -204,26 +257,34 @@ impl Condemned {
 
     /// How many blocks are condemned.
     pub fn count(&self) -> Result<u64> {
-        let n: i64 = self.db.conn().prepare_cached("SELECT count(*) FROM condemned")?.query_row([], |row| row.get(0))?;
+        let n: i64 = self.db.conn().prepare_cached("SELECT count(*) FROM condemned_blocks")?.query_row([], |row| row.get(0))?;
         Ok(u64::try_from(n).unwrap_or_default())
     }
 }
 
-/// Condemn what of these blocks nothing here keeps and could be let go
-/// of, and pardon what's condemned but kept now. Returns how many of each.
-pub fn judge(catalog: &Catalog, condemned: &Condemned, keys: &[Multihash]) -> Result<(usize, usize)> {
-    let (mut newly, mut pardoned) = (0usize, 0usize);
-    for key in keys {
-        if catalog.can_drop(key.as_ref())? && !catalog.kept_under(key.as_ref())? {
-            newly = newly.saturating_add(usize::from(condemned.condemn(key.as_ref())?));
-        } else {
-            pardoned = pardoned.saturating_add(usize::from(condemned.pardon(key.as_ref())?));
-        }
-    }
-    Ok((newly, pardoned))
+/// Whether nothing here references a block garbage collection could let
+/// go of.
+pub fn unreferenced(catalog: &Catalog, key: Key<'_>) -> Result<bool> {
+    Ok(catalog.can_collect(key)? && !catalog.referenced(key)?)
 }
 
-/// What a member asks of: whichever of the blocks are kept here.
+/// Condemn what of these blocks nothing here references, as of `since` or
+/// now, and pardon what's condemned but referenced now.
+pub fn judge(catalog: &Catalog, condemned: &Condemned, keys: &[Multihash], since: Option<i64>) -> Result<Report> {
+    let mut report = Report::default();
+    let mut doomed = Vec::new();
+    for key in keys {
+        if unreferenced(catalog, key.as_ref())? {
+            doomed.push(key.clone());
+        } else {
+            report.pardoned = report.pardoned.saturating_add(usize::from(condemned.pardon(key.as_ref())?));
+        }
+    }
+    report.condemned = condemned.condemn(&doomed, since)?;
+    Ok(report)
+}
+
+/// What a member asks of: whichever of the blocks a keep here reaches.
 pub fn answer(catalog: &Catalog, condemn: &Condemn) -> Result<Verdict> {
     let mut kept = Vec::new();
     for key in &condemn.blocks {
@@ -241,25 +302,6 @@ pub fn ask(keys: &[Multihash]) -> Condemn {
     Condemn { blocks: keys.iter().map(|key| ByteBuf::from(key.to_bytes())).collect() }
 }
 
-/// Take in a member's verdict on blocks it was asked of: what it keeps is
-/// pardoned, the rest it's said it doesn't. Returns how many were
-/// pardoned.
-pub fn heard(condemned: &Condemned, peer: &PeerId, asked: &[Vec<u8>], verdict: &Verdict) -> Result<usize> {
-    let kept: Vec<&[u8]> = verdict.kept().collect();
-    let mut pardoned = 0usize;
-    for key in asked {
-        let Some(multihash) = decode(key) else {
-            continue;
-        };
-        if kept.contains(&key.as_slice()) {
-            pardoned = pardoned.saturating_add(usize::from(condemned.pardon(multihash.as_ref())?));
-        } else {
-            condemned.ack(multihash.as_ref(), peer)?;
-        }
-    }
-    Ok(pardoned)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,30 +311,39 @@ mod tests {
     }
 
     #[test]
-    fn due_once_past_grace_and_every_member_has_said() {
+    fn batches_are_due_once_past_grace_and_every_member_has_answered() {
         let db = Db::memory().expect("db");
         let (a, b) = (PeerId::random(), PeerId::random());
         let condemned = Condemned::open(db.clone()).expect("open").with_grace(Duration::ZERO);
-        assert!(condemned.condemn(key(1).as_ref()).expect("condemn"));
-        assert!(!condemned.condemn(key(1).as_ref()).expect("condemn"), "once");
-        condemned.condemn(key(2).as_ref()).expect("condemn");
-        assert_eq!(condemned.unasked(&a, 10).expect("unasked").len(), 2);
+        assert_eq!(condemned.condemn(&[key(1), key(2)], None).expect("condemn"), 2);
+        assert_eq!(condemned.condemn(&[key(1)], None).expect("condemn"), 0, "once");
+        let asked = condemned.unasked(&a, 10).expect("unasked");
+        assert_eq!(asked.len(), 1, "one batch");
+        let batch = asked[0].0;
 
-        // Only what every member's said it doesn't keep
-        heard(&condemned, &a, &[key(1).to_bytes(), key(2).to_bytes()], &Verdict::default()).expect("heard");
+        condemned.heard(batch, &a, &Verdict::default()).expect("heard");
         assert!(condemned.unasked(&a, 10).expect("unasked").is_empty());
-        assert!(condemned.due(&[a, b]).expect("due").is_empty(), "b's yet to say");
+        assert!(condemned.due(&[a, b]).expect("due").is_empty(), "b's yet to answer");
         let verdict = Verdict { kept: vec![ByteBuf::from(key(2).to_bytes())] };
-        assert_eq!(heard(&condemned, &b, &[key(1).to_bytes(), key(2).to_bytes()], &verdict).expect("heard"), 1);
-        assert_eq!(condemned.due(&[a, b]).expect("due"), [key(1)], "b keeps 2, which is pardoned");
+        assert_eq!(condemned.heard(batch, &b, &verdict).expect("heard"), 1);
+        let due: Vec<Vec<Multihash>> = condemned.due(&[a, b]).expect("due").into_iter().map(|(_, keys)| keys).collect();
+        assert_eq!(due, [vec![key(1)]], "b keeps 2, which is pardoned");
         assert!(!condemned.is_condemned(key(2).as_ref()).expect("condemned"));
 
-        // Condemned again, it's asked of afresh
-        condemned.condemn(key(2).as_ref()).expect("condemn");
-        assert_eq!(condemned.unasked(&a, 10).expect("unasked"), [key(2)]);
+        // Condemned again, it's a new batch, asked of afresh
+        condemned.condemn(&[key(2)], Some(0)).expect("condemn");
+        let asked: Vec<Vec<Multihash>> = condemned.unasked(&a, 10).expect("unasked").into_iter().map(|(_, keys)| keys).collect();
+        assert_eq!(asked, [vec![key(2)]]);
 
-        // And not before its grace is up
+        // Pardoning a batch's last block lets the batch go
+        condemned.pardon(key(1).as_ref()).expect("pardon");
+        condemned.pardon(key(2).as_ref()).expect("pardon");
+        assert_eq!(condemned.count().expect("count"), 0);
+        assert!(condemned.unasked(&a, 10).expect("unasked").is_empty());
+
+        // And nothing's due before its grace is up
         let patient = Condemned::open(db).expect("open");
-        assert!(patient.due(&[a, b]).expect("due").is_empty());
+        patient.condemn(&[key(3)], None).expect("condemn");
+        assert!(patient.due(&[]).expect("due").is_empty());
     }
 }

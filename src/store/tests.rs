@@ -1132,6 +1132,26 @@ fn a_leaf_going_splits_its_kept_file() {
 }
 
 #[test]
+fn collecting_a_file_takes_its_kept_file_along() {
+    let scratch = Scratch::new("shards-collect");
+    let file = scratch.path().join("file");
+    std::fs::write(&file, content(1000, 0)).expect("write");
+    let mut router = sharded(&scratch);
+    let root = import_copying(&mut router, &file);
+    let root = owned(root.cid.multihash()).expect("root");
+    assert!(router.can_collect(root.as_ref()).expect("can") && !router.referenced(root.as_ref()).expect("referenced"));
+    let (dropping, leaves) = router.collect_all(std::slice::from_ref(&root)).expect("collect");
+    assert_eq!(dropping.dropped, [root]);
+    assert_eq!(leaves.len(), 16);
+    // Nothing references the leaves now, and they go together, moving nothing
+    assert!(leaves.iter().all(|leaf| !router.referenced(leaf.as_ref()).expect("referenced")));
+    let (dropping, _) = router.collect_all(&leaves).expect("collect");
+    assert_eq!((dropping.dropped.len(), dropping.freed), (16, 1000));
+    assert!(kept_files(&scratch).is_empty());
+    assert!(forms(&router).is_empty());
+}
+
+#[test]
 fn leaves_of_files_imported_in_place_stay() {
     let scratch = Scratch::new("shards-drop-in-place");
     let file = scratch.path().join("file");

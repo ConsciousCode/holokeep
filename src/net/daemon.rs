@@ -375,6 +375,7 @@ fn report(event: &Event) {
         // audits are reported as they finish
         Event::Failed(..) | Event::Audited { .. } | Event::Trimmed { .. } => {},
         Event::Fetched { fetched, missing, .. } => eprintln!("fetched {fetched} blocks, {} missing", missing.len()),
+        Event::Collected { collected } => eprintln!("collected: {collected} let go of"),
     }
 }
 

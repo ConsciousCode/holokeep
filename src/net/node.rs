@@ -118,6 +118,8 @@ pub enum Event {
     Audited { id: AuditId, report: Report },
     /// A trim finished.
     Trimmed { id: TrimId, report: trim::Report },
+    /// Garbage was let go of, as members answered.
+    Collected { collected: usize },
 }
 
 /// A transport for the mesh, over some base transport: the private
@@ -167,7 +169,7 @@ pub struct Node {
     noticing: HashSet<PeerId>,
     condemned: Condemned,
     /// Condemnations asked of members and unanswered: whom, and of what.
-    condemning: HashMap<request_response::OutboundRequestId, (PeerId, Vec<Vec<u8>>)>,
+    condemning: HashMap<request_response::OutboundRequestId, (PeerId, collect::BatchId)>,
     /// Events which happened outside `next`, for it to return first.
     ready: VecDeque<Event>,
 }
@@ -520,59 +522,76 @@ impl Node {
     }
 
     /// One round of collecting garbage, of a sample of what's here or of
-    /// everything: condemn what nothing here keeps, ask connected members
-    /// whether they keep what's condemned, and let go of what's due. See
-    /// `collect`.
+    /// everything: condemn what nothing here references, let go of what's
+    /// due, and ask connected members whether they keep what's condemned.
+    /// See `collect`.
     pub fn collect(&mut self, all: bool) -> Result<collect::Report> {
         let keys = if all { self.catalog.keys()? } else { self.catalog.sample(durability::FRESH)? };
-        let (condemned, pardoned) = collect::judge(&self.catalog, &self.condemned, &keys)?;
-        let mut report = collect::Report { condemned, pardoned, ..collect::Report::default() };
+        let mut report = collect::judge(&self.catalog, &self.condemned, &keys, None)?;
+        report.add(&self.collect_due()?);
+        self.ask_condemned()?;
+        Ok(report)
+    }
+
+    /// Let go of what's condemned and due, which nothing here references
+    /// still, and condemn what that leaves unreferenced as of when what
+    /// linked to it was: until nothing more's due.
+    fn collect_due(&mut self) -> Result<collect::Report> {
+        let mut report = collect::Report::default();
+        let me = self.peer_id();
+        let members: Vec<PeerId> = self.members.list()?.into_keys().filter(|&peer| peer != me).collect();
+        loop {
+            let due = self.condemned.due(&members)?;
+            if due.is_empty() {
+                return Ok(report);
+            }
+            let mut gone = Vec::new();
+            for (since, keys) in due {
+                let mut going = Vec::new();
+                for key in keys {
+                    if collect::unreferenced(&self.catalog, key.as_ref())? {
+                        going.push(key.clone());
+                    } else {
+                        report.pardoned = report.pardoned.saturating_add(1);
+                    }
+                    self.condemned.pardon(key.as_ref())?;
+                }
+                let (dropping, children) = self.catalog.collect_all(&going)?;
+                report.collected = report.collected.saturating_add(dropping.dropped.len());
+                report.freed = report.freed.saturating_add(dropping.freed);
+                let orphans = collect::judge(&self.catalog, &self.condemned, &children, Some(since))?;
+                report.condemned = report.condemned.saturating_add(orphans.condemned);
+                gone.extend(dropping.dropped);
+            }
+            for key in &gone {
+                if !self.catalog.has(key.as_ref())? {
+                    self.sightings.forget(key.as_ref())?;
+                }
+            }
+            if !gone.is_empty() {
+                let dropped = trim::dropped(&gone);
+                for peer in self.connected() {
+                    self.swarm.behaviour_mut().dropped.send_request(&peer, dropped.clone());
+                }
+                self.ready.push_back(Event::Collected { collected: gone.len() });
+            }
+        }
+    }
+
+    /// Ask each connected member of the batches it's yet to answer for,
+    /// one request each, unless it's still answering.
+    fn ask_condemned(&mut self) -> Result<()> {
         let asking: HashSet<PeerId> = self.condemning.values().map(|&(peer, _)| peer).collect();
         for peer in self.connected() {
             if asking.contains(&peer) {
                 continue;
             }
-            let keys = self.condemned.unasked(&peer, collect::BATCH)?;
-            if !keys.is_empty() {
+            for (batch, keys) in self.condemned.unasked(&peer, 8)? {
                 let request = self.swarm.behaviour_mut().condemn.send_request(&peer, collect::ask(&keys));
-                self.condemning.insert(request, (peer, keys.iter().map(Multihash::to_bytes).collect()));
+                self.condemning.insert(request, (peer, batch));
             }
         }
-        let me = self.peer_id();
-        let members: Vec<PeerId> = self.members.list()?.into_keys().filter(|&peer| peer != me).collect();
-        let due = self.condemned.due(&members)?;
-        // Kept since, by something that's arrived, or no longer here
-        let (due, kept) = {
-            let mut still = Vec::new();
-            let mut kept = 0usize;
-            for key in due {
-                if self.catalog.can_drop(key.as_ref())? && !self.catalog.kept_under(key.as_ref())? {
-                    still.push(key);
-                } else {
-                    kept = kept.saturating_add(usize::from(self.condemned.pardon(key.as_ref())?));
-                }
-            }
-            (still, kept)
-        };
-        report.pardoned = report.pardoned.saturating_add(kept);
-        let dropping = self.catalog.drop_all(&due)?;
-        for key in &due {
-            self.condemned.pardon(key.as_ref())?;
-        }
-        for key in &dropping.dropped {
-            if !self.catalog.has(key.as_ref())? {
-                self.sightings.forget(key.as_ref())?;
-            }
-        }
-        report.collected = dropping.dropped.len();
-        report.freed = dropping.freed;
-        if !dropping.dropped.is_empty() {
-            let dropped = trim::dropped(&dropping.dropped);
-            for peer in self.connected() {
-                self.swarm.behaviour_mut().dropped.send_request(&peer, dropped.clone());
-            }
-        }
-        Ok(report)
+        Ok(())
     }
 
     fn on_condemn(&mut self, event: request_response::Event<Condemn, Verdict>) -> Result<()> {
@@ -583,8 +602,14 @@ impl Node {
                 let _ = self.swarm.behaviour_mut().condemn.send_response(channel, verdict);
             },
             request_response::Event::Message { message: request_response::Message::Response { request_id, response }, .. } => {
-                if let Some((peer, asked)) = self.condemning.remove(&request_id) {
-                    collect::heard(&self.condemned, &peer, &asked, &response)?;
+                if let Some((peer, batch)) = self.condemning.remove(&request_id) {
+                    self.condemned.heard(batch, &peer, &response)?;
+                    // What that makes due goes now, and what it leaves
+                    // unreferenced is asked of at once
+                    self.collect_due()?;
+                    if !self.condemning.values().any(|&(asked, _)| asked == peer) {
+                        self.ask_condemned()?;
+                    }
                 }
             },
             request_response::Event::OutboundFailure { request_id, .. } => {

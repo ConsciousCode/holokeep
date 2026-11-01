@@ -99,6 +99,18 @@ impl IpldStore {
 impl Store for IpldStore {
     fn name(&self) -> &'static str { NAME }
     fn refs(&self) -> Option<&dyn RefIndex> { Some(self) }
+
+    /// Its links go with it.
+    fn remove(&self, key: Key<'_>) -> Result<Option<u64>> {
+        let Some(id) = self.db.lookup(key)? else {
+            return Ok(Some(0));
+        };
+        let len: Option<i64> = self.db.conn()
+            .prepare_cached("DELETE FROM ipld_blocks WHERE block = ?1 RETURNING length(data)")?
+            .query_row([id], |row| row.get(0))
+            .optional()?;
+        Ok(Some(len.map_or(0, |len| u64::try_from(len).unwrap_or_default())))
+    }
 }
 
 impl BlockIndex for IpldStore {

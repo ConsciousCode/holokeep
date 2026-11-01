@@ -582,8 +582,8 @@ async fn sightings_arent_trusted_with_the_last_copies() {
     assert!(has(&a, leaf));
 }
 
-/// Collect everything on a node, and wait for members to say whether they
-/// keep what it condemned.
+/// Collect everything on a node, and wait for members to answer for what it
+/// condemned, and whatever that cascades to.
 async fn condemn(nodes: &mut [&mut Node]) -> collect::Report {
     let report = nodes[0].collect(true).expect("collect");
     assert!(until(nodes, |n| !n[0].condemning()).await);
@@ -591,17 +591,14 @@ async fn condemn(nodes: &mut [&mut Node]) -> collect::Report {
 }
 
 #[tokio::test]
-async fn garbage_goes_once_every_member_says_it_keeps_none() {
+async fn garbage_goes_top_down_once_every_member_says_it_keeps_none() {
     let (mut a, mut b, blocks) = Box::pin(holding()).await;
     a.set_grace(Duration::ZERO).expect("grace");
-    // Nothing keeps the DAG, and its leaves can go; structure stays
+    // Only the root has nothing referencing it; the rest follow it, a level
+    // per round of answers
     let report = condemn(&mut [&mut a, &mut b]).await;
-    assert_eq!((report.condemned, report.collected), (2, 0), "b's yet to say: {report:?}");
-    let report = a.collect(true).expect("collect");
-    assert_eq!((report.collected, report.freed), (2, 8), "{report:?}");
-    let (root, leaves) = (&blocks[0], &blocks[2..]);
-    assert!(leaves.iter().all(|leaf| !has(&a, leaf)));
-    assert!(has(&a, root));
+    assert_eq!(report.condemned, 1, "{report:?}");
+    assert!(blocks.iter().all(|block| !has(&a, block)), "structure and all");
     assert_eq!(a.condemned().count().expect("count"), 0);
 }
 
@@ -616,6 +613,20 @@ async fn whats_kept_here_isnt_condemned() {
 }
 
 #[tokio::test]
+async fn whats_shared_with_something_kept_stays() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    a.set_grace(Duration::ZERO).expect("grace");
+    // Another root, kept, shares the leaf
+    let leaf = &blocks[2];
+    let other = cbor(&Ipld::List(vec![Ipld::Link(link(leaf))]));
+    a.catalog().put_block(&other, CidVersion::V1).expect("put");
+    a.catalog().keep(&link(&other)).expect("keep");
+    condemn(&mut [&mut a, &mut b]).await;
+    assert!(has(&a, leaf) && has(&a, &other));
+    assert!([&blocks[0], &blocks[1], &blocks[3]].iter().all(|block| !has(&a, block)));
+}
+
+#[tokio::test]
 async fn a_member_keeping_it_pardons_it() {
     let (mut a, mut b, blocks) = Box::pin(holding()).await;
     a.set_grace(Duration::ZERO).expect("grace");
@@ -625,10 +636,24 @@ async fn a_member_keeping_it_pardons_it() {
     }
     b.catalog().keep(&link(&blocks[0])).expect("keep");
     let report = condemn(&mut [&mut a, &mut b]).await;
-    assert_eq!(report.condemned, 2);
+    assert_eq!(report.condemned, 1);
     assert_eq!(a.condemned().count().expect("count"), 0, "pardoned");
-    assert_eq!(a.collect(true).expect("collect").collected, 0);
     assert!(blocks.iter().all(|block| has(&a, block)));
+}
+
+#[tokio::test]
+async fn a_member_keeping_whats_under_it_stops_the_cascade() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    a.set_grace(Duration::ZERO).expect("grace");
+    // b keeps only the branch, which a's yet to hear of
+    let (branch, deep) = (&blocks[1], &blocks[3]);
+    for block in [branch, deep] {
+        b.catalog().put_block(block, CidVersion::V1).expect("put");
+    }
+    b.catalog().keep(&link(branch)).expect("keep");
+    condemn(&mut [&mut a, &mut b]).await;
+    assert!(!has(&a, &blocks[0]) && !has(&a, &blocks[2]), "the root and the leaf go");
+    assert!(has(&a, branch) && has(&a, deep), "what b keeps stays");
 }
 
 #[tokio::test]
@@ -636,7 +661,7 @@ async fn nothing_goes_before_its_grace() {
     let (mut a, mut b, blocks) = Box::pin(holding()).await;
     condemn(&mut [&mut a, &mut b]).await;
     assert_eq!(a.collect(true).expect("collect").collected, 0);
-    assert_eq!(a.condemned().count().expect("count"), 2);
+    assert_eq!(a.condemned().count().expect("count"), 1);
     assert!(blocks.iter().all(|block| has(&a, block)));
 }
 
@@ -644,7 +669,7 @@ async fn nothing_goes_before_its_grace() {
 async fn a_member_away_holds_collection_up() {
     let (mut a, mut b, blocks) = Box::pin(holding()).await;
     a.set_grace(Duration::ZERO).expect("grace");
-    // A member which never connects, so never says
+    // A member which never connects, so never answers
     a.members().add(&PeerId::random()).expect("add");
     condemn(&mut [&mut a, &mut b]).await;
     assert_eq!(a.collect(true).expect("collect").collected, 0);
@@ -659,7 +684,7 @@ async fn condemned_copies_dont_count_to_a_trimmer() {
     let id = a.audit(2).expect("audit");
     audited(&mut [&mut a, &mut b], &[(0, id)]).await;
     // b means to collect its copy, so a mustn't let go of its own for it
-    b.condemned().condemn(leaf.cid().multihash()).expect("condemn");
+    b.condemned().condemn(&keys(std::slice::from_ref(leaf)), None).expect("condemn");
     let id = a.trim(1, keys(std::slice::from_ref(leaf))).expect("trim");
     let reports = trimmed(&mut [&mut a, &mut b], &[(0, id)]).await;
     assert_eq!(reports[0].dropped, 0, "{reports:?}");

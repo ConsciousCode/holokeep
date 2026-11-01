@@ -1134,9 +1134,82 @@ impl Catalog {
     /// which other DAGs share, becomes blocks of their own first. Leaves
     /// let go of together cost nothing to move.
     pub fn drop_all(&self, keys: &[Multihash]) -> Result<Dropping> {
+        self.let_go(keys, Self::droppable)
+    }
+
+    /// Where a block is in the repo's own volumes, if it's one garbage
+    /// collection could let go of: anything but claims, which hold the
+    /// history of what's kept, in stores which can remove it.
+    fn collectable(&self, key: Key<'_>) -> Result<Option<Vec<Placement>>> {
+        if key.code() == IDENTITY {
+            return Ok(None);
+        }
+        let own: Vec<usize> = self.placement.iter().map(|&(v, _)| v).collect();
+        let placed: Vec<Placement> = self.placements(key)?.into_iter().filter(|(v, _)| own.contains(v)).collect();
+        if placed.is_empty() || placed.iter().any(|(_, form)| form == "claims") {
+            return Ok(None);
+        }
+        if placed.iter().any(|(_, form)| form == "offset") && !self.offsets.as_ref().is_some_and(|offsets| offsets.only_kept(key).unwrap_or(false)) {
+            return Ok(None);
+        }
+        Ok(Some(placed))
+    }
+
+    pub fn can_collect(&self, key: Key<'_>) -> Result<bool> {
+        Ok(self.collectable(key)?.is_some())
+    }
+
+    /// Whether anything here references a block: structure linking to it,
+    /// or a keep that counts. Tags don't keep what they tag, and a tomb's
+    /// link to what it retracts is the opposite of a reference.
+    pub fn referenced(&self, key: Key<'_>) -> Result<bool> {
+        let Some(id) = self.db.lookup(key)? else {
+            return Ok(false);
+        };
+        let conn = self.db.conn();
+        let mut sources = vec!["SELECT 1 FROM refs WHERE target = ?1".to_owned()];
+        for table in ["unixfs_links", "ipld_links"] {
+            if conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?.exists([table])? {
+                sources.push(format!("SELECT 1 FROM {table} WHERE target = ?1"));
+            }
+        }
+        if self.claims.is_some() {
+            sources.push(format!(
+                "SELECT 1 FROM claim_targets t JOIN claims c ON c.id = t.claim WHERE t.target = ?1 AND c.kind = 'keep' AND {}",
+                claims::LIVE,
+            ));
+        }
+        let query = sources.iter().map(|source| format!("EXISTS ({source})")).collect::<Vec<_>>().join(" OR ");
+        Ok(conn.prepare_cached(&format!("SELECT {query}"))?.query_row([id], |row| row.get(0))?)
+    }
+
+    /// Let go of these blocks' copies in the repo's own volumes, structure
+    /// too, as garbage collection does: whichever can be. Returns what went,
+    /// with what the blocks that went linked to.
+    pub fn collect_all(&self, keys: &[Multihash]) -> Result<(Dropping, Vec<Multihash>)> {
+        let mut children = std::collections::BTreeMap::new();
+        for key in keys {
+            if self.collectable(key.as_ref())?.is_none() {
+                continue;
+            }
+            let Some(block) = self.readable(key.as_ref())? else {
+                continue;
+            };
+            for link in crate::links::links(block.cid().codec(), block.data()).unwrap_or_default() {
+                let child = owned(link.multihash())?;
+                children.insert(child.to_bytes(), child);
+            }
+        }
+        let dropping = self.let_go(keys, Self::collectable)?;
+        Ok((dropping, children.into_values().collect()))
+    }
+
+    /// Let go of the copies in the repo's own volumes of whichever of these
+    /// blocks `pick` says where to let go of. See `drop_all`.
+    fn let_go(&self, keys: &[Multihash], pick: impl Fn(&Self, Key<'_>) -> Result<Option<Vec<Placement>>>) -> Result<Dropping> {
         let mut going: std::collections::BTreeMap<Vec<u8>, (&Multihash, Vec<Placement>)> = std::collections::BTreeMap::new();
         for key in keys {
-            if let Some(placed) = self.droppable(key.as_ref())? {
+            if let Some(placed) = pick(self, key.as_ref())? {
                 going.insert(key.to_bytes(), (key, placed));
             }
         }
