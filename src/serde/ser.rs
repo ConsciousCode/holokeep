@@ -9,8 +9,8 @@ pub struct Serializer<Enc> {
     enc: Enc,
 }
 impl<Enc> Serializer<Enc> {
-    pub fn new(enc: Enc) -> Serializer<Enc> {
-        Serializer { enc }
+    pub const fn new(enc: Enc) -> Self {
+        Self { enc }
     }
 
     pub fn into_inner(self) -> Enc { self.enc }
@@ -179,7 +179,7 @@ struct CidSerializer<'a, E> {
     ser: &'a mut Serializer<E>
 }
 impl<'a, E> CidSerializer<'a, E> {
-    fn new(ser: &'a mut Serializer<E>) -> Self {
+    const fn new(ser: &'a mut Serializer<E>) -> Self {
         Self { ser }
     }
 }
@@ -277,7 +277,7 @@ impl<'a, E, M> ser::Serializer for &'a mut MapKeySerializer<'a, E, M>
 
     fn serialize_char(self, value: char) -> Result<(), Error> {
         // Coerce chars to str
-        let mut buf = [0; char::MAX_LEN_UTF8 as usize];
+        let mut buf = [0; char::MAX_LEN_UTF8];
         self.serialize_str(value.encode_utf8(&mut buf))
     }
 
@@ -310,7 +310,7 @@ pub struct Collection<'se, E: Encoder, C> {
     container: C,
 }
 impl<'se, E: Encoder, C> Collection<'se, E, C> {
-    fn new(ser: &'se mut Serializer<E>, container: C) -> Self {
+    const fn new(ser: &'se mut Serializer<E>, container: C) -> Self {
         Self { ser, container }
     }
 }
@@ -341,7 +341,7 @@ impl<'se, E, C> Collection<'se, E, C>
     }
 }
 
-impl<'se, E, C> SerializeSeq for Collection<'se, E, C>
+impl<E, C> SerializeSeq for Collection<'_, E, C>
     where
         E: Encoder,
         C: ListEncoder<E>,
@@ -357,7 +357,7 @@ impl<'se, E, C> SerializeSeq for Collection<'se, E, C>
     fn end(self) -> Result<(), Error> { self.list_end() }
 }
 
-impl<'se, E, C> SerializeTuple for Collection<'se, E, C>
+impl<E, C> SerializeTuple for Collection<'_, E, C>
     where
         E: Encoder,
         C: ListEncoder<E>,
@@ -373,7 +373,7 @@ impl<'se, E, C> SerializeTuple for Collection<'se, E, C>
     fn end(self) -> Result<(), Error> { self.list_end() }
 }
 
-impl<'se, E, C> SerializeTupleStruct for Collection<'se, E, C>
+impl<E, C> SerializeTupleStruct for Collection<'_, E, C>
     where
         E: Encoder,
         C: ListEncoder<E>,
@@ -409,7 +409,7 @@ impl<'se, E, C> Collection<'se, E, C>
     }
 }
 
-impl<'se, E, C> SerializeMap for Collection<'se, E, C>
+impl<E, C> SerializeMap for Collection<'_, E, C>
     where
         E: Encoder,
         C: MapEncoder<E>,
@@ -435,7 +435,7 @@ impl<'se, E, C> SerializeMap for Collection<'se, E, C>
     fn end(self) -> Result<(), Error> { self.map_end() }
 }
 
-impl<'se, E, C> SerializeStruct for Collection<'se, E, C>
+impl<E, C> SerializeStruct for Collection<'_, E, C>
     where
         E: Encoder,
         C: MapEncoder<E>,
@@ -455,7 +455,7 @@ impl<'se, E, C> SerializeStruct for Collection<'se, E, C>
     fn end(self) -> Result<(), Error> { self.map_end() }
 }
 
-impl<'se, E, C> SerializeStructVariant for Collection<'se, E, C>
+impl<E, C> SerializeStructVariant for Collection<'_, E, C>
     where
         E: Encoder,
         C: MapEncoder<E>,
@@ -483,13 +483,13 @@ pub struct Variant<Inner, Outer> {
     outer: Outer,
 }
 impl<Inner, Outer> Variant<Inner, Outer> {
-    fn new(inner: Inner, outer: Outer) -> Self {
+    const fn new(inner: Inner, outer: Outer) -> Self {
         Self { inner, outer }
     }
 }
 
-impl<'se, Enc, Inner, Outer> SerializeStructVariant 
-    for Variant<Collection<'se, Enc, Inner>, Outer>
+impl<Enc, Inner, Outer> SerializeStructVariant 
+    for Variant<Collection<'_, Enc, Inner>, Outer>
     where
         Enc: Encoder,
         Inner: MapEncoder<Enc>,
@@ -511,8 +511,8 @@ impl<'se, Enc, Inner, Outer> SerializeStructVariant
     }
 }
 
-impl<'se, Enc, Inner, Outer> SerializeTupleVariant
-    for Variant<Collection<'se, Enc, Inner>, Outer>
+impl<Enc, Inner, Outer> SerializeTupleVariant
+    for Variant<Collection<'_, Enc, Inner>, Outer>
     where
         Enc: Encoder,
         Inner: ListEncoder<Enc>,

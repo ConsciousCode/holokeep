@@ -36,8 +36,8 @@ pub enum Any<'de> {
     Float(f64),
     String(Cow<'de, str>),
     Bytes(Cow<'de, [u8]>),
-    List(Vec<Any<'de>>),
-    Map(Vec<(Cow<'de, str>, Any<'de>)>),
+    List(Vec<Self>),
+    Map(Vec<(Cow<'de, str>, Self)>),
     Link(Cow<'de, [u8]>),
 }
 
@@ -46,7 +46,7 @@ pub enum Any<'de> {
 /// begin -> serialize {element, end}
 /// element -> serialize {element, end}
 pub trait ListEncoder<E: Encoder>: Sized {
-    /// Begin list serialization. This should leave the ListEncoder in a state
+    /// Begin list serialization. This should leave the `ListEncoder` in a state
     /// ready to serialize an element.
     fn begin(enc: &mut E, size: Option<usize>) -> Result<Self, Error>;
 
@@ -58,7 +58,7 @@ pub trait ListEncoder<E: Encoder>: Sized {
 }
 
 pub trait MapEncoder<E: Encoder>: Sized {
-    /// Begin map serialization. This should leave the MapEncoder in a state
+    /// Begin map serialization. This should leave the `MapEncoder` in a state
     /// ready to serialize an element.
     fn begin(enc: &mut E, size: Option<usize>) -> Result<Self, Error>;
 
@@ -118,28 +118,28 @@ pub trait MapDecoder<'de, D: Decoder<'de>>: SizeHint {
 /// consolidated.
 /// 
 /// List has this flow in pseudocode:
-/// list_begin()
-/// if list_has_next() {
-///     deserialize()
-///     while(list_has_next()) {
-///         list_item()
-///         deserialize()
+/// `list_begin()`
+/// if `list_has_next()` {
+///     `deserialize()`
+///     `while(list_has_next())` {
+///         `list_item()`
+///         `deserialize()`
 ///     }
 /// }
-/// list_end()
+/// `list_end()`
 /// 
 /// Map has this flow in pseudocode:
-/// map_begin()
-/// if map_has_next_entry() {
-///     map_key()
-///     deserialize()
-///     while(map_has_next_entry()) {
-///         map_item()
-///         map_key()
-///         deserialize()
+/// `map_begin()`
+/// if `map_has_next_entry()` {
+///     `map_key()`
+///     `deserialize()`
+///     `while(map_has_next_entry())` {
+///         `map_item()`
+///         `map_key()`
+///         `deserialize()`
 ///     }
 /// }
-/// map_end()
+/// `map_end()`
 /// 
 /// This multi-stage flow for container types ensures that reasonable codecs
 /// can be serviced.

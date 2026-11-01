@@ -7,7 +7,7 @@ use crate::{dagcbor::Size, serde::{Decoder, Error, Kind, ListDecoder, MapDecoder
 use super::{Major, marker, CID_TAG};
 
 /// Get the name of the type corresponding to the tag.
-fn tag_name(byte: u8) -> &'static str {
+const fn tag_name(byte: u8) -> &'static str {
     match Major::from_byte(byte) {
         Major::Positive => "uint",
         Major::Negative => "sint",
@@ -43,7 +43,7 @@ impl<'de> Deserializer<'de> {
     }
 
     /// Mark the parsed value as noncanonical.
-    fn noncanonical(&mut self) { self.canon = false; }
+    const fn noncanonical(&mut self) { self.canon = false; }
 
     fn eof() -> Error { Error::custom("eof") }
 

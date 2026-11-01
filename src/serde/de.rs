@@ -43,7 +43,7 @@ pub struct Deserializer<D> {
     depth: usize,
 }
 impl<D> Deserializer<D> {
-    pub fn new(dec: D) -> Self {
+    pub const fn new(dec: D) -> Self {
         Self { dec, depth: 0 }
     }
 
@@ -229,7 +229,7 @@ struct CidDeserializer<'a, D> {
 }
 
 impl<'a, D> CidDeserializer<'a, D> {
-    fn new(de: &'a mut Deserializer<D>) -> Self {
+    const fn new(de: &'a mut Deserializer<D>) -> Self {
         Self { de }
     }
 }
@@ -278,7 +278,7 @@ impl<'de, 'a, D, C> Accessor<'a, D, C>
     }
 
     /// Count off an entry, returning whether there could be one.
-    fn take(&mut self) -> bool {
+    const fn take(&mut self) -> bool {
         match self.remain.as_mut() {
             Some(0) => false,
             Some(r) => {
@@ -290,7 +290,7 @@ impl<'de, 'a, D, C> Accessor<'a, D, C>
     }
 }
 
-impl<'de, 'a, D, C> Accessor<'a, D, C>
+impl<'de, D, C> Accessor<'_, D, C>
     where
         D: Decoder<'de>,
         C: ListDecoder<'de, D>,
@@ -315,7 +315,7 @@ impl<'de, 'a, D, C> Accessor<'a, D, C>
     }
 }
 
-impl<'de, 'a, D, C> SeqAccess<'de> for Accessor<'a, D, C>
+impl<'de, D, C> SeqAccess<'de> for Accessor<'_, D, C>
     where
         D: Decoder<'de>,
         C: ListDecoder<'de, D>,
@@ -342,7 +342,7 @@ impl<'de, 'a, D, C> SeqAccess<'de> for Accessor<'a, D, C>
     }
 }
 
-impl<'de, 'a, D, C> Accessor<'a, D, C>
+impl<'de, D, C> Accessor<'_, D, C>
     where
         D: Decoder<'de>,
         C: MapDecoder<'de, D>,
@@ -366,7 +366,7 @@ impl<'de, 'a, D, C> Accessor<'a, D, C>
     }
 }
 
-impl<'a, 'de, D, C> MapAccess<'de> for Accessor<'a, D, C>
+impl<'de, D, C> MapAccess<'de> for Accessor<'_, D, C>
     where
         D: Decoder<'de>,
         C: MapDecoder<'de, D>,
@@ -380,12 +380,9 @@ impl<'a, 'de, D, C> MapAccess<'de> for Accessor<'a, D, C>
             return Ok(None);
         }
         let key = if self.take() { self.container.key(&mut self.de.dec)? } else { None };
-        match key {
-            Some(key) => Ok(Some(seed.deserialize(CowStrDeserializer::new(key))?)),
-            None => {
-                self.end_map()?;
-                Ok(None)
-            },
+        if let Some(key) = key { Ok(Some(seed.deserialize(CowStrDeserializer::new(key))?)) } else {
+            self.end_map()?;
+            Ok(None)
         }
     }
 
@@ -406,7 +403,7 @@ struct EnumAccessor<'a, D, M> {
     map: Option<M>,
 }
 
-impl<'de, 'a, D: Decoder<'de>> EnumAccessor<'a, D, D::MapDecoder> {
+impl<'de, D: Decoder<'de>> EnumAccessor<'_, D, D::MapDecoder> {
     /// Deserialize the variant's value, then close the map around it.
     fn value<T>(self, f: impl FnOnce(&mut Deserializer<D>) -> Result<T, Error>) -> Result<T, Error> {
         let Some(mut map) = self.map else {
@@ -421,7 +418,7 @@ impl<'de, 'a, D: Decoder<'de>> EnumAccessor<'a, D, D::MapDecoder> {
     }
 }
 
-impl<'de, 'a, D: Decoder<'de>> EnumAccess<'de> for EnumAccessor<'a, D, D::MapDecoder> {
+impl<'de, D: Decoder<'de>> EnumAccess<'de> for EnumAccessor<'_, D, D::MapDecoder> {
     type Error = Error;
     type Variant = Self;
 
@@ -440,7 +437,7 @@ impl<'de, 'a, D: Decoder<'de>> EnumAccess<'de> for EnumAccessor<'a, D, D::MapDec
     }
 }
 
-impl<'de, 'a, D: Decoder<'de>> VariantAccess<'de> for EnumAccessor<'a, D, D::MapDecoder> {
+impl<'de, D: Decoder<'de>> VariantAccess<'de> for EnumAccessor<'_, D, D::MapDecoder> {
     type Error = Error;
 
     fn unit_variant(self) -> Result<(), Self::Error> {

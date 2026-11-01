@@ -75,7 +75,7 @@ impl SizeChunker {
     }
 
     /// Get the chunk size.
-    pub fn chunk_size(&self) -> usize {
+    pub const fn chunk_size(&self) -> usize {
         self.chunk_size
     }
 }
@@ -173,7 +173,7 @@ impl RabinWindow {
         }
     }
 
-    fn reset(&mut self) {
+    const fn reset(&mut self) {
         self.window = [0u8; rabin_const::WINDOW];
         self.wpos = 0;
         self.hash = 0;
@@ -187,13 +187,13 @@ impl RabinWindow {
         // Rolling CRC: shift the new byte in, cancel the one leaving, so
         // the hash depends only on the window's contents
         self.hash = (self.hash >> 8)
-            ^ rabin_const::TABLE[(self.hash ^ byte as u64) as u8 as usize]
+            ^ rabin_const::TABLE[(self.hash ^ u64::from(byte)) as u8 as usize]
             ^ rabin_const::OUT_TABLE[out as usize];
 
         self.hash
     }
 
-    fn is_boundary(&self) -> bool {
+    const fn is_boundary(&self) -> bool {
         (self.hash & self.mask) == 0
     }
 }
@@ -241,12 +241,11 @@ impl Chunker for RabinChunker {
             self.window.slide(byte);
             self.chunk_len += 1;
 
-            if self.window.is_boundary() || self.chunk_len >= self.max_size {
-                if self.chunk_len >= self.min_size {
+            if (self.window.is_boundary() || self.chunk_len >= self.max_size)
+                && self.chunk_len >= self.min_size {
                     emit(self.buffer.split_to(self.chunk_len).freeze());
                     self.chunk_len = 0;
                 }
-            }
         }
     }
 
@@ -270,7 +269,7 @@ pub enum ChunkerType {
 
 impl Default for ChunkerType {
     fn default() -> Self {
-        ChunkerType::Size(DEFAULT_CHUNK_SIZE)
+        Self::Size(DEFAULT_CHUNK_SIZE)
     }
 }
 
@@ -290,7 +289,7 @@ impl ChunkerType {
                 part.strip_prefix(label).unwrap_or(part).parse().ok()
             };
             match parts[..] {
-                [min, avg, max] => Some(ChunkerType::Rabin {
+                [min, avg, max] => Some(Self::Rabin {
                     min: labeled(min, "min:")?,
                     avg: labeled(avg, "avg:")?,
                     max: labeled(max, "max:")?,
@@ -306,7 +305,7 @@ impl ChunkerType {
 
     /// Rabin chunking around an average size, with Kubo's derived bounds.
     const fn rabin(avg: usize) -> Self {
-        ChunkerType::Rabin { min: avg / 3, avg, max: avg.saturating_add(avg / 2) }
+        Self::Rabin { min: avg / 3, avg, max: avg.saturating_add(avg / 2) }
     }
 }
 

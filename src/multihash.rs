@@ -56,7 +56,7 @@ pub struct Multihash<D: ?Sized=DefaultDigest> {
 
 impl<D: Sized> Multihash<D> {
     /// Build a new multihash given its digest.
-    pub fn new(code: u64, digest: D) -> Self {
+    pub const fn new(code: u64, digest: D) -> Self {
         Self { code, digest }
     }
     
@@ -109,7 +109,7 @@ impl<D: AsRef<[u8]>> Multihash<D> {
 
 impl<'a> Multihash<&'a [u8]> {
     /// Wrap a digest slice into a multihash.
-    pub fn wrap(code: u64, digest: &'a [u8]) -> Self {
+    pub const fn wrap(code: u64, digest: &'a [u8]) -> Self {
         Self { code, digest }
     }
 }

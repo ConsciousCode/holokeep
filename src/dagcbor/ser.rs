@@ -45,8 +45,8 @@ impl Default for Serializer {
 }
 
 impl Serializer {
-    pub fn new() -> Serializer {
-        Serializer { output: Vec::new(), maps: Vec::new() }
+    pub const fn new() -> Self {
+        Self { output: Vec::new(), maps: Vec::new() }
     }
 
     /// Get the encoded bytes.
@@ -73,7 +73,7 @@ impl Serializer {
         Ok(())
     }
 
-    fn enter_container(&self) -> Cursor {
+    const fn enter_container(&self) -> Cursor {
         Cursor {
             index: self.output.len(),
             size: 0,
@@ -101,11 +101,13 @@ impl Encoder for Serializer {
     type MapEncoder = Map;
 
     fn encode_null(&mut self) -> Result<(), Error> {
-        Ok(self.write_u8(marker::NULL))
+        self.write_u8(marker::NULL);
+        Ok(())
     }
 
     fn encode_bool(&mut self, value: bool) -> Result<(), Error> {
-        Ok(self.write_u8(if value { marker::TRUE } else { marker::FALSE }))
+        self.write_u8(if value { marker::TRUE } else { marker::FALSE });
+        Ok(())
     }
 
     fn encode_int(&mut self, value: i128) -> Result<(), Error> {
@@ -117,7 +119,10 @@ impl Encoder for Serializer {
         };
 
         match value.try_into() {
-            Ok(value) => Ok(self.write_len(major, value)),
+            Ok(value) => {
+                self.write_len(major, value);
+                Ok(())
+            },
             Err(_) => Err(Error::custom("out of range")),
         }
     }
@@ -130,7 +135,8 @@ impl Encoder for Serializer {
         // never negative zero
         let value = if value == 0.0 { 0.0 } else { value };
         self.write_u8(marker::F64);
-        Ok(self.write_slice(&value.to_be_bytes()))
+        self.write_slice(&value.to_be_bytes());
+        Ok(())
     }
 
     fn encode_string(&mut self, value: &str) -> Result<(), Error> {
@@ -149,7 +155,8 @@ impl Encoder for Serializer {
             .ok_or_else(|| Error::custom("CID too long"))?;
         self.write_len(Major::Bytes, len);
         self.write_u8(0);
-        Ok(self.write_slice(value))
+        self.write_slice(value);
+        Ok(())
     }
 }
 
@@ -177,9 +184,10 @@ impl ListEncoder<Serializer> for List {
     }
 
     fn element(&mut self, _enc: &mut Serializer) -> Result<(), Error> {
-        Ok(if let Some(cur) = self.cur.as_mut() {
+        let _: () = if let Some(cur) = self.cur.as_mut() {
             cur.size += 1;
-        })
+        };
+        Ok(())
     }
 
     fn end(self, enc: &mut Serializer) -> Result<(), Error> {
@@ -197,7 +205,7 @@ impl MapEncoder<Serializer> for Map {
         // The head comes after sorting, when the size is known anyway
         let parent = std::mem::take(&mut enc.output);
         enc.maps.push(MapFrame { parent, entries: Vec::new(), key: None });
-        Ok(Map)
+        Ok(Self)
     }
 
     fn key(&mut self, enc: &mut Serializer, key: &str) -> Result<(), Error> {

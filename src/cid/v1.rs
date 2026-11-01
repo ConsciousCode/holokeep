@@ -29,7 +29,7 @@ type X = Box<Cidv1<[u8]>>;
 
 impl<D> Cidv1<D> {
     /// Create a new CIDv1 from a codec and multihash.
-    pub fn new(codec: u64, hash: Multihash<D>) -> Self {
+    pub const fn new(codec: u64, hash: Multihash<D>) -> Self {
         Self { codec, hash }
     }
 }
@@ -64,7 +64,7 @@ impl<D: AsRef<[u8]>> CidRef for Cidv1<D> {
 }
 
 impl<'a> Cidv1<&'a [u8]> {
-    pub fn wrap(codec: u64, hash: Multihash<&'a [u8]>) -> Self {
+    pub const fn wrap(codec: u64, hash: Multihash<&'a [u8]>) -> Self {
         Self { codec, hash }
     }
 }
@@ -74,11 +74,11 @@ impl<D: DigestBuf> Cid<D> for Cidv1<D> {
     fn into_multihash(self) -> Multihash<D> { self.hash }
     fn into_digest(self) -> D { self.hash.into_digest() }
 
-    fn decode(mut bytes: &[u8]) -> Result<Cidv1<D>, DecodeError> {
+    fn decode(mut bytes: &[u8]) -> Result<Self, DecodeError> {
         match bytes.split_off_first() {
             Some(&0x01) => {
                 let codec = varint::read_minimal(&mut bytes)?;
-                let hash = Multihash::decode(&mut bytes)?;
+                let hash = Multihash::decode(bytes)?;
                 Ok(Self { codec, hash })
             },
             Some(_) => Err(DecodeError::Version),
@@ -115,7 +115,7 @@ impl<D: DigestBuf> TryFrom<Cidv1<D>> for Cidv0<D> {
 
     fn try_from(value: Cidv1<D>) -> Result<Self, Self::Error> {
         if value.codec() == DAG_PB_CODEC && value.hashcode() == v0::HASH_CODEC as u64 {
-            Ok(Cidv0::new(value.hash.into_digest()))
+            Ok(Self::new(value.hash.into_digest()))
         }
         else {
             Err(value)
@@ -142,7 +142,7 @@ pub struct Cidv1Spec<H: MultihashDigest=MultihashFunc> {
 }
 
 impl<H: MultihashDigest> Cidv1Spec<H> {
-    pub fn new(codec: u64, hash: H) -> Self {
+    pub const fn new(codec: u64, hash: H) -> Self {
         Self { codec, hash }
     }
 
@@ -153,8 +153,8 @@ impl<H: MultihashDigest> Cidv1Spec<H> {
         })
     }
 
-    pub fn version(&self) -> CidVersion { CidVersion::V1 }
-    pub fn codec(&self) -> u64 { self.codec }
+    pub const fn version(&self) -> CidVersion { CidVersion::V1 }
+    pub const fn codec(&self) -> u64 { self.codec }
     pub fn hashcode(&self) -> u64 { self.hash.code() }
 
     pub fn hash<D: DigestBuf>(&self, data: &[u8]) -> Cidv1<D> {
@@ -186,7 +186,7 @@ impl<'de, D: DigestBuf> de::Visitor<'de> for DigestBufVisitor<D> {
         write!(fmt, "a valid CIDv1 in bytes")
     }
 
-    /// IPLD codecs wrap CIDs in a newtype named CID_SERDE_PRIVATE_IDENTIFIER
+    /// IPLD codecs wrap CIDs in a newtype named `CID_SERDE_PRIVATE_IDENTIFIER`
     /// whose contents are the binary CID.
     fn visit_newtype_struct<De: de::Deserializer<'de>>(self, d: De) -> Result<Self::Value, De::Error> {
         d.deserialize_bytes(self)

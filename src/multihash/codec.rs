@@ -140,6 +140,6 @@ impl MultihashFunc {
     pub const fn name(&self) -> &'static str { self.size_name().1 }
 }
 
-impl Into<&'static str> for MultihashFunc {
-    fn into(self) -> &'static str { self.name() }
+impl From<MultihashFunc> for &'static str {
+    fn from(val: MultihashFunc) -> Self { val.name() }
 }

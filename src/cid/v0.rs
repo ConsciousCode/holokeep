@@ -29,7 +29,7 @@ pub struct Cidv0<D=[u8; 32]> {
 //--------------------//
 
 impl<D: Sized> Cidv0<D> {
-    pub fn new(digest: D) -> Self {
+    pub const fn new(digest: D) -> Self {
         Self { digest }
     }
 }
@@ -100,14 +100,14 @@ impl<D: DigestBuf> Cid<D> for Cidv0<D> {
 /// Cidv0 -> Multihash
 impl<D: DigestBuf> From<Cidv0<D>> for Multihash<D> {
     fn from(value: Cidv0<D>) -> Self {
-        Multihash::new(value.hashcode(), value.digest)
+        Self::new(value.hashcode(), value.digest)
     }
 }
 
 /// Cidv0 -> Cidv1
 impl<D: DigestBuf> From<Cidv0<D>> for Cidv1<D> {
     fn from(value: Cidv0<D>) -> Self {
-        Cidv1::new(
+        Self::new(
             value.codec(),
             Multihash::new(value.hashcode(), value.digest)
         )
@@ -145,7 +145,7 @@ impl<'de, D: DigestBuf> de::Visitor<'de> for DigestBufVisitor<D> {
         write!(fmt, "a valid CIDv0 in bytes")
     }
 
-    /// IPLD codecs wrap CIDs in a newtype named CID_SERDE_PRIVATE_IDENTIFIER
+    /// IPLD codecs wrap CIDs in a newtype named `CID_SERDE_PRIVATE_IDENTIFIER`
     /// whose contents are the binary CID.
     fn visit_newtype_struct<De: de::Deserializer<'de>>(self, d: De) -> Result<Self::Value, De::Error> {
         d.deserialize_bytes(self)

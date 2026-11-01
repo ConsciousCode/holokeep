@@ -126,12 +126,12 @@ pub trait CidRef: BaseCid + fmt::Display {
 // Test for dyn-compatibility
 const _: Option<&dyn CidRef> = None;
 
-/// An IPLD Content IDentifier (CID) with a generic digest backing.
+/// An IPLD Content `IDentifier` (CID) with a generic digest backing.
 /// As a "full" CID with a well-defined digest backing, this trait allows
 /// us to implement constructors.
 /// 
 /// This is not dyn-compatible, it's intended as a concrete owned type. For
-/// dynamic CIDs, see CidRef or AnyCid.
+/// dynamic CIDs, see `CidRef` or `AnyCid`.
 pub trait Cid<D>:
     CidRef +
     TryInto<Cidv0<D>> +

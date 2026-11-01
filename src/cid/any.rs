@@ -49,7 +49,7 @@ macro_rules! cid_dispatch {
 //--------------------//
 
 impl<D: AsRef<[u8]>> AnyCid<D> {
-    /// Get an AnyCid borrowing the digest.
+    /// Get an `AnyCid` borrowing the digest.
     pub fn as_ref(&self) -> AnyCid<&[u8]> {
         match self {
             Self::V0(v) => AnyCid::V0(v.as_ref()),
@@ -110,21 +110,21 @@ impl<D: DigestBuf> Cid<D> for AnyCid<D> {
 //-[ Trait impls ]-//
 //-----------------//
 
-/// Cidv0 -> AnyCid
+/// Cidv0 -> `AnyCid`
 impl<D> From<Cidv0<D>> for AnyCid<D> {
     fn from(cid: Cidv0<D>) -> Self {
         Self::V0(cid)
     }
 }
 
-/// Cidv1 -> AnyCid
+/// Cidv1 -> `AnyCid`
 impl<D> From<Cidv1<D>> for AnyCid<D> {
     fn from(cid: Cidv1<D>) -> Self {
         Self::V1(cid)
     }
 }
 
-/// AnyCid -> Cidv0
+/// `AnyCid` -> Cidv0
 impl<D: DigestBuf> TryFrom<AnyCid<D>> for Cidv0<D> {
     type Error = DecodeError;
 
@@ -144,7 +144,7 @@ impl<D: DigestBuf> From<AnyCid<D>> for Cidv1<D> {
     }
 }
 
-/// str -> AnyCid
+/// str -> `AnyCid`
 impl<D: DigestBuf> FromStr for AnyCid<D> {
     type Err = FromStrError;
 
@@ -161,7 +161,7 @@ impl<D: DigestBuf> FromStr for AnyCid<D> {
     }
 }
 
-/// AnyCid -> String
+/// `AnyCid` -> String
 impl<D: AsRef<[u8]>> fmt::Display for AnyCid<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         cid_call!(self.fmt(f))
@@ -211,7 +211,7 @@ impl<H: MultihashDigest> CidSpec<H> {
     }
 
     /// Get the CID's version.
-    pub fn version(&self) -> CidVersion {
+    pub const fn version(&self) -> CidVersion {
         match self {
             Self::V0 => CidVersion::V0,
             Self::V1(..) => CidVersion::V1,
@@ -254,7 +254,7 @@ impl<'de, D: DigestBuf> de::Visitor<'de> for AnyCidVisitor<D> {
         write!(fmt, "a valid CID in bytes")
     }
 
-    /// IPLD codecs wrap CIDs in a newtype named CID_SERDE_PRIVATE_IDENTIFIER
+    /// IPLD codecs wrap CIDs in a newtype named `CID_SERDE_PRIVATE_IDENTIFIER`
     /// whose contents are the binary CID.
     fn visit_newtype_struct<De: de::Deserializer<'de>>(self, d: De) -> Result<Self::Value, De::Error> {
         d.deserialize_bytes(self)

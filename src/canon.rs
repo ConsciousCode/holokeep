@@ -11,9 +11,9 @@ pub enum Canon<T> {
 
 impl<T> Canon<T> {
     /// Construct the canon directly.
-    pub fn new(value: T, canon: bool) -> Self {
-        if canon { Canon::Can(value) }
-        else { Canon::Non(value) }
+    pub const fn new(value: T, canon: bool) -> Self {
+        if canon { Self::Can(value) }
+        else { Self::Non(value) }
     }
 
     /// Construct the canon from a parts tuple.
@@ -43,7 +43,7 @@ impl<T> Canon<T> {
     }
 
     /// Get a canon reference.
-    pub fn as_ref(&self) -> Canon<&T> {
+    pub const fn as_ref(&self) -> Canon<&T> {
         match self {
             Self::Can(v) => Canon::Can(v),
             Self::Non(v) => Canon::Non(v),
@@ -61,7 +61,7 @@ impl<T> Canon<T> {
     }
 
     /// Return whether the value is canonical.
-    pub fn is_canon(&self) -> bool {
+    pub const fn is_canon(&self) -> bool {
         matches!(self, Self::Can(_))
     }
 }
@@ -91,12 +91,12 @@ pub struct CanonBuilder<T> {
 }
 
 impl<T> CanonBuilder<T> {
-    pub fn new(value: T) -> Self {
+    pub const fn new(value: T) -> Self {
         Self { value, canonical: true }
     }
 
     /// Get whether the Canonical is canon.
-    pub fn is_canon(&self) -> bool { self.canonical }
+    pub const fn is_canon(&self) -> bool { self.canonical }
 
     /// Finish building the value's canonicity.
     pub fn finish(self) -> Canon<T> {
@@ -104,7 +104,7 @@ impl<T> CanonBuilder<T> {
     }
 
     /// Mark the value as non-canonical.
-    pub fn noncanonical(&mut self) {
+    pub const fn noncanonical(&mut self) {
         self.canonical = false;
     }
 

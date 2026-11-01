@@ -46,9 +46,9 @@ pub const fn size(value: u64) -> usize {
 }
 
 fn payload_u8(byte: u8) -> u64 {
-    (byte & PAYLOAD) as u64
+    u64::from(byte & PAYLOAD)
 }
-fn payload_u64(value: u64) -> u8 {
+const fn payload_u64(value: u64) -> u8 {
     value as u8 & PAYLOAD
 }
 

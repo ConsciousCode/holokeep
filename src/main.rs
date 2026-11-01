@@ -502,15 +502,12 @@ fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
                 eprintln!("{} blocks are still short, with no connected member to raise them", report.short);
             }
         },
-        NodeCommand::Peers => match daemon::ask(dir, "peers")? {
-            Some(lines) => lines.iter().for_each(|line| out!("{line}")),
-            None => {
-                eprintln!("this node isn't running; members it knows of:");
-                for (peer, addrs) in daemon::members(dir)?.list()? {
-                    let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
-                    out!("{peer}\t-\t{}", addrs.join(" "));
-                }
-            },
+        NodeCommand::Peers => if let Some(lines) = daemon::ask(dir, "peers")? { lines.iter().for_each(|line| out!("{line}")) } else {
+            eprintln!("this node isn't running; members it knows of:");
+            for (peer, addrs) in daemon::members(dir)?.list()? {
+                let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
+                out!("{peer}\t-\t{}", addrs.join(" "));
+            }
         },
     }
     Ok(())
