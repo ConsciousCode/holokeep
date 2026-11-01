@@ -94,13 +94,14 @@ const AUTH_TABLES: &str = "
              key INTEGER NOT NULL REFERENCES multihashes (id)
          );
          CREATE INDEX IF NOT EXISTS claim_keys_key ON claim_keys (key);
-         -- Who signed a claim, when they say, and the signature, checked
-         -- before it's put.
+         -- Who signed claims, when they say, the sign they made before,
+         -- by multihash, and the signature, checked before it's put.
          CREATE TABLE IF NOT EXISTS sign_claims (
              id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
              by INTEGER NOT NULL REFERENCES multihashes (id),
              at INTEGER NOT NULL,
-             sig BLOB NOT NULL
+             sig BLOB NOT NULL,
+             prev INTEGER REFERENCES multihashes (id)
          );
          CREATE INDEX IF NOT EXISTS sign_claims_by ON sign_claims (by);
          -- The user's root key, by its name's multihash: once there is
@@ -193,9 +194,26 @@ fn schema() -> String {
     )
 }
 
+/// One of a key's signs, as a chain has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signed {
+    pub sign: Link,
+    /// The sign before it, unless it's the key's first.
+    pub prev: Option<Link>,
+    /// When it says it was.
+    pub at: u64,
+    /// How many claims it signs.
+    pub claims: usize,
+}
+
 /// Admits canonical claims, keeping them as rows.
 pub struct ClaimStore {
     db: Db,
+}
+
+/// A sign's CID, from its multihash: it's never dissolved.
+fn sign_cid(multihash: &[u8]) -> Result<Link> {
+    link(&[0x01, 0x71], multihash)
 }
 
 /// A link back out of its prefix and multihash.
@@ -228,6 +246,11 @@ impl ClaimStore {
     pub fn open(db: Db) -> Result<Self> {
         db.conn().execute_batch(&schema())?;
         db.conn().execute_batch(AUTH_TABLES)?;
+        let chained = db.conn().prepare("SELECT 1 FROM pragma_table_info('sign_claims') WHERE name = 'prev'")?.exists([])?;
+        if !chained {
+            db.conn().execute_batch("ALTER TABLE sign_claims ADD COLUMN prev INTEGER REFERENCES multihashes (id)")?;
+        }
+        db.conn().execute_batch("CREATE INDEX IF NOT EXISTS sign_claims_prev ON sign_claims (prev)")?;
         widen_kinds(&db)?;
         let store = Self { db };
         store.key_claims()?;
@@ -302,22 +325,83 @@ impl ClaimStore {
     }
 
     /// The CIDs of claims, other than signs and certificates, which a key
-    /// signed as of no later than `until`, and which no other authorized
-    /// key has signed: what revoking it would leave unsigned, unless it's
-    /// signed again.
-    pub fn signed_only_by(&self, key: &Link, until: u64) -> Result<Vec<Link>> {
-        let until = i64::try_from(until).unwrap_or(i64::MAX);
+    /// signed in its sign `cutoff` or one before it in its chain, and
+    /// which no other authorized key has signed: what revoking it would
+    /// leave unsigned, unless it's signed again.
+    pub fn signed_only_by(&self, key: &Link, cutoff: &Link) -> Result<Vec<Link>> {
+        let chain = self.chain(key, cutoff)?.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
+        let chain = format!("[{chain}]");
         self.claims_where(
             "c.kind NOT IN ('sign', 'device')
              AND EXISTS (
-                 SELECT 1 FROM claim_targets st JOIN sign_claims sg ON sg.id = st.claim JOIN multihashes b ON b.id = sg.by
-                 WHERE st.target = ck.key AND b.multihash = ?1 AND sg.at <= ?2)
+                 SELECT 1 FROM claim_targets st JOIN claims sc ON sc.id = st.claim
+                 WHERE st.target = ck.key AND sc.claim IN (SELECT value FROM json_each(?2)))
              AND NOT EXISTS (
                  SELECT 1 FROM claim_targets st JOIN sign_claims sg ON sg.id = st.claim JOIN multihashes b ON b.id = sg.by
                  JOIN authorized au ON au.key = sg.by
                  WHERE st.target = ck.key AND b.multihash != ?1)",
-            &[&key.multihash().to_bytes(), &until],
+            &[&key.multihash().to_bytes(), &chain],
         )
+    }
+
+    /// A key's sign `cutoff` and those before it in its chain, by their
+    /// multihashes' ids.
+    fn chain(&self, key: &Link, cutoff: &Link) -> Result<Vec<Id>> {
+        let by = self.db.lookup(key.multihash())?;
+        let mut current = self.db.lookup(cutoff.multihash())?;
+        let mut chain = Vec::new();
+        while let Some(id) = current {
+            let prev: Option<Option<Id>> = self.db.conn()
+                .prepare_cached("SELECT s.prev FROM claims c JOIN sign_claims s ON s.id = c.id WHERE c.claim = ?1 AND s.by = ?2")?
+                .query_row(params![id, by], |row| row.get(0))
+                .optional()?;
+            let Some(prev) = prev else {
+                break;
+            };
+            chain.push(id);
+            current = prev;
+        }
+        if chain.is_empty() {
+            return Err(Error::Invalid { store: NAME, reason: format!("{cutoff} isn't one of {key}'s signs") });
+        }
+        Ok(chain)
+    }
+
+    /// The sign a key made last, here: the latest of its signs no other
+    /// of its signs follows.
+    pub fn head(&self, key: &Link) -> Result<Option<Link>> {
+        let row: Option<Vec<u8>> = self.db.conn()
+            .prepare_cached(
+                "SELECT m.multihash FROM sign_claims s JOIN claims c ON c.id = s.id JOIN multihashes m ON m.id = c.claim
+                 JOIN multihashes b ON b.id = s.by
+                 WHERE b.multihash = ?1 AND NOT EXISTS (SELECT 1 FROM sign_claims n WHERE n.by = s.by AND n.prev = c.claim)
+                 ORDER BY c.id DESC LIMIT 1",
+            )?
+            .query_row([key.multihash().to_bytes()], |row| row.get(0))
+            .optional()?;
+        row.map(|multihash| sign_cid(&multihash)).transpose()
+    }
+
+    /// Every sign a key made that's here, in the order they came.
+    pub fn signs_by(&self, key: &Link) -> Result<Vec<Signed>> {
+        type Row = (Vec<u8>, Option<Vec<u8>>, i64, i64);
+        let rows: Vec<Row> = self.db.conn()
+            .prepare_cached(
+                "SELECT m.multihash, p.multihash, s.at, (SELECT count(*) FROM claim_targets t WHERE t.claim = c.id)
+                 FROM sign_claims s JOIN claims c ON c.id = s.id JOIN multihashes m ON m.id = c.claim
+                 JOIN multihashes b ON b.id = s.by LEFT JOIN multihashes p ON p.id = s.prev
+                 WHERE b.multihash = ?1 ORDER BY c.id",
+            )?
+            .query_map([key.multihash().to_bytes()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter()
+            .map(|(sign, prev, at, count)| Ok(Signed {
+                sign: sign_cid(&sign)?,
+                prev: prev.map(|prev| sign_cid(&prev)).transpose()?,
+                at: u64::try_from(at).unwrap_or_default(),
+                claims: usize::try_from(count).unwrap_or_default(),
+            }))
+            .collect()
     }
 
     /// The CIDs of the claims matching a condition on `c` and its key `ck`.
@@ -348,12 +432,15 @@ impl ClaimStore {
     }
 
     fn sign(&self, id: Id) -> Result<crate::claim::Sign> {
-        let (by, at, sig): (Vec<u8>, i64, Vec<u8>) = self.db.conn()
-            .prepare_cached("SELECT b.multihash, s.at, s.sig FROM sign_claims s JOIN multihashes b ON b.id = s.by WHERE s.id = ?1")?
-            .query_row([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-        let [target] = <[Link; 1]>::try_from(self.targets(id)?)
-            .map_err(|_| Error::Invalid { store: NAME, reason: "a sign of other than one claim".into() })?;
-        Ok(crate::claim::Sign::from_parts(target, link(&KEY_PREFIX, &by)?, u64::try_from(at).unwrap_or_default(), sig))
+        let (by, at, sig, prev): (Vec<u8>, i64, Vec<u8>, Option<Vec<u8>>) = self.db.conn()
+            .prepare_cached(
+                "SELECT b.multihash, s.at, s.sig, p.multihash FROM sign_claims s JOIN multihashes b ON b.id = s.by
+                 LEFT JOIN multihashes p ON p.id = s.prev WHERE s.id = ?1",
+            )?
+            .query_row([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+        let prev = prev.map(|prev| sign_cid(&prev)).transpose()?;
+        crate::claim::Sign::from_parts(self.targets(id)?, link(&KEY_PREFIX, &by)?, u64::try_from(at).unwrap_or_default(), prev, sig)
+            .ok_or_else(|| Error::Invalid { store: NAME, reason: "a sign of no claims".into() })
     }
 
     fn group(&self, id: Id) -> Result<Group> {
@@ -565,8 +652,9 @@ impl ClaimStore {
         };
         conn.prepare_cached("INSERT INTO claim_keys (claim, key) VALUES (?1, ?2)")?.execute([row, key])?;
         if let Claim::Sign(sign) = claim {
-            conn.prepare_cached("INSERT INTO sign_claims (id, by, at, sig) VALUES (?1, ?2, ?3, ?4)")?
-                .execute(params![row, self.db.intern(sign.by().multihash())?, i64::try_from(sign.at()).unwrap_or(i64::MAX), sign.sig()])?;
+            let prev = sign.prev().map(|prev| self.db.intern(prev.multihash())).transpose()?;
+            conn.prepare_cached("INSERT INTO sign_claims (id, by, at, sig, prev) VALUES (?1, ?2, ?3, ?4, ?5)")?
+                .execute(params![row, self.db.intern(sign.by().multihash())?, i64::try_from(sign.at()).unwrap_or(i64::MAX), sign.sig(), prev])?;
         }
         if let Claim::Set(set) = claim {
             let (value_prefix, value) = split(set.value())?;

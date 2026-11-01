@@ -240,17 +240,23 @@ enum KeepCommand {
 
 #[derive(Subcommand, Debug)]
 enum DeviceCommand {
-    /// Print the user's root key, then each device by peer ID, and
-    /// whether it counts
+    /// Print the user's root key, then each device by peer ID, whether
+    /// it counts, and whether its chain of signs forks, a copy of its key
+    /// having signed
     List,
-    /// Revoke a device, with the user's root key, which must be here.
-    /// What it alone signed as of `--until` is signed again here, so it
-    /// still counts; what it signed after doesn't
+    /// Print a device's signs, in the order they came: CID, the sign
+    /// before it, when it says, and how many claims it signs
+    Log { peer: String },
+    /// Revoke a device, with the user's passphrase. What it alone signed
+    /// up to `--until` is signed again here, so it still counts; nothing
+    /// else it signed does
     Revoke {
         peer: String,
-        /// Seconds since the epoch [default: now]
+        /// One of its signs, to trust it and those before it in its chain,
+        /// or seconds since the epoch, to trust its signs until then if
+        /// its chain doesn't fork [default: now]
         #[arg(long)]
-        until: Option<u64>,
+        until: Option<String>,
     },
 }
 
@@ -706,15 +712,33 @@ fn device(dir: &Path, command: DeviceCommand) -> anyhow::Result<()> {
             let me = repo.signer().map(Key::id);
             for (device, ok) in repo.devices()? {
                 let this = if me.as_ref() == Some(&device) { "\tthis node" } else { "" };
-                out!("{}\t{}{this}", keys::peer_id(&device), if ok { "certified" } else { "revoked" });
+                let forked = if repo.forks(&device)?.is_empty() { "" } else { "\tforked" };
+                out!("{}\t{}{forked}{this}", keys::peer_id(&device), if ok { "certified" } else { "revoked" });
+            }
+        },
+        DeviceCommand::Log { peer } => {
+            let device = keys::from_peer_id(&peer).context("not an ed25519 peer ID")?;
+            for signed in repo.claims().context("this repo keeps no claims")?.signs_by(&device)? {
+                let prev = signed.prev.map_or_else(|| "-".to_owned(), |prev| prev.to_string());
+                out!("{}\t{prev}\t{}\t{}", signed.sign, signed.at, signed.claims);
+            }
+            for fork in repo.forks(&device)? {
+                eprintln!("forks at {}", fork.map_or_else(|| "its start".to_owned(), |fork| fork.to_string()));
             }
         },
         DeviceCommand::Revoke { peer, until } => {
             let device = keys::from_peer_id(&peer).context("not an ed25519 peer ID")?;
             anyhow::ensure!(repo.signer().is_some_and(|key| key.id() != device), "a node can't revoke itself");
-            let until = until.unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs()));
+            let cutoff = match until.as_deref().map(str::parse::<u64>) {
+                Some(Ok(at)) => repo.cutoff_at(&device, at)?,
+                Some(Err(_)) => Some(until.as_deref().unwrap_or_default().parse::<Link>().context("--until is neither a CID nor a time")?),
+                None => {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+                    repo.cutoff_at(&device, now)?
+                },
+            };
             let root = root_key(&repo, dir)?;
-            let resigned = repo.batch(|repo| repo.revoke(&root, &device, until))?;
+            let resigned = repo.batch(|repo| repo.revoke(&root, &device, cutoff.as_ref()))?;
             out!("revoked {peer}; signed {resigned} of its claims again");
         },
     }

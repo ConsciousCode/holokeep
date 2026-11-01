@@ -81,13 +81,21 @@ pub struct Set {
     at: u64,
 }
 
-/// "`by` vouches for the target, a claim, as of `at`": `sig` is the key's
+/// "`by` vouches for the targets, claims, as of `at`": `sig` is the key's
 /// signature of the sign's own encoding without it. Never dissolved.
+///
+/// A key's signs are a chain: each names the one it made before as
+/// `prev`, left out for its first. A key that's honest has one chain, so
+/// a sign that isn't on it, two signs with one `prev`, is a copy of the
+/// key at work; and revoking a key can trust a sign and what came before
+/// it, which nothing made later can claim to be among.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sign {
-    target: Link,
+    /// Sorted by CID bytes and distinct.
+    target: Vec<Link>,
     by: Link,
     at: u64,
+    prev: Option<Link>,
     sig: Vec<u8>,
 }
 
@@ -185,11 +193,12 @@ impl Tomb {
 }
 
 impl Sign {
-    /// A key's signature of a claim, as of `at`.
-    pub fn new(key: &crate::keys::Key, claim: Link, at: u64) -> Self {
-        let mut sign = Self { target: claim, by: key.id(), at, sig: Vec::new() };
+    /// A key's signature of claims, as of `at`, after its sign `prev`, if
+    /// there are any claims.
+    pub fn new(key: &crate::keys::Key, claims: impl IntoIterator<Item = Link>, prev: Option<Link>, at: u64) -> Option<Self> {
+        let mut sign = Self::from_parts(claims, key.id(), at, prev, Vec::new())?;
         sign.sig = key.sign(&sign.message());
-        sign
+        Some(sign)
     }
 
     /// What's signed: the sign's encoding without the signature.
@@ -200,18 +209,24 @@ impl Sign {
     }
 
     fn fields(&self) -> BTreeMap<String, Ipld> {
-        BTreeMap::from([
+        let mut map = BTreeMap::from([
             ("at".to_owned(), Ipld::Integer(self.at.into())),
             ("by".to_owned(), Ipld::Link(self.by.clone())),
             ("claim".to_owned(), Ipld::String("sign".to_owned())),
             ("sig".to_owned(), Ipld::Bytes(self.sig.clone())),
-            ("target".to_owned(), links(std::slice::from_ref(&self.target))),
-        ])
+            ("target".to_owned(), links(&self.target)),
+        ]);
+        if let Some(prev) = &self.prev {
+            map.insert("prev".to_owned(), Ipld::Link(prev.clone()));
+        }
+        map
     }
 
-    /// A sign with the given parts, as stored, checked or not.
-    pub const fn from_parts(target: Link, by: Link, at: u64, sig: Vec<u8>) -> Self {
-        Self { target, by, at, sig }
+    /// A sign with the given parts, as stored, checked or not, if it signs
+    /// any claims.
+    pub fn from_parts(target: impl IntoIterator<Item = Link>, by: Link, at: u64, prev: Option<Link>, sig: Vec<u8>) -> Option<Self> {
+        let target = set(target);
+        (!target.is_empty()).then_some(Self { target, by, at, prev, sig })
     }
 
     /// Whether the signature is `by`'s.
@@ -219,12 +234,15 @@ impl Sign {
         crate::keys::verify(&self.by, &self.message(), &self.sig)
     }
 
-    /// The claim signed.
-    pub const fn signs(&self) -> &Link { &self.target }
+    /// The claims signed.
+    pub fn signs(&self) -> &[Link] { &self.target }
 
     pub const fn by(&self) -> &Link { &self.by }
 
     pub const fn at(&self) -> u64 { self.at }
+
+    /// The sign its key made before, if any.
+    pub const fn prev(&self) -> Option<&Link> { self.prev.as_ref() }
 
     pub fn sig(&self) -> &[u8] { &self.sig }
 }
@@ -246,7 +264,7 @@ impl Claim {
             Self::Keep(keep) => keep.target(),
             Self::Set(set) => set.target(),
             Self::Tomb(tomb) => tomb.target(),
-            Self::Sign(sign) => std::slice::from_ref(&sign.target),
+            Self::Sign(sign) => sign.signs(),
             Self::Device(device) => device.target(),
         }
     }
@@ -362,10 +380,12 @@ impl Claim {
                 let (Ipld::Link(by), Ipld::Integer(at), Ipld::Bytes(sig)) = (map.remove("by")?, map.remove("at")?, map.remove("sig")?) else {
                     return None;
                 };
-                let [signs] = target.as_slice() else {
-                    return None;
+                let prev = match map.remove("prev") {
+                    Some(Ipld::Link(prev)) => Some(prev),
+                    Some(_) => return None,
+                    None => None,
                 };
-                Self::Sign(Sign::from_parts(signs.clone(), by, u64::try_from(at).ok()?, sig))
+                Self::Sign(Sign::from_parts(target.clone(), by, u64::try_from(at).ok()?, prev, sig)?)
             },
             "device" => Self::Device(Device::new(target.clone())?),
             _ => return None,
@@ -481,6 +501,23 @@ mod tests {
         let long = group(&[cid(b"a")], &"x".repeat(100));
         assert!(!long.dissolves());
         assert_eq!(dissolved(&long.cid()), None);
+    }
+
+    #[test]
+    fn signs_cover_many_claims_and_name_the_one_before() {
+        let key = crate::keys::Key::generate().expect("key");
+        let (a, b) = (cid(b"a"), cid(b"b"));
+        let first = Sign::new(&key, [b.clone(), a.clone(), b.clone()], None, 1).expect("sign");
+        assert_eq!(first.signs(), set([a.clone(), b]).as_slice());
+        let first = Claim::Sign(first);
+        let second = Sign::new(&key, [a], Some(first.cid()), 2).expect("sign");
+        for sign in [first, Claim::Sign(second.clone())] {
+            let parsed = Claim::parse(sign.block().data()).expect("parse");
+            assert!(matches!(&parsed, Claim::Sign(parsed) if parsed.verify()));
+            assert_eq!(parsed, sign);
+        }
+        assert!(second.prev().is_some());
+        assert!(Sign::new(&key, [], None, 3).is_none());
     }
 
     #[test]

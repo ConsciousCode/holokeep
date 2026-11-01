@@ -1752,7 +1752,7 @@ fn signed_router(root: &crate::keys::Key) -> (Catalog, crate::keys::Key) {
 
 /// Sign a claim with a key, as another device would.
 fn sign(router: &Catalog, key: &crate::keys::Key, claim: &crate::model::Link) {
-    let sign = Claim::Sign(crate::claim::Sign::new(key, claim.clone(), 1));
+    let sign = Claim::Sign(crate::claim::Sign::new(key, [claim.clone()], None, 1).expect("sign"));
     router.put_block(&sign.block(), CidVersion::V1).expect("put");
 }
 
@@ -1811,7 +1811,7 @@ fn claims_count_only_when_an_authorized_key_signs_them() {
 
     // A device can't certify another
     let other = crate::keys::Key::generate().expect("key");
-    let (device, _) = router.certify(&stranger, &other.id()).expect("certify");
+    let device = router.certify(&stranger, &other.id()).expect("certify");
     assert!(!claims.authorized(&other.id()).expect("authorized"));
     // Nor revoke one
     let tomb = Claim::Tomb(crate::claim::Tomb::new([device]).expect("tomb"));
@@ -1834,8 +1834,10 @@ fn a_tampered_signature_is_no_claim() {
     let root = crate::keys::Key::generate().expect("key");
     let (router, device) = signed_router(&root);
     let keep = Claim::Keep(crate::claim::Keep::new([link(&raw(b"kept"))]).expect("keep"));
-    let sign = crate::claim::Sign::new(&device, keep.cid(), 1);
-    let forged = crate::claim::Sign::from_parts(keep.cid(), device.id(), 2, sign.sig().to_vec());
+    let sign = crate::claim::Sign::new(&device, [keep.cid()], None, 1).expect("sign");
+    let forged = crate::claim::Sign::from_parts([keep.cid()], device.id(), 2, None, sign.sig().to_vec()).expect("sign");
+    let unlinked = crate::claim::Sign::from_parts([keep.cid()], device.id(), 1, Some(keep.cid()), sign.sig().to_vec()).expect("sign");
+    assert!(!unlinked.verify(), "prev is signed too");
     assert!(sign.verify() && !forged.verify());
     // Just dag-cbor, to the claim store
     assert_eq!(router.put_block(&Claim::Sign(forged).block(), CidVersion::V1).expect("put"), "ipld");
@@ -1844,33 +1846,76 @@ fn a_tampered_signature_is_no_claim() {
 }
 
 #[test]
-fn revoking_a_device_unsigns_what_it_alone_said_after() {
+fn revoking_a_device_unsigns_what_it_alone_said_after_its_cutoff() {
     let root = crate::keys::Key::generate().expect("key");
     let (router, _) = signed_router(&root);
     let claims = router.claims().expect("claims");
     let lost = crate::keys::Key::generate().expect("key");
     router.certify(&root, &lost.id()).expect("certify");
-    let (before, after, both) = (raw(b"before"), raw(b"after"), raw(b"both"));
+    let (before, after, both, forged) = (raw(b"before"), raw(b"after"), raw(b"both"), raw(b"forged"));
     let keep = |block: &Block| Claim::Keep(crate::claim::Keep::new([link(block)]).expect("keep"));
-    for block in [&before, &after, &both] {
+    for block in [&before, &after, &both, &forged] {
         router.put_block(&keep(block).block(), CidVersion::V1).expect("put");
     }
-    let at = |time, block: &Block| {
-        let sign = Claim::Sign(crate::claim::Sign::new(&lost, keep(block).cid(), time));
+    let sign = |blocks: &[&Block], prev: Option<Link>, at| {
+        let sign = Claim::Sign(crate::claim::Sign::new(&lost, blocks.iter().map(|block| keep(block).cid()), prev, at).expect("sign"));
         router.put_block(&sign.block(), CidVersion::V1).expect("put");
+        sign.cid()
     };
-    at(10, &before);
-    at(30, &after);
-    at(10, &both);
+    // Its chain: before and both at 10, then after at 30
+    let first = sign(&[&before, &both], None, 10);
+    let second = sign(&[&after], Some(first.clone()), 30);
+    assert_eq!(claims.head(&lost.id()).expect("head"), Some(second.clone()));
     router.put_claim(&keep(&both)).expect("signed here too");
     let kept = |block: &Block| claims.kept(block.cid().multihash()).expect("kept");
     assert!(kept(&before) && kept(&after) && kept(&both));
+    assert_eq!(router.cutoff_at(&lost.id(), 20).expect("cutoff"), Some(first.clone()));
+    assert_eq!(router.cutoff_at(&lost.id(), 5).expect("cutoff"), None);
+    assert_eq!(router.cutoff_at(&lost.id(), 40).expect("cutoff"), Some(second));
 
-    // Lost at 20: what it said before is signed again here, what after isn't
-    assert_eq!(router.revoke(&root, &lost.id(), 20).expect("revoke"), 1);
+    // A thief, with a copy of the key, backdates a sign to before then
+    sign(&[&forged], Some(first.clone()), 15);
+    assert!(kept(&forged));
+    assert_eq!(router.forks(&lost.id()).expect("forks"), [Some(first.clone())]);
+    assert!(router.cutoff_at(&lost.id(), 20).is_err(), "times aren't to be trusted once it forks");
+
+    // Lost after its first sign: what that signed is signed again here,
+    // and nothing after, backdated or not
+    assert_eq!(router.revoke(&root, &lost.id(), Some(&first)).expect("revoke"), 1);
     assert!(!claims.authorized(&lost.id()).expect("authorized"));
-    assert!(kept(&before) && !kept(&after) && kept(&both));
+    assert!(kept(&before) && !kept(&after) && kept(&both) && !kept(&forged));
     assert_eq!(router.devices().expect("devices").iter().filter(|(_, ok)| *ok).count(), 1);
+}
+
+#[test]
+fn a_batch_says_what_it_says_in_one_sign_and_signs_follow_each_other() {
+    let root = crate::keys::Key::generate().expect("key");
+    let (mut router, device) = signed_router(&root);
+    let (a, b, c) = (raw(b"a"), raw(b"b"), raw(b"c"));
+    let claims = |router: &Catalog| router.claims().expect("claims").signs_by(&device.id()).expect("signs");
+    router.keep(&link(&a)).expect("keep");
+    let [first] = <[_; 1]>::try_from(claims(&router)).expect("one sign");
+    assert_eq!((first.prev.as_ref(), first.claims), (None, 1));
+    router.batch(|router| {
+        router.keep(&link(&b))?;
+        router.tag(&link(&b), &tag("bee"))?;
+        router.keep(&link(&c))?;
+        Ok::<_, Error>(())
+    }).expect("batch");
+    let signs = claims(&router);
+    assert_eq!(signs.len(), 2);
+    assert_eq!(signs.get(1).map(|signed| (signed.prev.clone(), signed.claims)), Some((Some(first.sign), 3)));
+    let store = router.claims().expect("claims");
+    assert!(store.kept(b.cid().multihash()).expect("kept") && store.kept(c.cid().multihash()).expect("kept"));
+    assert_eq!(store.tags(b.cid().multihash()).expect("tags"), [tag("bee")]);
+    // A batch that fails signs nothing
+    let failed: Result<()> = router.batch(|router| {
+        router.keep(&link(&raw(b"d")))?;
+        Err(Error::NoClaims)
+    });
+    assert!(failed.is_err());
+    assert_eq!(claims(&router).len(), 2);
+    assert!(router.forks(&device.id()).expect("forks").is_empty());
 }
 
 #[test]

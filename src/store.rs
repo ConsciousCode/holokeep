@@ -41,7 +41,7 @@ mod shards;
 mod unixfs;
 mod volume;
 
-pub use claims::ClaimStore;
+pub use claims::{ClaimStore, Signed};
 pub use ipld::IpldStore;
 pub use offset::{ExternalFile, OffsetStore};
 use offset::{Fingerprint, Location, Whole};
@@ -360,6 +360,10 @@ pub struct Catalog {
     claims: Option<Rc<ClaimStore>>,
     /// This device's key, which signs the claims made here, if it has one.
     signer: Option<crate::keys::Key>,
+    /// Claims made in a batch, which its end signs at once.
+    unsigned: std::cell::RefCell<Vec<Link>>,
+    /// How deep in batches this is.
+    batching: usize,
 }
 
 /// Where a block is: an attached volume, by index, and the form it's in.
@@ -474,6 +478,17 @@ fn path_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_bytes()
 }
 
+/// Where signs fork, given each one's CID and the sign before it: each
+/// sign followed by more than one, or `None` for more than one first.
+fn forks(signs: &[claims::Signed]) -> Vec<Option<Link>> {
+    let mut followers: std::collections::BTreeMap<Option<Vec<u8>>, (Option<Link>, usize)> = std::collections::BTreeMap::new();
+    for claims::Signed { prev, .. } in signs {
+        let entry = followers.entry(prev.as_ref().map(Link::to_bytes)).or_insert_with(|| (prev.clone(), 0));
+        entry.1 = entry.1.saturating_add(1);
+    }
+    followers.into_values().filter(|(_, n)| *n > 1).map(|(prev, _)| prev).collect()
+}
+
 /// Seconds since the epoch.
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs())
@@ -529,25 +544,86 @@ impl Catalog {
         self.claims.as_ref().ok_or(Error::NoClaims)?.set_user(root)
     }
 
-    /// Put a claim, signed with this device's key if it has one. Returns
-    /// the claim's CID.
+    /// Put a claim, signed with this device's key if it has one: at once,
+    /// or in a batch, with the rest of the batch's claims when it ends.
+    /// Returns the claim's CID.
     pub fn put_claim(&self, claim: &Claim) -> Result<Link> {
         self.put_block(&claim.block(), CidVersion::V1)?;
         let cid = claim.cid();
         if let Some(key) = &self.signer {
-            self.sign_with(key, &cid)?;
+            if self.batching > 0 {
+                self.unsigned.borrow_mut().push(cid.clone());
+            } else {
+                self.sign_with(key, [cid.clone()])?;
+            }
         }
         Ok(cid)
     }
 
-    /// Sign a claim with a key, unless it's signed it already.
-    fn sign_with(&self, key: &crate::keys::Key, claim: &Link) -> Result<()> {
-        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
-        if !claims.signed_by(claim, &key.id())? {
-            let sign = Claim::Sign(crate::claim::Sign::new(key, claim.clone(), now()));
+    /// Sign claims with a key, those it hasn't already, in one sign which
+    /// follows the key's last. Returns the sign's CID, if there was
+    /// anything to sign.
+    ///
+    /// The key's last sign is read and the next written in one
+    /// transaction, so two writers can't both follow it: the second
+    /// fails, rather than forking the chain.
+    fn sign_with(&self, key: &crate::keys::Key, claims: impl IntoIterator<Item = Link>) -> Result<Option<Link>> {
+        let store = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let mut fresh = Vec::new();
+        for claim in claims {
+            if !store.signed_by(&claim, &key.id())? {
+                fresh.push(claim);
+            }
+        }
+        if fresh.is_empty() {
+            return Ok(None);
+        }
+        self.db.atomically(|| {
+            // Take the write lock before reading the head
+            self.db.conn().execute("DELETE FROM sign_claims WHERE 0", [])?;
+            let prev = store.head(&key.id())?;
+            let Some(sign) = crate::claim::Sign::new(key, fresh, prev, now()) else {
+                return Ok(None);
+            };
+            let sign = Claim::Sign(sign);
             self.put_block(&sign.block(), CidVersion::V1)?;
+            Ok(Some(sign.cid()))
+        })
+    }
+
+    /// Sign what a batch has said so far.
+    fn sign_batch(&self) -> Result<()> {
+        let unsigned = std::mem::take(&mut *self.unsigned.borrow_mut());
+        if let Some(key) = &self.signer {
+            self.sign_with(key, unsigned)?;
         }
         Ok(())
+    }
+
+    /// Where to cut a device's chain of signs, revoking it, to trust what
+    /// it signed as of a time: its last sign then, following the chain
+    /// from its first. Nothing, if its first came after. Only for a chain
+    /// that doesn't fork: once a copy of the key has signed, when isn't
+    /// to be trusted, and only a sign is.
+    pub fn cutoff_at(&self, device: &Link, until: u64) -> Result<Option<Link>> {
+        let signs = self.claims.as_ref().ok_or(Error::NoClaims)?.signs_by(device)?;
+        if let Some(fork) = forks(&signs).first() {
+            let at = fork.as_ref().map_or_else(|| "its start".to_owned(), ToString::to_string);
+            return Err(Error::User(format!("{} has more than one chain of signs, forking at {at}: its key was copied, so revoke it up to a sign rather than a time", crate::keys::peer_id(device))));
+        }
+        let mut cutoff = None;
+        let mut next = signs.iter().find(|signed| signed.prev.is_none());
+        while let Some(signed) = next.filter(|signed| signed.at <= until) {
+            cutoff = Some(signed.sign.clone());
+            next = signs.iter().find(|other| other.prev.as_ref() == Some(&signed.sign));
+        }
+        Ok(cutoff)
+    }
+
+    /// Where a device's signs fork: each sign followed by more than one,
+    /// or `None` for more than one first sign.
+    pub fn forks(&self, device: &Link) -> Result<Vec<Option<Link>>> {
+        Ok(forks(&self.claims.as_ref().ok_or(Error::NoClaims)?.signs_by(device)?))
     }
 
     /// Make a user for this repo, as a mesh is made: a new root key, which
@@ -606,33 +682,31 @@ impl Catalog {
     }
 
     /// Certify a device's key with the user's root key: a device claim the
-    /// root signs. Returns the claim's CID, and the sign's.
-    pub fn certify(&self, root: &crate::keys::Key, device: &Link) -> Result<(Link, Link)> {
+    /// root signs. Returns the claim's CID.
+    pub fn certify(&self, root: &crate::keys::Key, device: &Link) -> Result<Link> {
         let claim = Claim::Device(crate::claim::Device::new([device.clone()]).ok_or(Error::NoClaims)?);
         self.put_block(&claim.block(), CidVersion::V1)?;
-        let sign = Claim::Sign(crate::claim::Sign::new(root, claim.cid(), now()));
-        self.put_block(&sign.block(), CidVersion::V1)?;
-        Ok((claim.cid(), sign.cid()))
+        self.sign_with(root, [claim.cid()])?;
+        Ok(claim.cid())
     }
 
     /// Revoke a device with the user's root key: a tomb of its certificate,
-    /// which the root signs. What it signed as of `until` and nothing else
-    /// authorized has is signed again, with this device's key, so it still
-    /// counts; what it signed after doesn't. Returns how many were signed
-    /// again.
-    pub fn revoke(&self, root: &crate::keys::Key, device: &Link, until: u64) -> Result<usize> {
+    /// which the root signs. What it signed in its sign `cutoff` or before
+    /// it in its chain, and nothing else authorized has, is signed again,
+    /// with this device's key, so it still counts; nothing else it signed
+    /// does, whenever it says it was, and with no cutoff nothing it signed
+    /// does. Returns how many were signed again.
+    pub fn revoke(&self, root: &crate::keys::Key, device: &Link, cutoff: Option<&Link>) -> Result<usize> {
         let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
         let key = self.signer.as_ref().filter(|key| key.id() != *device).ok_or(Error::NoClaims)?;
-        let orphans = claims.signed_only_by(device, until)?;
+        let orphans = cutoff.map(|cutoff| claims.signed_only_by(device, cutoff)).transpose()?.unwrap_or_default();
         let certificate = Claim::Device(crate::claim::Device::new([device.clone()]).ok_or(Error::NoClaims)?);
         let tomb = Claim::Tomb(Tomb::new([certificate.cid()]).ok_or(Error::NoClaims)?);
         self.put_block(&tomb.block(), CidVersion::V1)?;
-        let sign = Claim::Sign(crate::claim::Sign::new(root, tomb.cid(), now()));
-        self.put_block(&sign.block(), CidVersion::V1)?;
-        for claim in &orphans {
-            self.sign_with(key, claim)?;
-        }
-        Ok(orphans.len())
+        self.sign_with(root, [tomb.cid()])?;
+        let count = orphans.len();
+        self.sign_with(key, orphans)?;
+        Ok(count)
     }
 
     /// Every device a certificate names, and whether it counts now.
@@ -715,7 +789,7 @@ impl Catalog {
         if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
             return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
         }
-        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None };
+        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, unsigned: std::cell::RefCell::default(), batching: 0 };
         for volume in volumes {
             catalog.attach(volume)?;
         }
@@ -1716,7 +1790,15 @@ impl Catalog {
         for db in &dbs {
             db.conn().execute_batch("BEGIN").map_err(Error::from)?;
         }
-        let result = f(self);
+        self.batching = self.batching.saturating_add(1);
+        let mut result = f(self);
+        self.batching = self.batching.saturating_sub(1);
+        if self.batching == 0 {
+            let signed = if result.is_ok() { self.sign_batch() } else { self.unsigned.take().clear(); Ok(()) };
+            if let (Ok(_), Err(e)) = (&result, signed) {
+                result = Err(e.into());
+            }
+        }
         let end = if result.is_ok() { "COMMIT" } else { "ROLLBACK" };
         for db in &dbs {
             db.conn().execute_batch(end).map_err(Error::from)?;
