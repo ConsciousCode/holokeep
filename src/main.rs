@@ -873,10 +873,17 @@ fn invite_friend(place: &holokeep::net::mesh::Place, peer: &str, vault: &str, qu
     let uid = members.account()?.context("a protected mesh with no account")?;
     let mut repo = Catalog::open_repo(dir)?;
     repo.act_for(uid, holokeep::keys::account_key(dir, uid)?)?;
+    for cid in repo.held()? {
+        if cid.codec() == holokeep::cid::DAG_CBOR_CODEC
+            && let Some(block) = repo.get_block(&cid)?
+            && holokeep::keys::Sealed::parse(block.data()).is_some()
+        {
+            sealed.push(block.data().to_vec());
+        }
+    }
     for cid in repo.claims().context("this repo keeps no claims")?.keeps()? {
-        match repo.get_block(&cid)? {
-            Some(block) if holokeep::keys::Sealed::parse(block.data()).is_some() => sealed.push(block.data().to_vec()),
-            _ => held.push(cid),
+        if repo.get_block(&cid)?.is_none_or(|block| holokeep::keys::Sealed::parse(block.data()).is_none()) {
+            held.push(cid);
         }
     }
     drop(repo);

@@ -2075,3 +2075,21 @@ fn an_account_sees_only_the_blocks_in_its_repo() {
     repo.act_for(me, owner).expect("act");
     assert!(!repo.visible(sign.multihash()).expect("visible"));
 }
+
+#[test]
+fn another_accounts_dissolved_claims_are_withheld_too() {
+    let scratch = Scratch::new("dissolved-withheld");
+    let mut repo = Catalog::open_repo(scratch.path()).expect("open");
+    let block = raw(b"tagged");
+    repo.put_block(&block, CidVersion::V1).expect("put");
+    let owner = repo.signer().expect("signer").clone();
+    let me = repo.uid();
+    let mine = repo.tag(&link(&block), &tag("mine")).expect("tag");
+    assert_eq!(mine.hashcode(), crate::block::IDENTITY, "dissolved");
+    repo.act_for(me.wrapping_add(1), crate::keys::Key::generate().expect("key")).expect("act");
+    assert!(!repo.visible(mine.multihash()).expect("visible"), "the owner's, dissolved or not");
+    // An identity block that isn't a claim hides nothing
+    assert!(repo.visible(tag("mine").multihash()).expect("visible"));
+    repo.act_for(me, owner).expect("act");
+    assert!(repo.visible(mine.multihash()).expect("visible"));
+}

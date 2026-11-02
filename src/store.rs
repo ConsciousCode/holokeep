@@ -578,6 +578,26 @@ impl Catalog {
         Ok(u64::try_from(used).unwrap_or_default())
     }
 
+    /// Every block here the account this acts for put here, whenever it
+    /// did, by CID.
+    pub fn held(&self) -> Result<Vec<Link>> {
+        let rows: Vec<Vec<u8>> = self.db.conn()
+            .prepare_cached(
+                "SELECT m.multihash FROM holdings h JOIN multihashes m ON m.id = h.block
+                 WHERE h.uid = ?1 AND h.block IN (SELECT block FROM blocks) ORDER BY h.block",
+            )?
+            .query_map([self.uid], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut held = Vec::new();
+        for bytes in rows {
+            let key = decode_key("router", &bytes)?;
+            if let Some(cid) = self.cid_of(key.as_ref())? {
+                held.push(cid);
+            }
+        }
+        Ok(held)
+    }
+
     /// The quota, and how much of it's left, if there is one.
     pub fn quota_left(&self) -> Result<Option<(u64, u64)>> {
         self.quota.map(|quota| Ok((quota, quota.saturating_sub(self.used()?)))).transpose()
@@ -1990,8 +2010,13 @@ impl Catalog {
     /// Anything else here is another account's, which this one can't
     /// read, serve or hear of. Without claims, everything is anyone's.
     pub fn visible(&self, key: Key<'_>) -> Result<bool> {
-        if key.code() == IDENTITY || self.claims.is_none() {
+        let Some(claims) = &self.claims else {
             return Ok(true);
+        };
+        // An identity block is its CID, so it hides nothing, but a
+        // dissolved claim is still someone's to tell
+        if key.code() == IDENTITY {
+            return Ok(!claims.withheld(key, self.uid)?);
         }
         let held = self.db.conn()
             .prepare_cached(
@@ -2002,7 +2027,6 @@ impl Catalog {
         if held || self.kept_for_acting(key)? {
             return Ok(true);
         }
-        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
         Ok(claims.has(key)? && !claims.withheld(key, self.uid)?)
     }
 
