@@ -47,7 +47,9 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 enum Node {
     /// A raw leaf: file content.
     Raw(Vec<u8>),
-    Pb { data: DataBuf, links: Vec<(Link, Vec<u8>)> },
+    /// A dag-pb node: its data, its links as (CID, name), and the sizes
+    /// its links say what they link to is, which is advisory.
+    Pb { data: DataBuf, links: Vec<(Link, Vec<u8>)>, sizes: Vec<Option<u64>> },
 }
 
 fn load(src: &impl Fetch, cid: &Link) -> io::Result<Node> {
@@ -62,7 +64,8 @@ fn load(src: &impl Fetch, cid: &Link) -> io::Result<Node> {
                 .iter()
                 .map(|link| Ok((link.cid().map_err(|e| invalid(format!("{cid}: {e}")))?, link.name.unwrap_or_default().to_vec())))
                 .collect::<io::Result<_>>()?;
-            Ok(Node::Pb { data, links })
+            let sizes = node.links.iter().map(|link| link.tsize).collect();
+            Ok(Node::Pb { data, links, sizes })
         },
         codec => Err(invalid(format!("{cid}: codec 0x{codec:x} isn't UnixFS"))),
     }
@@ -85,7 +88,7 @@ pub fn cat(src: &impl Fetch, cid: &Link, out: &mut impl Write) -> io::Result<()>
 fn write_file(src: &impl Fetch, node: Node, out: &mut impl Write, depth: usize) -> io::Result<()> {
     match node {
         Node::Raw(bytes) => out.write_all(&bytes),
-        Node::Pb { data, links } => match data.data_type {
+        Node::Pb { data, links, .. } => match data.data_type {
             // A file's content is its own data, then its children's
             DataType::File | DataType::Raw => {
                 if let Some(bytes) = &data.data {
@@ -132,7 +135,7 @@ fn write_entry(src: &impl Fetch, cid: &Link, dest: &Path, depth: usize) -> io::R
             }
             Ok(())
         },
-        (DataType::HAMTShard, Node::Pb { data, links }) => {
+        (DataType::HAMTShard, Node::Pb { data, links, .. }) => {
             fs::create_dir(dest)?;
             write_shard(src, &data, links, dest, depth)
         },
@@ -160,7 +163,7 @@ fn write_shard(src: &impl Fetch, data: &DataBuf, links: Vec<(Link, Vec<u8>)>, de
         }
         if entry.is_empty() {
             match load(src, &cid)? {
-                Node::Pb { data, links } if data.data_type == DataType::HAMTShard => {
+                Node::Pb { data, links, .. } if data.data_type == DataType::HAMTShard => {
                     write_shard(src, &data, links, dest, depth)?;
                 },
                 _ => return Err(invalid(format!("{cid}: child shard isn't a HAMT shard"))),
@@ -198,7 +201,7 @@ pub fn stat(src: &impl Fetch, cid: &Link) -> io::Result<Kind> {
     }
     match load(src, cid)? {
         Node::Raw(bytes) => Ok(Kind::File(len(&bytes))),
-        Node::Pb { data, links } => match data.data_type {
+        Node::Pb { data, links, .. } => match data.data_type {
             DataType::File | DataType::Raw => Ok(Kind::File(file_size(src, &data, &links, 0)?)),
             DataType::Directory | DataType::HAMTShard => Ok(Kind::Directory),
             DataType::Symlink => Ok(Kind::Symlink(data.data.unwrap_or_default())),
@@ -230,7 +233,7 @@ fn file_size(src: &impl Fetch, data: &DataBuf, links: &[(Link, Vec<u8>)], depth:
 fn part_size(src: &impl Fetch, cid: &Link, depth: usize) -> io::Result<u64> {
     match load(src, cid)? {
         Node::Raw(bytes) => Ok(len(&bytes)),
-        Node::Pb { data, links } if matches!(data.data_type, DataType::File | DataType::Raw) => file_size(src, &data, &links, depth),
+        Node::Pb { data, links, .. } if matches!(data.data_type, DataType::File | DataType::Raw) => file_size(src, &data, &links, depth),
         Node::Pb { .. } => Err(invalid(format!("{cid}: part of a file isn't a file"))),
     }
 }
@@ -254,7 +257,7 @@ fn read_part(src: &impl Fetch, node: Node, mut offset: u64, size: usize, out: &m
             take(&bytes, offset, size, out);
             Ok(())
         },
-        Node::Pb { data, links } => match data.data_type {
+        Node::Pb { data, links, .. } => match data.data_type {
             DataType::File | DataType::Raw => {
                 let inline = data.data.as_deref().unwrap_or_default();
                 take(inline, offset, size, out);
@@ -318,29 +321,54 @@ fn take(bytes: &[u8], offset: u64, size: usize, out: &mut Vec<u8>) {
     }
 }
 
-/// A directory's entries, a sharded one's gathered from its shards, as
-/// (name, CID). Names which could name anything outside it are left out.
-pub fn list(src: &impl Fetch, cid: &Link) -> io::Result<Vec<(Vec<u8>, Link)>> {
+/// An entry of a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub name: Vec<u8>,
+    pub cid: Link,
+    /// The size the directory says what it links to is: for a raw block,
+    /// the file's, if the directory's honest. Advisory only, since it isn't
+    /// checked against the block.
+    pub size: Option<u64>,
+}
+
+/// A directory's entries, a sharded one's gathered from its shards.
+/// Names which could name anything outside it are left out.
+///
+/// What isn't raw among them is prefetched, being what a listing needs to
+/// read to say what each entry is; a raw block is a file, whose size the
+/// directory says.
+pub fn list(src: &impl Fetch, cid: &Link) -> io::Result<Vec<Listed>> {
     let mut entries = Vec::new();
     match load(src, cid)? {
-        Node::Pb { data, links } if data.data_type == DataType::Directory => {
-            src.prefetch(&links.iter().map(|(cid, _)| cid.clone()).collect::<Vec<_>>());
-            entries.extend(links.into_iter().filter(|(_, name)| entry_name(name).is_ok()).map(|(cid, name)| (name, cid)));
+        Node::Pb { data, links, sizes } if data.data_type == DataType::Directory => {
+            src.prefetch(&structure(&links));
+            entries.extend(
+                links.into_iter()
+                    .zip(sizes)
+                    .filter(|((_, name), _)| entry_name(name).is_ok())
+                    .map(|((cid, name), size)| Listed { name, cid, size }),
+            );
         },
-        Node::Pb { data, links } if data.data_type == DataType::HAMTShard => list_shard(src, &data, links, &mut entries, 0)?,
+        Node::Pb { data, links, sizes } if data.data_type == DataType::HAMTShard => list_shard(src, &data, links, sizes, &mut entries, 0)?,
         _ => return Err(io::Error::new(io::ErrorKind::NotADirectory, format!("{cid} isn't a directory"))),
     }
     Ok(entries)
 }
 
-fn list_shard(src: &impl Fetch, data: &DataBuf, links: Vec<(Link, Vec<u8>)>, entries: &mut Vec<(Vec<u8>, Link)>, depth: usize) -> io::Result<()> {
+/// The links which aren't to raw blocks.
+fn structure(links: &[(Link, Vec<u8>)]) -> Vec<Link> {
+    links.iter().filter(|(cid, _)| cid.codec() != RAW_CODEC).map(|(cid, _)| cid.clone()).collect()
+}
+
+fn list_shard(src: &impl Fetch, data: &DataBuf, links: Vec<(Link, Vec<u8>)>, sizes: Vec<Option<u64>>, entries: &mut Vec<Listed>, depth: usize) -> io::Result<()> {
     let fanout = data.fanout
         .filter(|f| f.is_power_of_two() && (2..=1024).contains(f))
         .ok_or_else(|| invalid("HAMT shard with an invalid fanout"))?;
     let pad = format!("{:X}", fanout.saturating_sub(1)).len();
     let depth = deeper(depth)?;
-    src.prefetch(&links.iter().map(|(cid, _)| cid.clone()).collect::<Vec<_>>());
-    for (cid, name) in links {
+    src.prefetch(&structure(&links));
+    for ((cid, name), size) in links.into_iter().zip(sizes) {
         let (prefix, entry) = name.split_at_checked(pad)
             .ok_or_else(|| invalid("HAMT link name shorter than its prefix"))?;
         if !prefix.iter().all(u8::is_ascii_hexdigit) {
@@ -348,11 +376,11 @@ fn list_shard(src: &impl Fetch, data: &DataBuf, links: Vec<(Link, Vec<u8>)>, ent
         }
         if entry.is_empty() {
             match load(src, &cid)? {
-                Node::Pb { data, links } if data.data_type == DataType::HAMTShard => list_shard(src, &data, links, entries, depth)?,
+                Node::Pb { data, links, sizes } if data.data_type == DataType::HAMTShard => list_shard(src, &data, links, sizes, entries, depth)?,
                 _ => return Err(invalid(format!("{cid}: child shard isn't a HAMT shard"))),
             }
         } else if entry_name(entry).is_ok() {
-            entries.push((entry.to_vec(), cid));
+            entries.push(Listed { name: entry.to_vec(), cid, size });
         }
     }
     Ok(())
@@ -450,10 +478,14 @@ mod tests {
                 let mut names: Vec<Vec<u8>> = fs::read_dir(path).expect("list").map(|e| e.expect("entry").file_name().as_bytes().to_vec()).collect();
                 names.sort();
                 let entries = list(router, cid).expect("list");
-                let mut listed: Vec<Vec<u8>> = entries.iter().map(|(name, _)| name.clone()).collect();
+                let mut listed: Vec<Vec<u8>> = entries.iter().map(|entry| entry.name.clone()).collect();
                 listed.sort();
                 assert_eq!(listed, names, "{}", path.display());
-                for (name, child) in entries {
+                for Listed { name, cid: child, size } in entries {
+                    // A raw block's size, as the directory says, is right here
+                    if child.codec() == RAW_CODEC {
+                        assert_eq!(size, Some(fs::metadata(path.join(OsStr::from_bytes(&name))).expect("meta").len()));
+                    }
                     walk(router, &child, &path.join(OsStr::from_bytes(&name)));
                 }
             },
@@ -523,7 +555,7 @@ mod tests {
         let mut router = router();
         let root = add(&mut router, &t);
         let src = Recording { router: &router, prefetched: std::cell::RefCell::default(), fetched: std::cell::RefCell::default() };
-        let lookup = |dir: &Link, name: &str| list(&router, dir).expect("list").into_iter().find(|(entry, _)| entry == name.as_bytes()).expect("entry").1;
+        let lookup = |dir: &Link, name: &str| list(&router, dir).expect("list").into_iter().find(|entry| entry.name == name.as_bytes()).expect("entry").cid;
         let big = lookup(&lookup(&lookup(&lookup(&root, "a"), "b"), "c"), "big");
         let original = fs::read(t.join("a/b/c/big")).expect("read");
         for (offset, size) in [(0, 10), (1000, 200), (5000, 64), (19_990, 100), (0, 30_000)] {
@@ -538,7 +570,8 @@ mod tests {
         for dir in [root.clone(), lookup(&root, "shard")] {
             let entries = list(&src, &dir).expect("list");
             let prefetched = src.prefetched.take();
-            assert!(entries.iter().all(|(_, cid)| prefetched.contains(cid)));
+            // All but raw blocks, files whose sizes the directory says
+            assert!(entries.iter().all(|entry| prefetched.contains(&entry.cid) == (entry.cid.codec() != RAW_CODEC)));
             src.fetched.take();
         }
     }

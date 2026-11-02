@@ -110,6 +110,10 @@ pub struct Soup {
     open: Opener,
     fetcher: Option<Fetcher>,
     inodes: Mutex<Inodes>,
+    /// The sizes directories say raw blocks are, by CID, so a listing
+    /// needn't fetch every file in it to say how big each is. Advisory,
+    /// as a stat's size is: reading reads what's there.
+    sizes: Mutex<HashMap<Vec<u8>, u64>>,
     /// Directory listings open, by handle.
     listings: Mutex<HashMap<u64, std::sync::Arc<Vec<Entry>>>>,
     next_handle: AtomicU64,
@@ -172,6 +176,7 @@ impl Soup {
             open,
             fetcher,
             inodes: Mutex::new(Inodes::new()),
+            sizes: Mutex::new(HashMap::new()),
             listings: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             uid: rustix::process::getuid().as_raw(),
@@ -210,8 +215,27 @@ impl Soup {
         }
     }
 
+    /// Note the sizes a directory says its raw entries are.
+    fn note_sizes(&self, entries: &[export::Listed]) {
+        let mut sizes = self.sizes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in entries {
+            if let Some(size) = entry.size
+                && entry.cid.codec() == crate::cid::RAW_CODEC
+            {
+                sizes.insert(entry.cid.to_bytes(), size);
+            }
+        }
+    }
+
     fn kind(&self, catalog: &Catalog, inode: &Inode) -> Result<Kind, Errno> {
         match inode {
+            Inode::Node(cid) if cid.codec() == crate::cid::RAW_CODEC => {
+                let said = self.sizes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&cid.to_bytes()).copied();
+                said.map_or_else(
+                    || export::stat(&Source { catalog, fetcher: self.fetcher.as_ref() }, cid).map_err(|e| errno(&e)),
+                    |size| Ok(Kind::File(size)),
+                )
+            },
             Inode::Node(cid) => export::stat(&Source { catalog, fetcher: self.fetcher.as_ref() }, cid).map_err(|e| errno(&e)),
             _ => Ok(Kind::Directory),
         }
@@ -292,8 +316,9 @@ impl Soup {
             },
             Inode::Node(dir) => {
                 let entries = export::list(&Source { catalog: &catalog, fetcher: self.fetcher.as_ref() }, &dir).map_err(|e| errno(&e))?;
-                let (_, cid) = entries.into_iter().find(|(entry, _)| entry.as_slice() == name.as_bytes()).ok_or(Errno::ENOENT)?;
-                Inode::Node(cid)
+                self.note_sizes(&entries);
+                let entry = entries.into_iter().find(|entry| entry.name.as_slice() == name.as_bytes()).ok_or(Errno::ENOENT)?;
+                Inode::Node(entry.cid)
             },
         };
         let kind = self.kind(&catalog, &inode)?;
@@ -344,7 +369,8 @@ impl Soup {
             },
             Inode::Node(dir) => {
                 let entries = export::list(&Source { catalog: &catalog, fetcher: self.fetcher.as_ref() }, &dir).map_err(|e| errno(&e))?;
-                with_kinds(entries.into_iter().map(|(name, cid)| (name, Inode::Node(cid))).collect())?
+                self.note_sizes(&entries);
+                with_kinds(entries.into_iter().map(|entry| (entry.name, Inode::Node(entry.cid))).collect())?
             },
         };
         drop(catalog);
@@ -560,6 +586,50 @@ mod tests {
             assert_eq!(ino(&soup, missing).err(), Some(Errno::ENOENT), "{missing}");
         }
         assert_eq!(soup.read(ino(&soup, &by_cid).expect("dir").ino.0, 0, 1).err(), Some(Errno::EISDIR));
+    }
+
+    #[test]
+    fn listing_fetches_no_files() {
+        use crate::store::BlockIndex as _;
+        let scratch = Scratch::new("mount-list");
+        let t = scratch.path().join("t");
+        std::fs::create_dir_all(t.join("sub")).expect("mkdir");
+        for i in 0..5 {
+            std::fs::write(t.join(format!("f{i}")), vec![b'x'; 1000 * (i + 1)]).expect("write");
+        }
+        std::fs::write(t.join("sub/g"), "under").expect("write");
+        let mut there = Catalog::open_repo(&scratch.path().join("there")).expect("catalog");
+        let root = AnyCid::V1(Importer::default().add_path(&t, &mut there, &mut |_, _| {}).expect("import").expect("root").cid);
+        // Here: the structure, none of the files
+        let here = scratch.path().join("here");
+        let catalog = Catalog::open_repo(&here).expect("catalog");
+        for key in there.keys().expect("keys") {
+            let cid = there.cid_of(key.as_ref()).expect("cid").expect("cid");
+            if cid.codec() != crate::cid::RAW_CODEC {
+                catalog.put_block(&there.get_block(&cid).expect("get").expect("block"), CidVersion::V1).expect("put");
+            }
+        }
+        drop(catalog);
+        let asked = std::sync::Arc::new(Mutex::new(Vec::<Link>::new()));
+        let noted = std::sync::Arc::clone(&asked);
+        let fetcher: Fetcher = Box::new(move |cids: &[Link]| {
+            noted.lock().expect("lock").extend_from_slice(cids);
+            false
+        });
+        let soup = Soup::new(Box::new(move || Catalog::open_repo(&here)), Some(fetcher));
+        let dir = ino(&soup, &format!("cid/{root}")).expect("dir");
+        let entries = soup.list(dir.ino.0).expect("list");
+        assert_eq!(entries.len(), 6);
+        for i in 0..5 {
+            let attr = ino(&soup, &format!("cid/{root}/f{i}")).expect("file");
+            assert_eq!((attr.kind, attr.size), (FileType::RegularFile, 1000 * (i + 1)));
+        }
+        assert_eq!(names(&soup, &format!("cid/{root}/sub")), ["g"]);
+        assert!(asked.lock().expect("lock").is_empty(), "nothing fetched to list: {:?}", asked.lock().expect("lock"));
+        // Reading is what fetches
+        let f0 = ino(&soup, &format!("cid/{root}/f0")).expect("file");
+        assert_eq!(soup.read(f0.ino.0, 0, 10).err(), Some(Errno::ENOENT));
+        assert_eq!(asked.lock().expect("lock").len(), 1);
     }
 
     #[test]

@@ -345,13 +345,17 @@ Checklist:
   - [x] Keeps, `Keep` claims which say to keep their targets and what they link to: `hk add` keeps what it adds unless `--no-keep` (`hk keep add/rm/ls`)
   - [x] Dissolved claims, named by identity CIDs
 - [ ] Purging blocks immediately, across stores and permission tiers
+- [ ] Marking suspect blocks: ones whose links say sizes, or other things, that turn out wrong
 - [ ] Querying
 - [ ] Perkeep-style claims
 - [ ] File mutation
 - [ ] FUSE (`hk mount`)
   - [x] Read-only: `cid/<cid>` looked up by name, `anchors/<anchor>` as each is now, `tags/<tag>/<cid>`; reads fetch only the parts of a file they're in, and what isn't here is fetched through the running node; another account's blocks aren't there
   - [x] Fetching only what's read: just the blocks a read or listing needs, not the DAGs under them, all of a read's file parts or a directory's entries in one request
+  - [x] Listing without fetching files: a raw entry is a file, as big as its directory says (advisory, as a stat's size is: reading reads what's there)
   - [ ] Writable anchors: changes staged, imported on close (Kubo-identical CIDs), and the anchor set once per save
+  - [ ] Copying what's written to on demand: a file opened to write is copied whole now; instead, moved from the store when the mesh holds enough other copies, else copied in the background, the ranges being read first
+  - [ ] Merging concurrent edits of an anchor from its history, path by path, keeping conflicting versions side by side
   - [ ] Names for anchors, rather than their CIDs
 - [ ] P2P private mesh
   - [x] Joining: swarm key, members, tickets, mDNS, identify (`hk node id/invite/join/run/peers`)
