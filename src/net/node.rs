@@ -230,7 +230,7 @@ impl Node {
         let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(IDLE);
         let swarm = Swarm::new(transport, behaviour, peer, config);
         let sightings = Sightings::open(catalog.db().clone())?;
-        let cursors = Cursors::open(catalog.db().clone())?;
+        let cursors = Cursors::open(catalog.db().clone(), members.mesh())?;
         let condemned = Condemned::open(catalog.db().clone())?;
         let mut node = Self {
             swarm,
@@ -576,7 +576,9 @@ impl Node {
     fn collect_due(&mut self) -> Result<collect::Report> {
         let mut report = collect::Report::default();
         let me = self.peer_id();
-        let members: Vec<PeerId> = self.members.list()?.into_keys().filter(|&peer| peer != me).collect();
+        // Members of every mesh this node is in, since what's here may be
+        // kept in any of them
+        let members: Vec<PeerId> = self.members.everyone()?.into_iter().filter(|&peer| peer != me).collect();
         loop {
             let due = self.condemned.due(&members)?;
             if due.is_empty() {

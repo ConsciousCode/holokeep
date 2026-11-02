@@ -27,7 +27,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::net::unix::OwnedWriteHalf;
 
-use super::mesh::{self, Error, Members, Result};
+use super::mesh::{self, Error, Members, Place, Result};
 use super::durability::Report;
 use super::node::{AuditId, Event, FetchId, Node, TrimId};
 use crate::cid::CidRef as _;
@@ -176,19 +176,20 @@ pub fn parse_size(text: &str) -> std::result::Result<u64, String> {
 }
 
 /// The members of the repo's mesh, as this node knows them.
-pub fn members(dir: &Path) -> Result<Members> {
-    Members::open(Db::open(&dir.join("blocks.db"))?)
+pub fn members(place: &Place) -> Result<Members> {
+    Members::open(Db::open(&place.repo.join("blocks.db"))?, &place.mesh)
 }
 
 /// The daemon's socket: in the repo, unless the path is too long for a
 /// socket (about a hundred bytes), then in the temporary directory, named
 /// for the repo.
-fn socket(dir: &Path) -> PathBuf {
+fn socket(place: &Place) -> PathBuf {
+    let dir = place.dir();
     let path = dir.join(SOCKET);
     if path.as_os_str().len() < 100 {
         return path;
     }
-    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
     let hash = sha2::Sha256::digest(dir.as_os_str().as_encoded_bytes());
     let name = hash.iter().take(8).fold(String::new(), |mut name, byte| {
         let _ = write!(name, "{byte:02x}");
@@ -198,21 +199,21 @@ fn socket(dir: &Path) -> PathBuf {
 }
 
 /// Ask the running daemon something, or None if there isn't one.
-pub fn ask(dir: &Path, command: &str) -> Result<Option<Vec<String>>> {
-    ask_within(dir, command, Some(Duration::from_secs(10)))
+pub fn ask(place: &Place, command: &str) -> Result<Option<Vec<String>>> {
+    ask_within(place, command, Some(Duration::from_secs(10)))
 }
 
 /// Ask the running daemon something which may take a while, such as
 /// fetching a DAG: as long as it takes.
-pub fn ask_patiently(dir: &Path, command: &str) -> Result<Option<Vec<String>>> {
-    ask_within(dir, command, None)
+pub fn ask_patiently(place: &Place, command: &str) -> Result<Option<Vec<String>>> {
+    ask_within(place, command, None)
 }
 
 /// Have the running daemon fetch the DAG under a root: how many blocks it
 /// fetched and the CIDs no connected member had, or None if it isn't
 /// running.
-pub fn fetch(dir: &Path, root: &crate::model::Link) -> Result<Option<(usize, Vec<String>)>> {
-    let Some(lines) = ask_patiently(dir, &format!("fetch {root}"))? else {
+pub fn fetch(place: &Place, root: &crate::model::Link) -> Result<Option<(usize, Vec<String>)>> {
+    let Some(lines) = ask_patiently(place, &format!("fetch {root}"))? else {
         return Ok(None);
     };
     let (mut fetched, mut missing) = (None, Vec::new());
@@ -235,9 +236,9 @@ pub fn fetch(dir: &Path, root: &crate::model::Link) -> Result<Option<(usize, Vec
 /// Have the running daemon audit now, as many failures to lose a block as
 /// it's run with unless said: what it reported, or None if it isn't
 /// running.
-pub fn audit(dir: &Path, copies: Option<usize>) -> Result<Option<Report>> {
+pub fn audit(place: &Place, copies: Option<usize>) -> Result<Option<Report>> {
     let command = copies.map_or_else(|| "audit".to_owned(), |copies| format!("audit {copies}"));
-    let Some(lines) = ask_patiently(dir, &command)? else {
+    let Some(lines) = ask_patiently(place, &command)? else {
         return Ok(None);
     };
     let mut report = None;
@@ -258,8 +259,8 @@ pub fn audit(dir: &Path, copies: Option<usize>) -> Result<Option<Report>> {
 /// Have the running daemon let go of whatever the mesh can spare of what's
 /// here, pressed or not: (considered, dropped, freed), or None if it isn't
 /// running.
-pub fn trim(dir: &Path) -> Result<Option<super::trim::Report>> {
-    let Some(lines) = ask_patiently(dir, "trim")? else {
+pub fn trim(place: &Place) -> Result<Option<super::trim::Report>> {
+    let Some(lines) = ask_patiently(place, "trim")? else {
         return Ok(None);
     };
     for line in lines {
@@ -285,8 +286,8 @@ pub fn trim(dir: &Path) -> Result<Option<super::trim::Report>> {
 ///
 /// What it condemns is let go of only once its grace is up and every
 /// member's said it doesn't keep it.
-pub fn collect(dir: &Path) -> Result<Option<super::collect::Report>> {
-    let Some(lines) = ask_patiently(dir, "collect")? else {
+pub fn collect(place: &Place) -> Result<Option<super::collect::Report>> {
+    let Some(lines) = ask_patiently(place, "collect")? else {
         return Ok(None);
     };
     for line in lines {
@@ -304,8 +305,8 @@ pub fn collect(dir: &Path) -> Result<Option<super::collect::Report>> {
     Err(Error::Invalid("the node hung up without saying what it collected".into()))
 }
 
-fn ask_within(dir: &Path, command: &str, time: Option<Duration>) -> Result<Option<Vec<String>>> {
-    let Ok(mut stream) = UnixStream::connect(socket(dir)) else {
+fn ask_within(place: &Place, command: &str, time: Option<Duration>) -> Result<Option<Vec<String>>> {
+    let Ok(mut stream) = UnixStream::connect(socket(place)) else {
         return Ok(None);
     };
     stream.set_read_timeout(time)?;
@@ -314,25 +315,36 @@ fn ask_within(dir: &Path, command: &str, time: Option<Duration>) -> Result<Optio
     Ok(Some(lines))
 }
 
+/// The node for a mesh, acting for the account it's for.
+fn open_node(place: &Place) -> Result<Node> {
+    let dir = place.repo.as_path();
+    let key = mesh::node_key(dir)?;
+    let swarm_key = mesh::swarm_key(&place.dir())?.ok_or_else(|| Error::Invalid("this node isn't in that mesh: invite another, or join one".into()))?;
+    let mut catalog = crate::store::Catalog::open_repo(dir)?;
+    let members = members(place)?;
+    // A mesh for another of the host's accounts holds and hears of its repo
+    if let Some(uid) = members.account()? {
+        catalog.act_for(uid, crate::keys::account_key(dir, uid)?)?;
+    }
+    Node::tcp(&key, swarm_key, catalog, members)
+}
+
 /// Run the node until interrupted, auditing as a trickle that it would
 /// take `copies` failures to lose each block it holds.
 ///
 /// Free space is kept between watermarks, `(low, high)`: below the low,
 /// the node lets go of copies the mesh can spare until it's above the
 /// high. If `collecting`, garbage is collected too, a sample at a time.
-pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64, u64), collecting: bool, shared: bool) -> Result<()> {
-    let key = mesh::node_key(dir)?;
-    let swarm_key = mesh::swarm_key(dir)?.ok_or_else(|| Error::Invalid("this node isn't in a mesh: invite another, or join one".into()))?;
-    let catalog = crate::store::Catalog::open_repo(dir)?;
-    let mut node = Node::tcp(&key, swarm_key, catalog, members(dir)?)?;
+pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (u64, u64), collecting: bool, shared: bool) -> Result<()> {
+    let mut node = open_node(place)?;
     node.set_watermarks(low, high);
     node.listen(listen)?;
     node.dial_members()?;
-    let path = socket(dir);
+    let path = socket(place);
     // A socket nothing answers on is left from a daemon that died
     if path.exists() {
         if UnixStream::connect(&path).is_ok() {
-            return Err(Error::Invalid(format!("a node is already running on {}", dir.display())));
+            return Err(Error::Invalid(format!("a node is already running on {} in mesh {}", place.repo.display(), place.mesh)));
         }
         std::fs::remove_file(&path)?;
     }
@@ -341,7 +353,7 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
     }
-    eprintln!("node {} in mesh {}", node.peer_id(), swarm_key.fingerprint());
+    eprintln!("node {} in mesh {}", node.peer_id(), place.mesh);
     let mut redial = tokio::time::interval(REDIAL);
     let later = |delay| tokio::time::Instant::now().checked_add(delay).unwrap_or_else(tokio::time::Instant::now);
     let mut trickle = later(SETTLE);
@@ -350,9 +362,10 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
     let mut collect = later(SETTLE);
     let mut waiting = Waiting::default();
     let (notify, mut changes) = tokio::sync::mpsc::unbounded_channel();
-    let mut watch = watch_external(&node, notify)?;
+    // Files imported in place are watched by the main mesh's node alone
+    let mut watch = if place.is_main() { watch_external(&node, notify)? } else { Watch::new(notify) };
     let (done, mut remounted) = tokio::sync::mpsc::unbounded_channel();
-    let mut remounts = Remounts { dir: dir.to_owned(), pending: HashSet::new(), done };
+    let mut remounts = Remounts { dir: place.repo.clone(), pending: HashSet::new(), done };
     let result = loop {
         tokio::select! {
             event = node.next() => match event {
@@ -371,7 +384,7 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
                 let Ok((stream, _)) = accepted else {
                     continue;
                 };
-                match answer(&mut node, dir, stream, copies, collecting).await {
+                match answer(&mut node, place, stream, copies, collecting).await {
                     Ok(Some((waiter, write))) => waiting.wait(waiter, write),
                     Ok(None) => {},
                     Err(e) => eprintln!("control: {e}"),
@@ -384,7 +397,9 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
                 // calm interval
                 if node.arrived()? {
                     // Perhaps files imported in place, to watch
-                    watch.add(&node.catalog().external_files(None)?);
+                    if place.is_main() {
+                        watch.add(&node.catalog().external_files(None)?);
+                    }
                     if !node.connected().is_empty() {
                         trickle = tokio::time::Instant::now();
                     }
@@ -395,7 +410,9 @@ pub async fn run(dir: &Path, listen: Multiaddr, copies: usize, (low, high): (u64
                     node.trickle(copies)?;
                 }
                 let paths = node.take_changed();
-                remounts.changed(&node, &paths)?;
+                if place.is_main() {
+                    remounts.changed(&node, &paths)?;
+                }
                 trickle = later(node.trickle_delay());
             },
             () = tokio::time::sleep_until(pressure) => {
@@ -527,21 +544,21 @@ fn report(event: &Event) {
 /// its key here, made the first time it asks, then act for the owner
 /// again.
 fn as_account(node: &mut Node, dir: &Path, uid: u32, command: &str) -> Result<Vec<String>> {
-    let me = rustix::process::getuid().as_raw();
-    if uid == me {
+    let home = node.catalog().uid();
+    if uid == home {
         return Ok(crate::account::answer(node.catalog_mut(), command));
     }
-    let key = crate::keys::Key::load_or_make(&dir.join("accounts").join(format!("{uid}.key")))?;
-    let owner = crate::keys::Key::load_or_make(&dir.join(crate::keys::NODE_KEY))?;
+    let key = crate::keys::account_key(dir, uid)?;
+    let back = crate::keys::account_key(dir, home)?;
     node.catalog_mut().act_for(uid, key)?;
     let lines = crate::account::answer(node.catalog_mut(), command);
-    node.catalog_mut().act_for(me, owner)?;
+    node.catalog_mut().act_for(home, back)?;
     Ok(lines)
 }
 
 /// Answer one command on the control socket, or say which fetch it waits
 /// on, to be answered when that finishes.
-async fn answer(node: &mut Node, dir: &Path, stream: tokio::net::UnixStream, copies: usize, collecting: bool) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
+async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, copies: usize, collecting: bool) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
     let uid = stream.peer_cred()?.uid();
     let me = rustix::process::getuid().as_raw();
     let (read, mut write) = stream.into_split();
@@ -551,7 +568,7 @@ async fn answer(node: &mut Node, dir: &Path, stream: tokio::net::UnixStream, cop
         .map_err(|_| Error::Invalid("no command".into()))??;
     let mut out = String::new();
     if let Some(command) = line.trim_end_matches(['\r', '\n']).strip_prefix("as\t") {
-        for line in as_account(node, dir, uid, command)? {
+        for line in as_account(node, &place.repo, uid, command)? {
             let _ = writeln!(out, "{line}");
         }
         write.write_all(out.as_bytes()).await?;

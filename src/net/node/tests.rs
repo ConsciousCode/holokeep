@@ -7,7 +7,7 @@ use libp2p::multiaddr::Protocol;
 /// A node over the in-memory transport, listening at a fresh address.
 async fn node(swarm_key: PreSharedKey) -> Node {
     let key = Keypair::generate_ed25519();
-    let members = Members::open(Db::memory().expect("db")).expect("members");
+    let members = Members::open(Db::memory().expect("db"), crate::net::mesh::MAIN).expect("members");
     let transport = transport(MemoryTransport::default(), &key, swarm_key).expect("transport");
     let catalog = Catalog::standard(Db::memory().expect("db")).expect("catalog");
     let mut node = Node::new(transport, &key, catalog, members, false).expect("node");

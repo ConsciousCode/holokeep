@@ -108,28 +108,58 @@ enum Command {
     Volume(VolumeCommand),
     /// Link this repo's machines into a private mesh
     #[cfg(feature = "net")]
+    Node(NodeArgs),
+}
+
+#[cfg(feature = "net")]
+#[derive(clap::Args, Debug)]
+struct NodeArgs {
+    /// Which of the meshes this node is in: each a swarm of its own, under
+    /// its own key, for one of the host's accounts
+    #[arg(long, global = true, default_value = holokeep::net::mesh::MAIN)]
+    mesh: String,
     #[command(subcommand)]
-    Node(NodeCommand),
+    command: NodeCommand,
 }
 
 #[cfg(feature = "net")]
 #[derive(Subcommand, Debug)]
 enum NodeCommand {
     /// Print this node's peer id, for another node to invite
-    Id,
+    Id {
+        /// Print instead the key this repo signs with for one of the host's
+        /// accounts, by uid, for an invite's --device
+        #[arg(long)]
+        account: Option<u32>,
+    },
     /// Let a machine into the mesh, printing a ticket for it to join with.
     /// The ticket holds the mesh's key: keep it secret
     Invite {
         peer: String,
+        /// The key to certify as the user's device, by peer ID, if it isn't
+        /// the peer's own: an account's on a shared host (`hk whoami`)
+        #[arg(long)]
+        device: Option<String>,
+        /// Whose mesh a new one is, by uid [default: yours]
+        #[arg(long)]
+        account: Option<u32>,
     },
     /// Join a mesh with a ticket from a node already in it
     Join {
         ticket: String,
+        /// Whose mesh it is, by uid, for one other than the main one
+        /// [default: yours]
+        #[arg(long)]
+        account: Option<u32>,
     },
+    /// List the meshes this node is in, and whose each is
+    Meshes,
     /// Run this node in the mesh until interrupted
     Run {
-        #[arg(long, default_value = holokeep::net::daemon::LISTEN)]
-        listen: String,
+        /// Where to listen [default: port 4011 for the main mesh, any
+        /// other port for another]
+        #[arg(long)]
+        listen: Option<String>,
         /// Copy blocks to other members until it would take this many
         /// failures to lose each, counting risks, auditing a few at a time
         #[arg(short, long, default_value_t = 2)]
@@ -386,7 +416,7 @@ fn fetch_first(repo: Option<&PathBuf>, cid: &Link) -> anyhow::Result<()> {
     #[cfg(feature = "net")]
     {
         let dir = repo_dir(repo.cloned())?;
-        if let Some((_, missing)) = holokeep::net::daemon::fetch(&dir, cid)?
+        if let Some((_, missing)) = holokeep::net::daemon::fetch(&holokeep::net::mesh::Place::main(&dir), cid)?
             && !missing.is_empty()
         {
             eprintln!("warning: {} blocks aren't here or on any connected member", missing.len());
@@ -417,7 +447,7 @@ fn foreign(dir: &Path) -> bool {
 #[cfg(feature = "net")]
 fn as_account(dir: &Path, words: &[String]) -> anyhow::Result<()> {
     anyhow::ensure!(!words.iter().any(|word| word.contains(['\t', '\n'])), "what an account asks can't have tabs or newlines in it");
-    let lines = holokeep::net::daemon::ask(dir, &format!("as\t{}", words.join("\t")))?
+    let lines = holokeep::net::daemon::ask(&holokeep::net::mesh::Place::main(dir), &format!("as\t{}", words.join("\t")))?
         .context("this repo is another user's, and its node isn't running to act for you: its owner can `hk node run --shared`")?;
     for line in lines {
         if let Some(error) = line.strip_prefix("error: ") {
@@ -579,7 +609,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         },
         Command::Volume(command) => volume(open_repo(args.repo)?, command),
         #[cfg(feature = "net")]
-        Command::Node(command) => node(&repo_dir(args.repo)?, command),
+        Command::Node(NodeArgs { mesh, command }) => node(&holokeep::net::mesh::Place::new(&repo_dir(args.repo)?, &mesh), command),
     }
 }
 
@@ -634,9 +664,10 @@ fn user_blocks(repo: &Catalog) -> anyhow::Result<Vec<Vec<u8>>> {
 /// this node signed before counts as the user's, since the ticket
 /// certifies it.
 #[cfg(feature = "net")]
-fn join_user(dir: &Path, user: &Link, blocks: &[Vec<u8>]) -> anyhow::Result<()> {
+fn join_user(dir: &Path, uid: u32, user: &Link, blocks: &[Vec<u8>]) -> anyhow::Result<()> {
     use holokeep::cid::{CidVersion, Cidv1Spec, DAG_CBOR_CODEC};
     let mut repo = Catalog::open_repo(dir)?;
+    repo.act_for(uid, holokeep::keys::account_key(dir, uid)?)?;
     let me = repo.signer().context("no key to sign with")?.id();
     repo.batch(|repo| {
         for data in blocks {
@@ -658,91 +689,163 @@ fn join_user(dir: &Path, user: &Link, blocks: &[Vec<u8>]) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Let a machine into a mesh, printing its ticket: certifying it as a
+/// device of the mesh's user, made now if the mesh is new.
 #[cfg(feature = "net")]
-fn node(dir: &Path, command: NodeCommand) -> anyhow::Result<()> {
+fn invite(place: &holokeep::net::mesh::Place, peer: &str, device: Option<&str>, account: Option<u32>) -> anyhow::Result<()> {
     use holokeep::net::{daemon, mesh};
+    let dir = place.repo.as_path();
+    let peer: libp2p::PeerId = peer.parse().context("not a peer id")?;
+    let me = mesh::node_key(dir)?.public().to_peer_id();
+    anyhow::ensure!(peer != me, "that's this node");
+    let members = daemon::members(place)?;
+    let uid = mesh_account(&members, account)?;
+    let swarm_key = mesh::ensure_swarm_key(&place.dir())?;
+    members.add(&peer)?;
+    let mut list = members.list()?;
+    // Where this node listens, if it's running
+    let listening = daemon::ask(place, "listeners")?.unwrap_or_default();
+    list.insert(me, listening.iter().filter_map(|addr| addr.parse().ok()).collect());
+    // The joiner's certificate, which the user's root key signs: the
+    // first invite makes the user, and so the mesh
+    let device = holokeep::keys::from_peer_id(device.unwrap_or(&peer.to_string())).context("not an ed25519 peer")?;
+    let mut repo = Catalog::open_repo(dir)?;
+    repo.act_for(uid, holokeep::keys::account_key(dir, uid)?)?;
+    let root = if repo.user()?.is_some() {
+        root_key(&repo, dir)?
+    } else {
+        let passphrase = passphrase(true)?;
+        let root = repo.batch(|repo| repo.found_user(passphrase.as_bytes(), holokeep::keys::Cost::RECOMMENDED))?;
+        eprintln!("made a user for this mesh, {}: its root key is sealed with the passphrase, in the mesh", holokeep::keys::peer_id(&root.id()));
+        root
+    };
+    repo.batch(|repo| repo.certify(&root, &device))?;
+    let user = root.id();
+    let blocks = user_blocks(&repo)?;
+    daemon::ask(place, "reload")?;
+    out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: Some((user, blocks)) }.encode());
+    if listening.is_empty() {
+        eprintln!("note: this node isn't running, so the ticket says nowhere to find it; it'll be found on the LAN, or start `hk node run` and invite again");
+    }
+    Ok(())
+}
+
+/// The account a mesh is for, by uid: the main one's owner's, unless
+/// it's said, and a new one's whoever's said, or the owner's, recorded.
+#[cfg(feature = "net")]
+fn mesh_account(members: &holokeep::net::mesh::Members, said: Option<u32>) -> anyhow::Result<u32> {
+    let (uid, new) = mesh_uid(members, said)?;
+    if new {
+        members.set_account(uid)?;
+    }
+    Ok(uid)
+}
+
+/// The account a mesh is for, by uid, and whether the mesh is new.
+#[cfg(feature = "net")]
+fn mesh_uid(members: &holokeep::net::mesh::Members, said: Option<u32>) -> anyhow::Result<(u32, bool)> {
+    let me = rustix::process::getuid().as_raw();
+    if members.mesh() == holokeep::net::mesh::MAIN {
+        anyhow::ensure!(said.is_none_or(|uid| uid == me), "the main mesh is the owner's: give another --mesh for another account");
+        return Ok((me, false));
+    }
+    if let Some(uid) = members.account()? {
+        anyhow::ensure!(said.is_none_or(|said| said == uid), "mesh {} is uid {uid}'s", members.mesh());
+        return Ok((uid, false));
+    }
+    Ok((said.unwrap_or(me), true))
+}
+
+/// Refuse to make an account another user's device when it's a device of
+/// a user with others: an account has one user, and another mesh's is
+/// another account's.
+#[cfg(feature = "net")]
+fn may_join(dir: &Path, uid: u32, user: &Link) -> anyhow::Result<()> {
+    let mut repo = Catalog::open_repo(dir)?;
+    repo.act_for(uid, holokeep::keys::account_key(dir, uid)?)?;
+    if let Some(had) = repo.user()?
+        && had != *user
+        && repo.devices()?.len() > 1
+    {
+        anyhow::bail!("uid {uid}'s user is {}, which has other devices; join another user's mesh with --mesh and --account", holokeep::keys::peer_id(&had));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "net")]
+fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Result<()> {
+    use holokeep::net::{daemon, mesh};
+    anyhow::ensure!(mesh::Place::valid(&place.mesh), "a mesh's name is letters, digits, - and _");
+    let dir = place.repo.as_path();
     match command {
-        NodeCommand::Id => out!("{}", mesh::node_key(dir)?.public().to_peer_id()),
-        NodeCommand::Invite { peer } => {
-            let peer: libp2p::PeerId = peer.parse().context("not a peer id")?;
-            let me = mesh::node_key(dir)?.public().to_peer_id();
-            anyhow::ensure!(peer != me, "that's this node");
-            let swarm_key = mesh::ensure_swarm_key(dir)?;
-            let members = daemon::members(dir)?;
-            members.add(&peer)?;
-            let mut list = members.list()?;
-            // Where this node listens, if it's running
-            let listening = daemon::ask(dir, "listeners")?.unwrap_or_default();
-            list.insert(me, listening.iter().filter_map(|addr| addr.parse().ok()).collect());
-            // The joiner's certificate, which the user's root key signs: the
-            // first invite makes the user, and so the mesh
-            let device = holokeep::keys::from_peer_id(&peer.to_string()).context("not an ed25519 peer")?;
-            let mut repo = Catalog::open_repo(dir)?;
-            let root = if repo.user()?.is_some() {
-                root_key(&repo, dir)?
-            } else {
-                let passphrase = passphrase(true)?;
-                let root = repo.batch(|repo| repo.found_user(passphrase.as_bytes(), holokeep::keys::Cost::RECOMMENDED))?;
-                eprintln!("made a user for this mesh, {}: its root key is sealed with the passphrase, in the mesh", holokeep::keys::peer_id(&root.id()));
-                root
-            };
-            repo.batch(|repo| repo.certify(&root, &device))?;
-            let user = root.id();
-            let blocks = user_blocks(&repo)?;
-            daemon::ask(dir, "reload")?;
-            out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: Some((user, blocks)) }.encode());
-            if listening.is_empty() {
-                eprintln!("note: this node isn't running, so the ticket says nowhere to find it; it'll be found on the LAN, or start `hk node run` and invite again");
+        NodeCommand::Id { account: None } => out!("{}", mesh::node_key(dir)?.public().to_peer_id()),
+        NodeCommand::Id { account: Some(uid) } => out!("{}", holokeep::keys::peer_id(&holokeep::keys::account_key(dir, uid)?.id())),
+        NodeCommand::Meshes => {
+            let members = daemon::members(place)?;
+            if mesh::swarm_key(dir)?.is_some() {
+                out!("{}\t{}", mesh::MAIN, rustix::process::getuid().as_raw());
+            }
+            for (name, uid) in members.meshes()? {
+                out!("{name}\t{uid}");
             }
         },
-        NodeCommand::Join { ticket } => {
+        NodeCommand::Invite { peer, device, account } => invite(place, &peer, device.as_deref(), account)?,
+        NodeCommand::Join { ticket, account } => {
             let mut ticket = mesh::Ticket::decode(&ticket)?;
             let me = mesh::node_key(dir)?.public().to_peer_id();
             anyhow::ensure!(ticket.members.remove(&me).is_some(), "the ticket isn't for this node, {me}");
-            mesh::set_swarm_key(dir, ticket.swarm_key)?;
-            daemon::members(dir)?.merge(&ticket.members)?;
-            if let Some((user, blocks)) = &ticket.user {
-                join_user(dir, user, blocks)?;
+            let members = daemon::members(place)?;
+            let (uid, _) = mesh_uid(&members, account)?;
+            if let Some((user, _)) = &ticket.user {
+                may_join(dir, uid, user)?;
             }
-            daemon::ask(dir, "reload")?;
-            eprintln!("joined the mesh of {}; `hk node run` to connect", ticket.inviter);
+            mesh::set_swarm_key(&place.dir(), ticket.swarm_key)?;
+            let uid = mesh_account(&members, account)?;
+            members.merge(&ticket.members)?;
+            if let Some((user, blocks)) = &ticket.user {
+                join_user(dir, uid, user, blocks)?;
+            }
+            daemon::ask(place, "reload")?;
+            let mesh = if place.is_main() { String::new() } else { format!(" --mesh {}", place.mesh) };
+            eprintln!("joined the mesh of {}; `hk node run{mesh}` to connect", ticket.inviter);
         },
         NodeCommand::Run { listen, copies, low_water, high_water, no_collect, shared } => {
+            let listen = listen.as_deref().unwrap_or_else(|| if place.is_main() { daemon::LISTEN } else { "/ip4/0.0.0.0/tcp/0" });
             let listen = listen.parse().context("not a multiaddr")?;
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            runtime.block_on(daemon::run(dir, listen, copies, (low_water, high_water), !no_collect, shared))?;
+            runtime.block_on(daemon::run(place, listen, copies, (low_water, high_water), !no_collect, shared))?;
         },
         NodeCommand::Collect => {
-            let report = daemon::collect(dir)?.context("this node isn't running: start `hk node run`")?;
+            let report = daemon::collect(place)?.context("this node isn't running: start `hk node run`")?;
             out!(
                 "condemned {}, pardoned {}, let go of {}, freeing {} bytes",
                 report.condemned, report.pardoned, report.collected, report.freed,
             );
         },
         NodeCommand::Trim => {
-            let report = daemon::trim(dir)?.context("this node isn't running: start `hk node run`")?;
+            let report = daemon::trim(place)?.context("this node isn't running: start `hk node run`")?;
             out!("let go of {} of {} spare blocks, freeing {} bytes", report.dropped, report.considered, report.freed);
         },
         NodeCommand::Status => {
-            let lines = daemon::ask(dir, "status")?.context("this node isn't running: start `hk node run`")?;
+            let lines = daemon::ask(place, "status")?.context("this node isn't running: start `hk node run`")?;
             for line in &lines {
                 out!("{line}");
             }
         },
         NodeCommand::Audit { copies } => {
-            let report = daemon::audit(dir, copies)?.context("this node isn't running: start `hk node run`")?;
+            let report = daemon::audit(place, copies)?.context("this node isn't running: start `hk node run`")?;
             out!("advertised {}, copied {}", report.advertised, report.copied);
             if report.short > 0 {
                 eprintln!("{} blocks are still short, with no connected member to raise them", report.short);
             }
         },
-        NodeCommand::Peers => if let Some(lines) = daemon::ask(dir, "peers")? {
+        NodeCommand::Peers => if let Some(lines) = daemon::ask(place, "peers")? {
             for line in &lines {
                 out!("{line}");
             }
         } else {
             eprintln!("this node isn't running; members it knows of:");
-            for (peer, addrs) in daemon::members(dir)?.list()? {
+            for (peer, addrs) in daemon::members(place)?.list()? {
                 let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
                 out!("{peer}\t-\t{}", addrs.join(" "));
             }
@@ -900,7 +1003,7 @@ fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {
         #[cfg(feature = "net")]
         DagCommand::Fetch { cid } => {
             let dir = repo_dir(repo)?;
-            let (fetched, missing) = holokeep::net::daemon::fetch(&dir, &cid)?.context("this node isn't running: start `hk node run`")?;
+            let (fetched, missing) = holokeep::net::daemon::fetch(&holokeep::net::mesh::Place::main(&dir), &cid)?.context("this node isn't running: start `hk node run`")?;
             out!("fetched {fetched}");
             for cid in &missing {
                 out!("missing {cid}");

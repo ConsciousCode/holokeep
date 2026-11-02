@@ -114,6 +114,16 @@ impl Key {
     }
 }
 
+/// The key a repo signs with for one of the host's accounts: the node's
+/// own for its owner, otherwise one of the account's own in `accounts/`,
+/// made the first time it's needed.
+pub fn account_key(repo: &Path, uid: u32) -> io::Result<Key> {
+    if uid == rustix::process::getuid().as_raw() {
+        return Key::load_or_make(&repo.join(NODE_KEY));
+    }
+    Key::load_or_make(&repo.join("accounts").join(format!("{uid}.key")))
+}
+
 /// A public key's name.
 fn id_of(key: &VerifyingKey) -> Link {
     let encoded = [&PUBLIC_PREFIX[..], key.as_bytes()].concat();

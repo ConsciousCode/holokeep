@@ -169,13 +169,18 @@ pub fn pushes(catalog: &Catalog, wants: &Wants) -> Result<Vec<Push>> {
     Push::batches(catalog, blocks)
 }
 
-/// How far through the catalog's generations each member's been noticed.
+/// How far through the catalog's generations each member of a mesh's
+/// been noticed.
+///
+/// A member of the main mesh is known by its peer ID, of another by the
+/// mesh's name, a slash, and its peer ID, since one peer may be in several.
 pub struct Cursors {
     db: Db,
+    prefix: String,
 }
 
 impl Cursors {
-    pub fn open(db: Db) -> Result<Self> {
+    pub fn open(db: Db, mesh: &str) -> Result<Self> {
         db.conn().execute_batch(
             "-- How far through the generations of the catalog's database each
              -- member's been noticed of the structure which arrived.
@@ -184,20 +189,25 @@ impl Cursors {
                  generation INTEGER NOT NULL
              );",
         )?;
-        Ok(Self { db })
+        let prefix = if mesh == super::mesh::MAIN { String::new() } else { format!("{mesh}/") };
+        Ok(Self { db, prefix })
+    }
+
+    fn name(&self, peer: &PeerId) -> String {
+        format!("{}{peer}", self.prefix)
     }
 
     pub fn get(&self, peer: &PeerId) -> Result<i64> {
         Ok(self.db.conn()
             .prepare_cached("SELECT generation FROM notice_cursors WHERE peer = ?1")?
-            .query_row([peer.to_string()], |row| row.get(0))
+            .query_row([self.name(peer)], |row| row.get(0))
             .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(0) } else { Err(e) })?)
     }
 
     pub fn set(&self, peer: &PeerId, generation: i64) -> Result<()> {
         self.db.conn()
             .prepare_cached("INSERT OR REPLACE INTO notice_cursors (peer, generation) VALUES (?1, ?2)")?
-            .execute(params![peer.to_string(), generation])?;
+            .execute(params![self.name(peer), generation])?;
         Ok(())
     }
 
@@ -207,8 +217,11 @@ impl Cursors {
         let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get(1)?)))?;
         let mut cursors = Vec::new();
         for row in rows {
-            let (peer, generation) = row?;
-            if let Ok(peer) = PeerId::from_str(&peer) {
+            let (peer, generation): (String, i64) = row?;
+            let Some(peer) = peer.strip_prefix(&self.prefix).filter(|peer| !peer.contains('/')) else {
+                continue;
+            };
+            if let Ok(peer) = PeerId::from_str(peer) {
                 cursors.push((peer, generation));
             }
         }

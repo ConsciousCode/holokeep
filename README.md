@@ -300,6 +300,8 @@ Beliefs about other nodes' copies, *sightings*, are kept apart from `blocks`, wh
 
 **Joining**, so far: every node of a repository shares a *swarm key*, a libp2p private-network key (Kubo's `swarm.key` format), which encrypts a connection before anything else is said, so a machine without it can't speak to the mesh; it works over TCP, not QUIC. Each node also keeps the members it lets in, so one can be shut out without changing the key, and members tell each other of the members they know whenever they connect, so a machine invited by one is let in by all. A machine joins with a ticket from a member: `hk node id` on it, `hk node invite <id>` on the member, `hk node join <ticket>` back on it. The keys are files beside the catalog (`node.key`, `swarm.key`), not rows in it, since its database is a volume another node may open. mDNS finds members on the LAN; identify tells each where the others listen; Kademlia, under `/holokeep/kad/1.0.0` so it's no part of Amino, will find them as they move. `hk node run` owns the mesh on one thread, the catalog's database with it; other commands open the repo as ever, and ask the daemon over a Unix socket for what needs the mesh. Being let in is the swarm key and the list; what a node may say is its certificate, below.
 
+**Several meshes.** A node may be in several meshes, each a swarm of its own under its own key, with its own members and its own daemon (`hk node ... --mesh <name>`), for one of the host's accounts. The main mesh is the owner's, and keeps its files where they always were; another keeps its swarm key and socket in `meshes/<name>/`, and is for whichever account joined it (`--account <uid>`). A mesh's daemon acts for its account, so it hears of, holds and serves that account's repo and nothing else: a node in alice's mesh and bob's tells neither of the other, though the bits of a block both have are kept once. An account has one user, so a node joins another user's mesh as another account, certified by that user as a device under the account's own key (`hk node id --account <uid>`, then `hk node invite <peer> --device <id>`). The files imported in place are watched by the main mesh's daemon alone. Collecting asks the members of every mesh, since what's here may be kept in any of them, and waits for them all.
+
 Ideas:
 
 - *Failure-domain placement*: describe each blockstore's risk with a set of tags, eg `{living-room, home, new-mexico, us}` is very far from `{bangkok, data-center}` and very close to `{living-room, raid-3, home, new-mexico, us}`, and place replicas to maximize the distance between them. Volumes' risks, found and said, now do this for counting (see durability above); what's open is weighing distance beyond shared risks, perhaps with Ceph's CRUSH, perhaps latency-aware.
@@ -368,7 +370,7 @@ Checklist:
   - [x] No user until a mesh; the root sealed with a passphrase, in the mesh, so any node can invite or revoke
   - [x] Signatures by the batch, chained per device, so revoking cuts at a signature rather than a time and backdating is out (`hk device log`)
   - [x] Several users to a catalog, with the daemon acting for the host's users (`hk node run --shared`, `hk whoami`)
-  - [ ] An account on a shared host joining its own user's mesh: one node in several private meshes, each with its own swarm key
+  - [x] A node in several meshes, each its own swarm, members and daemon, for one of the host's accounts (`--mesh`, `--account`, `hk node meshes`)
   - [x] Each account's blocks its own: what it put here or keeps, served, audited and noticed only to its mesh
   - [ ] Shared anchors, deliberately: documents several users write to
   - [ ] Adding files and reading as another account through the daemon, with the files passed as descriptors so the daemon reads only what the user can
@@ -440,6 +442,7 @@ $hk node id                         # this node's peer id, to be invited by
 $hk node invite <peer-id>           # let a machine into the mesh, certifying it as a device, with
                                     # the user's passphrase (the first makes the user); prints a secret ticket
 $hk node join <ticket>              # join a mesh, and become a device of its user
+$hk node meshes                     # the meshes this node is in, and whose each is (any node command takes --mesh)
 $hk whoami                          # the account this acts for: uid, device key, user
 $hk device list                     # the user's root key, and each device, certified or revoked, and if forked
 $hk device log <peer-id>            # a device's chain of signs: CID, the one before, when, how many claims
