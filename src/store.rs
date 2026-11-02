@@ -36,6 +36,7 @@ use crate::multihash::Multihash;
 mod claims;
 mod ipld;
 mod offset;
+pub mod overlay;
 mod raw;
 mod shards;
 mod unixfs;
@@ -408,6 +409,10 @@ pub struct Mount {
     pub chunk_size: usize,
     pub width: usize,
     pub hidden: bool,
+    /// Whether the path holds only what's changed of the anchor, written
+    /// through `hk mount`, over what it was: a work directory, imported
+    /// with the anchor's overlay marks rather than as all there is.
+    pub overlay: bool,
 }
 
 impl Mount {
@@ -861,9 +866,28 @@ impl Catalog {
                  path BLOB UNIQUE NOT NULL,
                  chunk_size INTEGER NOT NULL,
                  width INTEGER NOT NULL,
-                 hidden INTEGER NOT NULL
-             );",
+                 hidden INTEGER NOT NULL,
+                 overlay INTEGER NOT NULL DEFAULT 0
+             );
+             -- What an overlay mount says of paths beyond its work directory:
+             -- that what's there is gone (cid NULL), or is a block already in
+             -- the soup, as a rename leaves it, with the size its link says.
+             CREATE TABLE IF NOT EXISTS overlay_marks (
+                 anchor BLOB NOT NULL,
+                 path BLOB NOT NULL,
+                 cid BLOB,
+                 tsize INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (anchor, path)
+             ) WITHOUT ROWID;",
         )?;
+        let has_overlay: bool = catalog.db.conn().query_row(
+            "SELECT count(*) FROM pragma_table_info('mounts') WHERE name = 'overlay'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? > 0;
+        if !has_overlay {
+            catalog.db.conn().execute_batch("ALTER TABLE mounts ADD COLUMN overlay INTEGER NOT NULL DEFAULT 0")?;
+        }
         catalog.offsets = Some(offsets);
         catalog.claims = Some(claims);
         catalog.shards = shards;
@@ -2103,22 +2127,24 @@ impl Catalog {
     }
 
     pub fn mounts(&self) -> Result<Vec<Mount>> {
-        let mut stmt = self.db.conn().prepare_cached("SELECT anchor, path, chunk_size, width, hidden FROM mounts ORDER BY path")?;
+        let mut stmt = self.db.conn().prepare_cached("SELECT anchor, path, chunk_size, width, hidden, overlay FROM mounts ORDER BY path")?;
         let rows = stmt.query_map([], |row| Ok((
             row.get::<_, Vec<u8>>(0)?,
             row.get::<_, Vec<u8>>(1)?,
             row.get::<_, i64>(2)?,
             row.get::<_, i64>(3)?,
             row.get::<_, bool>(4)?,
+            row.get::<_, bool>(5)?,
         )))?;
         rows.map(|row| {
-            let (anchor, path, chunk_size, width, hidden) = row?;
+            let (anchor, path, chunk_size, width, hidden, overlay) = row?;
             Ok(Mount {
                 anchor: Link::decode(&anchor).map_err(|e| Error::Invalid { store: "router", reason: format!("anchor: {e:?}") })?,
                 path: path_from(&path),
                 chunk_size: usize::try_from(chunk_size).unwrap_or_default(),
                 width: usize::try_from(width).unwrap_or_default(),
                 hidden,
+                overlay,
             })
         })
         .collect()
@@ -2127,13 +2153,14 @@ impl Catalog {
     /// Record a mount, replacing whatever was at its path.
     pub fn mount(&self, mount: &Mount) -> Result<()> {
         self.db.conn()
-            .prepare_cached("INSERT OR REPLACE INTO mounts (anchor, path, chunk_size, width, hidden) VALUES (?1, ?2, ?3, ?4, ?5)")?
+            .prepare_cached("INSERT OR REPLACE INTO mounts (anchor, path, chunk_size, width, hidden, overlay) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?
             .execute(params![
                 mount.anchor.to_bytes(),
                 path_bytes(&mount.path),
                 i64::try_from(mount.chunk_size).unwrap_or(i64::MAX),
                 i64::try_from(mount.width).unwrap_or(i64::MAX),
                 mount.hidden,
+                mount.overlay,
             ])?;
         Ok(())
     }
@@ -2151,7 +2178,7 @@ impl Catalog {
             Some(mount) => mount.anchor,
             None => self.new_anchor()?,
         };
-        let mount = Mount { anchor, path, chunk_size: importer.chunk_size, width: importer.layout.width, hidden: importer.hidden };
+        let mount = Mount { anchor, path, chunk_size: importer.chunk_size, width: importer.layout.width, hidden: importer.hidden, overlay: false };
         self.mount(&mount)?;
         if self.anchor_value(&mount.anchor)?.as_ref() != Some(&root) {
             self.set_anchor(&mount.anchor, &root)?;
@@ -2161,6 +2188,9 @@ impl Catalog {
 
     /// Import a mount again, as it's changed. Returns what it's now.
     pub fn remount(&mut self, mount: &Mount) -> Result<Link> {
+        if mount.overlay {
+            return self.batch(|catalog| catalog.import_overlay(mount));
+        }
         let importer = mount.importer();
         let path = mount.path.clone();
         self.batch(|catalog| catalog.import_mounted(&importer, &path, &mut |_, _| {}).map(|(_, root)| root))

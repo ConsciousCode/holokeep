@@ -1,10 +1,17 @@
-//! `hk mount`: the soup as a read-only filesystem, over FUSE.
+//! `hk mount`: the soup as a filesystem, over FUSE.
 //!
 //! ```text
 //! cid/<cid>/…         whatever's at a CID; looked up by name, not listed
-//! anchors/<anchor>/…  what each anchor is now
+//! anchors/<anchor>/…  what each anchor is now, and writable
 //! tags/<tag>/<cid>/…  what's tagged so
 //! ```
+//!
+//! Writing to an anchor writes to its overlay (see `store::overlay`): a
+//! file opened to write is copied into the anchor's work directory, and
+//! what's created, removed and renamed is done there and in the anchor's
+//! marks. Once nothing of an anchor's is open to write and it's been quiet
+//! a second, the overlay's imported and the anchor set to what it now is,
+//! once for what an editor's save does in a burst.
 //!
 //! UnixFS directories are directories, files files and symlinks symlinks;
 //! a block of any other codec reads as its bytes. A file's read fetches
@@ -14,24 +21,30 @@
 //! another account's is as good as not here, as for `hk cat`. Anchors and
 //! tags are looked up again every second, so the mount follows them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::os::unix::ffi::{OsStrExt, OsStringExt as _};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request,
+    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, KernelConfig, LockOwner, MountOption, OpenFlags,
+    RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    WriteFlags,
 };
 
 use crate::cid::{BaseCid as _, CidRef as _};
 use crate::export::{self, Fetch, Kind};
 use crate::model::Link;
 use crate::store::Catalog;
+use crate::store::overlay;
+
+mod write;
+use write::{Committer, Handle};
 
 /// How long the kernel may take what it's told as still so.
 const TTL: Duration = Duration::from_secs(1);
@@ -61,6 +74,8 @@ enum Inode {
     Tags,
     Tag(Link),
     Node(Link),
+    /// A path of what an anchor is, overlay and all.
+    Path(Link, PathBuf),
 }
 
 /// The top level, by inode number.
@@ -82,10 +97,38 @@ impl Inodes {
         self.all.get(usize::try_from(ino.checked_sub(1)?).ok()?).cloned()
     }
 
-    fn of(&mut self, inode: Inode) -> u64 {
-        let key = match &inode {
+    /// A path of an anchor renamed: the inodes of it and what's under it
+    /// are where they moved to, as the kernel takes them to be.
+    fn renamed(&mut self, anchor: &Link, from: &Path, to: &Path) {
+        for (index, inode) in self.all.iter_mut().enumerate() {
+            let Inode::Path(at, rel) = &*inode else {
+                continue;
+            };
+            let Ok(rest) = rel.strip_prefix(from) else {
+                continue;
+            };
+            if at != anchor {
+                continue;
+            }
+            let moved = Inode::Path(at.clone(), if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) });
+            self.by_key.remove(&Self::key(inode));
+            self.by_key.insert(Self::key(&moved), u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1));
+            *inode = moved;
+        }
+    }
+
+    fn key(inode: &Inode) -> Vec<u8> {
+        match inode {
             Inode::Tag(tag) => [b"t".as_slice(), &tag.to_bytes()].concat(),
             Inode::Node(cid) => [b"n".as_slice(), &cid.to_bytes()].concat(),
+            Inode::Path(anchor, rel) => [b"p".as_slice(), &anchor.to_bytes(), &[0], rel.as_os_str().as_bytes()].concat(),
+            Inode::Root | Inode::Cids | Inode::Anchors | Inode::Tags => Vec::new(),
+        }
+    }
+
+    fn of(&mut self, inode: Inode) -> u64 {
+        let key = match &inode {
+            Inode::Tag(_) | Inode::Node(_) | Inode::Path(..) => Self::key(&inode),
             Inode::Root => return 1,
             Inode::Cids => return 2,
             Inode::Anchors => return 3,
@@ -107,7 +150,12 @@ pub type Entry = (Vec<u8>, u64, FileType);
 /// The soup, mounted.
 pub struct Soup {
     id: u64,
-    open: Opener,
+    open: Arc<dyn Fn() -> crate::store::Result<Catalog> + Send + Sync>,
+    /// Where anchors' work directories go, if anchors are writable.
+    work: Option<PathBuf>,
+    /// Files open, by handle: those written to, or in a work directory.
+    handles: Mutex<HashMap<u64, Handle>>,
+    committer: Arc<Committer>,
     fetcher: Option<Fetcher>,
     inodes: Mutex<Inodes>,
     /// The sizes directories say raw blocks are, by CID, so a listing
@@ -154,6 +202,42 @@ impl Fetch for Source<'_> {
     }
 }
 
+/// What's at a path of an anchor.
+enum At {
+    /// Something in its work directory.
+    Work(std::fs::Metadata),
+    /// A block of what the anchor had, with the size its link says.
+    Base(Link, Option<u64>),
+}
+
+/// What something in a work directory is.
+fn work_kind(path: &Path, meta: &std::fs::Metadata) -> Result<Kind, Errno> {
+    if meta.is_dir() {
+        Ok(Kind::Directory)
+    } else if meta.file_type().is_symlink() {
+        Ok(Kind::Symlink(std::fs::read_link(path).map_err(|e| errno(&e))?.into_os_string().into_vec()))
+    } else {
+        Ok(Kind::File(meta.len()))
+    }
+}
+
+/// Up to `size` bytes of a file from `offset`.
+fn read_file(file: &std::fs::File, offset: u64, size: usize) -> Result<Vec<u8>, Errno> {
+    use std::os::unix::fs::FileExt as _;
+    let mut buf = vec![0; size];
+    let mut read = 0;
+    while read < size {
+        match file.read_at(buf.get_mut(read..).unwrap_or_default(), offset.saturating_add(u64::try_from(read).unwrap_or(u64::MAX))) {
+            Ok(0) => break,
+            Ok(n) => read = read.saturating_add(n),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+            Err(e) => return Err(errno(&e)),
+        }
+    }
+    buf.truncate(read);
+    Ok(buf)
+}
+
 fn errno(e: &io::Error) -> Errno {
     match e.kind() {
         io::ErrorKind::NotFound => Errno::ENOENT,
@@ -171,9 +255,13 @@ impl Soup {
     /// The soup as the account the catalog `open` opens acts for sees
     /// it, asking `fetcher` for what isn't here, if there's a node to ask.
     pub fn new(open: Opener, fetcher: Option<Fetcher>) -> Self {
+        let open: Arc<dyn Fn() -> crate::store::Result<Catalog> + Send + Sync> = Arc::from(open);
         Self {
             id: SOUPS.fetch_add(1, Ordering::Relaxed),
+            committer: Arc::new(Committer::new(Arc::clone(&open))),
             open,
+            work: None,
+            handles: Mutex::new(HashMap::new()),
             fetcher,
             inodes: Mutex::new(Inodes::new()),
             sizes: Mutex::new(HashMap::new()),
@@ -183,6 +271,13 @@ impl Soup {
             gid: rustix::process::getgid().as_raw(),
             at: SystemTime::now(),
         }
+    }
+
+    /// Anchors writable, their work directories under `work`.
+    #[must_use]
+    pub fn writable(mut self, work: PathBuf) -> Self {
+        self.work = Some(work);
+        self
     }
 
     /// The catalog, as opened on this thread.
@@ -237,14 +332,90 @@ impl Soup {
                 )
             },
             Inode::Node(cid) => export::stat(&Source { catalog, fetcher: self.fetcher.as_ref() }, cid).map_err(|e| errno(&e)),
+            Inode::Path(anchor, rel) => match self.at(catalog, anchor, rel)?.ok_or(Errno::ENOENT)? {
+                At::Work(meta) => work_kind(&self.work_path(anchor, rel).unwrap_or_default(), &meta),
+                At::Base(cid, size) => {
+                    if let Some(size) = size.filter(|_| cid.codec() == crate::cid::RAW_CODEC) {
+                        return Ok(Kind::File(size));
+                    }
+                    self.kind(catalog, &Inode::Node(cid))
+                },
+            },
             _ => Ok(Kind::Directory),
         }
     }
 
+    /// Where a path of an anchor is in its work directory, if anchors are
+    /// writable.
+    fn work_path(&self, anchor: &Link, rel: &Path) -> Option<PathBuf> {
+        let dir = self.work.as_ref()?.join(anchor.to_string());
+        Some(if rel.as_os_str().is_empty() { dir } else { dir.join(rel) })
+    }
+
+    /// What an anchor is now, if it's anything.
+    fn anchor_root(catalog: &Catalog, anchor: &Link) -> Result<Option<Link>, Errno> {
+        catalog.claims().map(|claims| claims.value_of(anchor.multihash())).transpose().map_err(store_errno).map(Option::flatten)
+    }
+
+    /// What's at a path of an anchor: what's in its work directory, else
+    /// what the anchor had there, after marks.
+    fn at(&self, catalog: &Catalog, anchor: &Link, rel: &Path) -> Result<Option<At>, Errno> {
+        if let Some(path) = self.work_path(anchor, rel) {
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) => return Ok(Some(At::Work(meta))),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+                Err(e) => return Err(errno(&e)),
+            }
+        }
+        Ok(self.base_at(catalog, anchor, rel)?.map(|(cid, size)| At::Base(cid, size)))
+    }
+
+    /// What the anchor had at a path, after marks, whatever's in the work
+    /// directory.
+    fn base_at(&self, catalog: &Catalog, anchor: &Link, rel: &Path) -> Result<overlay::Base, Errno> {
+        let marks = catalog.overlay_marks(anchor).map_err(store_errno)?;
+        let root = Self::anchor_root(catalog, anchor)?;
+        overlay::resolve(&Source { catalog, fetcher: self.fetcher.as_ref() }, root, rel, &marks).map_err(|e| errno(&e))
+    }
+
+    /// A directory of an anchor's entries: its work directory's over what
+    /// the anchor had there.
+    fn overlay_entries(&self, catalog: &Catalog, anchor: &Link, rel: &Path) -> Result<Vec<(Vec<u8>, Inode)>, Errno> {
+        let marks = catalog.overlay_marks(anchor).map_err(store_errno)?;
+        let root = Self::anchor_root(catalog, anchor)?;
+        let source = Source { catalog, fetcher: self.fetcher.as_ref() };
+        let mut names: BTreeSet<Vec<u8>> = BTreeSet::new();
+        // Under a file in the work directory, the anchor's had nothing
+        let shadowed = self.work_path(anchor, rel).is_some_and(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_dir()));
+        if !shadowed {
+            let entries = overlay::base_entries(&source, root, rel, &marks).map_err(|e| errno(&e))?;
+            let listed: Vec<export::Listed> = entries.iter().map(|(name, (cid, size))| export::Listed { name: name.clone(), cid: cid.clone(), size: *size }).collect();
+            self.note_sizes(&listed);
+            names.extend(entries.into_keys());
+        }
+        if let Some(path) = self.work_path(anchor, rel)
+            && let Ok(dir) = std::fs::read_dir(path)
+        {
+            for entry in dir.flatten() {
+                names.insert(entry.file_name().as_bytes().to_vec());
+            }
+        }
+        Ok(names.into_iter().map(|name| {
+            let child = rel.join(OsStr::from_bytes(&name));
+            (name, Inode::Path(anchor.clone(), child))
+        }).collect())
+    }
+
     fn attr_of(&self, ino: u64, kind: &Kind) -> FileAttr {
+        self.attr_with(ino, kind, false)
+    }
+
+    /// Attributes, writable ones if `writable`.
+    fn attr_with(&self, ino: u64, kind: &Kind, writable: bool) -> FileAttr {
+        let (file, dir) = if writable { (0o644, 0o755) } else { (0o444, 0o555) };
         let (kind, size, perm, nlink) = match kind {
-            Kind::File(size) => (FileType::RegularFile, *size, 0o444, 1),
-            Kind::Directory => (FileType::Directory, 0, 0o555, 2),
+            Kind::File(size) => (FileType::RegularFile, *size, file, 1),
+            Kind::Directory => (FileType::Directory, 0, dir, 2),
             Kind::Symlink(target) => (FileType::Symlink, u64::try_from(target.len()).unwrap_or(u64::MAX), 0o777, 1),
         };
         FileAttr {
@@ -270,7 +441,12 @@ impl Soup {
     pub fn attr(&self, ino: u64) -> Result<FileAttr, Errno> {
         let inode = self.inode(ino)?;
         let kind = self.kind(&*self.catalog()?, &inode)?;
-        Ok(self.attr_of(ino, &kind))
+        Ok(self.attr_with(ino, &kind, self.writes(&inode)))
+    }
+
+    /// Whether an inode can be written to.
+    const fn writes(&self, inode: &Inode) -> bool {
+        self.work.is_some() && matches!(inode, Inode::Path(..))
     }
 
     /// What a name in a directory is.
@@ -291,12 +467,19 @@ impl Soup {
                 Inode::Node(cid)
             },
             Inode::Anchors => {
-                let claims = catalog.claims().ok_or(Errno::ENOENT)?;
-                let value = claims.value_of(cid(name)?.multihash()).map_err(store_errno)?.ok_or(Errno::ENOENT)?;
+                let anchor = cid(name)?;
+                let value = Self::anchor_root(&catalog, &anchor)?.ok_or(Errno::ENOENT)?;
                 if !self.reachable(&catalog, &value)? {
                     return Err(Errno::ENOENT);
                 }
-                Inode::Node(value)
+                Inode::Path(anchor, PathBuf::new())
+            },
+            Inode::Path(anchor, rel) => {
+                let child = rel.join(name);
+                if self.at(&catalog, &anchor, &child)?.is_none() {
+                    return Err(Errno::ENOENT);
+                }
+                Inode::Path(anchor, child)
             },
             Inode::Tags => {
                 let claims = catalog.claims().ok_or(Errno::ENOENT)?;
@@ -323,8 +506,9 @@ impl Soup {
         };
         let kind = self.kind(&catalog, &inode)?;
         drop(catalog);
+        let writable = self.writes(&inode);
         let ino = self.inodes().of(inode);
-        Ok(self.attr_of(ino, &kind))
+        Ok(self.attr_with(ino, &kind, writable))
     }
 
     /// A directory's entries, but `.` and `..`.
@@ -343,7 +527,7 @@ impl Soup {
                 let mut found = Vec::new();
                 for (anchor, value) in anchors {
                     if self.reachable(&catalog, &value)? {
-                        found.push((anchor.to_string().into_bytes(), Inode::Node(value)));
+                        found.push((anchor.to_string().into_bytes(), Inode::Path(anchor, PathBuf::new())));
                     }
                 }
                 with_kinds(found)?
@@ -372,6 +556,10 @@ impl Soup {
                 self.note_sizes(&entries);
                 with_kinds(entries.into_iter().map(|entry| (entry.name, Inode::Node(entry.cid))).collect())?
             },
+            Inode::Path(anchor, rel) => {
+                let entries = self.overlay_entries(&catalog, &anchor, &rel)?;
+                with_kinds(entries)?
+            },
         };
         drop(catalog);
         let mut inodes = self.inodes();
@@ -398,6 +586,17 @@ impl Soup {
             Inode::Node(cid) => {
                 let catalog = self.catalog()?;
                 export::read_at(&Source { catalog: &catalog, fetcher: self.fetcher.as_ref() }, &cid, offset, size).map_err(|e| errno(&e))
+            },
+            Inode::Path(anchor, rel) => {
+                let catalog = self.catalog()?;
+                match self.at(&catalog, &anchor, &rel)?.ok_or(Errno::ENOENT)? {
+                    At::Work(meta) if meta.is_dir() => Err(Errno::EISDIR),
+                    At::Work(_) => {
+                        let file = std::fs::File::open(self.work_path(&anchor, &rel).ok_or(Errno::ENOENT)?).map_err(|e| errno(&e))?;
+                        read_file(&file, offset, size)
+                    },
+                    At::Base(cid, _) => export::read_at(&Source { catalog: &catalog, fetcher: self.fetcher.as_ref() }, &cid, offset, size).map_err(|e| errno(&e)),
+                }
             },
             _ => Err(Errno::EISDIR),
         }
@@ -442,9 +641,126 @@ impl Filesystem for Soup {
         }
     }
 
-    fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
-        match self.read(ino.0, offset, usize::try_from(size).unwrap_or(usize::MAX)) {
+    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> io::Result<()> {
+        self.start();
+        Ok(())
+    }
+
+    fn destroy(&mut self) {
+        self.finish();
+    }
+
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let write = flags.0 & libc::O_ACCMODE != libc::O_RDONLY;
+        match self.open(ino.0, write, write && flags.0 & libc::O_TRUNC != 0) {
+            Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn read(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
+        let size = usize::try_from(size).unwrap_or(usize::MAX);
+        match self.read_handle(fh.0, offset, size).unwrap_or_else(|| self.read(ino.0, offset, size)) {
             Ok(data) => reply.data(&data),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn write(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64, data: &[u8], _write_flags: WriteFlags, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyWrite) {
+        match self.write(fh.0, offset, data) {
+            Ok(n) => reply.written(u32::try_from(n).unwrap_or(u32::MAX)),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn release(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, _lock: Option<LockOwner>, _flush: bool, reply: ReplyEmpty) {
+        self.release(fh.0);
+        reply.ok();
+    }
+
+    fn flush(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _lock: LockOwner, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
+    fn fsync(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+        reply.ok();
+    }
+
+    fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
+        match self.create(parent.0, name) {
+            Ok((attr, fh)) => reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty()),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+        match self.mkdir(parent.0, name) {
+            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
+        match self.symlink(parent.0, link_name, target) {
+            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.unlink(parent.0, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.rmdir(parent.0, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn rename(&self, _req: &Request, parent: INodeNo, name: &OsStr, newparent: INodeNo, newname: &OsStr, flags: RenameFlags, reply: ReplyEmpty) {
+        if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        match self.rename(parent.0, name, newparent.0, newname, flags.contains(RenameFlags::RENAME_NOREPLACE)) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    // Modes, owners and times aren't kept, as the UnixFS profile doesn't
+    // keep them, so only a size changes anything
+    #[allow(clippy::too_many_arguments, reason = "the trait's")]
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        if let Some(size) = size
+            && let Err(e) = self.truncate(ino.0, fh.map(|fh| fh.0), size)
+        {
+            reply.error(e);
+            return;
+        }
+        match self.attr(ino.0) {
+            Ok(attr) => reply.attr(&TTL, &attr),
             Err(e) => reply.error(e),
         }
     }
@@ -486,7 +802,10 @@ impl Filesystem for Soup {
 /// (`fusermount3 -u`), then unmount it.
 pub fn mount(soup: Soup, dir: &Path) -> io::Result<()> {
     let mut config = fuser::Config::default();
-    config.mount_options = vec![MountOption::RO, MountOption::FSName("holokeep".into()), MountOption::Subtype("hk".into())];
+    config.mount_options = vec![MountOption::FSName("holokeep".into()), MountOption::Subtype("hk".into())];
+    if soup.work.is_none() {
+        config.mount_options.push(MountOption::RO);
+    }
     // Signals wait for this thread to take them, so the filesystem's
     // threads, which inherit the mask, don't die of them still mounted
     let mut signals = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
@@ -570,8 +889,10 @@ mod tests {
         assert_eq!(soup.read(big.ino.0, 299_990, 100).expect("read").len(), 10);
         let link = ino(&soup, &format!("{by_cid}/link")).expect("link");
         assert_eq!((link.kind, soup.link(link.ino.0).expect("readlink")), (FileType::Symlink, b"hello".to_vec()));
-        // One inode wherever it's reached
-        assert_eq!(ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino, ino(&soup, &by_cid).expect("cid").ino);
+        // A CID's one inode wherever it's reached, but an anchor's paths are
+        // its own, being writable
+        assert_eq!(ino(&soup, &format!("tags/greeting/{hello}")).expect("tagged").ino, ino(&soup, &format!("{by_cid}/hello")).expect("cid").ino);
+        assert_ne!(ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino, ino(&soup, &by_cid).expect("cid").ino);
         assert_eq!(names(&soup, "anchors"), [anchor.to_string()]);
         assert_eq!(names(&soup, &format!("anchors/{anchor}/sub")), ["big"]);
         assert_eq!(names(&soup, "tags"), ["greeting"]);
@@ -630,6 +951,106 @@ mod tests {
         let f0 = ino(&soup, &format!("cid/{root}/f0")).expect("file");
         assert_eq!(soup.read(f0.ino.0, 0, 10).err(), Some(Errno::ENOENT));
         assert_eq!(asked.lock().expect("lock").len(), 1);
+    }
+
+    /// A soup over an anchor of a small tree, writable, and the anchor.
+    fn writable(scratch: &Scratch) -> (Soup, Link, PathBuf) {
+        let t = scratch.path().join("t");
+        std::fs::create_dir_all(t.join("dir/deep")).expect("mkdir");
+        std::fs::write(t.join("a"), "first").expect("write");
+        std::fs::write(t.join("big"), vec![3u8; 3_000_000]).expect("write");
+        std::fs::write(t.join("dir/b"), "bee").expect("write");
+        std::fs::write(t.join("dir/deep/c"), "sea").expect("write");
+        let repo = scratch.path().join("repo");
+        let mut catalog = Catalog::open_repo(&repo).expect("catalog");
+        let importer = Importer { hidden: true, ..Importer::default() };
+        let root = AnyCid::V1(importer.add_path(&t, &mut catalog, &mut |_, _| {}).expect("import").expect("root").cid);
+        let anchor = catalog.new_anchor().expect("anchor");
+        catalog.set_anchor(&anchor, &root).expect("set");
+        drop(catalog);
+        let opened = repo.clone();
+        let soup = Soup::new(Box::new(move || Catalog::open_repo(&opened)), None).writable(repo.join("work"));
+        (soup, anchor, repo)
+    }
+
+    /// What the anchor is now, imported from scratch for comparing.
+    fn expect_tree(scratch: &Scratch, files: &[(&str, &[u8])]) -> Link {
+        let t = scratch.path().join("expected");
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(&t).expect("mkdir");
+        for (path, data) in files {
+            let path = t.join(path);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, data).expect("write");
+        }
+        let mut catalog = Catalog::standard(crate::store::Db::memory().expect("db")).expect("catalog");
+        let importer = Importer { hidden: true, ..Importer::default() };
+        AnyCid::V1(importer.add_path(&t, &mut catalog, &mut |_, _| {}).expect("import").expect("root").cid)
+    }
+
+    fn value(repo: &Path, anchor: &Link) -> Link {
+        Catalog::open_repo(repo).expect("catalog").anchor_value(anchor).expect("value").expect("set")
+    }
+
+    #[test]
+    fn writing_to_an_anchor_sets_it() {
+        let scratch = Scratch::new("mount-write");
+        let (soup, anchor, repo) = writable(&scratch);
+        let at = |path: &str| ino(&soup, &format!("anchors/{anchor}/{path}"));
+        let top = at("").expect("anchor").ino.0;
+        let big = vec![3u8; 3_000_000];
+
+        // Rewriting part of a file copies it to write, then reads what's written
+        let a = at("a").expect("a");
+        assert_eq!(a.perm, 0o644);
+        let fh = soup.open(a.ino.0, true, false).expect("open");
+        soup.write(fh, 0, b"F").expect("write");
+        assert_eq!(soup.read_handle(fh, 0, 100).expect("handle").expect("read"), b"First");
+        soup.release(fh);
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/a")), b"First");
+        soup.commit();
+        let first = expect_tree(&scratch, &[("a", b"First"), ("big", &big), ("dir/b", b"bee"), ("dir/deep/c", b"sea")]);
+        assert_eq!(value(&repo, &anchor), first);
+
+        // An editor's save: a new file written, renamed over the old one
+        let (_, fh) = soup.create(top, OsStr::new(".a.swp")).expect("create");
+        soup.write(fh, 0, b"second").expect("write");
+        soup.release(fh);
+        let swp = at(".a.swp").expect("swp").ino.0;
+        soup.rename(top, OsStr::new(".a.swp"), top, OsStr::new("a"), false).expect("rename");
+        // The kernel keeps the renamed file's inode, so it's the file's new path
+        assert_eq!(soup.read(swp, 0, 100).expect("read"), b"second");
+        // A directory made, one removed, and one moved, copying nothing
+        let dir = at("dir").expect("dir").ino.0;
+        soup.mkdir(top, OsStr::new("new")).expect("mkdir");
+        soup.symlink(at("new").expect("new").ino.0, OsStr::new("link"), Path::new("../a")).expect("symlink");
+        soup.unlink(dir, OsStr::new("b")).expect("unlink");
+        assert_eq!(soup.rmdir(dir, OsStr::new("deep")).err(), Some(Errno::ENOTEMPTY));
+        let deep_c = at("dir/deep/c").expect("c").ino.0;
+        soup.rename(dir, OsStr::new("deep"), top, OsStr::new("moved"), false).expect("rename");
+        assert_eq!(soup.read(deep_c, 0, 100).expect("read"), b"sea", "and what's under a renamed directory");
+        assert_eq!(soup.rmdir(top, OsStr::new("dir")).err(), None, "empty now");
+        // Truncating, without opening
+        soup.truncate(at("big").expect("big").ino.0, None, 10).expect("truncate");
+        assert!(!scratch.path().join("repo/work").join(anchor.to_string()).join("moved").exists(), "moved by marks alone");
+
+        assert_eq!(names(&soup, &format!("anchors/{anchor}")), ["a", "big", "moved", "new"]);
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/moved/c")), b"sea");
+        assert_eq!(at("big").expect("big").size, 10);
+        soup.commit();
+        let with_link = value(&repo, &anchor);
+        // expect_tree writes no symlinks, so compare once it's gone too
+        soup.unlink(at("new").expect("new").ino.0, OsStr::new("link")).expect("unlink");
+        soup.rmdir(top, OsStr::new("new")).expect("rmdir");
+        soup.commit();
+        assert_eq!(value(&repo, &anchor), expect_tree(&scratch, &[("a", b"second"), ("big", &big[..10]), ("moved/c", b"sea")]));
+        assert_ne!(with_link, value(&repo, &anchor));
+
+        // Anchors, but not what's under cid/, are writable
+        let root = value(&repo, &anchor);
+        let by_cid = ino(&soup, &format!("cid/{root}/a")).expect("a");
+        assert_eq!(soup.open(by_cid.ino.0, true, false).err(), Some(Errno::EROFS));
+        assert_eq!(by_cid.perm, 0o444);
     }
 
     #[test]

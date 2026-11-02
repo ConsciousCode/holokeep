@@ -118,7 +118,9 @@ impl Remounts {
     fn changed(&mut self, node: &Node, paths: &[PathBuf]) -> Result<()> {
         for path in paths {
             for mount in node.catalog().mounts_over(path)? {
-                if !self.pending.insert(mount.anchor.to_bytes()) {
+                // What's written through `hk mount` is imported by it, once
+                // what's being written is closed, not part way through
+                if mount.overlay || !self.pending.insert(mount.anchor.to_bytes()) {
                     continue;
                 }
                 let (dir, done) = (self.dir.clone(), self.done.clone());

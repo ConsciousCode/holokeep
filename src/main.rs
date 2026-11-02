@@ -113,12 +113,16 @@ enum Command {
     /// Link this repo's machines into a private mesh
     #[cfg(feature = "net")]
     Node(NodeArgs),
-    /// Mount the soup as a read-only filesystem until interrupted:
-    /// cid/<cid>, anchors/<anchor> and tags/<tag>/<cid>
+    /// Mount the soup as a filesystem until interrupted: cid/<cid>,
+    /// anchors/<anchor> and tags/<tag>/<cid>. What's written to an anchor
+    /// is committed, setting it, once it's closed and quiet a second.
     #[cfg(feature = "fuse")]
     Mount {
         /// An empty directory to mount it on
         dir: PathBuf,
+        /// Anchors too are read-only
+        #[arg(long)]
+        read_only: bool,
     },
 }
 
@@ -695,7 +699,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         },
         Command::Volume(command) => volume(open_repo(args.repo)?, command),
         #[cfg(feature = "fuse")]
-        Command::Mount { dir } => mount(repo_dir(args.repo)?, &dir),
+        Command::Mount { dir, read_only } => mount(repo_dir(args.repo)?, &dir, read_only),
         #[cfg(feature = "net")]
         Command::Node(NodeArgs { mesh, command }) => node(&holokeep::net::mesh::Place::new(&repo_dir(args.repo)?, &mesh), command),
     }
@@ -704,7 +708,7 @@ fn run(args: Args) -> anyhow::Result<()> {
 /// Mount the soup at `dir`, as this repo's owner sees it, until
 /// interrupted.
 #[cfg(feature = "fuse")]
-fn mount(repo: PathBuf, dir: &Path) -> anyhow::Result<()> {
+fn mount(repo: PathBuf, dir: &Path, read_only: bool) -> anyhow::Result<()> {
     anyhow::ensure!(!foreign(&repo), "this repo is another user's: only its owner can mount it");
     // Opened here first so a repo that won't open says so before mounting
     drop(Catalog::open_repo(&repo).with_context(|| format!("opening repo {}", repo.display()))?);
@@ -715,7 +719,9 @@ fn mount(repo: PathBuf, dir: &Path) -> anyhow::Result<()> {
     };
     #[cfg(not(feature = "net"))]
     let fetcher = None;
+    let work = repo.join("work");
     let soup = holokeep::mount::Soup::new(Box::new(move || Catalog::open_repo(&repo)), fetcher);
+    let soup = if read_only { soup } else { soup.writable(work) };
     eprintln!("mounted on {}; interrupt to unmount", dir.display());
     holokeep::mount::mount(soup, dir).with_context(|| format!("mounting on {}", dir.display()))
 }
