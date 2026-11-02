@@ -5,6 +5,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Write as _};
 use std::os::unix::fs::FileExt as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -34,7 +35,8 @@ const COPY: usize = 1 << 20;
 /// write.
 pub struct Handle {
     file: File,
-    anchor: Link,
+    /// The anchor it's of, or none for a loose file.
+    anchor: Option<Link>,
     writable: bool,
 }
 
@@ -236,10 +238,10 @@ impl Soup {
         Ok(path)
     }
 
-    fn handle(&self, file: File, anchor: Link, writable: bool) -> u64 {
+    fn handle(&self, file: File, anchor: Option<Link>, writable: bool) -> u64 {
         let fh = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        if writable {
-            self.committer.writing(&anchor, true);
+        if writable && let Some(anchor) = &anchor {
+            self.committer.writing(anchor, true);
         }
         self.handles().insert(fh, Handle { file, anchor, writable });
         fh
@@ -249,12 +251,17 @@ impl Soup {
     /// it in its anchor's work directory. Returns a handle, or 0 for what's
     /// read straight from the soup.
     pub fn open(&self, ino: u64, write: bool, truncate: bool) -> Result<u64, Errno> {
+        if let Inode::Loose(name) = self.inode(ino)? {
+            let path = self.loose_path(&name).ok_or(Errno::ENOENT)?;
+            let file = File::options().read(true).write(write).truncate(truncate).open(path).map_err(|e| io_errno(&e))?;
+            return Ok(self.handle(file, None, write));
+        }
         if !write {
             if let Inode::Path(anchor, rel) = self.inode(ino)?
                 && let Some(path) = self.work_path(&anchor, &rel)
                 && let Ok(file) = File::open(path)
             {
-                return Ok(self.handle(file, anchor, false));
+                return Ok(self.handle(file, Some(anchor), false));
             }
             return Ok(0);
         }
@@ -265,7 +272,7 @@ impl Soup {
         if truncate {
             self.committer.touched(&anchor);
         }
-        Ok(self.handle(file, anchor, true))
+        Ok(self.handle(file, Some(anchor), true))
     }
 
     /// Read from an open file, if it's one with a handle.
@@ -284,7 +291,9 @@ impl Soup {
         let anchor = handle.anchor.clone();
         drop(handles);
         written.map_err(|e| io_errno(&e))?;
-        self.committer.touched(&anchor);
+        if let Some(anchor) = anchor {
+            self.committer.touched(&anchor);
+        }
         Ok(data.len())
     }
 
@@ -292,14 +301,24 @@ impl Soup {
     pub fn release(&self, fh: u64) {
         if let Some(handle) = self.handles().remove(&fh)
             && handle.writable
+            && let Some(anchor) = handle.anchor
         {
-            self.committer.writing(&handle.anchor, false);
-            self.committer.touched(&handle.anchor);
+            self.committer.writing(&anchor, false);
+            self.committer.touched(&anchor);
         }
     }
 
     /// Make a file, open to write.
     pub fn create(&self, parent: u64, name: &OsStr) -> Result<(FileAttr, u64), Errno> {
+        if self.inode(parent)? == Inode::Anchors {
+            // Not an anchor: a loose file, as an editor writes beside a file
+            // anchor to rename over it
+            let path = self.loose_path(name.as_bytes()).ok_or(Errno::EROFS)?;
+            Self::parents(&path)?;
+            let file = File::options().read(true).write(true).create(true).truncate(true).open(&path).map_err(|e| io_errno(&e))?;
+            let fh = self.handle(file, None, true);
+            return Ok((self.resolve(parent, name)?, fh));
+        }
         let (anchor, rel) = self.overlay_of(parent)?;
         let rel = rel.join(name);
         let catalog = self.catalog()?;
@@ -309,7 +328,7 @@ impl Soup {
         let file = File::options().read(true).write(true).create(true).truncate(true).open(&path).map_err(|e| io_errno(&e))?;
         drop(catalog);
         self.committer.touched(&anchor);
-        let fh = self.handle(file, anchor, true);
+        let fh = self.handle(file, Some(anchor), true);
         Ok((self.resolve(parent, name)?, fh))
     }
 
@@ -349,6 +368,10 @@ impl Soup {
 
     /// Remove a file or symlink.
     pub fn unlink(&self, parent: u64, name: &OsStr) -> Result<(), Errno> {
+        if self.inode(parent)? == Inode::Anchors {
+            let path = self.loose_path(name.as_bytes()).filter(|path| path.exists()).ok_or(Errno::EPERM)?;
+            return fs::remove_file(path).map_err(|e| io_errno(&e));
+        }
         let (anchor, rel) = self.overlay_of(parent)?;
         let rel = rel.join(name);
         let catalog = self.catalog()?;
@@ -390,6 +413,9 @@ impl Soup {
     /// Rename within an anchor: what's in the work directory moves there,
     /// and what the anchor had moves by marks, copying nothing.
     pub fn rename(&self, parent: u64, name: &OsStr, new_parent: u64, new_name: &OsStr, no_replace: bool) -> Result<(), Errno> {
+        if self.inode(parent)? == Inode::Anchors || self.inode(new_parent)? == Inode::Anchors {
+            return self.rename_loose(parent, name, new_parent, new_name, no_replace);
+        }
         let (anchor, from) = self.overlay_of(parent)?;
         let (other, to) = self.overlay_of(new_parent)?;
         if anchor != other {
@@ -443,6 +469,50 @@ impl Soup {
         Ok(())
     }
 
+    /// Where a loose file of `anchors/` is kept.
+    pub(super) fn loose_path(&self, name: &[u8]) -> Option<PathBuf> {
+        Some(self.work.as_ref()?.join(".loose").join(OsStr::from_bytes(name)))
+    }
+
+    /// The loose files of `anchors/`.
+    pub(super) fn loose(&self) -> Vec<Vec<u8>> {
+        self.work.as_ref()
+            .and_then(|work| fs::read_dir(work.join(".loose")).ok())
+            .map(|dir| dir.flatten().map(|entry| entry.file_name().as_bytes().to_vec()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Rename in `anchors/`: a loose file to another name, or over a file
+    /// anchor, which is then what it is, as an editor saves. Anchors
+    /// themselves don't move.
+    fn rename_loose(&self, parent: u64, name: &OsStr, new_parent: u64, new_name: &OsStr, no_replace: bool) -> Result<(), Errno> {
+        if self.inode(parent)? != Inode::Anchors || self.inode(new_parent)? != Inode::Anchors {
+            return Err(Errno::EXDEV);
+        }
+        let from = self.loose_path(name.as_bytes()).filter(|path| path.exists()).ok_or(Errno::EPERM)?;
+        let replaced = self.resolve(new_parent, new_name).ok().map(|attr| attr.ino.0);
+        if no_replace && replaced.is_some() {
+            return Err(Errno::EEXIST);
+        }
+        if let Some(Inode::Path(anchor, rel)) = replaced.map(|ino| self.inode(ino)).transpose()? {
+            if self.kind(&*self.catalog()?, &Inode::Path(anchor.clone(), rel.clone()))? == Kind::Directory {
+                return Err(Errno::EISDIR);
+            }
+            let catalog = self.catalog()?;
+            let to = self.prepare(&catalog, &anchor)?;
+            drop(catalog);
+            Self::parents(&to)?;
+            fs::rename(&from, &to).map_err(|e| io_errno(&e))?;
+            self.inodes().became(&Inode::Loose(name.as_bytes().to_vec()), Inode::Path(anchor.clone(), rel));
+            self.committer.touched(&anchor);
+        } else {
+            let to = self.loose_path(new_name.as_bytes()).ok_or(Errno::EROFS)?;
+            fs::rename(&from, &to).map_err(|e| io_errno(&e))?;
+            self.inodes().became(&Inode::Loose(name.as_bytes().to_vec()), Inode::Loose(new_name.as_bytes().to_vec()));
+        }
+        Ok(())
+    }
+
     /// Change a file's size: copying it to the work directory, if it isn't
     /// there yet.
     pub fn truncate(&self, ino: u64, fh: Option<u64>, size: u64) -> Result<(), Errno> {
@@ -450,9 +520,15 @@ impl Soup {
             let handles = self.handles();
             if let Some(handle) = handles.get(&fh).filter(|handle| handle.writable) {
                 handle.file.set_len(size).map_err(|e| io_errno(&e))?;
-                self.committer.touched(&handle.anchor);
+                if let Some(anchor) = &handle.anchor {
+                    self.committer.touched(anchor);
+                }
                 return Ok(());
             }
+        }
+        if let Inode::Loose(name) = self.inode(ino)? {
+            let path = self.loose_path(&name).ok_or(Errno::EROFS)?;
+            return File::options().write(true).open(path).and_then(|file| file.set_len(size)).map_err(|e| io_errno(&e));
         }
         let (anchor, rel) = self.overlay_of(ino)?;
         let catalog = self.catalog()?;

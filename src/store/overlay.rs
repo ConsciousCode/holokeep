@@ -184,7 +184,9 @@ impl Catalog {
     /// there, or nothing.
     fn overlay_node(&mut self, importer: &crate::import::Importer, mount: &Mount, rel: &Path, base: Base, marks: &Marks) -> Result<Option<DagLink>> {
         let base = marks.get(rel).map_or(base, |mark| mark.clone().map(|(cid, size)| (cid, Some(size))));
-        let work = mount.path.join(rel);
+        // Joining nothing would add a slash, which a file anchor's work
+        // file isn't under
+        let work = if rel.as_os_str().is_empty() { mount.path.clone() } else { mount.path.join(rel) };
         let meta = match fs::symlink_metadata(&work) {
             Ok(meta) => Some(meta),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -303,5 +305,20 @@ mod tests {
         assert!(marks.contains_key(Path::new("again")) && !marks.contains_key(Path::new("moved")));
         catalog.clear_overlay_marks(&anchor, Path::new("")).expect("clear");
         assert!(catalog.overlay_marks(&anchor).expect("marks").is_empty());
+    }
+
+    #[test]
+    fn an_anchor_can_be_a_file() {
+        let scratch = Scratch::new("overlay-file");
+        let mut catalog = Catalog::open_repo(&scratch.path().join("repo")).expect("catalog");
+        write(&scratch.path().join("before"), "before");
+        let root = add(&mut catalog, &scratch.path().join("before"));
+        let anchor = catalog.new_anchor().expect("anchor");
+        catalog.set_anchor(&anchor, &root).expect("set");
+        let mount = Mount { anchor, path: scratch.path().join("work"), chunk_size: crate::import::CHUNK_SIZE, width: crate::dag::FILE_WIDTH, hidden: true, overlay: true };
+        assert_eq!(catalog.import_overlay(&mount).expect("import"), root);
+        write(&mount.path, "after");
+        write(&scratch.path().join("after"), "after");
+        assert_eq!(catalog.import_overlay(&mount).expect("import"), add(&mut catalog, &scratch.path().join("after")));
     }
 }
