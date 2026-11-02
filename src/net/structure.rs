@@ -71,7 +71,12 @@ pub fn notices(catalog: &Catalog, structure: &[Link]) -> Result<Vec<Notice>> {
         let Ok(Some(block)) = catalog.get_block(cid) else {
             continue;
         };
-        let links = crate::links::links(cid.codec(), block.data()).unwrap_or_default();
+        // A signature's about what it signs, not the key or the chain it
+        // continues: those would draw every signature to any holder of one
+        let links = match crate::claim::Claim::parse(block.data()) {
+            Some(crate::claim::Claim::Sign(sign)) => sign.signs().to_vec(),
+            _ => crate::links::links(cid.codec(), block.data()).unwrap_or_default(),
+        };
         if links.is_empty() {
             continue;
         }
@@ -134,9 +139,11 @@ fn is_claim(catalog: &Catalog, cid: &Link) -> Result<bool> {
     })
 }
 
-/// Want what's noticed which isn't here and links to something that is.
+/// Want what's noticed which isn't here and links to something that is,
+/// or to something else wanted of the same notice: a keep noticed with
+/// what it keeps, before that's here, goes with it.
 pub fn answer(catalog: &Catalog, notice: &Notice) -> Result<Wants> {
-    let mut want = Vec::new();
+    let mut candidates = Vec::new();
     for (cid, targets) in &notice.blocks {
         let Ok(link) = Link::decode(cid) else {
             continue;
@@ -144,16 +151,41 @@ pub fn answer(catalog: &Catalog, notice: &Notice) -> Result<Wants> {
         if catalog.holds(&link)? {
             continue;
         }
-        for target in targets {
-            if let Ok(target) = Multihash::<Vec<u8>>::decode(target)
-                && catalog.has(target.as_ref())?
-            {
-                want.push(cid.clone());
-                break;
+        let targets: Vec<Multihash<Vec<u8>>> = targets.iter().filter_map(|target| Multihash::decode(target).ok()).collect();
+        candidates.push((cid, link.multihash().to_bytes(), targets));
+    }
+    let mut wanted = std::collections::BTreeSet::new();
+    let mut want = Vec::new();
+    loop {
+        let before = want.len();
+        for (cid, key, targets) in &candidates {
+            if wanted.contains(key) {
+                continue;
+            }
+            for target in targets {
+                if wanted.contains(&target.to_bytes()) || held(catalog, target)? {
+                    wanted.insert(key.clone());
+                    want.push((*cid).clone());
+                    break;
+                }
             }
         }
+        if want.len() == before {
+            return Ok(Wants { want });
+        }
     }
-    Ok(Wants { want })
+}
+
+/// Whether a block's here to link to: an identity block only if it's a
+/// dissolved claim held here, since otherwise it's no one's in particular.
+fn held(catalog: &Catalog, key: &Multihash<Vec<u8>>) -> Result<bool> {
+    if key.code() == crate::block::IDENTITY {
+        return match catalog.cid_of(key.as_ref())? {
+            Some(cid) => Ok(catalog.holds(&cid)?),
+            None => Ok(false),
+        };
+    }
+    Ok(catalog.has(key.as_ref())?)
 }
 
 /// Pushes of what a member wants, of what's here.

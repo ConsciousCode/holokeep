@@ -478,6 +478,70 @@ async fn fetching_takes_tombs_along() {
     assert!(tags(&b, leaf).is_empty());
 }
 
+#[tokio::test]
+async fn fetching_takes_keeps_along() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    one_user(&mut [&mut a, &mut b]);
+    let leaf = blocks.get(2).expect("leaf");
+    let keep = a.catalog().keep(&link(leaf)).expect("keep");
+    assert!(a.catalog().kept_under(leaf.cid().multihash()).expect("kept"));
+    assert_eq!(fetch(&mut a, &mut b, link(leaf)).await, (1, vec![]));
+    assert!(until(&mut [&mut a, &mut b], |n| holds(n[1], &keep)).await, "the keep");
+    assert!(
+        until(&mut [&mut a, &mut b], |n| n[1].catalog().kept_under(leaf.cid().multihash()).expect("kept")).await,
+        "and what makes it count",
+    );
+}
+
+#[tokio::test]
+async fn a_vaults_keeps_reach_a_friend_holding_it() {
+    use crate::store::RefIndex as _;
+    let scratch = crate::testutil::Scratch::new("node-vault-keeps");
+    let (mut a, mut b, _) = Box::pin(holding()).await;
+    a.catalog_mut().set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
+    assert!(crate::vault::seal(a.catalog_mut(), scratch.path(), b"pass", crate::keys::Cost::NONE).expect("seal"));
+    let vault = crate::vault::Vault::open(scratch.path(), a.catalog().uid()).expect("vault");
+    a.catalog_mut().act_for(vault.uid(), vault.key().clone()).expect("act");
+    let kept = a.catalog().claims().expect("claims").keeps().expect("keeps");
+    let sealed = kept.first().expect("sealed").clone();
+    let keep = a.catalog().backrefs(sealed.multihash()).expect("backrefs").first().and_then(|key| a.catalog().cid_of(key.as_ref()).expect("cid")).expect("keep");
+    // A friend's account, the vault its user
+    let friend = 0xC000_0000;
+    b.catalog_mut().act_for(friend, crate::keys::Key::generate().expect("key")).expect("act");
+    b.catalog().claims().expect("claims").set_user(friend, &vault.key().id()).expect("user");
+    b.catalog_mut().act_for(friend, crate::keys::Key::generate().expect("key")).expect("act");
+    assert_eq!(fetch(&mut a, &mut b, sealed.clone()).await, (1, vec![]));
+    assert!(until(&mut [&mut a, &mut b], |n| holds(n[1], &keep)).await, "the keep");
+    assert!(until(&mut [&mut a, &mut b], |n| n[1].catalog().kept_for_acting(sealed.multihash()).expect("kept")).await, "counting");
+}
+
+#[tokio::test]
+async fn a_keep_noticed_with_its_target_goes_with_it() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    one_user(&mut [&mut a, &mut b]);
+    let leaf = blocks.get(2).expect("leaf");
+    b.catalog().put_block(leaf, CidVersion::V1).expect("put");
+    // New structure over what b holds, and a keep of it, in one notice
+    let over = cbor(&Ipld::List(vec![Ipld::Link(link(leaf))]));
+    a.catalog().put_block(&over, CidVersion::V1).expect("put");
+    let keep = a.catalog().keep(&link(&over)).expect("keep");
+    a.announce().expect("announce");
+    assert!(until(&mut [&mut a, &mut b], |n| holds(n[1], &link(&over))).await, "the structure");
+    assert!(until(&mut [&mut a, &mut b], |n| holds(n[1], &keep)).await, "and its keep");
+    assert!(until(&mut [&mut a, &mut b], |n| n[1].catalog().kept_under(over.cid().multihash()).expect("kept")).await, "counting");
+}
+
+#[tokio::test]
+async fn signatures_over_what_a_member_lacks_stay_put() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    one_user(&mut [&mut a, &mut b]);
+    let before = b.catalog().keys().expect("keys").len();
+    a.catalog().keep(&link(&blocks[0])).expect("keep");
+    a.announce().expect("announce");
+    // b holds none of it, so neither the keep nor what signs it is b's
+    assert!(!within(Duration::from_millis(500), &mut [&mut a, &mut b], |n| n[1].catalog().keys().expect("keys").len() != before).await);
+}
+
 /// Make nodes devices of one user, its root certifying each.
 fn one_user(nodes: &mut [&mut Node]) -> crate::keys::Key {
     let root = crate::keys::Key::generate().expect("key");

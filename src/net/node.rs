@@ -749,14 +749,16 @@ impl Node {
                 return Ok(());
             },
             request_response::Event::Message { peer, message: request_response::Message::Response { request_id, response }, .. } => {
+                // What links to what's pushed goes after it, copies or
+                // not: claims about it may have been noticed before it
+                // was there to want them for
+                let kept = response.keys();
                 if let Some(audit) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
-                    // What links to the copies goes after them
-                    let kept = response.keys();
                     audit.kept(&self.sightings, request_id, response)?;
-                    self.notice_backrefs(peer, &kept)?;
                 } else {
                     response.sight(&self.catalog, &self.sightings, &peer)?;
                 }
+                self.notice_backrefs(peer, &kept)?;
             },
             request_response::Event::OutboundFailure { request_id, .. } => {
                 if let Some(audit) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
