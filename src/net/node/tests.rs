@@ -24,7 +24,7 @@ fn invite(inviter: &Node, joiner: &Node, swarm_key: PreSharedKey) {
     inviter.members().add(&joiner.peer_id()).expect("add");
     let mut members = inviter.members().list().expect("list");
     members.insert(inviter.peer_id(), inviter.listeners());
-    let ticket = Ticket { swarm_key, inviter: inviter.peer_id(), members, user: None, protected: false };
+    let ticket = Ticket { swarm_key, inviter: inviter.peer_id(), members, user: None, protected: false, sealed: Vec::new(), held: Vec::new() };
     let ticket = Ticket::decode(&ticket.encode()).expect("round trip");
     joiner.members().merge(&ticket.members).expect("join");
 }

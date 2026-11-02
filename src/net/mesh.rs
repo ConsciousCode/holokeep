@@ -341,6 +341,13 @@ pub struct Ticket {
     /// inviter's but what the inviter holds of its vault, and joins with
     /// its own.
     pub protected: bool,
+    /// For a protected mesh holding a vault already, what the vault has
+    /// it keep sealed with the user's passphrase, the vault itself and the
+    /// user's root key, so a machine that's lost everything else recovers
+    /// them by joining.
+    pub sealed: Vec<Vec<u8>>,
+    /// ...and the rest of what it keeps there: the manifests, to restore.
+    pub held: Vec<Link>,
 }
 
 impl Ticket {
@@ -363,6 +370,12 @@ impl Ticket {
         }
         if self.protected {
             ticket.insert("protected".to_owned(), Ipld::Bool(true));
+        }
+        if !self.sealed.is_empty() {
+            ticket.insert("sealed".to_owned(), Ipld::List(self.sealed.iter().cloned().map(Ipld::Bytes).collect()));
+        }
+        if !self.held.is_empty() {
+            ticket.insert("held".to_owned(), Ipld::List(self.held.iter().cloned().map(Ipld::Link).collect()));
         }
         let ticket = Ipld::Map(ticket);
         multibase::encode(multibase::Base::Base32Lower, crate::dagcbor::to_vec(&ticket).unwrap_or_default())
@@ -418,7 +431,23 @@ impl Ticket {
             Some(Ipld::Bool(protected)) => protected,
             Some(_) => return Err(invalid("protected")),
         };
-        Ok(Self { swarm_key, inviter, members, user, protected })
+        let sealed = match map.remove("sealed") {
+            None => Vec::new(),
+            Some(Ipld::List(list)) => list.into_iter().map(|item| match item {
+                Ipld::Bytes(bytes) => Ok(bytes),
+                _ => Err(invalid("sealed")),
+            }).collect::<Result<_>>()?,
+            Some(_) => return Err(invalid("sealed")),
+        };
+        let held = match map.remove("held") {
+            None => Vec::new(),
+            Some(Ipld::List(list)) => list.into_iter().map(|item| match item {
+                Ipld::Link(link) => Ok(link),
+                _ => Err(invalid("held")),
+            }).collect::<Result<_>>()?,
+            Some(_) => return Err(invalid("held")),
+        };
+        Ok(Self { swarm_key, inviter, members, user, protected, sealed, held })
     }
 }
 

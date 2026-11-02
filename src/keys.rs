@@ -188,6 +188,9 @@ impl Cost {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sealed {
     key: Link,
+    /// What else it seals besides a key, if anything: `vault`, a vault's
+    /// key and its secret.
+    what: Option<String>,
     cost: Cost,
     salt: Vec<u8>,
     nonce: [u8; 24],
@@ -216,24 +219,51 @@ fn random<const N: usize>() -> io::Result<[u8; N]> {
 impl Sealed {
     /// Seal a key with a passphrase, at a cost to anyone guessing it.
     pub fn seal(key: &Key, passphrase: &[u8], cost: Cost) -> io::Result<Self> {
+        Self::seal_with(key, None, &[], passphrase, cost)
+    }
+
+    /// Seal a key, and more after it, saying what it is.
+    pub fn seal_with(key: &Key, what: Option<&str>, more: &[u8], passphrase: &[u8], cost: Cost) -> io::Result<Self> {
         let salt = random::<16>()?.to_vec();
         let nonce = random::<24>()?;
         let secret = stretch(passphrase, &salt, cost).ok_or_else(|| io::Error::other("argon2id won't take that cost"))?;
         let cipher = XChaCha20Poly1305::new_from_slice(secret.as_ref()).map_err(io::Error::other)?;
         let id = key.id();
-        let plain = Zeroizing::new(key.to_protobuf());
+        let what = what.map(str::to_owned);
+        let plain = Zeroizing::new([key.to_protobuf().as_slice(), more].concat());
         let ciphertext = cipher
-            .encrypt(&nonce.into(), Payload { msg: &plain, aad: &id.to_bytes() })
+            .encrypt(&nonce.into(), Payload { msg: &plain, aad: &Self::bound(&id, what.as_deref()) })
             .map_err(|_| io::Error::other("sealing failed"))?;
-        Ok(Self { key: id, cost, salt, nonce, ciphertext })
+        Ok(Self { key: id, what, cost, salt, nonce, ciphertext })
     }
 
-    /// The key, if the passphrase is the one it was sealed with.
+    /// What the ciphertext is bound to: the key's name, and what it says
+    /// it is.
+    fn bound(key: &Link, what: Option<&str>) -> Vec<u8> {
+        let mut bound = key.to_bytes();
+        if let Some(what) = what {
+            bound.push(0);
+            bound.extend_from_slice(what.as_bytes());
+        }
+        bound
+    }
+
+    /// The key, if the passphrase is the one it was sealed with and it
+    /// seals a key alone.
     pub fn open(&self, passphrase: &[u8]) -> Option<Key> {
+        self.what.is_none().then_some(())?;
+        self.open_with(passphrase).filter(|(_, more)| more.is_empty()).map(|(key, _)| key)
+    }
+
+    /// The key and what's sealed after it, if the passphrase is the one it
+    /// was sealed with.
+    pub fn open_with(&self, passphrase: &[u8]) -> Option<(Key, Zeroizing<Vec<u8>>)> {
         let secret = stretch(passphrase, &self.salt, self.cost)?;
         let cipher = XChaCha20Poly1305::new_from_slice(secret.as_ref()).ok()?;
-        let plain = Zeroizing::new(cipher.decrypt(&self.nonce.into(), Payload { msg: &self.ciphertext, aad: &self.key.to_bytes() }).ok()?);
-        Key::from_protobuf(&plain).filter(|key| key.id() == self.key)
+        let aad = Self::bound(&self.key, self.what.as_deref());
+        let plain = Zeroizing::new(cipher.decrypt(&self.nonce.into(), Payload { msg: &self.ciphertext, aad: &aad }).ok()?);
+        let (pair, more) = (plain.get(..SECRET_PREFIX.len().saturating_add(64))?, plain.get(SECRET_PREFIX.len().saturating_add(64)..)?);
+        Key::from_protobuf(pair).filter(|key| key.id() == self.key).map(|key| (key, Zeroizing::new(more.to_vec())))
     }
 
     /// Which key it is.
@@ -241,8 +271,13 @@ impl Sealed {
         &self.key
     }
 
+    /// What else it seals, if anything.
+    pub fn what(&self) -> Option<&str> {
+        self.what.as_deref()
+    }
+
     fn to_ipld(&self) -> Ipld {
-        Ipld::Map(BTreeMap::from([
+        let mut map = BTreeMap::from([
             ("cipher".to_owned(), Ipld::String(CIPHER.to_owned())),
             ("kdf".to_owned(), Ipld::String(KDF.to_owned())),
             ("key".to_owned(), Ipld::Link(self.key.clone())),
@@ -252,7 +287,11 @@ impl Sealed {
             ("passes".to_owned(), Ipld::Integer(self.cost.passes.into())),
             ("salt".to_owned(), Ipld::Bytes(self.salt.clone())),
             ("sealed".to_owned(), Ipld::Bytes(self.ciphertext.clone())),
-        ]))
+        ]);
+        if let Some(what) = &self.what {
+            map.insert("what".to_owned(), Ipld::String(what.clone()));
+        }
+        Ipld::Map(map)
     }
 
     /// The sealed key as a dag-cbor block.
@@ -281,7 +320,12 @@ impl Sealed {
         (kdf == KDF && cipher == CIPHER && is_key(&key)).then_some(())?;
         let cost = Cost { memory: integer(take("memory"))?, passes: integer(take("passes"))?, lanes: integer(take("lanes"))? };
         let (salt, nonce, ciphertext) = (bytes(take("salt"))?, bytes(take("nonce"))?, bytes(take("sealed"))?);
-        let sealed = Self { key, cost, salt, nonce: nonce.as_slice().try_into().ok()?, ciphertext };
+        let what = match take("what") {
+            None => None,
+            Some(Ipld::String(what)) => Some(what),
+            Some(_) => return None,
+        };
+        let sealed = Self { key, what, cost, salt, nonce: nonce.as_slice().try_into().ok()?, ciphertext };
         map.is_empty().then_some(sealed)
     }
 }
@@ -328,6 +372,14 @@ mod tests {
         let other = Key::generate().unwrap();
         let swapped = Sealed { key: other.id(), ..sealed };
         assert!(swapped.open(b"correct horse").is_none());
+        // More after the key, and saying so, which it's bound to
+        let vault = Sealed::seal_with(&key, Some("vault"), &[7; 32], b"correct horse", Cost::NONE).unwrap();
+        let parsed = Sealed::parse(vault.block().data()).unwrap();
+        assert_eq!(parsed.what(), Some("vault"));
+        assert!(parsed.open(b"correct horse").is_none(), "not a key alone");
+        let (opened, more) = parsed.open_with(b"correct horse").unwrap();
+        assert_eq!((opened.id(), more.as_slice()), (key.id(), &[7u8; 32][..]));
+        assert!(Sealed { what: Some("other".into()), ..parsed }.open_with(b"correct horse").is_none());
         assert!(Sealed::parse(crate::claim::Claim::Tomb(crate::claim::Tomb::new([key.id()]).unwrap()).block().data()).is_none());
     }
 

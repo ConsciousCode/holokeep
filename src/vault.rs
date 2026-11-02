@@ -262,6 +262,132 @@ impl Vault {
     }
 }
 
+/// The vault's key and secret, sealed with the user's passphrase.
+const SEALED: &str = "vault";
+
+/// Whether the vault of the account the catalog acts for keeps itself,
+/// sealed, so holders keep it too.
+pub fn is_sealed(catalog: &mut Catalog, repo: &Path) -> Result<bool> {
+    let vault = Vault::open(repo, catalog.uid())?;
+    Ok(vault_keeps(catalog, &vault)?.iter().any(|cid| {
+        matches!(catalog.get_block(cid), Ok(Some(block)) if crate::keys::Sealed::parse(block.data()).is_some_and(|sealed| sealed.what() == Some(SEALED) && *sealed.key() == vault.key.id()))
+    }))
+}
+
+/// What a vault keeps.
+fn vault_keeps(catalog: &mut Catalog, vault: &Vault) -> Result<Vec<Link>> {
+    let owner = (catalog.uid(), catalog.signer().cloned().ok_or_else(|| invalid("this repo has no key to sign with"))?);
+    catalog.act_for(vault.uid, vault.key.clone())?;
+    let keeps = catalog.claims().map(crate::store::ClaimStore::keeps).transpose();
+    catalog.act_for(owner.0, owner.1)?;
+    Ok(keeps?.unwrap_or_default())
+}
+
+/// Have the vault keep itself sealed with the user's passphrase, and the
+/// user's root key as it's sealed in its mesh.
+///
+/// So a friend holding the vault holds what it takes to recover all of it
+/// with the passphrase alone. Nothing, if the vault does already. Returns
+/// whether it didn't.
+pub fn seal(catalog: &mut Catalog, repo: &Path, passphrase: &[u8], cost: crate::keys::Cost) -> Result<bool> {
+    if is_sealed(catalog, repo)? {
+        return Ok(false);
+    }
+    let owner = (catalog.uid(), catalog.signer().cloned().ok_or_else(|| invalid("this repo has no key to sign with"))?);
+    let vault = Vault::open(repo, owner.0)?;
+    let sealed = crate::keys::Sealed::seal_with(&vault.key, Some(SEALED), vault.secret.as_ref(), passphrase, cost)?.block();
+    let mut blocks = vec![sealed];
+    for (cid, _) in catalog.seals()? {
+        blocks.extend(catalog.get_block(&cid)?);
+    }
+    catalog.act_for(vault.uid, vault.key)?;
+    let kept = catalog.batch(|catalog| {
+        for block in &blocks {
+            catalog.put_block(block, CidVersion::V1)?;
+            catalog.keep(&AnyCid::V1(block.cid().clone()))?;
+        }
+        Ok::<_, Error>(())
+    });
+    catalog.act_for(owner.0, owner.1)?;
+    kept.map(|()| true)
+}
+
+/// What sealed blocks give back with the passphrase: a vault, and the
+/// user's root key, if it was among them.
+pub struct Recovered {
+    pub vault: Vault,
+    pub root: Option<crate::keys::Key>,
+}
+
+/// Recover an account's vault from sealed blocks a friend holding it kept,
+/// with the user's passphrase.
+///
+/// Its key and secret are here again, and the user's root key is given
+/// back, if it was sealed too. Refuses if the account has a vault here
+/// already.
+pub fn recover(repo: &Path, owner: u32, sealed: &[Vec<u8>], passphrase: &[u8]) -> Result<Recovered> {
+    let uid = vault_of(owner);
+    let (key_path, secret_path) = (repo.join("accounts").join(format!("{uid}.key")), repo.join("accounts").join(format!("{uid}.secret")));
+    if key_path.exists() || secret_path.exists() {
+        return Err(invalid("this account has a vault here already"));
+    }
+    let parsed: Vec<crate::keys::Sealed> = sealed.iter().filter_map(|data| crate::keys::Sealed::parse(data)).collect();
+    let (key, secret) = parsed.iter()
+        .filter(|sealed| sealed.what() == Some(SEALED))
+        .find_map(|sealed| sealed.open_with(passphrase))
+        .ok_or_else(|| invalid("nothing sealed opens with that passphrase"))?;
+    let secret: [u8; 32] = secret.as_slice().try_into().map_err(|_| invalid("a vault sealed without its secret"))?;
+    let root = parsed.iter().filter(|sealed| sealed.what().is_none()).find_map(|sealed| sealed.open(passphrase));
+    std::fs::create_dir_all(repo.join("accounts"))?;
+    key.save(&key_path)?;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&secret_path)?;
+    file.write_all(&secret)?;
+    file.sync_all()?;
+    Ok(Recovered { vault: Vault::open(repo, owner)?, root })
+}
+
+/// The block access token in a block of a vault's, if it has one: an
+/// encrypted block's, after its magic, or a manifest's.
+pub fn bat(data: &[u8]) -> Option<[u8; 32]> {
+    if data.starts_with(&MAGIC) {
+        let start = MAGIC.len().saturating_add(BATS.len());
+        return data.get(start..HEADER)?.try_into().ok();
+    }
+    let Ipld::Map(mut map) = crate::dagcbor::from_slice(data).ok()? else {
+        return None;
+    };
+    match map.remove("bats") {
+        Some(Ipld::List(bats)) => match bats.into_iter().next() {
+            Some(Ipld::Bytes(bat)) => bat.as_slice().try_into().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// How long a proof of knowing a block's token stands.
+pub const PROOF_LIFE: u64 = 300;
+
+/// Proof of knowing a block's token, to ask for it: an HMAC of its CID,
+/// the asker's peer ID and the time, keyed by the token, so it's good
+/// only for that block, that asker and a few minutes.
+pub fn prove(bat: &[u8; 32], cid: &Link, asker: &[u8], at: u64) -> [u8; 32] {
+    let message = [cid.to_bytes().as_slice(), &[0], asker, &[0], &at.to_be_bytes()].concat();
+    *hmac(bat, &message)
+}
+
+/// Whether a proof is of knowing a block's token, by this asker, recently.
+pub fn check(data: &[u8], cid: &Link, asker: &[u8], at: u64, proof: &[u8; 32], now: u64) -> bool {
+    let Some(bat) = bat(data) else {
+        return false;
+    };
+    if now.abs_diff(at) > PROOF_LIFE {
+        return false;
+    }
+    // In constant time, so timing says nothing of how near a guess was
+    prove(&bat, cid, asker, at).iter().zip(proof).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
+}
+
 /// Protect a DAG, all of which must be here, in the vault of the account
 /// the catalog acts for: encrypt it, as the vault's, and keep a manifest
 /// of it. Returns the manifest's CID.
@@ -429,6 +555,72 @@ mod tests {
         assert_eq!((back, count), (root_cid.clone(), leaves.len().saturating_add(1)));
         assert_eq!(other.get_block(&root_cid).expect("get").map(|block| block.data().to_vec()), Some(root.data().to_vec()));
         assert!(other.visible(root_cid.multihash()).expect("visible"));
+    }
+
+    #[test]
+    fn a_vault_and_its_user_come_back_from_what_a_friend_holds_and_the_passphrase() {
+        use crate::keys::Cost;
+        let scratch = Scratch::new("vault-recover");
+        let mut repo = Catalog::open_repo(scratch.path()).expect("open");
+        let root = repo.found_user(b"pass", Cost::NONE).expect("user");
+        let block = raw(b"precious");
+        repo.put_block(&block, CidVersion::V1).expect("put");
+        let plain = AnyCid::V1(block.cid().clone());
+        let manifest = protect(&mut repo, scratch.path(), &plain).expect("protect");
+        assert!(!is_sealed(&mut repo, scratch.path()).expect("sealed"));
+        assert!(seal(&mut repo, scratch.path(), b"pass", Cost::NONE).expect("seal"));
+        assert!(!seal(&mut repo, scratch.path(), b"pass", Cost::NONE).expect("seal"), "once");
+        // What the vault keeps, as a holder would: the manifest, and the
+        // sealed vault and root
+        let vault = Vault::open(scratch.path(), repo.uid()).expect("vault");
+        let kept = vault_keeps(&mut repo, &vault).expect("keeps");
+        assert_eq!(kept.len(), 3);
+        let sealed: Vec<Vec<u8>> = kept.iter()
+            .filter_map(|cid| repo.get_block(cid).expect("get"))
+            .filter(|block| crate::keys::Sealed::parse(block.data()).is_some())
+            .map(|block| block.data().to_vec())
+            .collect();
+        assert_eq!(sealed.len(), 2);
+
+        // Everything here is lost but that, and the ciphertext
+        let fresh = Scratch::new("vault-recover-fresh");
+        assert!(recover(fresh.path(), repo.uid(), &sealed, b"wrong").is_err());
+        let recovered = recover(fresh.path(), repo.uid(), &sealed, b"pass").expect("recover");
+        assert_eq!(recovered.vault.key().id(), vault.key().id());
+        assert_eq!(recovered.root.map(|root| root.id()), Some(root.id()));
+        assert!(recover(fresh.path(), repo.uid(), &sealed, b"pass").is_err(), "a vault's here already");
+        let mut other = Catalog::open_repo(fresh.path()).expect("open");
+        for cid in std::iter::once(manifest.clone()).chain(kept) {
+            let data = repo.get_block(&cid).expect("get").expect("block");
+            other.put_block(&data, CidVersion::V1).expect("put");
+            for link in crate::links::links(cid.codec(), data.data()).unwrap_or_default() {
+                if let Some(block) = repo.get_block(&link).expect("get") {
+                    other.put_block(&block, CidVersion::V1).expect("put");
+                }
+            }
+        }
+        assert_eq!(restore(&mut other, fresh.path(), &manifest).expect("restore").0, plain);
+    }
+
+    #[test]
+    fn proofs_of_a_token_are_for_one_block_one_asker_and_a_few_minutes() {
+        let scratch = Scratch::new("vault-bat");
+        let vault = Vault::open(scratch.path(), 1000).expect("vault");
+        let block = raw(b"shared");
+        let plain = AnyCid::V1(block.cid().clone());
+        let sealed = vault.seal(&plain, block.data()).expect("seal");
+        let cid = AnyCid::V1(sealed.cid().clone());
+        let bat = bat(sealed.data()).expect("bat");
+        let proof = prove(&bat, &cid, b"asker", 1000);
+        assert!(check(sealed.data(), &cid, b"asker", 1000, &proof, 1100));
+        assert!(!check(sealed.data(), &cid, b"another", 1000, &proof, 1100));
+        assert!(!check(sealed.data(), &cid, b"asker", 1000, &proof, 1000 + PROOF_LIFE + 1));
+        assert!(!check(sealed.data(), &plain, b"asker", 1000, &proof, 1100));
+        assert!(!check(sealed.data(), &cid, b"asker", 1000, &prove(&[0; 32], &cid, b"asker", 1000), 1100));
+        assert!(!check(block.data(), &cid, b"asker", 1000, &proof, 1100), "no token, no proof");
+        // A manifest has one too
+        let manifest = vault.manifest(&[(plain, cid)], &[], None).expect("manifest");
+        assert!(super::bat(manifest.data()).is_some());
     }
 
     fn list_of(repo: &mut Catalog, scratch: &Scratch) -> Vec<(Link, Link)> {

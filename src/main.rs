@@ -522,6 +522,19 @@ fn protect(dir: &Path, command: ProtectCommand) -> anyhow::Result<()> {
         ProtectCommand::Add { cid } => {
             let mut repo = Catalog::open_repo(dir)?;
             out!("{}", vault::protect(&mut repo, dir, &cid)?);
+            // The vault, sealed with the user's passphrase, goes where it does,
+            // so the passphrase alone recovers it
+            if !vault::is_sealed(&mut repo, dir)? {
+                let passphrase = if repo.user()?.is_some() {
+                    let passphrase = passphrase(false)?;
+                    repo.root(passphrase.as_bytes()).context("the vault is sealed with the user's passphrase")?;
+                    passphrase
+                } else {
+                    passphrase(true)?
+                };
+                vault::seal(&mut repo, dir, passphrase.as_bytes(), holokeep::keys::Cost::RECOMMENDED)?;
+                eprintln!("sealed the vault with the passphrase: friends holding it hold what it takes to recover it");
+            }
         },
         ProtectCommand::Ls => {
             let mut repo = Catalog::open_repo(dir)?;
@@ -789,10 +802,46 @@ fn invite(place: &holokeep::net::mesh::Place, peer: &str, device: Option<&str>, 
     let user = root.id();
     let blocks = user_blocks(&repo)?;
     daemon::ask(place, "reload")?;
-    out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: Some((user, blocks)), protected: false }.encode());
+    out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: Some((user, blocks)), protected: false, sealed: Vec::new(), held: Vec::new() }.encode());
     if listening.is_empty() {
         eprintln!("note: this node isn't running, so the ticket says nowhere to find it; it'll be found on the LAN, or start `hk node run` and invite again");
     }
+    Ok(())
+}
+
+/// Recover this account's vault from what a friend holding it kept sealed,
+/// with the passphrase, and its user's root key with it: this repo's user
+/// again, certifying this node, and kept sealed here again too.
+#[cfg(feature = "net")]
+fn recover(dir: &Path, me: u32, sealed: &[Vec<u8>]) -> anyhow::Result<()> {
+    eprintln!("the friend holds your vault, sealed: recovering it");
+    let passphrase = passphrase(false)?;
+    let recovered = holokeep::vault::recover(dir, me, sealed, passphrase.as_bytes())?;
+    eprintln!("recovered vault {}", holokeep::keys::peer_id(&recovered.vault.key().id()));
+    let Some(root) = recovered.root else {
+        return Ok(());
+    };
+    let mut repo = Catalog::open_repo(dir)?;
+    if repo.user()?.is_some() {
+        return Ok(());
+    }
+    let device = repo.signer().context("no key to sign with")?.id();
+    repo.batch(|repo| {
+        repo.set_user(&root.id())?;
+        repo.certify(&root, &device)?;
+        for data in sealed {
+            if holokeep::keys::Sealed::parse(data).is_some_and(|sealed| sealed.what().is_none() && *sealed.key() == root.id()) {
+                let block = holokeep::block::Block::hash(
+                    holokeep::cid::Cidv1Spec::new(holokeep::cid::DAG_CBOR_CODEC, holokeep::multihash::MultihashFunc::Sha2_256),
+                    data.clone().into(),
+                );
+                repo.put_block(&block, holokeep::cid::CidVersion::V1)?;
+                repo.keep(&holokeep::cid::AnyCid::V1(block.cid().clone()))?;
+            }
+        }
+        anyhow::Ok(())
+    })?;
+    eprintln!("recovered user {}, which certifies this node", holokeep::keys::peer_id(&root.id()));
     Ok(())
 }
 
@@ -818,13 +867,26 @@ fn invite_friend(place: &holokeep::net::mesh::Place, peer: &str, vault: &str, qu
         repo.claims().context("this repo keeps no claims")?.set_user(next, &vault)?;
     }
     anyhow::ensure!(members.protected()?.is_some(), "mesh {} isn't protected", place.mesh);
+    // What the vault keeps here already, for a machine of theirs that's
+    // lost everything else to recover from
+    let (mut sealed, mut held) = (Vec::new(), Vec::new());
+    let uid = members.account()?.context("a protected mesh with no account")?;
+    let mut repo = Catalog::open_repo(dir)?;
+    repo.act_for(uid, holokeep::keys::account_key(dir, uid)?)?;
+    for cid in repo.claims().context("this repo keeps no claims")?.keeps()? {
+        match repo.get_block(&cid)? {
+            Some(block) if holokeep::keys::Sealed::parse(block.data()).is_some() => sealed.push(block.data().to_vec()),
+            _ => held.push(cid),
+        }
+    }
+    drop(repo);
     let swarm_key = mesh::ensure_swarm_key(&place.dir())?;
     members.add(&peer)?;
     let mut list = members.list()?;
     let listening = daemon::ask(place, "listeners")?.unwrap_or_default();
     list.insert(me, listening.iter().filter_map(|addr| addr.parse().ok()).collect());
     daemon::ask(place, "reload")?;
-    out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: None, protected: true }.encode());
+    out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: None, protected: true, sealed, held }.encode());
     Ok(())
 }
 
@@ -905,6 +967,10 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
             let account = if ticket.protected {
                 anyhow::ensure!(!place.is_main() && account.is_none(), "a protected mesh holds your vault: join it with a --mesh of its own");
                 let me = rustix::process::getuid().as_raw();
+                let uid = holokeep::vault::vault_of(me);
+                if !ticket.sealed.is_empty() && !dir.join("accounts").join(format!("{uid}.key")).exists() {
+                    recover(dir, me, &ticket.sealed)?;
+                }
                 Some(holokeep::vault::Vault::open(dir, me)?.uid())
             } else {
                 account
@@ -922,6 +988,12 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
             daemon::ask(place, "reload")?;
             let mesh = if place.is_main() { String::new() } else { format!(" --mesh {}", place.mesh) };
             eprintln!("joined the mesh of {}; `hk node run{mesh}` to connect", ticket.inviter);
+            if !ticket.held.is_empty() {
+                eprintln!("it holds {} of your vault's manifests; once it's running, restore each with `hk protect restore`:", ticket.held.len());
+                for cid in &ticket.held {
+                    out!("{cid}");
+                }
+            }
         },
         NodeCommand::Run { listen, copies, low_water, high_water, no_collect, shared } => {
             let listen = listen.as_deref().unwrap_or_else(|| if place.is_main() { daemon::LISTEN } else { "/ip4/0.0.0.0/tcp/0" });
