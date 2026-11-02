@@ -76,7 +76,8 @@ pub fn answer(catalog: &Catalog, want: &Want) -> Blocks {
             answer.missing.push(key.clone());
             continue;
         };
-        let Ok(Some(data)) = catalog.get(multihash.as_ref()) else {
+        // Another account's is as good as not here
+        let Ok(Some(data)) = catalog.visible(multihash.as_ref()).and_then(|visible| visible.then(|| catalog.get(multihash.as_ref())).transpose().map(Option::flatten)) else {
             answer.missing.push(key.clone());
             continue;
         };

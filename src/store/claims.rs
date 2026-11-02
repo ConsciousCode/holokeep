@@ -80,6 +80,9 @@ pub(super) const LIVE: &str = live!("(acting_user() IS NULL OR u.key = (SELECT i
 /// respect, whoever's acting.
 pub(super) const LIVE_ANY: &str = live!("1");
 
+/// Whether the claims row `c` counts for any user but the acting one.
+pub(super) const LIVE_OTHERS: &str = live!("u.key IS NOT (SELECT id FROM multihashes WHERE multihash = acting_user())");
+
 /// The keys each user has authorized: itself, and devices it has
 /// certified and not revoked.
 const AUTHORIZE: &str = "

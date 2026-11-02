@@ -374,7 +374,7 @@ pub fn answer_advert(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, ad
         let Ok(multihash) = decode(key) else {
             continue;
         };
-        if multihash.code() == IDENTITY || !catalog.has(multihash.as_ref())? {
+        if multihash.code() == IDENTITY || !catalog.has(multihash.as_ref())? || !catalog.visible(multihash.as_ref())? {
             continue;
         }
         for replica in theirs {

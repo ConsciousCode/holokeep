@@ -767,3 +767,17 @@ async fn files_imported_in_place_which_change_are_let_go_of_and_said_so() {
     assert!(!has(&a, &leaf));
     assert!(until(&mut [&mut a, &mut b], |n| n[1].sightings().of(leaf.cid().multihash()).expect("of").is_empty()).await, "b's told");
 }
+
+#[tokio::test]
+async fn another_accounts_blocks_arent_this_meshs() {
+    let (mut a, mut b, _) = Box::pin(holding()).await;
+    let theirs = raw(b"another account's");
+    let me = a.catalog().uid();
+    a.catalog_mut().act_for(me.wrapping_add(1), crate::keys::Key::generate().expect("key")).expect("act");
+    a.catalog().put_block(&theirs, CidVersion::V1).expect("put");
+    a.catalog_mut().act_for(me, crate::keys::Key::generate().expect("key")).expect("act");
+    assert_eq!(fetch(&mut a, &mut b, link(&theirs)).await, (0, vec![link(&theirs)]));
+    // Once this account puts it here too, it's in its repo, and its mesh's
+    a.catalog().put_block(&theirs, CidVersion::V1).expect("put");
+    assert_eq!(fetch(&mut a, &mut b, link(&theirs)).await, (1, vec![]));
+}

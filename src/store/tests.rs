@@ -2033,3 +2033,45 @@ fn what_another_account_says_isnt_for_this_ones_mesh() {
     repo.act_for(me.wrapping_add(1), other).expect("act");
     assert!(repo.withheld(&mine).expect("withheld") && !repo.withheld(&theirs).expect("withheld"));
 }
+
+#[test]
+fn an_account_sees_only_the_blocks_in_its_repo() {
+    let scratch = Scratch::new("visible");
+    let mut repo = Catalog::open_repo(scratch.path()).expect("open");
+    let (mine, theirs, both) = (raw(b"mine"), raw(b"theirs"), raw(b"both"));
+    let owner = repo.signer().expect("signer").clone();
+    let me = repo.uid();
+    let bob = me.wrapping_add(1);
+    let bobs = crate::keys::Key::generate().expect("key");
+    let visible = |repo: &Catalog, block: &Block| repo.visible(block.cid().multihash()).expect("visible");
+    let others = |repo: &Catalog, block: &Block| repo.visible_to_others(block.cid().multihash()).expect("others");
+
+    repo.put_block(&mine, CidVersion::V1).expect("put");
+    repo.put_block(&both, CidVersion::V1).expect("put");
+    repo.keep(&link(&both)).expect("keep");
+    repo.act_for(bob, bobs.clone()).expect("act");
+    repo.put_block(&theirs, CidVersion::V1).expect("put");
+    assert!(visible(&repo, &theirs) && !visible(&repo, &mine) && !visible(&repo, &both));
+    assert!(others(&repo, &mine) && others(&repo, &both) && !others(&repo, &theirs));
+
+    repo.act_for(me, owner.clone()).expect("act");
+    assert!(visible(&repo, &mine) && visible(&repo, &both) && !visible(&repo, &theirs));
+    assert!(others(&repo, &theirs) && !others(&repo, &mine));
+
+    // Past the grace period, only what a keep of one's own reaches
+    repo.db.conn().execute("UPDATE holdings SET since = 0", []).expect("age");
+    assert!(!visible(&repo, &mine) && visible(&repo, &both));
+    repo.act_for(bob, bobs.clone()).expect("act");
+    assert!(!visible(&repo, &theirs));
+    repo.keep(&link(&theirs)).expect("keep");
+    assert!(visible(&repo, &theirs) && !visible(&repo, &both));
+    assert!(!visible(&repo, &raw(b"never put")));
+    // Its signature of the keep is its own, and not another's; the keep,
+    // dissolved, is its own CID, which hides nothing
+    let signs = repo.claims().expect("claims").signs_by(&bobs.id()).expect("signs");
+    let sign = &signs.last().expect("sign").sign;
+    repo.db.conn().execute("UPDATE holdings SET since = 0", []).expect("age");
+    assert!(repo.visible(sign.multihash()).expect("visible"));
+    repo.act_for(me, owner).expect("act");
+    assert!(!repo.visible(sign.multihash()).expect("visible"));
+}

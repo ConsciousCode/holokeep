@@ -289,7 +289,7 @@ pub fn answer(catalog: &Catalog, condemn: &Condemn) -> Result<Verdict> {
     let mut kept = Vec::new();
     for key in &condemn.blocks {
         if let Some(multihash) = decode(key)
-            && catalog.kept_under(multihash.as_ref())?
+            && catalog.kept_for_acting(multihash.as_ref())?
         {
             kept.push(key.clone());
         }

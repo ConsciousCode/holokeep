@@ -397,6 +397,13 @@ fn fetch_first(repo: Option<&PathBuf>, cid: &Link) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Refuse a block another of the host's accounts has here, but this one
+/// doesn't: it's as good as not here.
+fn in_repo(repo: &Catalog, cid: &Link) -> anyhow::Result<()> {
+    anyhow::ensure!(repo.visible(cid.multihash())?, "block {cid} not found");
+    Ok(())
+}
+
 /// Whether the repo is another of the host's users', so this one's to ask
 /// its running node to act for it, rather than open it.
 fn foreign(dir: &Path) -> bool {
@@ -534,6 +541,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Cat { cid } => {
             fetch_first(args.repo.as_ref(), &cid)?;
             let repo = open_repo(args.repo)?;
+            in_repo(&repo, &cid)?;
             let mut out = io::BufWriter::new(io::stdout().lock());
             export::cat(&repo, &cid, &mut out)?;
             Ok(out.flush()?)
@@ -541,6 +549,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Get { cid, output } => {
             fetch_first(args.repo.as_ref(), &cid)?;
             let repo = open_repo(args.repo)?;
+            in_repo(&repo, &cid)?;
             let dest = output.unwrap_or_else(|| PathBuf::from(cid.to_string()));
             export::get(&repo, &cid, &dest).with_context(|| format!("writing {}", dest.display()))
         },
@@ -553,6 +562,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Anchor(command) => anchor(args.repo.as_ref(), open_repo(args.repo.clone())?, command),
         Command::Block(BlockCommand::Get { cid }) => {
             let repo = open_repo(args.repo)?;
+            in_repo(&repo, &cid)?;
             let block = repo.get_block(&cid)?.with_context(|| format!("block {cid} not found"))?;
             Ok(io::stdout().lock().write_all(block.data())?)
         },

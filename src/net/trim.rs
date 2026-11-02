@@ -162,7 +162,13 @@ impl Trim {
         let mut trim = Self { copies, candidates: BTreeMap::new(), awaiting: HashSet::new(), report: Report::default() };
         for key in keys {
             let bytes = key.to_bytes();
-            if trim.candidates.contains_key(&bytes) || !catalog.can_drop(key.as_ref())? {
+            // Spare to this mesh is only spare here if no other account has
+            // it
+            if trim.candidates.contains_key(&bytes)
+                || !catalog.can_drop(key.as_ref())?
+                || !catalog.visible(key.as_ref())?
+                || catalog.visible_to_others(key.as_ref())?
+            {
                 continue;
             }
             let staying: Vec<Replica> = catalog.replicas(key.as_ref())?.into_iter().filter(|replica| !own.contains(&replica.label)).collect();
@@ -253,7 +259,7 @@ pub fn answer(catalog: &Catalog, me: &PeerId, peer: &PeerId, intent: &Intent, tr
         let Ok(multihash) = <Multihash>::decode(key) else {
             continue;
         };
-        if !catalog.has(multihash.as_ref())? {
+        if !catalog.has(multihash.as_ref())? || !catalog.visible(multihash.as_ref())? {
             continue;
         }
         let mine = trims.iter().any(|trim| trim.means(key));

@@ -671,6 +671,8 @@ impl Node {
     fn audit_of_keys(&mut self, copies: usize, mut keys: Vec<Multihash>) -> Result<AuditId> {
         // What's to be collected isn't worth more copies
         keys.retain(|key| !self.condemned.is_condemned(key.as_ref()).unwrap_or(false));
+        // Nor is another account's this mesh's to copy
+        keys.retain(|key| self.catalog.visible(key.as_ref()).unwrap_or(false));
         let id = self.next_audit;
         self.next_audit = id.wrapping_add(1);
         let mut peers = self.connected();

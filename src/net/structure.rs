@@ -65,7 +65,7 @@ pub fn notices(catalog: &Catalog, structure: &[Link]) -> Result<Vec<Notice>> {
     let mut notices = Vec::new();
     let mut notice = Notice::default();
     for cid in structure {
-        if catalog.withheld(cid)? {
+        if !catalog.visible(cid.multihash())? {
             continue;
         }
         let Ok(Some(block)) = catalog.get_block(cid) else {
@@ -106,7 +106,7 @@ pub fn backrefs<'a>(catalog: &Catalog, keys: impl IntoIterator<Item = &'a [u8]>)
                 }
                 if let Some(cid) = catalog.cid_of(source.as_ref())?
                     && catalog.holds(&cid)?
-                    && !catalog.withheld(&cid)?
+                    && catalog.visible(cid.multihash())?
                 {
                     if is_claim(catalog, &cid)? {
                         claims.push(Multihash::<Vec<u8>>::decode(&cid.multihash().to_bytes()).map_err(|e| super::mesh::Error::Invalid(format!("{e:?}")))?);

@@ -492,6 +492,15 @@ fn forks(signs: &[claims::Signed]) -> Vec<Option<Link>> {
     followers.into_values().filter(|(_, n)| *n > 1).map(|(prev, _)| prev).collect()
 }
 
+/// How long a block an account put here stays in its repo with nothing
+/// of its keeping it: collecting's grace period.
+pub const HOLDING: std::time::Duration = std::time::Duration::from_hours(24 * 7);
+
+/// The time from which a block put here is still in its putter's repo.
+fn held_since() -> i64 {
+    i64::try_from(now().saturating_sub(HOLDING.as_secs())).unwrap_or(i64::MAX)
+}
+
 /// Seconds since the epoch.
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs())
@@ -885,6 +894,27 @@ impl Catalog {
              CREATE INDEX IF NOT EXISTS refs_target ON refs (target);",
         )?;
         db.conn().execute_batch(volume::BLOCK_CIDS)?;
+        let fresh = !db.conn().prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'holdings'")?.exists([])?;
+        db.conn().execute_batch(
+            "-- Which of the host's accounts put each block here, by uid, and
+             -- when last: added, fetched, or had from its mesh. A block is in
+             -- an account's repo while it put it here within the grace
+             -- period, or a keep that counts for its user reaches it.
+             CREATE TABLE IF NOT EXISTS holdings (
+                 uid INTEGER NOT NULL,
+                 block INTEGER NOT NULL REFERENCES multihashes (id) ON DELETE CASCADE,
+                 since INTEGER NOT NULL,
+                 PRIMARY KEY (uid, block)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS holdings_block ON holdings (block);",
+        )?;
+        // From before holdings: everything here is its owner's
+        if fresh {
+            db.conn().execute(
+                "INSERT OR IGNORE INTO holdings (uid, block, since) SELECT DISTINCT ?1, block, ?2 FROM blocks",
+                params![rustix::process::getuid().as_raw(), i64::try_from(now()).unwrap_or(i64::MAX)],
+            )?;
+        }
         Ok(())
     }
 
@@ -1511,6 +1541,14 @@ impl Catalog {
             }
         }
         let dropping = self.let_go(keys, Self::collectable)?;
+        // What's gone from here is no one's
+        let mut forget = self.db.conn().prepare_cached(
+            "DELETE FROM holdings WHERE block = (SELECT id FROM multihashes WHERE multihash = ?1)
+                 AND block NOT IN (SELECT block FROM blocks)",
+        )?;
+        for key in keys {
+            forget.execute([key.to_bytes()])?;
+        }
         Ok((dropping, children.into_values().collect()))
     }
 
@@ -1884,11 +1922,21 @@ impl Catalog {
         self.put_claim(&claim)
     }
 
-    /// Whether a keep that counts reaches a block, by its backrefs: the
-    /// block, or anything linking to it however indirectly, is a keep's
-    /// target; an anchor links to what it is now. Without claims to keep,
-    /// everything is kept.
+    /// Whether a keep that counts for anyone reaches a block, by its
+    /// backrefs: the block, or anything linking to it however indirectly,
+    /// is a keep's target; an anchor links to what it is now. Without
+    /// claims to keep, everything is kept.
     pub fn kept_under(&self, key: Key<'_>) -> Result<bool> {
+        self.kept_under_by(key, claims::LIVE_ANY, "anchor_values_any")
+    }
+
+    /// Whether a keep that counts for the acting account's user reaches a
+    /// block: whether its mesh keeps it, as far as this node can say.
+    pub fn kept_for_acting(&self, key: Key<'_>) -> Result<bool> {
+        self.kept_under_by(key, claims::LIVE, "anchor_values")
+    }
+
+    fn kept_under_by(&self, key: Key<'_>, live: &str, anchors: &str) -> Result<bool> {
         if self.claims.is_none() {
             return Ok(true);
         }
@@ -1897,15 +1945,55 @@ impl Catalog {
                 "WITH RECURSIVE up (id) AS (
                      SELECT id FROM multihashes WHERE multihash = ?1
                      UNION SELECT l.source FROM links l JOIN up ON l.target = up.id
-                     UNION SELECT a.anchor FROM anchor_values_any a JOIN up ON a.value = up.id
+                     UNION SELECT a.anchor FROM {anchors} a JOIN up ON a.value = up.id
                  )
                  SELECT 1 FROM up
                  JOIN claim_targets t ON t.target = up.id
                  JOIN claims c ON c.id = t.claim
-                 WHERE c.kind = 'keep' AND {} LIMIT 1",
-                claims::LIVE_ANY,
+                 WHERE c.kind = 'keep' AND {live} LIMIT 1"
             ))?
             .exists([key.to_bytes()])?)
+    }
+
+    /// Whether a block is in the repo of the account this acts for: it
+    /// put it here within the grace period, a keep that counts for its
+    /// user reaches it, or it's a claim no other account alone signed.
+    /// Anything else here is another account's, which this one can't
+    /// read, serve or hear of. Without claims, everything is anyone's.
+    pub fn visible(&self, key: Key<'_>) -> Result<bool> {
+        if key.code() == IDENTITY || self.claims.is_none() {
+            return Ok(true);
+        }
+        let held = self.db.conn()
+            .prepare_cached(
+                "SELECT 1 FROM holdings h JOIN multihashes m ON m.id = h.block
+                 WHERE m.multihash = ?1 AND h.uid = ?2 AND h.since >= ?3",
+            )?
+            .exists(params![key.to_bytes(), self.uid, held_since()])?;
+        if held || self.kept_for_acting(key)? {
+            return Ok(true);
+        }
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        Ok(claims.has(key)? && !claims.withheld(key, self.uid)?)
+    }
+
+    /// Whether a block is in any other account's repo: put here by it
+    /// within the grace period, or reached by a keep that counts for
+    /// another user. Copies the acting account's mesh can spare are only
+    /// spare here if it isn't.
+    pub fn visible_to_others(&self, key: Key<'_>) -> Result<bool> {
+        let others = self.db.conn().prepare_cached("SELECT 1 FROM holdings WHERE uid != ?1 LIMIT 1")?.exists([self.uid])?
+            || self.db.conn().prepare_cached("SELECT 1 FROM accounts WHERE uid != ?1 LIMIT 1").and_then(|mut stmt| stmt.exists([self.uid])).unwrap_or(false);
+        if self.claims.is_none() || !others {
+            return Ok(false);
+        }
+        let held = self.db.conn()
+            .prepare_cached(
+                "SELECT 1 FROM holdings h JOIN multihashes m ON m.id = h.block
+                 WHERE m.multihash = ?1 AND h.uid != ?2 AND h.since >= ?3",
+            )?
+            .exists(params![key.to_bytes(), self.uid, held_since()])?;
+        Ok(held || self.kept_under_by(key, claims::LIVE_OTHERS, "anchor_values_any")?)
     }
 
     /// What isn't here of the DAG under a root: each block linked to,
@@ -2153,6 +2241,12 @@ impl Catalog {
             if new_cid && self.named(&placed)?.refs().is_none() {
                 self.index_links(id, block.cid().codec(), block.data())?;
             }
+            self.db.conn()
+                .prepare_cached(
+                    "INSERT INTO holdings (uid, block, since) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (uid, block) DO UPDATE SET since = excluded.since",
+                )?
+                .execute(params![self.uid, id, i64::try_from(now()).unwrap_or(i64::MAX)])?;
             Ok(placed.1)
         })
     }
