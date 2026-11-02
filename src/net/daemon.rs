@@ -343,10 +343,18 @@ fn ask_within(place: &Place, command: &str, time: Option<Duration>) -> Result<Op
 }
 
 /// The node for a mesh, acting for the account it's for.
-fn open_node(place: &Place) -> Result<Node> {
+/// Open the node of a place, and say whether it's alone: a repo in no
+/// mesh yet still runs its main node, for what it does on its own, such
+/// as watching files imported in place, with a swarm key of its own no
+/// one has, kept nowhere, so it isn't in a mesh by running.
+fn open_node(place: &Place) -> Result<(Node, bool)> {
     let dir = place.repo.as_path();
     let key = mesh::node_key(dir)?;
-    let swarm_key = mesh::swarm_key(&place.dir())?.ok_or_else(|| Error::Invalid("this node isn't in that mesh: invite another, or join one".into()))?;
+    let (swarm_key, alone) = match mesh::swarm_key(&place.dir())? {
+        Some(swarm_key) => (swarm_key, false),
+        None if place.is_main() => (mesh::fresh_swarm_key()?, true),
+        None => return Err(Error::Invalid("this node isn't in that mesh: invite another, or join one".into())),
+    };
     let mut catalog = crate::store::Catalog::open_repo(dir)?;
     let members = members(place)?;
     // A mesh for another of the host's accounts holds and hears of its repo
@@ -357,7 +365,19 @@ fn open_node(place: &Place) -> Result<Node> {
     if let Some(quota) = members.protected()? {
         catalog.set_quota(quota);
     }
-    Node::tcp(&key, swarm_key, catalog, members)
+    Ok((Node::tcp(&key, swarm_key, catalog, members)?, alone))
+}
+
+/// Listen and connect to members, and say so, unless alone.
+fn start(node: &mut Node, place: &Place, listen: Multiaddr, alone: bool) -> Result<()> {
+    if alone {
+        eprintln!("node {} in no mesh yet, alone: watching files imported in place, and collecting what nothing keeps", node.peer_id());
+        return Ok(());
+    }
+    node.listen(listen)?;
+    node.dial_members()?;
+    eprintln!("node {} in mesh {}", node.peer_id(), place.mesh);
+    Ok(())
 }
 
 /// Run the node until interrupted, auditing as a trickle that it would
@@ -367,10 +387,9 @@ fn open_node(place: &Place) -> Result<Node> {
 /// the node lets go of copies the mesh can spare until it's above the
 /// high. If `collecting`, garbage is collected too, a sample at a time.
 pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (u64, u64), collecting: bool, shared: bool) -> Result<()> {
-    let mut node = open_node(place)?;
+    let (mut node, alone) = open_node(place)?;
     node.set_watermarks(low, high);
-    node.listen(listen)?;
-    node.dial_members()?;
+    start(&mut node, place, listen, alone)?;
     let path = socket(place);
     // A socket nothing answers on is left from a daemon that died
     if path.exists() {
@@ -384,7 +403,6 @@ pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
     }
-    eprintln!("node {} in mesh {}", node.peer_id(), place.mesh);
     let mut redial = tokio::time::interval(REDIAL);
     let later = |delay| tokio::time::Instant::now().checked_add(delay).unwrap_or_else(tokio::time::Instant::now);
     let mut trickle = later(SETTLE);
@@ -415,7 +433,7 @@ pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (
                 let Ok((stream, _)) = accepted else {
                     continue;
                 };
-                match answer(&mut node, place, stream, copies, collecting).await {
+                match answer(&mut node, place, stream, copies, collecting, alone).await {
                     Ok(Some((waiter, write))) => waiting.wait(waiter, write),
                     Ok(None) => {},
                     Err(e) => eprintln!("control: {e}"),
@@ -587,9 +605,42 @@ fn as_account(node: &mut Node, dir: &Path, uid: u32, command: &str) -> Result<Ve
     Ok(lines)
 }
 
+/// What `status` says of a node.
+fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<String> {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "peer\t{}", node.peer_id());
+    if alone {
+        let _ = writeln!(out, "mesh\tnone yet, alone");
+    }
+    let _ = writeln!(out, "connected\t{}", node.connected().len());
+    let _ = writeln!(out, "blocks\t{}", node.catalog().block_count()?);
+    let _ = writeln!(out, "copies\t{copies}");
+    let _ = writeln!(out, "trickle\t{:.1}s", node.trickle_interval().as_secs_f64());
+    let free = node.catalog().offer()?.free;
+    let _ = writeln!(out, "free\t{}", free.map_or_else(|| "unknown".to_owned(), |free| format!("{} MiB", free >> 20)));
+    let marks = node.watermarks();
+    let _ = writeln!(out, "watermarks\t{} MiB to {} MiB", marks.low >> 20, marks.high >> 20);
+    let _ = writeln!(out, "pressed\t{}", if marks.pressed() { "yes" } else { "no" });
+    let _ = writeln!(out, "collecting\t{}", if collecting { "yes" } else { "no" });
+    let _ = writeln!(out, "condemned\t{}", node.condemned().count()?);
+    let _ = writeln!(out, "account\t{}", node.catalog().uid());
+    let keeps = node.catalog().claims().map(crate::store::ClaimStore::keeps).transpose()?.map_or(0, |keeps| keeps.len());
+    let _ = writeln!(out, "keeps\t{keeps}");
+    match node.catalog().quota_left()? {
+        Some((quota, left)) => {
+            let _ = writeln!(out, "used\t{} of {} bytes", quota.saturating_sub(left), quota);
+        },
+        None => {
+            let _ = writeln!(out, "used\t{} bytes", node.catalog().used()?);
+        },
+    }
+    Ok(out)
+}
+
 /// Answer one command on the control socket, or say which fetch it waits
 /// on, to be answered when that finishes.
-async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, copies: usize, collecting: bool) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
+async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, copies: usize, collecting: bool, alone: bool) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
     let uid = stream.peer_cred()?.uid();
     let me = rustix::process::getuid().as_raw();
     let (read, mut write) = stream.into_split();
@@ -618,39 +669,21 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
                 let _ = writeln!(out, "{peer}\t{state}\t{}", addrs.join(" "));
             }
         },
-        "status" => {
-            let _ = writeln!(out, "peer\t{}", node.peer_id());
-            let _ = writeln!(out, "connected\t{}", node.connected().len());
-            let _ = writeln!(out, "blocks\t{}", node.catalog().block_count()?);
-            let _ = writeln!(out, "copies\t{copies}");
-            let _ = writeln!(out, "trickle\t{:.1}s", node.trickle_interval().as_secs_f64());
-            let free = node.catalog().offer()?.free;
-            let _ = writeln!(out, "free\t{}", free.map_or_else(|| "unknown".to_owned(), |free| format!("{} MiB", free >> 20)));
-            let marks = node.watermarks();
-            let _ = writeln!(out, "watermarks\t{} MiB to {} MiB", marks.low >> 20, marks.high >> 20);
-            let _ = writeln!(out, "pressed\t{}", if marks.pressed() { "yes" } else { "no" });
-            let _ = writeln!(out, "collecting\t{}", if collecting { "yes" } else { "no" });
-            let _ = writeln!(out, "condemned\t{}", node.condemned().count()?);
-            let _ = writeln!(out, "account\t{}", node.catalog().uid());
-            let keeps = node.catalog().claims().map(crate::store::ClaimStore::keeps).transpose()?.map_or(0, |keeps| keeps.len());
-            let _ = writeln!(out, "keeps\t{keeps}");
-            match node.catalog().quota_left()? {
-                Some((quota, left)) => {
-                    let _ = writeln!(out, "used\t{} of {} bytes", quota.saturating_sub(left), quota);
-                },
-                None => {
-                    let _ = writeln!(out, "used\t{} bytes", node.catalog().used()?);
-                },
-            }
-        },
+        "status" => out.push_str(&status(node, copies, collecting, alone)?),
         "listeners" => {
             for addr in node.listeners() {
                 let _ = writeln!(out, "{addr}");
             }
         },
         "reload" => {
-            node.reload()?;
-            node.dial_members()?;
+            // Alone, it has a swarm key no member has, so it's restarted
+            // to join a mesh
+            if alone {
+                let _ = writeln!(out, "alone");
+            } else {
+                node.reload()?;
+                node.dial_members()?;
+            }
         },
         command if command.starts_with("fetch-blocks ") => {
             let cids: std::result::Result<Vec<crate::model::Link>, _> = command.trim_start_matches("fetch-blocks ").split_whitespace().map(str::parse).collect();

@@ -713,6 +713,17 @@ fn run(args: Args) -> anyhow::Result<()> {
     }
 }
 
+/// Have a running node take up changes to its mesh, saying if it has to
+/// be restarted to, having been running alone, and returning whether.
+#[cfg(feature = "net")]
+fn reload(place: &holokeep::net::mesh::Place) -> anyhow::Result<bool> {
+    let alone = holokeep::net::daemon::ask(place, "reload")?.is_some_and(|lines| lines.iter().any(|line| line == "alone"));
+    if alone {
+        eprintln!("note: the running node was in no mesh, so restart `hk node run` for it to connect");
+    }
+    Ok(alone)
+}
+
 /// Mount the soup at `dir`, as this repo's owner sees it, until
 /// interrupted.
 #[cfg(feature = "fuse")]
@@ -843,9 +854,11 @@ fn invite(place: &holokeep::net::mesh::Place, peer: &str, device: Option<&str>, 
     repo.batch(|repo| repo.certify(&root, &device))?;
     let user = root.id();
     let blocks = user_blocks(&repo)?;
-    daemon::ask(place, "reload")?;
+    let alone = reload(place)?;
     out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: Some((user, blocks)), protected: false, sealed: Vec::new(), held: Vec::new() }.encode());
-    if listening.is_empty() {
+    if alone {
+        eprintln!("note: so the ticket says nowhere to find it until it's restarted; it'll be found on the LAN, or invite again once it is");
+    } else if listening.is_empty() {
         eprintln!("note: this node isn't running, so the ticket says nowhere to find it; it'll be found on the LAN, or start `hk node run` and invite again");
     }
     Ok(())
@@ -934,7 +947,7 @@ fn invite_friend(place: &holokeep::net::mesh::Place, peer: &str, vault: &str, qu
     let mut list = members.list()?;
     let listening = daemon::ask(place, "listeners")?.unwrap_or_default();
     list.insert(me, listening.iter().filter_map(|addr| addr.parse().ok()).collect());
-    daemon::ask(place, "reload")?;
+    let _ = reload(place)?;
     out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: None, protected: true, sealed, held }.encode());
     Ok(())
 }
@@ -1034,7 +1047,7 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
             if let Some((user, blocks)) = &ticket.user {
                 join_user(dir, uid, user, blocks)?;
             }
-            daemon::ask(place, "reload")?;
+            let _ = reload(place)?;
             let mesh = if place.is_main() { String::new() } else { format!(" --mesh {}", place.mesh) };
             eprintln!("joined the mesh of {}; `hk node run{mesh}` to connect", ticket.inviter);
             if !ticket.held.is_empty() {
