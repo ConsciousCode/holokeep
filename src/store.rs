@@ -878,6 +878,20 @@ impl Catalog {
                  cid BLOB,
                  tsize INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (anchor, path)
+             ) WITHOUT ROWID;
+             -- Files of overlays being copied from what the anchor had as
+             -- they're read and written, rather than all at once: the block
+             -- each is from, how much of it's wanted, and which of its
+             -- chunks are filled, a bit each. A chunk's marked filled before
+             -- anything's written to it, so one that isn't is the anchor's
+             -- still.
+             CREATE TABLE IF NOT EXISTS overlay_partials (
+                 anchor BLOB NOT NULL,
+                 path BLOB NOT NULL,
+                 base BLOB NOT NULL,
+                 len INTEGER NOT NULL,
+                 filled BLOB NOT NULL,
+                 PRIMARY KEY (anchor, path)
              ) WITHOUT ROWID;",
         )?;
         let has_overlay: bool = catalog.db.conn().query_row(

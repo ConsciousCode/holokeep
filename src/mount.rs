@@ -44,7 +44,7 @@ use crate::store::Catalog;
 use crate::store::overlay;
 
 mod write;
-use write::{Committer, Handle};
+use write::{Committer, Filler, Handle};
 
 /// How long the kernel may take what it's told as still so.
 const TTL: Duration = Duration::from_secs(1);
@@ -172,7 +172,9 @@ pub struct Soup {
     /// Files open, by handle: those written to, or in a work directory.
     handles: Mutex<HashMap<u64, Handle>>,
     committer: Arc<Committer>,
-    fetcher: Option<Fetcher>,
+    fetcher: Option<Arc<Fetcher>>,
+    /// Files of overlays being copied as they're read and written.
+    filler: Arc<write::Filler>,
     inodes: Mutex<Inodes>,
     /// The sizes directories say raw blocks are, by CID, so a listing
     /// needn't fetch every file in it to say how big each is. Advisory,
@@ -216,6 +218,12 @@ impl Fetch for Source<'_> {
             fetcher(&missing);
         }
     }
+}
+
+/// Where a path of an anchor is in its work directory, under `work`.
+fn work_path(work: &Path, anchor: &Link, rel: &Path) -> PathBuf {
+    let dir = work.join(anchor.to_string());
+    if rel.as_os_str().is_empty() { dir } else { dir.join(rel) }
 }
 
 /// What's at a path of an anchor.
@@ -272,9 +280,12 @@ impl Soup {
     /// it, asking `fetcher` for what isn't here, if there's a node to ask.
     pub fn new(open: Opener, fetcher: Option<Fetcher>) -> Self {
         let open: Arc<dyn Fn() -> crate::store::Result<Catalog> + Send + Sync> = Arc::from(open);
+        let fetcher = fetcher.map(Arc::new);
+        let filler = Arc::new(Filler::new(None, fetcher.clone()));
         Self {
             id: SOUPS.fetch_add(1, Ordering::Relaxed),
-            committer: Arc::new(Committer::new(Arc::clone(&open))),
+            committer: Arc::new(Committer::new(Arc::clone(&open), Arc::clone(&filler))),
+            filler,
             open,
             work: None,
             handles: Mutex::new(HashMap::new()),
@@ -292,6 +303,8 @@ impl Soup {
     /// Anchors writable, their work directories under `work`.
     #[must_use]
     pub fn writable(mut self, work: PathBuf) -> Self {
+        self.filler = Arc::new(Filler::new(Some(work.clone()), self.fetcher.clone()));
+        self.committer = Arc::new(Committer::new(Arc::clone(&self.open), Arc::clone(&self.filler)));
         self.work = Some(work);
         self
     }
@@ -343,11 +356,11 @@ impl Soup {
             Inode::Node(cid) if cid.codec() == crate::cid::RAW_CODEC => {
                 let said = self.sizes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&cid.to_bytes()).copied();
                 said.map_or_else(
-                    || export::stat(&Source { catalog, fetcher: self.fetcher.as_ref() }, cid).map_err(|e| errno(&e)),
+                    || export::stat(&Source { catalog, fetcher: self.fetcher.as_deref() }, cid).map_err(|e| errno(&e)),
                     |size| Ok(Kind::File(size)),
                 )
             },
-            Inode::Node(cid) => export::stat(&Source { catalog, fetcher: self.fetcher.as_ref() }, cid).map_err(|e| errno(&e)),
+            Inode::Node(cid) => export::stat(&Source { catalog, fetcher: self.fetcher.as_deref() }, cid).map_err(|e| errno(&e)),
             Inode::Path(anchor, rel) => match self.at(catalog, anchor, rel)?.ok_or(Errno::ENOENT)? {
                 At::Work(meta) => work_kind(&self.work_path(anchor, rel).unwrap_or_default(), &meta),
                 At::Base(cid, size) => {
@@ -369,8 +382,7 @@ impl Soup {
     /// Where a path of an anchor is in its work directory, if anchors are
     /// writable.
     fn work_path(&self, anchor: &Link, rel: &Path) -> Option<PathBuf> {
-        let dir = self.work.as_ref()?.join(anchor.to_string());
-        Some(if rel.as_os_str().is_empty() { dir } else { dir.join(rel) })
+        Some(work_path(self.work.as_ref()?, anchor, rel))
     }
 
     /// What an anchor is now, if it's anything.
@@ -396,7 +408,7 @@ impl Soup {
     fn base_at(&self, catalog: &Catalog, anchor: &Link, rel: &Path) -> Result<overlay::Base, Errno> {
         let marks = catalog.overlay_marks(anchor).map_err(store_errno)?;
         let root = Self::anchor_root(catalog, anchor)?;
-        overlay::resolve(&Source { catalog, fetcher: self.fetcher.as_ref() }, root, rel, &marks).map_err(|e| errno(&e))
+        overlay::resolve(&Source { catalog, fetcher: self.fetcher.as_deref() }, root, rel, &marks).map_err(|e| errno(&e))
     }
 
     /// A directory of an anchor's entries: its work directory's over what
@@ -404,7 +416,7 @@ impl Soup {
     fn overlay_entries(&self, catalog: &Catalog, anchor: &Link, rel: &Path) -> Result<Vec<(Vec<u8>, Inode)>, Errno> {
         let marks = catalog.overlay_marks(anchor).map_err(store_errno)?;
         let root = Self::anchor_root(catalog, anchor)?;
-        let source = Source { catalog, fetcher: self.fetcher.as_ref() };
+        let source = Source { catalog, fetcher: self.fetcher.as_deref() };
         let mut names: BTreeSet<Vec<u8>> = BTreeSet::new();
         // Under a file in the work directory, the anchor's had nothing
         let shadowed = self.work_path(anchor, rel).is_some_and(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_dir()));
@@ -522,7 +534,7 @@ impl Soup {
                 Inode::Node(cid)
             },
             Inode::Node(dir) => {
-                let entries = export::list(&Source { catalog: &catalog, fetcher: self.fetcher.as_ref() }, &dir).map_err(|e| errno(&e))?;
+                let entries = export::list(&Source { catalog: &catalog, fetcher: self.fetcher.as_deref() }, &dir).map_err(|e| errno(&e))?;
                 self.note_sizes(&entries);
                 let entry = entries.into_iter().find(|entry| entry.name.as_slice() == name.as_bytes()).ok_or(Errno::ENOENT)?;
                 Inode::Node(entry.cid)
@@ -577,7 +589,7 @@ impl Soup {
                 with_kinds(found)?
             },
             Inode::Node(dir) => {
-                let entries = export::list(&Source { catalog: &catalog, fetcher: self.fetcher.as_ref() }, &dir).map_err(|e| errno(&e))?;
+                let entries = export::list(&Source { catalog: &catalog, fetcher: self.fetcher.as_deref() }, &dir).map_err(|e| errno(&e))?;
                 self.note_sizes(&entries);
                 with_kinds(entries.into_iter().map(|entry| (entry.name, Inode::Node(entry.cid))).collect())?
             },
@@ -611,7 +623,7 @@ impl Soup {
         match self.inode(ino)? {
             Inode::Node(cid) => {
                 let catalog = self.catalog()?;
-                export::read_at(&Source { catalog: &catalog, fetcher: self.fetcher.as_ref() }, &cid, offset, size).map_err(|e| errno(&e))
+                export::read_at(&Source { catalog: &catalog, fetcher: self.fetcher.as_deref() }, &cid, offset, size).map_err(|e| errno(&e))
             },
             Inode::Loose(name) => {
                 let file = std::fs::File::open(self.loose_path(&name).ok_or(Errno::ENOENT)?).map_err(|e| errno(&e))?;
@@ -622,10 +634,11 @@ impl Soup {
                 match self.at(&catalog, &anchor, &rel)?.ok_or(Errno::ENOENT)? {
                     At::Work(meta) if meta.is_dir() => Err(Errno::EISDIR),
                     At::Work(_) => {
+                        self.filler.fill(&catalog, &anchor, &rel, offset, size, None).map_err(|e| errno(&e))?;
                         let file = std::fs::File::open(self.work_path(&anchor, &rel).ok_or(Errno::ENOENT)?).map_err(|e| errno(&e))?;
                         read_file(&file, offset, size)
                     },
-                    At::Base(cid, _) => export::read_at(&Source { catalog: &catalog, fetcher: self.fetcher.as_ref() }, &cid, offset, size).map_err(|e| errno(&e)),
+                    At::Base(cid, _) => export::read_at(&Source { catalog: &catalog, fetcher: self.fetcher.as_deref() }, &cid, offset, size).map_err(|e| errno(&e)),
                 }
             },
             _ => Err(Errno::EISDIR),
@@ -1081,6 +1094,62 @@ mod tests {
         let by_cid = ino(&soup, &format!("cid/{root}/a")).expect("a");
         assert_eq!(soup.open(by_cid.ino.0, true, false).err(), Some(Errno::EROFS));
         assert_eq!(by_cid.perm, 0o444);
+    }
+
+    /// What of a file of an anchor is still to be copied, by chunk.
+    fn unfilled(repo: &Path) -> Vec<Vec<u64>> {
+        Catalog::open_repo(repo).expect("catalog").partials().expect("partials").iter()
+            .map(|partial| (0..partial.len.div_ceil(overlay::CHUNK)).filter(|&chunk| !partial.is_filled(chunk)).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_big_file_is_copied_as_its_read_and_written() {
+        let scratch = Scratch::new("mount-partial");
+        let (soup, anchor, repo) = writable(&scratch);
+        let mut big = vec![3u8; 3_000_000];
+        let file = ino(&soup, &format!("anchors/{anchor}/big")).expect("big").ino.0;
+        // Opened to write, nothing's copied, but it's as big as it was
+        let fh = soup.open(file, true, false).expect("open");
+        let work = repo.join("work").join(anchor.to_string()).join("big");
+        assert_eq!(std::fs::metadata(&work).expect("work").len(), 3_000_000);
+        assert_eq!(unfilled(&repo), [vec![0, 1, 2]]);
+        // A write fills the chunk it's in first, and only that
+        soup.write(fh, 1_500_000, b"middle").expect("write");
+        big[1_500_000..1_500_006].copy_from_slice(b"middle");
+        assert_eq!(unfilled(&repo), [vec![0, 2]]);
+        // A read fills what it reads
+        assert_eq!(soup.read_handle(fh, 2_999_990, 100).expect("handle").expect("read"), &big[2_999_990..]);
+        assert_eq!(unfilled(&repo), [vec![0]]);
+        // A write over a whole chunk needn't fetch it
+        let chunk = usize::try_from(overlay::CHUNK).expect("chunk");
+        soup.write(fh, 0, &vec![9u8; chunk]).expect("write");
+        big[..chunk].fill(9);
+        assert!(unfilled(&repo).is_empty(), "all filled, and forgotten");
+        soup.release(fh);
+        soup.commit();
+        let expected = expect_tree(&scratch, &[("a", b"first"), ("big", &big), ("dir/b", b"bee"), ("dir/deep/c", b"sea")]);
+        assert_eq!(value(&repo, &anchor), expected);
+    }
+
+    #[test]
+    fn whats_left_to_copy_is_copied_when_next_mounted() {
+        let scratch = Scratch::new("mount-partial-recover");
+        let (soup, anchor, repo) = writable(&scratch);
+        let file = ino(&soup, &format!("anchors/{anchor}/big")).expect("big").ino.0;
+        let fh = soup.open(file, true, false).expect("open");
+        soup.write(fh, 10, b"x").expect("write");
+        soup.release(fh);
+        // Gone before it committed, or copied the rest
+        drop(soup);
+        assert_eq!(unfilled(&repo), [vec![1, 2]]);
+        let opened = repo.clone();
+        let again = Soup::new(Box::new(move || Catalog::open_repo(&opened)), None).writable(repo.join("work"));
+        again.committer.recover();
+        assert!(unfilled(&repo).is_empty());
+        let mut big = vec![3u8; 3_000_000];
+        big[10] = b'x';
+        assert_eq!(value(&repo, &anchor), expect_tree(&scratch, &[("a", b"first"), ("big", &big), ("dir/b", b"bee"), ("dir/deep/c", b"sea")]));
     }
 
     #[test]

@@ -108,7 +108,91 @@ pub fn base_entries(src: &impl Fetch, root: Option<Link>, rel: &Path, marks: &Ma
     Ok(entries)
 }
 
+/// How much of a partial file's filled at once: a leaf's worth, as the
+/// importer chunks.
+pub const CHUNK: u64 = 1 << 20;
+const _: () = assert!(crate::import::CHUNK_SIZE == 1 << 20, "a partial file's chunks are the importer's");
+
+/// A file of an overlay being copied from what the anchor had as it's
+/// read and written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Partial {
+    pub anchor: Link,
+    pub path: PathBuf,
+    /// What it's copied from.
+    pub base: Link,
+    /// How much of that's wanted: past it, the file's what's written.
+    pub len: u64,
+    /// Which chunks are filled, a bit each.
+    pub filled: Vec<u8>,
+}
+
+impl Partial {
+    pub fn new(anchor: Link, path: PathBuf, base: Link, len: u64) -> Self {
+        let chunks = usize::try_from(len.div_ceil(CHUNK)).unwrap_or(usize::MAX);
+        Self { anchor, path, base, len, filled: vec![0; chunks.div_ceil(8)] }
+    }
+
+    const fn chunks(&self) -> u64 {
+        self.len.div_ceil(CHUNK)
+    }
+
+    pub fn is_filled(&self, chunk: u64) -> bool {
+        chunk >= self.chunks() || usize::try_from(chunk / 8).ok().and_then(|byte| self.filled.get(byte)).is_some_and(|byte| byte & (1 << (chunk % 8)) != 0)
+    }
+
+    pub fn fill(&mut self, chunk: u64) {
+        if let Some(byte) = usize::try_from(chunk / 8).ok().and_then(|byte| self.filled.get_mut(byte)) {
+            *byte |= 1 << (chunk % 8);
+        }
+    }
+
+    /// The chunks a range of bytes is in which aren't filled.
+    pub fn unfilled(&self, offset: u64, size: u64) -> impl Iterator<Item = u64> + '_ {
+        let end = offset.saturating_add(size).min(self.len);
+        (offset / CHUNK..end.div_ceil(CHUNK)).filter(|&chunk| !self.is_filled(chunk))
+    }
+
+    /// The first chunk not filled, if any.
+    pub fn next_unfilled(&self) -> Option<u64> {
+        (0..self.chunks()).find(|&chunk| !self.is_filled(chunk))
+    }
+
+    /// Wanting no more of what it's from than `len`, as a truncation.
+    pub fn cut(&mut self, len: u64) {
+        self.len = self.len.min(len);
+    }
+}
+
 impl Catalog {
+    /// Every overlay file being copied as it's read and written.
+    pub fn partials(&self) -> Result<Vec<Partial>> {
+        let mut stmt = self.db.conn().prepare_cached("SELECT anchor, path, base, len, filled FROM overlay_partials")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?, row.get::<_, Vec<u8>>(4)?)))?;
+        rows.map(|row| {
+            let (anchor, path, base, len, filled) = row?;
+            let link = |bytes: &[u8]| Link::decode(bytes).map_err(|e| Error::Invalid { store: "router", reason: format!("partial: {e:?}") });
+            Ok(Partial { anchor: link(&anchor)?, path: path_from(&path), base: link(&base)?, len: u64::try_from(len).unwrap_or_default(), filled })
+        })
+        .collect()
+    }
+
+    /// Record a partial file as it now is.
+    pub fn set_partial(&self, partial: &Partial) -> Result<()> {
+        self.db.conn()
+            .prepare_cached("INSERT OR REPLACE INTO overlay_partials (anchor, path, base, len, filled) VALUES (?1, ?2, ?3, ?4, ?5)")?
+            .execute(params![partial.anchor.to_bytes(), path_bytes(&partial.path), partial.base.to_bytes(), i64::try_from(partial.len).unwrap_or(i64::MAX), partial.filled])?;
+        Ok(())
+    }
+
+    /// Forget a partial file, as it's filled or gone.
+    pub fn remove_partial(&self, anchor: &Link, path: &Path) -> Result<()> {
+        self.db.conn()
+            .prepare_cached("DELETE FROM overlay_partials WHERE anchor = ?1 AND path = ?2")?
+            .execute(params![anchor.to_bytes(), path_bytes(path)])?;
+        Ok(())
+    }
+
     /// An anchor's overlay marks.
     pub fn overlay_marks(&self, anchor: &Link) -> Result<Marks> {
         let mut stmt = self.db.conn().prepare_cached("SELECT path, cid, tsize FROM overlay_marks WHERE anchor = ?1")?;

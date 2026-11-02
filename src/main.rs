@@ -345,7 +345,15 @@ enum AnchorCommand {
     New,
     /// Say an anchor is a DAG now, which must all be here or fetched
     /// through the running node; prints the set
-    Set { anchor: Link, cid: Link },
+    Set {
+        anchor: Link,
+        cid: Link,
+        /// Fetch none of it now: what isn't here is fetched as it's read,
+        /// through `hk mount`. Like `keep --shallow`, what a keep of the
+        /// anchor reaches may then not all be here
+        #[arg(long)]
+        lazy: bool,
+    },
     /// Print what an anchor is now, then every value it's had, oldest
     /// first, with when
     Show { anchor: Link },
@@ -1319,9 +1327,11 @@ fn hold_all(dir: Option<&PathBuf>, repo: &Catalog, cids: &[Link], shallow: bool)
 fn anchor(dir: Option<&PathBuf>, mut repo: Catalog, command: AnchorCommand) -> anyhow::Result<()> {
     match command {
         AnchorCommand::New => out!("{}", repo.new_anchor()?),
-        AnchorCommand::Set { anchor, cid } => {
+        AnchorCommand::Set { anchor, cid, lazy } => {
             anyhow::ensure!(holokeep::claim::is_anchor(&anchor), "{anchor} isn't an anchor");
-            hold_all(dir, &repo, std::slice::from_ref(&cid), false)?;
+            if !lazy {
+                hold_all(dir, &repo, std::slice::from_ref(&cid), false)?;
+            }
             let set = repo.batch(|repo| repo.set_anchor(&anchor, &cid))?;
             out!("{set}");
         },
