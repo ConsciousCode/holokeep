@@ -605,6 +605,8 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
             let _ = writeln!(out, "collecting\t{}", if collecting { "yes" } else { "no" });
             let _ = writeln!(out, "condemned\t{}", node.condemned().count()?);
             let _ = writeln!(out, "account\t{}", node.catalog().uid());
+            let keeps = node.catalog().claims().map(crate::store::ClaimStore::keeps).transpose()?.map_or(0, |keeps| keeps.len());
+            let _ = writeln!(out, "keeps\t{keeps}");
             match node.catalog().quota_left()? {
                 Some((quota, left)) => {
                     let _ = writeln!(out, "used\t{} of {} bytes", quota.saturating_sub(left), quota);

@@ -859,6 +859,31 @@ mod tests {
     }
 
     #[test]
+    fn a_push_past_the_accounts_quota_is_refused() {
+        let (db, mut catalog, _) = catalog_of(0);
+        let sightings = Sightings::open(db).expect("sightings");
+        let marks = super::super::trim::Watermarks::new(0, 0);
+        let peer = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
+        let block = |data: &[u8]| Block::hash(crate::cid::Cidv1Spec::default(), data.into());
+        let push = |block: &Block| Push {
+            blocks: vec![(ByteBuf::from(block.cid().to_bytes()), ByteBuf::from(block.data().to_vec()))],
+            copies: Vec::new(),
+        };
+        catalog.set_quota(Some(100));
+        let small = block(&[1; 60]);
+        let kept = answer_push(&catalog, &sightings, &peer, push(&small), &marks).expect("push");
+        assert_eq!(kept.kept.len(), 1);
+        assert_eq!(catalog.quota_left().expect("left"), Some((100, 40)));
+        // Another 60 bytes would be 120
+        let more = block(&[2; 60]);
+        assert!(answer_push(&catalog, &sightings, &peer, push(&more), &marks).expect("push").kept.is_empty());
+        assert!(!catalog.has(more.cid().multihash()).expect("has"));
+        // And its offers say as much
+        let advert = Advert { blocks: Vec::new() };
+        assert_eq!(answer_advert(&catalog, &sightings, &peer, &advert, &marks).expect("advert").offer.and_then(|offer| offer.free), Some(40));
+    }
+
+    #[test]
     fn samples_are_of_whats_here() {
         let (_, catalog, blocks) = catalog_of(50);
         assert_eq!(catalog.block_count().expect("count"), 50);

@@ -302,6 +302,8 @@ Beliefs about other nodes' copies, *sightings*, are kept apart from `blocks`, wh
 
 **Several meshes.** A node may be in several meshes, each a swarm of its own under its own key, with its own members and its own daemon (`hk node ... --mesh <name>`), for one of the host's accounts. The main mesh is the owner's, and keeps its files where they always were; another keeps its swarm key and socket in `meshes/<name>/`, and is for whichever account joined it (`--account <uid>`). A mesh's daemon acts for its account, so it hears of, holds and serves that account's repo and nothing else: a node in alice's mesh and bob's tells neither of the other, though the bits of a block both have are kept once. An account has one user, so a node joins another user's mesh as another account, certified by that user as a device under the account's own key (`hk node id --account <uid>`, then `hk node invite <peer> --device <id>`). The files imported in place are watched by the main mesh's daemon alone. Collecting asks the members of every mesh, since what's here may be kept in any of them, and waits for them all.
 
+**Protected meshes: vaults, held by friends.** Each account has a *vault*, an internal account with a key and a secret of its own (`accounts/` in the repo). `hk protect add <cid>` encrypts a DAG into it: each block with XChaCha20-Poly1305, its key and nonce derived from the secret and the block's CID, so it encrypts the same way every time within one vault, and no way anyone else can predict. Pushing again is idempotent and a vault's own duplicates are kept once, but nobody can confirm a vault holds a file they know, as they could with convergent encryption. An encrypted block is raw, laid out as Peergos lays them: 8 fixed bytes, a dag-cbor list of one block access token, then the ciphertext, the token bound to it as associated data. Nothing checks the tokens yet; they're there so a block can later be shared with someone outside the vault's meshes, who proves knowing the token, without encrypting it again. The vault keeps a *manifest*: dag-cbor whose links to the ciphertext, and to further manifests past 1024 blocks, are plain, so a holder keeps all of it from one keep, and whose sealed bytes say which plaintext CID each ciphertext is, and the root. A holder learns how many blocks there are and how big, and nothing of what they say or how they link. `hk protect restore <manifest>` fetches what isn't here through the vault's meshes, decrypts, checks every block against its CID, and keeps the root. A friend holds a vault in a *protected mesh*: `hk node invite <peer> --mesh <name> --protected --device <vault> --quota <size>` makes them an internal account here whose user is their vault's key (`hk protect id`), and joining with a protected ticket joins as one's vault. Since a mesh's daemon acts for its account, a vault's hears of, holds and serves only the vault's ciphertext, manifests and keeps, and no private claim goes there; the holder keeps what the vault keeps, and takes no more than the quota, which its offers and its acceptance of pushes both respect. `hk node status` tallies what an account has used. Each direction is a mesh of its own: holding for each other is inviting each other.
+
 Ideas:
 
 - *Failure-domain placement*: describe each blockstore's risk with a set of tags, eg `{living-room, home, new-mexico, us}` is very far from `{bangkok, data-center}` and very close to `{living-room, raid-3, home, new-mexico, us}`, and place replicas to maximize the distance between them. Volumes' risks, found and said, now do this for counting (see durability above); what's open is weighing distance beyond shared risks, perhaps with Ceph's CRUSH, perhaps latency-aware.
@@ -375,7 +377,9 @@ Checklist:
   - [ ] Shared anchors, deliberately: documents several users write to
   - [ ] Adding files and reading as another account through the daemon, with the files passed as descriptors so the daemon reads only what the user can
   - [ ] Changing the passphrase
-  - [ ] Protected meshes: friends holding encrypted blocks, with nodes in both
+  - [x] Protected meshes: friends holding a vault, encrypted, to a quota (`hk protect add/ls/restore/id`, `hk node invite --protected --quota`)
+  - [ ] Checking block access tokens, to share protected blocks beyond the vault's meshes
+  - [ ] Restoring from the passphrase alone: the vault's secret sealed like the root, where holders keep it
 - [ ] Peergos BAT with friends
 
 ## Open questions
@@ -442,6 +446,8 @@ $hk node id                         # this node's peer id, to be invited by
 $hk node invite <peer-id>           # let a machine into the mesh, certifying it as a device, with
                                     # the user's passphrase (the first makes the user); prints a secret ticket
 $hk node join <ticket>              # join a mesh, and become a device of its user
+$hk protect add <cid>               # encrypt a DAG into this account's vault, which friends hold; prints its manifest
+$hk protect restore <manifest>      # fetch, decrypt and keep a protected DAG
 $hk node meshes                     # the meshes this node is in, and whose each is (any node command takes --mesh)
 $hk whoami                          # the account this acts for: uid, device key, user
 $hk device list                     # the user's root key, and each device, certified or revoked, and if forked
