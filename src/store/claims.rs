@@ -679,6 +679,22 @@ impl ClaimStore {
         row.map(|(prefix, value)| link(&prefix, &value)).transpose()
     }
 
+    /// Every anchor some set that counts says is something, with what.
+    pub fn anchors(&self) -> Result<Vec<(Link, Link)>> {
+        let mut stmt = self.db.conn().prepare_cached(
+            "SELECT DISTINCT t.prefix, m.multihash, a.prefix, v.multihash FROM anchor_values a
+             JOIN claim_targets t ON t.claim = a.claim AND t.target = a.anchor
+             JOIN multihashes m ON m.id = a.anchor JOIN multihashes v ON v.id = a.value
+             ORDER BY m.multihash",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, Vec<u8>>(3)?)))?;
+        rows.map(|row| {
+            let (anchor_prefix, anchor, prefix, value) = row?;
+            Ok((link(&anchor_prefix, &anchor)?, link(&prefix, &value)?))
+        })
+        .collect()
+    }
+
     /// Every set of an anchor that counts, as (at, value), oldest first.
     pub fn history(&self, anchor: Key<'_>) -> Result<Vec<(u64, Link)>> {
         let mut stmt = self.db.conn().prepare_cached(&format!(
@@ -905,6 +921,18 @@ impl ClaimStore {
              ORDER BY i.multihash"
         ))?;
         links(stmt.query_map([target.to_bytes()], pair)?)
+    }
+
+    /// Every tag that counts on anything.
+    pub fn all_tags(&self) -> Result<Vec<Link>> {
+        let mut stmt = self.db.conn().prepare_cached(&format!(
+            "SELECT DISTINCT g.into_prefix, i.multihash FROM claims c
+             JOIN group_claims g ON g.id = c.id
+             JOIN multihashes i ON i.id = g.into_
+             WHERE {LIVE}
+             ORDER BY i.multihash"
+        ))?;
+        links(stmt.query_map([], pair)?)
     }
 
     /// Every block with a tag that counts, under the CIDs it was tagged by.

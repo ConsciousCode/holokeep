@@ -22,6 +22,8 @@ pub mod hamt;
 pub mod import;
 pub mod links;
 pub mod export;
+#[cfg(feature = "fuse")]
+pub mod mount;
 pub mod model;
 pub mod store;
 #[cfg(feature = "net")]

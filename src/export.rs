@@ -177,6 +177,159 @@ fn entry_name(name: &[u8]) -> io::Result<&OsStr> {
     Ok(OsStr::from_bytes(name))
 }
 
+/// What's at a CID, as a filesystem sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kind {
+    /// A file of so many bytes. Blocks of other codecs read as their bytes.
+    File(u64),
+    Directory,
+    /// A symlink, to this target.
+    Symlink(Vec<u8>),
+}
+
+/// What's at a CID.
+pub fn stat(src: &impl Fetch, cid: &Link) -> io::Result<Kind> {
+    if !matches!(cid.codec(), RAW_CODEC | DAG_PB_CODEC) {
+        return Ok(Kind::File(len(&src.fetch(cid)?)));
+    }
+    match load(src, cid)? {
+        Node::Raw(bytes) => Ok(Kind::File(len(&bytes))),
+        Node::Pb { data, links } => match data.data_type {
+            DataType::File | DataType::Raw => Ok(Kind::File(file_size(src, &data, &links, 0)?)),
+            DataType::Directory | DataType::HAMTShard => Ok(Kind::Directory),
+            DataType::Symlink => Ok(Kind::Symlink(data.data.unwrap_or_default())),
+            DataType::Metadata => Err(invalid("UnixFS metadata nodes aren't supported")),
+        },
+    }
+}
+
+fn len(bytes: &[u8]) -> u64 {
+    u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+}
+
+/// A file node's size: what it says, or else what its parts add up to.
+fn file_size(src: &impl Fetch, data: &DataBuf, links: &[(Link, Vec<u8>)], depth: usize) -> io::Result<u64> {
+    if let Some(size) = data.filesize {
+        return Ok(size);
+    }
+    let mut size = len(data.data.as_deref().unwrap_or_default());
+    if data.blocksizes.len() == links.len() {
+        return Ok(data.blocksizes.iter().fold(size, |size, part| size.saturating_add(*part)));
+    }
+    let depth = deeper(depth)?;
+    for (cid, _) in links {
+        size = size.saturating_add(part_size(src, cid, depth)?);
+    }
+    Ok(size)
+}
+
+fn part_size(src: &impl Fetch, cid: &Link, depth: usize) -> io::Result<u64> {
+    match load(src, cid)? {
+        Node::Raw(bytes) => Ok(len(&bytes)),
+        Node::Pb { data, links } if matches!(data.data_type, DataType::File | DataType::Raw) => file_size(src, &data, &links, depth),
+        Node::Pb { .. } => Err(invalid(format!("{cid}: part of a file isn't a file"))),
+    }
+}
+
+/// Up to `size` bytes of a file from `offset`, fetching only the parts
+/// of it they're in. Fewer at the end of the file.
+pub fn read_at(src: &impl Fetch, cid: &Link, offset: u64, size: usize) -> io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(size.min(1 << 20));
+    if matches!(cid.codec(), RAW_CODEC | DAG_PB_CODEC) {
+        read_part(src, load(src, cid)?, offset, size, &mut out, 0)?;
+    } else {
+        take(&src.fetch(cid)?, offset, size, &mut out);
+    }
+    Ok(out)
+}
+
+/// Read what's wanted of a part of a file, `offset` into it.
+fn read_part(src: &impl Fetch, node: Node, mut offset: u64, size: usize, out: &mut Vec<u8>, depth: usize) -> io::Result<()> {
+    match node {
+        Node::Raw(bytes) => {
+            take(&bytes, offset, size, out);
+            Ok(())
+        },
+        Node::Pb { data, links } => match data.data_type {
+            DataType::File | DataType::Raw => {
+                let inline = data.data.as_deref().unwrap_or_default();
+                take(inline, offset, size, out);
+                offset = offset.saturating_sub(len(inline));
+                let depth = deeper(depth)?;
+                let sized = data.blocksizes.len() == links.len();
+                for (i, (cid, _)) in links.iter().enumerate() {
+                    if out.len() >= size {
+                        break;
+                    }
+                    let part = match data.blocksizes.get(i) {
+                        Some(&part) if sized => part,
+                        _ => part_size(src, cid, depth)?,
+                    };
+                    if offset >= part {
+                        offset = offset.saturating_sub(part);
+                        continue;
+                    }
+                    read_part(src, load(src, cid)?, offset, size, out, depth)?;
+                    offset = 0;
+                }
+                Ok(())
+            },
+            DataType::Directory | DataType::HAMTShard => Err(io::Error::new(io::ErrorKind::IsADirectory, "this is a directory, not a file")),
+            DataType::Symlink => Err(invalid("this is a symlink, not a file")),
+            DataType::Metadata => Err(invalid("UnixFS metadata nodes aren't supported")),
+        },
+    }
+}
+
+/// Add bytes from `offset` to `out`, up to `size` in all.
+fn take(bytes: &[u8], offset: u64, size: usize, out: &mut Vec<u8>) {
+    let Ok(start) = usize::try_from(offset) else {
+        return;
+    };
+    if let Some(rest) = bytes.get(start..) {
+        let wanted = size.saturating_sub(out.len()).min(rest.len());
+        out.extend_from_slice(rest.get(..wanted).unwrap_or_default());
+    }
+}
+
+/// A directory's entries, a sharded one's gathered from its shards, as
+/// (name, CID). Names which could name anything outside it are left out.
+pub fn list(src: &impl Fetch, cid: &Link) -> io::Result<Vec<(Vec<u8>, Link)>> {
+    let mut entries = Vec::new();
+    match load(src, cid)? {
+        Node::Pb { data, links } if data.data_type == DataType::Directory => {
+            entries.extend(links.into_iter().filter(|(_, name)| entry_name(name).is_ok()).map(|(cid, name)| (name, cid)));
+        },
+        Node::Pb { data, links } if data.data_type == DataType::HAMTShard => list_shard(src, &data, links, &mut entries, 0)?,
+        _ => return Err(io::Error::new(io::ErrorKind::NotADirectory, format!("{cid} isn't a directory"))),
+    }
+    Ok(entries)
+}
+
+fn list_shard(src: &impl Fetch, data: &DataBuf, links: Vec<(Link, Vec<u8>)>, entries: &mut Vec<(Vec<u8>, Link)>, depth: usize) -> io::Result<()> {
+    let fanout = data.fanout
+        .filter(|f| f.is_power_of_two() && (2..=1024).contains(f))
+        .ok_or_else(|| invalid("HAMT shard with an invalid fanout"))?;
+    let pad = format!("{:X}", fanout.saturating_sub(1)).len();
+    let depth = deeper(depth)?;
+    for (cid, name) in links {
+        let (prefix, entry) = name.split_at_checked(pad)
+            .ok_or_else(|| invalid("HAMT link name shorter than its prefix"))?;
+        if !prefix.iter().all(u8::is_ascii_hexdigit) {
+            return Err(invalid("HAMT link name without a hex prefix"));
+        }
+        if entry.is_empty() {
+            match load(src, &cid)? {
+                Node::Pb { data, links } if data.data_type == DataType::HAMTShard => list_shard(src, &data, links, entries, depth)?,
+                _ => return Err(invalid(format!("{cid}: child shard isn't a HAMT shard"))),
+            }
+        } else if entry_name(entry).is_ok() {
+            entries.push((entry.to_vec(), cid));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -258,6 +411,52 @@ mod tests {
                 assert_same_tree(&a.join(&name), &b.join(&name));
             }
         }
+    }
+
+    /// Walk a tree as a filesystem would, against the original.
+    fn walk(router: &Catalog, cid: &Link, path: &Path) {
+        let meta = fs::symlink_metadata(path).expect("meta");
+        match stat(router, cid).expect("stat") {
+            Kind::Directory => {
+                assert!(meta.is_dir(), "{}", path.display());
+                let mut names: Vec<Vec<u8>> = fs::read_dir(path).expect("list").map(|e| e.expect("entry").file_name().as_bytes().to_vec()).collect();
+                names.sort();
+                let entries = list(router, cid).expect("list");
+                let mut listed: Vec<Vec<u8>> = entries.iter().map(|(name, _)| name.clone()).collect();
+                listed.sort();
+                assert_eq!(listed, names, "{}", path.display());
+                for (name, child) in entries {
+                    walk(router, &child, &path.join(OsStr::from_bytes(&name)));
+                }
+            },
+            Kind::File(size) => {
+                let original = fs::read(path).expect("read");
+                assert_eq!(size, u64::try_from(original.len()).expect("size"), "{}", path.display());
+                assert_eq!(read_at(router, cid, 0, original.len().saturating_add(10)).expect("read"), original);
+                // Every window, across chunk and branch boundaries
+                for offset in (0..original.len().saturating_add(3)).step_by(37) {
+                    for size in [1, 63, 64, 65, 200, 1000] {
+                        let want = original.get(offset..).map_or(&[][..], |rest| &rest[..size.min(rest.len())]);
+                        assert_eq!(read_at(router, cid, u64::try_from(offset).expect("offset"), size).expect("read"), want, "{} at {offset}+{size}", path.display());
+                    }
+                }
+            },
+            Kind::Symlink(target) => assert_eq!(target, fs::read_link(path).expect("link").as_os_str().as_bytes()),
+        }
+    }
+
+    #[test]
+    fn reading_anywhere_in_a_tree() {
+        let scratch = Scratch::new("export-read-at");
+        let t = tree(scratch.path());
+        let mut router = router();
+        let root = add(&mut router, &t);
+        walk(&router, &root, &t);
+        // Other codecs read as their bytes
+        let block = Block::hash(Cidv1Spec::new(crate::cid::DAG_CBOR_CODEC, crate::multihash::MultihashFunc::Sha2_256), b"\xa0".as_slice().into());
+        let cid = put(&router, &block);
+        assert_eq!(stat(&router, &cid).expect("stat"), Kind::File(1));
+        assert_eq!(read_at(&router, &cid, 0, 10).expect("read"), b"\xa0");
     }
 
     #[test]

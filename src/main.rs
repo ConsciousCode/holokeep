@@ -113,6 +113,13 @@ enum Command {
     /// Link this repo's machines into a private mesh
     #[cfg(feature = "net")]
     Node(NodeArgs),
+    /// Mount the soup as a read-only filesystem until interrupted:
+    /// cid/<cid>, anchors/<anchor> and tags/<tag>/<cid>
+    #[cfg(feature = "fuse")]
+    Mount {
+        /// An empty directory to mount it on
+        dir: PathBuf,
+    },
 }
 
 #[cfg(feature = "net")]
@@ -687,9 +694,30 @@ fn run(args: Args) -> anyhow::Result<()> {
             Ok(())
         },
         Command::Volume(command) => volume(open_repo(args.repo)?, command),
+        #[cfg(feature = "fuse")]
+        Command::Mount { dir } => mount(repo_dir(args.repo)?, &dir),
         #[cfg(feature = "net")]
         Command::Node(NodeArgs { mesh, command }) => node(&holokeep::net::mesh::Place::new(&repo_dir(args.repo)?, &mesh), command),
     }
+}
+
+/// Mount the soup at `dir`, as this repo's owner sees it, until
+/// interrupted.
+#[cfg(feature = "fuse")]
+fn mount(repo: PathBuf, dir: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(!foreign(&repo), "this repo is another user's: only its owner can mount it");
+    // Opened here first so a repo that won't open says so before mounting
+    drop(Catalog::open_repo(&repo).with_context(|| format!("opening repo {}", repo.display()))?);
+    #[cfg(feature = "net")]
+    let fetcher: Option<holokeep::mount::Fetcher> = {
+        let place = holokeep::net::mesh::Place::main(&repo);
+        Some(Box::new(move |cid: &Link| matches!(holokeep::net::daemon::fetch(&place, cid), Ok(Some(_)))))
+    };
+    #[cfg(not(feature = "net"))]
+    let fetcher = None;
+    let soup = holokeep::mount::Soup::new(Box::new(move || Catalog::open_repo(&repo)), fetcher);
+    eprintln!("mounted on {}; interrupt to unmount", dir.display());
+    holokeep::mount::mount(soup, dir).with_context(|| format!("mounting on {}", dir.display()))
 }
 
 /// The passphrase of the user's root key: `HK_PASSPHRASE` if it's set,

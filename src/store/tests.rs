@@ -770,6 +770,7 @@ fn anchors_are_what_they_were_last_set_to() {
     assert!(router.kept_under(leaf2.cid().multihash()).expect("kept"));
     let history: Vec<Link> = router.anchor_history(&anchor).expect("history").into_iter().map(|(_, value)| value).collect();
     assert_eq!(history, [link(&v1), link(&v2)]);
+    assert_eq!(router.claims().expect("claims").anchors().expect("anchors"), [(anchor.clone(), link(&v2))]);
 
     // Retracting the latest set makes it what it was
     let tomb = Claim::Tomb(Tomb::new([second]).expect("tomb"));
@@ -816,6 +817,7 @@ fn tags_keep_target_cids() {
     assert_eq!(router.get_block(&link(&claim)).expect("get"), Some(claim));
     let tagged = tagged(&router, "empty");
     assert_eq!(tagged.len(), 2);
+    assert_eq!(router.claims().expect("claims").all_tags().expect("tags"), [tag("empty")]);
     assert!(tagged.contains(&v0));
 }
 

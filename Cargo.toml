@@ -8,9 +8,13 @@ name = "hk"
 path = "src/main.rs"
 
 [features]
-default = ["net"]
+default = ["net", "fuse"]
 # The private mesh: libp2p, and a daemon to run it
 net = ["dep:libp2p", "dep:tokio", "dep:notify"]
+# `hk mount`: the soup as a read-only filesystem
+fuse = ["dep:fuser", "dep:libc"]
+fuser = ["dep:fuser"]
+libc = ["dep:libc"]
 
 [dependencies]
 libp2p = { version = "0.56", optional = true, features = ["tokio", "tcp", "noise", "yamux", "pnet", "macros", "identify", "ping", "mdns", "kad", "request-response", "cbor", "ed25519"] }
@@ -47,6 +51,8 @@ argon2 = "0.5"
 chacha20poly1305 = "0.10"
 rpassword = "7"
 zeroize = "1"
+fuser = { version = "0.18", default-features = false, optional = true }
+libc = { version = "0.2.191", optional = true }
 
 [lints]
 [lints.clippy]

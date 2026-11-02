@@ -29,7 +29,7 @@ Holokeep is early. What exists is the content-addressing core, each piece checke
 - **Import**: `hk add` turns files and directories into UnixFSv1 with CIDs identical to Kubo's `ipfs add` under the `unixfs-v1-2025` profile, including chunked files, nested directories, symlinks and HAMT-sharded directories.
 - **CIDs and multihashes**: v0 and v1; SHA-1, SHA-2, SHA-3, BLAKE2b-256 and murmur3 (no identity hash yet).
 - **Codecs**: dag-pb, dag-cbor and dag-json, strict and canonical, passing all of [ipld/codec-fixtures](https://github.com/ipld/codec-fixtures) and differential fuzzing against `serde_ipld_dagcbor`/`serde_ipld_dagjson`.
-- **Storage and retrieval**: `hk add` stores into a repo where a routing store sorts blocks by structure: UnixFS nodes as rows, dag-cbor and dag-json as queryable JSONB, large blocks and whole files in a flatfs-style sharded directory, file leaves as ranges of whole files kept there (or left in place with `--nocopy`), and everything else as raw bytes. `hk cat`/`hk get` read them back out, checked against the original files.
+- **Storage and retrieval**: `hk add` stores into a repo where a routing store sorts blocks by structure: UnixFS nodes as rows, dag-cbor and dag-json as queryable JSONB, large blocks and whole files in a flatfs-style sharded directory, file leaves as ranges of whole files kept there (or left in place with `--nocopy`), and everything else as raw bytes. `hk cat`/`hk get` read them back out, checked against the original files, and `hk mount` shows the soup as a read-only filesystem (FUSE): `cid/<cid>`, `anchors/<anchor>` and `tags/<tag>/<cid>`.
 - **Interchange**: `hk dag export` writes a DAG as a CARv1 byte-for-byte identical to `ipfs dag export`, and `hk dag import` reads CARv1 and CARv2 files, Kubo's included, verifying every block. Legacy CIDv0 DAGs round-trip unchanged.
 
 Nodes can join a private mesh (`hk node`) and fetch blocks from each other, so any file in the repo can be read from any running node, and they keep each other's blocks replicated, counting the risks each copy shares, so a block isn't one disk failure from being lost; see the [roadmap](#roadmap) for what isn't done.
@@ -348,7 +348,11 @@ Checklist:
 - [ ] Querying
 - [ ] Perkeep-style claims
 - [ ] File mutation
-- [ ] FUSE
+- [ ] FUSE (`hk mount`)
+  - [x] Read-only: `cid/<cid>` looked up by name, `anchors/<anchor>` as each is now, `tags/<tag>/<cid>`; reads fetch only the parts of a file they're in, and what isn't here is fetched through the running node; another account's blocks aren't there
+  - [ ] Fetching only what's read: a missing block now fetches the DAG under it, which for a directory is everything beneath
+  - [ ] Writable anchors: changes staged, imported on close (Kubo-identical CIDs), and the anchor set once per save
+  - [ ] Names for anchors, rather than their CIDs
 - [ ] P2P private mesh
   - [x] Joining: swarm key, members, tickets, mDNS, identify (`hk node id/invite/join/run/peers`)
   - [x] Fetching DAGs from other nodes (`hk dag fetch`, and `cat`/`get`/`dag export` through a running node)
@@ -424,6 +428,7 @@ $hk add -n <path>                   # only print CIDs, like `ipfs add --only-has
 $hk add --nocopy <path>             # keep contents in place, like Kubo's filestore
 $hk cat <cid>                       # a file's contents
 $hk get <cid> -o <path>             # a file, directory or symlink
+$hk mount <dir>                     # the soup, read-only, until interrupted
 $hk block get <cid>                 # a block's bytes
 $hk refs [--back] <cid>             # a block's links, or what links to it
 $hk tag add <name> <cid>...         # tag blocks, with a Group claim
