@@ -187,12 +187,18 @@ impl Members {
                  FOREIGN KEY (mesh, peer) REFERENCES mesh_members (mesh, peer) ON DELETE CASCADE
              ) WITHOUT ROWID;
              -- Each mesh other than the main one, and the account, by uid,
-             -- it's for.
+             -- it's for; whether it's protected, holding friends' vaults,
+             -- and how many bytes the account may have here, if limited.
              CREATE TABLE IF NOT EXISTS meshes (
                  name TEXT PRIMARY KEY,
-                 uid INTEGER NOT NULL
+                 uid INTEGER NOT NULL,
+                 protected INTEGER NOT NULL DEFAULT 0,
+                 quota INTEGER
              );",
         )?;
+        if !db.conn().prepare("SELECT 1 FROM pragma_table_info('meshes') WHERE name = 'protected'")?.exists([])? {
+            db.conn().execute_batch("ALTER TABLE meshes ADD COLUMN protected INTEGER NOT NULL DEFAULT 0; ALTER TABLE meshes ADD COLUMN quota INTEGER;")?;
+        }
         // From when a node was in one mesh
         let old = db.conn().prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'members'")?.exists([])?;
         if old {
@@ -222,6 +228,24 @@ impl Members {
             .prepare_cached("INSERT INTO meshes (name, uid) VALUES (?1, ?2) ON CONFLICT (name) DO UPDATE SET uid = excluded.uid")?
             .execute(params![self.mesh, uid])?;
         Ok(())
+    }
+
+    /// Say the mesh is protected, and how many bytes its account may have
+    /// here, if it's limited.
+    pub fn set_protected(&self, quota: Option<u64>) -> Result<()> {
+        self.db.conn()
+            .prepare_cached("UPDATE meshes SET protected = 1, quota = ?2 WHERE name = ?1")?
+            .execute(params![self.mesh, quota.map(|quota| i64::try_from(quota).unwrap_or(i64::MAX))])?;
+        Ok(())
+    }
+
+    /// Whether the mesh is protected, and if so, its account's quota.
+    pub fn protected(&self) -> Result<Option<Option<u64>>> {
+        let row: Option<(bool, Option<i64>)> = self.db.conn()
+            .prepare_cached("SELECT protected, quota FROM meshes WHERE name = ?1")?
+            .query_row([&self.mesh], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        Ok(row.filter(|(protected, _)| *protected).map(|(_, quota)| quota.and_then(|quota| u64::try_from(quota).ok())))
     }
 
     /// Every mesh this node is in but the main one, and its account.
@@ -313,6 +337,10 @@ pub struct Ticket {
     /// its devices: every certificate and revocation, signed, the
     /// joiner's among them, and the root key, sealed, with what keeps it.
     pub user: Option<(Link, Vec<Vec<u8>>)>,
+    /// Whether the mesh is protected: the joiner holds nothing of the
+    /// inviter's but what the inviter holds of its vault, and joins with
+    /// its own.
+    pub protected: bool,
 }
 
 impl Ticket {
@@ -332,6 +360,9 @@ impl Ticket {
         if let Some((user, certificate)) = &self.user {
             ticket.insert("user".to_owned(), Ipld::Link(user.clone()));
             ticket.insert("blocks".to_owned(), Ipld::List(certificate.iter().cloned().map(Ipld::Bytes).collect()));
+        }
+        if self.protected {
+            ticket.insert("protected".to_owned(), Ipld::Bool(true));
         }
         let ticket = Ipld::Map(ticket);
         multibase::encode(multibase::Base::Base32Lower, crate::dagcbor::to_vec(&ticket).unwrap_or_default())
@@ -382,7 +413,12 @@ impl Ticket {
             (None, None) => None,
             _ => return Err(invalid("user")),
         };
-        Ok(Self { swarm_key, inviter, members, user })
+        let protected = match map.remove("protected") {
+            None => false,
+            Some(Ipld::Bool(protected)) => protected,
+            Some(_) => return Err(invalid("protected")),
+        };
+        Ok(Self { swarm_key, inviter, members, user, protected })
     }
 }
 

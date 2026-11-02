@@ -363,6 +363,9 @@ pub struct Catalog {
     /// The account, by the host's uid, the catalog acts for: whose key
     /// signs, and whose user's claims it sees.
     uid: u32,
+    /// How many bytes the account this acts for may have here, if it's
+    /// limited: a friend's, in a protected mesh.
+    quota: Option<u64>,
     /// Claims made in a batch, which its end signs at once.
     unsigned: std::cell::RefCell<Vec<Link>>,
     /// How deep in batches this is.
@@ -556,6 +559,28 @@ impl Catalog {
     /// The key claims made here are signed with, if any.
     pub const fn signer(&self) -> Option<&crate::keys::Key> {
         self.signer.as_ref()
+    }
+
+    /// Limit the bytes the account this acts for may have here.
+    pub const fn set_quota(&mut self, quota: Option<u64>) {
+        self.quota = quota;
+    }
+
+    /// The bytes of the blocks here that the account this acts for put
+    /// here: its tally, against its quota.
+    pub fn used(&self) -> Result<u64> {
+        let used: i64 = self.db.conn()
+            .prepare_cached(
+                "SELECT coalesce(sum(size), 0) FROM holdings
+                 WHERE uid = ?1 AND block IN (SELECT block FROM blocks)",
+            )?
+            .query_row([self.uid], |row| row.get(0))?;
+        Ok(u64::try_from(used).unwrap_or_default())
+    }
+
+    /// The quota, and how much of it's left, if there is one.
+    pub fn quota_left(&self) -> Result<Option<(u64, u64)>> {
+        self.quota.map(|quota| Ok((quota, quota.saturating_sub(self.used()?)))).transpose()
     }
 
     /// The uid of the account this acts for.
@@ -840,7 +865,7 @@ impl Catalog {
         if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
             return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
         }
-        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), unsigned: std::cell::RefCell::default(), batching: 0 };
+        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0 };
         for volume in volumes {
             catalog.attach(volume)?;
         }
@@ -904,10 +929,14 @@ impl Catalog {
                  uid INTEGER NOT NULL,
                  block INTEGER NOT NULL REFERENCES multihashes (id) ON DELETE CASCADE,
                  since INTEGER NOT NULL,
+                 size INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (uid, block)
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS holdings_block ON holdings (block);",
         )?;
+        if !db.conn().prepare("SELECT 1 FROM pragma_table_info('holdings') WHERE name = 'size'")?.exists([])? {
+            db.conn().execute_batch("ALTER TABLE holdings ADD COLUMN size INTEGER NOT NULL DEFAULT 0")?;
+        }
         // From before holdings: everything here is its owner's
         if fresh {
             db.conn().execute(
@@ -2243,10 +2272,10 @@ impl Catalog {
             }
             self.db.conn()
                 .prepare_cached(
-                    "INSERT INTO holdings (uid, block, since) VALUES (?1, ?2, ?3)
-                     ON CONFLICT (uid, block) DO UPDATE SET since = excluded.since",
+                    "INSERT INTO holdings (uid, block, since, size) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (uid, block) DO UPDATE SET since = excluded.since, size = excluded.size",
                 )?
-                .execute(params![self.uid, id, i64::try_from(now()).unwrap_or(i64::MAX)])?;
+                .execute(params![self.uid, id, i64::try_from(now()).unwrap_or(i64::MAX), i64::try_from(block.data().len()).unwrap_or(i64::MAX)])?;
             Ok(placed.1)
         })
     }

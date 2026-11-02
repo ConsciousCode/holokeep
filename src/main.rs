@@ -82,6 +82,10 @@ enum Command {
     /// adds, or stop
     #[command(subcommand)]
     Keep(KeepCommand),
+    /// Keep things with friends, encrypted: in this account's vault, which
+    /// joins their protected meshes
+    #[command(subcommand)]
+    Protect(ProtectCommand),
     /// Print the account this acts for: the host's uid, the key the repo
     /// signs with for it, and its user, if it's in a mesh. In a repo
     /// another user owns, `hk keep` and `hk tag` act for an account of
@@ -143,6 +147,15 @@ enum NodeCommand {
         /// Whose mesh a new one is, by uid [default: yours]
         #[arg(long)]
         account: Option<u32>,
+        /// Make a new mesh protected: a friend's, whose vault this node
+        /// holds, encrypted, for an account of its own; --device names the
+        /// vault (`hk protect id` on the friend's machine)
+        #[arg(long)]
+        protected: bool,
+        /// The most a friend's vault may have here (bytes, or with K, M,
+        /// G, T) [default: no limit]
+        #[arg(long, value_parser = holokeep::net::daemon::parse_size)]
+        quota: Option<u64>,
     },
     /// Join a mesh with a ticket from a node already in it
     Join {
@@ -276,6 +289,21 @@ enum KeepCommand {
     },
     /// List what's kept
     Ls,
+}
+
+#[derive(Subcommand, Debug)]
+enum ProtectCommand {
+    /// Print the vault's key, by peer ID, for a friend to invite it with
+    /// (`hk node invite --protected --device`)
+    Id,
+    /// Encrypt a DAG, all of which must be here, into the vault, keeping a
+    /// manifest of it, which friends' nodes keep too; prints the manifest
+    Add { cid: Link },
+    /// List what the vault keeps: each manifest, and the root it protects
+    Ls,
+    /// Bring a DAG back from its manifest, fetching what isn't here
+    /// through the vault's protected meshes, and keep it; prints its root
+    Restore { manifest: Link },
 }
 
 #[derive(Subcommand, Debug)]
@@ -486,6 +514,43 @@ fn keep_here_or_there(repo: Option<PathBuf>, command: KeepCommand) -> anyhow::Re
     keep(Some(&dir), open_repo(Some(dir.clone()))?, command)
 }
 
+fn protect(dir: &Path, command: ProtectCommand) -> anyhow::Result<()> {
+    use holokeep::vault;
+    let me = rustix::process::getuid().as_raw();
+    match command {
+        ProtectCommand::Id => out!("{}", holokeep::keys::peer_id(&vault::Vault::open(dir, me)?.key().id())),
+        ProtectCommand::Add { cid } => {
+            let mut repo = Catalog::open_repo(dir)?;
+            out!("{}", vault::protect(&mut repo, dir, &cid)?);
+        },
+        ProtectCommand::Ls => {
+            let mut repo = Catalog::open_repo(dir)?;
+            for (manifest, root) in vault::list(&mut repo, dir)? {
+                out!("{manifest}\t{root}");
+            }
+        },
+        ProtectCommand::Restore { manifest } => {
+            #[cfg(feature = "net")]
+            {
+                use holokeep::net::{daemon, mesh};
+                let uid = vault::vault_of(me);
+                for (name, _) in daemon::members(&mesh::Place::main(dir))?.meshes()?.into_iter().filter(|&(_, account)| account == uid) {
+                    if let Some((_, missing)) = daemon::fetch(&mesh::Place::new(dir, &name), &manifest)?
+                        && missing.is_empty()
+                    {
+                        break;
+                    }
+                }
+            }
+            let mut repo = Catalog::open_repo(dir)?;
+            let (root, blocks) = vault::restore(&mut repo, dir, &manifest)?;
+            eprintln!("restored {blocks} blocks");
+            out!("{root}");
+        },
+    }
+    Ok(())
+}
+
 fn whoami(repo: Option<PathBuf>) -> anyhow::Result<()> {
     let dir = repo_dir(repo)?;
     if foreign(&dir) {
@@ -588,6 +653,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Tag(command) => tag_here_or_there(args.repo, command),
         Command::Keep(command) => keep_here_or_there(args.repo, command),
         Command::Whoami => whoami(args.repo),
+        Command::Protect(command) => protect(&repo_dir(args.repo)?, command),
         Command::Device(command) => device(&repo_dir(args.repo.clone())?, command),
         Command::Anchor(command) => anchor(args.repo.as_ref(), open_repo(args.repo.clone())?, command),
         Command::Block(BlockCommand::Get { cid }) => {
@@ -723,12 +789,48 @@ fn invite(place: &holokeep::net::mesh::Place, peer: &str, device: Option<&str>, 
     let user = root.id();
     let blocks = user_blocks(&repo)?;
     daemon::ask(place, "reload")?;
-    out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: Some((user, blocks)) }.encode());
+    out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: Some((user, blocks)), protected: false }.encode());
     if listening.is_empty() {
         eprintln!("note: this node isn't running, so the ticket says nowhere to find it; it'll be found on the LAN, or start `hk node run` and invite again");
     }
     Ok(())
 }
+
+/// Let a friend's machine into a protected mesh, which holds their vault
+/// here for an internal account of its own, whose user is the vault's key:
+/// what the vault keeps, this node keeps for it, up to its quota.
+#[cfg(feature = "net")]
+fn invite_friend(place: &holokeep::net::mesh::Place, peer: &str, vault: &str, quota: Option<u64>) -> anyhow::Result<()> {
+    use holokeep::net::{daemon, mesh};
+    anyhow::ensure!(!place.is_main(), "the main mesh is the owner's: give a protected one a --mesh of its own");
+    let dir = place.repo.as_path();
+    let peer: libp2p::PeerId = peer.parse().context("not a peer id")?;
+    let me = mesh::node_key(dir)?.public().to_peer_id();
+    anyhow::ensure!(peer != me, "that's this node");
+    let vault = holokeep::keys::from_peer_id(vault).context("--device isn't an ed25519 peer ID")?;
+    let members = daemon::members(place)?;
+    if members.account()?.is_none() {
+        // The next internal account for a friend
+        let next = members.meshes()?.iter().map(|&(_, uid)| uid).filter(|&uid| uid >= FRIENDS).max().map_or(FRIENDS, |uid| uid.saturating_add(1));
+        members.set_account(next)?;
+        members.set_protected(quota)?;
+        let repo = Catalog::open_repo(dir)?;
+        repo.claims().context("this repo keeps no claims")?.set_user(next, &vault)?;
+    }
+    anyhow::ensure!(members.protected()?.is_some(), "mesh {} isn't protected", place.mesh);
+    let swarm_key = mesh::ensure_swarm_key(&place.dir())?;
+    members.add(&peer)?;
+    let mut list = members.list()?;
+    let listening = daemon::ask(place, "listeners")?.unwrap_or_default();
+    list.insert(me, listening.iter().filter_map(|addr| addr.parse().ok()).collect());
+    daemon::ask(place, "reload")?;
+    out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: None, protected: true }.encode());
+    Ok(())
+}
+
+/// Where the internal accounts for friends' vaults start.
+#[cfg(feature = "net")]
+const FRIENDS: u32 = 0xC000_0000;
 
 /// The account a mesh is for, by uid: the main one's owner's, unless
 /// it's said, and a new one's whoever's said, or the owner's, recorded.
@@ -789,12 +891,24 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
                 out!("{name}\t{uid}");
             }
         },
-        NodeCommand::Invite { peer, device, account } => invite(place, &peer, device.as_deref(), account)?,
+        NodeCommand::Invite { peer, device, account, protected: false, quota: None } => invite(place, &peer, device.as_deref(), account)?,
+        NodeCommand::Invite { peer, device, account: None, protected: true, quota } => {
+            invite_friend(place, &peer, device.as_deref().context("a protected mesh holds a friend's vault: name it with --device")?, quota)?;
+        },
+        NodeCommand::Invite { .. } => anyhow::bail!("--quota is for a protected mesh, which is a friend's, not an account's"),
         NodeCommand::Join { ticket, account } => {
             let mut ticket = mesh::Ticket::decode(&ticket)?;
             let me = mesh::node_key(dir)?.public().to_peer_id();
             anyhow::ensure!(ticket.members.remove(&me).is_some(), "the ticket isn't for this node, {me}");
             let members = daemon::members(place)?;
+            // A protected mesh holds this account's vault, and nothing else
+            let account = if ticket.protected {
+                anyhow::ensure!(!place.is_main() && account.is_none(), "a protected mesh holds your vault: join it with a --mesh of its own");
+                let me = rustix::process::getuid().as_raw();
+                Some(holokeep::vault::Vault::open(dir, me)?.uid())
+            } else {
+                account
+            };
             let (uid, _) = mesh_uid(&members, account)?;
             if let Some((user, _)) = &ticket.user {
                 may_join(dir, uid, user)?;

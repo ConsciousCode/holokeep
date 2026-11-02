@@ -384,14 +384,21 @@ pub fn answer_advert(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, ad
     }
     let mut offer = catalog.offer()?;
     offer.free = offer.free.map(|free| marks.spare(free));
+    if let Some((_, left)) = catalog.quota_left()? {
+        offer.free = Some(offer.free.map_or(left, |free| free.min(left)));
+    }
     Ok(Haves { held, offer: Some(offer) })
 }
 
 /// Keep what's pushed, if there's room and each block matches its CID,
 /// noting the sender's copies of what's kept.
 pub fn answer_push(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, push: Push, marks: &super::trim::Watermarks) -> Result<Kept> {
-    let size = push.blocks.iter().fold(0usize, |size, (_, data)| size.saturating_add(data.len()));
-    if catalog.offer()?.free.is_some_and(|free| u64::try_from(size).unwrap_or(u64::MAX) > marks.spare(free)) {
+    let size = u64::try_from(push.blocks.iter().fold(0usize, |size, (_, data)| size.saturating_add(data.len()))).unwrap_or(u64::MAX);
+    if catalog.offer()?.free.is_some_and(|free| size > marks.spare(free)) {
+        return Ok(Kept::default());
+    }
+    // Nor past what the account's allowed
+    if catalog.quota_left()?.is_some_and(|(_, left)| size > left) {
         return Ok(Kept::default());
     }
     let mut kept = Vec::new();

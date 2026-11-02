@@ -326,6 +326,10 @@ fn open_node(place: &Place) -> Result<Node> {
     if let Some(uid) = members.account()? {
         catalog.act_for(uid, crate::keys::account_key(dir, uid)?)?;
     }
+    // A friend's account takes no more than it's allowed
+    if let Some(quota) = members.protected()? {
+        catalog.set_quota(quota);
+    }
     Node::tcp(&key, swarm_key, catalog, members)
 }
 
@@ -600,6 +604,15 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
             let _ = writeln!(out, "pressed\t{}", if marks.pressed() { "yes" } else { "no" });
             let _ = writeln!(out, "collecting\t{}", if collecting { "yes" } else { "no" });
             let _ = writeln!(out, "condemned\t{}", node.condemned().count()?);
+            let _ = writeln!(out, "account\t{}", node.catalog().uid());
+            match node.catalog().quota_left()? {
+                Some((quota, left)) => {
+                    let _ = writeln!(out, "used\t{} of {} bytes", quota.saturating_sub(left), quota);
+                },
+                None => {
+                    let _ = writeln!(out, "used\t{} bytes", node.catalog().used()?);
+                },
+            }
         },
         "listeners" => {
             for addr in node.listeners() {
