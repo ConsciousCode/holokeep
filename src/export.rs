@@ -23,6 +23,10 @@ const MAX_DEPTH: usize = 1024;
 pub trait Fetch {
     /// A block's bytes, which must match its CID.
     fn fetch(&self, cid: &Link) -> io::Result<Vec<u8>>;
+
+    /// Blocks about to be fetched, so a source that gets them from
+    /// elsewhere can ask for them all at once rather than one by one.
+    fn prefetch(&self, _cids: &[Link]) {}
 }
 
 impl Fetch for Catalog {
@@ -257,6 +261,9 @@ fn read_part(src: &impl Fetch, node: Node, mut offset: u64, size: usize, out: &m
                 offset = offset.saturating_sub(len(inline));
                 let depth = deeper(depth)?;
                 let sized = data.blocksizes.len() == links.len();
+                if sized {
+                    src.prefetch(&in_range(&links, &data.blocksizes, offset, size.saturating_sub(out.len())));
+                }
                 for (i, (cid, _)) in links.iter().enumerate() {
                     if out.len() >= size {
                         break;
@@ -281,6 +288,25 @@ fn read_part(src: &impl Fetch, node: Node, mut offset: u64, size: usize, out: &m
     }
 }
 
+/// The parts of a file a read of `size` bytes from `offset` past its
+/// inline data is in.
+fn in_range(links: &[(Link, Vec<u8>)], sizes: &[u64], offset: u64, size: usize) -> Vec<Link> {
+    let end = offset.saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
+    let mut start = 0u64;
+    let mut parts = Vec::new();
+    for ((cid, _), part) in links.iter().zip(sizes) {
+        let next = start.saturating_add(*part);
+        if next > offset && start < end {
+            parts.push(cid.clone());
+        }
+        if start >= end {
+            break;
+        }
+        start = next;
+    }
+    parts
+}
+
 /// Add bytes from `offset` to `out`, up to `size` in all.
 fn take(bytes: &[u8], offset: u64, size: usize, out: &mut Vec<u8>) {
     let Ok(start) = usize::try_from(offset) else {
@@ -298,6 +324,7 @@ pub fn list(src: &impl Fetch, cid: &Link) -> io::Result<Vec<(Vec<u8>, Link)>> {
     let mut entries = Vec::new();
     match load(src, cid)? {
         Node::Pb { data, links } if data.data_type == DataType::Directory => {
+            src.prefetch(&links.iter().map(|(cid, _)| cid.clone()).collect::<Vec<_>>());
             entries.extend(links.into_iter().filter(|(_, name)| entry_name(name).is_ok()).map(|(cid, name)| (name, cid)));
         },
         Node::Pb { data, links } if data.data_type == DataType::HAMTShard => list_shard(src, &data, links, &mut entries, 0)?,
@@ -312,6 +339,7 @@ fn list_shard(src: &impl Fetch, data: &DataBuf, links: Vec<(Link, Vec<u8>)>, ent
         .ok_or_else(|| invalid("HAMT shard with an invalid fanout"))?;
     let pad = format!("{:X}", fanout.saturating_sub(1)).len();
     let depth = deeper(depth)?;
+    src.prefetch(&links.iter().map(|(cid, _)| cid.clone()).collect::<Vec<_>>());
     for (cid, name) in links {
         let (prefix, entry) = name.split_at_checked(pad)
             .ok_or_else(|| invalid("HAMT link name shorter than its prefix"))?;
@@ -457,6 +485,62 @@ mod tests {
         let cid = put(&router, &block);
         assert_eq!(stat(&router, &cid).expect("stat"), Kind::File(1));
         assert_eq!(read_at(&router, &cid, 0, 10).expect("read"), b"\xa0");
+    }
+
+    /// A source that notes what's prefetched and what's fetched.
+    struct Recording<'a> {
+        router: &'a Catalog,
+        prefetched: std::cell::RefCell<Vec<Link>>,
+        fetched: std::cell::RefCell<Vec<Link>>,
+    }
+
+    impl Fetch for Recording<'_> {
+        fn fetch(&self, cid: &Link) -> io::Result<Vec<u8>> {
+            self.fetched.borrow_mut().push(cid.clone());
+            self.router.fetch(cid)
+        }
+
+        fn prefetch(&self, cids: &[Link]) {
+            self.prefetched.borrow_mut().extend_from_slice(cids);
+        }
+    }
+
+    impl Recording<'_> {
+        /// What was fetched without being prefetched first, but the
+        /// first, and what was prefetched but never fetched.
+        fn surprises(&self) -> (Vec<Link>, Vec<Link>) {
+            let (prefetched, fetched) = (self.prefetched.take(), self.fetched.take());
+            let unasked = fetched.iter().skip(1).filter(|cid| !prefetched.contains(cid)).cloned().collect();
+            let wasted = prefetched.iter().filter(|cid| !fetched.contains(cid)).cloned().collect();
+            (unasked, wasted)
+        }
+    }
+
+    #[test]
+    fn reads_and_listings_say_what_theyll_fetch_first() {
+        let scratch = Scratch::new("export-prefetch");
+        let t = tree(scratch.path());
+        let mut router = router();
+        let root = add(&mut router, &t);
+        let src = Recording { router: &router, prefetched: std::cell::RefCell::default(), fetched: std::cell::RefCell::default() };
+        let lookup = |dir: &Link, name: &str| list(&router, dir).expect("list").into_iter().find(|(entry, _)| entry == name.as_bytes()).expect("entry").1;
+        let big = lookup(&lookup(&lookup(&lookup(&root, "a"), "b"), "c"), "big");
+        let original = fs::read(t.join("a/b/c/big")).expect("read");
+        for (offset, size) in [(0, 10), (1000, 200), (5000, 64), (19_990, 100), (0, 30_000)] {
+            let got = read_at(&src, &big, offset, size).expect("read");
+            assert_eq!(got, original.get(usize::try_from(offset).expect("offset")..).map(|rest| &rest[..size.min(rest.len())]).expect("in range"));
+            // Only the root's fetched unannounced, and only what's read is announced
+            let (unasked, wasted) = src.surprises();
+            assert!(unasked.is_empty(), "{offset}+{size}: {unasked:?}");
+            assert!(wasted.is_empty(), "{offset}+{size}: {wasted:?}");
+        }
+        // A directory's, and a sharded one's, entries are announced together
+        for dir in [root.clone(), lookup(&root, "shard")] {
+            let entries = list(&src, &dir).expect("list");
+            let prefetched = src.prefetched.take();
+            assert!(entries.iter().all(|(_, cid)| prefetched.contains(cid)));
+            src.fetched.take();
+        }
     }
 
     #[test]

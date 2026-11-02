@@ -111,11 +111,24 @@ pub struct Fetch {
     seen: HashSet<Vec<u8>>,
     fetched: usize,
     missing: Vec<Link>,
+    /// Whether to follow links, fetching whole DAGs, or just the blocks.
+    deep: bool,
 }
 
 impl Fetch {
+    /// Fetch the DAG under a root.
     pub fn new(root: Link) -> Self {
-        Self { queue: vec![root], wanted: BTreeMap::new(), inflight: HashMap::new(), seen: HashSet::new(), fetched: 0, missing: Vec::new() }
+        Self::of(vec![root], true)
+    }
+
+    /// Fetch just these blocks, not what they link to: what a reader
+    /// needs next, without the rest of a DAG it may never read.
+    pub fn blocks(blocks: Vec<Link>) -> Self {
+        Self::of(blocks, false)
+    }
+
+    fn of(queue: Vec<Link>, deep: bool) -> Self {
+        Self { queue, wanted: BTreeMap::new(), inflight: HashMap::new(), seen: HashSet::new(), fetched: 0, missing: Vec::new(), deep }
     }
 
     /// Look at what's queued here, then say what to ask of whom: batches
@@ -127,7 +140,7 @@ impl Fetch {
                 continue;
             }
             if catalog.has(link.multihash())? {
-                if link.codec() == RAW_CODEC {
+                if link.codec() == RAW_CODEC || !self.deep {
                     continue;
                 }
                 // Here, unless it's only on a volume that isn't attached
@@ -203,7 +216,7 @@ impl Fetch {
                 }
             }
             self.fetched = self.fetched.saturating_add(1);
-            if link.codec() != RAW_CODEC {
+            if link.codec() != RAW_CODEC && self.deep {
                 self.queue.extend(crate::links::links(link.codec(), block.data()).unwrap_or_default());
             }
         }

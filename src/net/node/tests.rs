@@ -152,6 +152,12 @@ async fn holding() -> (Node, Node, Vec<Block>) {
 /// Fetch a DAG with one node, while driving both, and say what came of it.
 async fn fetch(a: &mut Node, b: &mut Node, root: Link) -> (usize, Vec<Link>) {
     let id = b.fetch(root).expect("fetch");
+    fetched(a, b, id).await
+}
+
+/// Drive both nodes until the second's fetch is done, and say what came
+/// of it.
+async fn fetched(a: &mut Node, b: &mut Node, id: FetchId) -> (usize, Vec<Link>) {
     let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(10)).expect("deadline");
     loop {
         let event = tokio::time::timeout_at(deadline, async {
@@ -179,6 +185,20 @@ async fn members_fetch_dags_from_each_other() {
     }
     // Now it's all here, nothing's asked
     assert_eq!(fetch(&mut a, &mut b, root).await, (0, vec![]));
+}
+
+#[tokio::test]
+async fn fetching_blocks_takes_only_them() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    // The root, and a leaf it doesn't link to directly
+    let (root, deep) = (blocks.first().expect("root"), blocks.get(3).expect("deep"));
+    let id = b.fetch_blocks(vec![link(root), link(deep)]).expect("fetch");
+    assert_eq!(fetched(&mut a, &mut b, id).await, (2, vec![]));
+    assert!(has(&b, root) && has(&b, deep));
+    assert!(!has(&b, blocks.get(1).expect("branch")) && !has(&b, blocks.get(2).expect("leaf")));
+    let nowhere = raw(b"nowhere");
+    let id = b.fetch_blocks(vec![link(root), link(&nowhere)]).expect("fetch");
+    assert_eq!(fetched(&mut a, &mut b, id).await, (0, vec![link(&nowhere)]));
 }
 
 #[tokio::test]

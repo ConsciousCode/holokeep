@@ -9,7 +9,8 @@
 //! UnixFS directories are directories, files files and symlinks symlinks;
 //! a block of any other codec reads as its bytes. A file's read fetches
 //! only the parts of it the read is in. What isn't here is asked of the
-//! running node, which fetches the DAG under it from members, and what's
+//! running node, which fetches just those blocks from members, all of a
+//! read's or a directory's entries at once, and what's
 //! another account's is as good as not here, as for `hk cat`. Anchors and
 //! tags are looked up again every second, so the mount follows them.
 
@@ -27,7 +28,7 @@ use fuser::{
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request,
 };
 
-use crate::cid::CidRef as _;
+use crate::cid::{BaseCid as _, CidRef as _};
 use crate::export::{self, Fetch, Kind};
 use crate::model::Link;
 use crate::store::Catalog;
@@ -47,9 +48,9 @@ thread_local! {
 /// Tells soups apart, for their catalogs.
 static SOUPS: AtomicU64 = AtomicU64::new(0);
 
-/// Asks the running node to fetch the DAG under a CID, saying whether it
+/// Asks the running node to fetch blocks, just them, saying whether it
 /// could ask.
-pub type Fetcher = Box<dyn Fn(&Link) -> bool + Send + Sync>;
+pub type Fetcher = Box<dyn Fn(&[Link]) -> bool + Send + Sync>;
 
 /// What an inode is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,10 +128,24 @@ impl Fetch for Source<'_> {
     fn fetch(&self, cid: &Link) -> io::Result<Vec<u8>> {
         match self.catalog.fetch(cid) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => match self.fetcher {
-                Some(fetcher) if fetcher(cid) => self.catalog.fetch(cid),
+                Some(fetcher) if fetcher(std::slice::from_ref(cid)) => self.catalog.fetch(cid),
                 _ => Err(e),
             },
             result => result,
+        }
+    }
+
+    fn prefetch(&self, cids: &[Link]) {
+        use crate::store::BlockIndex as _;
+        let Some(fetcher) = self.fetcher else {
+            return;
+        };
+        let missing: Vec<Link> = cids.iter()
+            .filter(|cid| cid.hashcode() != crate::block::IDENTITY && !self.catalog.has(cid.multihash()).unwrap_or(true))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            fetcher(&missing);
         }
     }
 }
@@ -190,7 +205,7 @@ impl Soup {
             return Ok(true);
         }
         match &self.fetcher {
-            Some(fetcher) if fetcher(cid) => catalog.visible(cid.multihash()).map_err(store_errno),
+            Some(fetcher) if fetcher(std::slice::from_ref(cid)) => catalog.visible(cid.multihash()).map_err(store_errno),
             _ => Ok(false),
         }
     }

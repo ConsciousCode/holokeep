@@ -711,7 +711,7 @@ fn mount(repo: PathBuf, dir: &Path) -> anyhow::Result<()> {
     #[cfg(feature = "net")]
     let fetcher: Option<holokeep::mount::Fetcher> = {
         let place = holokeep::net::mesh::Place::main(&repo);
-        Some(Box::new(move |cid: &Link| matches!(holokeep::net::daemon::fetch(&place, cid), Ok(Some(_)))))
+        Some(Box::new(move |cids: &[Link]| matches!(holokeep::net::daemon::fetch_blocks(&place, cids), Ok(Some(_)))))
     };
     #[cfg(not(feature = "net"))]
     let fetcher = None;

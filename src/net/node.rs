@@ -794,6 +794,16 @@ impl Node {
         Ok(id)
     }
 
+    /// Fetch just these blocks from other members, not what they link
+    /// to. It's done when `next` returns `Fetched` with the id.
+    pub fn fetch_blocks(&mut self, blocks: Vec<Link>) -> Result<FetchId> {
+        let id = self.next_fetch;
+        self.next_fetch = id.wrapping_add(1);
+        self.fetches.insert(id, Fetch::blocks(blocks));
+        self.drive(id)?;
+        Ok(id)
+    }
+
     /// Send what a fetch has to ask, or finish it.
     fn drive(&mut self, id: FetchId) -> Result<()> {
         let mut peers = self.connected();

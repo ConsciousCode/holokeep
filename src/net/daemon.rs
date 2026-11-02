@@ -209,6 +209,26 @@ pub fn ask_patiently(place: &Place, command: &str) -> Result<Option<Vec<String>>
     ask_within(place, command, None)
 }
 
+/// The most blocks one `fetch_blocks` asks the daemon for at once.
+pub const FETCH_BLOCKS: usize = 1024;
+
+/// Have the running daemon fetch just these blocks, not what they link
+/// to: how many it fetched and the CIDs no connected member had, or None
+/// if it isn't running.
+pub fn fetch_blocks(place: &Place, blocks: &[crate::model::Link]) -> Result<Option<(usize, Vec<String>)>> {
+    let (mut fetched, mut missing) = (0usize, Vec::new());
+    for chunk in blocks.chunks(FETCH_BLOCKS) {
+        let words: Vec<String> = chunk.iter().map(ToString::to_string).collect();
+        let Some(lines) = ask_patiently(place, &format!("fetch-blocks {}", words.join(" ")))? else {
+            return Ok(None);
+        };
+        let (n, gone) = fetched_of(lines)?;
+        fetched = fetched.saturating_add(n);
+        missing.extend(gone);
+    }
+    Ok(Some((fetched, missing)))
+}
+
 /// Have the running daemon fetch the DAG under a root: how many blocks it
 /// fetched and the CIDs no connected member had, or None if it isn't
 /// running.
@@ -216,6 +236,11 @@ pub fn fetch(place: &Place, root: &crate::model::Link) -> Result<Option<(usize, 
     let Some(lines) = ask_patiently(place, &format!("fetch {root}"))? else {
         return Ok(None);
     };
+    fetched_of(lines).map(Some)
+}
+
+/// What the daemon said it fetched, and what was missing.
+fn fetched_of(lines: Vec<String>) -> Result<(usize, Vec<String>)> {
     let (mut fetched, mut missing) = (None, Vec::new());
     for line in lines {
         if let Some(n) = line.strip_prefix("fetched ") {
@@ -230,7 +255,7 @@ pub fn fetch(place: &Place, root: &crate::model::Link) -> Result<Option<(usize, 
         }
     }
     let fetched = fetched.ok_or_else(|| Error::Invalid("the node hung up without saying what it fetched".into()))?;
-    Ok(Some((fetched, missing)))
+    Ok((fetched, missing))
 }
 
 /// Have the running daemon audit now, as many failures to lose a block as
@@ -578,7 +603,7 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
         write.write_all(out.as_bytes()).await?;
         return Ok(None);
     }
-    if uid != me && uid != 0 && !line.starts_with("fetch ") {
+    if uid != me && uid != 0 && !line.starts_with("fetch ") && !line.starts_with("fetch-blocks ") {
         write.write_all(format!("error: only the repo's owner, uid {me}, may ask that\n").as_bytes()).await?;
         return Ok(None);
     }
@@ -624,6 +649,15 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
         "reload" => {
             node.reload()?;
             node.dial_members()?;
+        },
+        command if command.starts_with("fetch-blocks ") => {
+            let cids: std::result::Result<Vec<crate::model::Link>, _> = command.trim_start_matches("fetch-blocks ").split_whitespace().map(str::parse).collect();
+            match cids {
+                Ok(cids) => return Ok(Some((Waiter::Fetch(node.fetch_blocks(cids)?), write))),
+                Err(_) => {
+                    let _ = writeln!(out, "error: not a list of CIDs");
+                },
+            }
         },
         command if command.starts_with("fetch ") => {
             let cid = command.trim_start_matches("fetch ").trim();
