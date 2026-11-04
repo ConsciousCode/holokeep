@@ -361,6 +361,14 @@ Checklist:
   - [ ] Merging concurrent edits of an anchor from its history, path by path, keeping conflicting versions side by side
   - [x] Names for anchors: the account's root anchor at the top, a directory made there a new anchor it names by symlink, late bound and per account (`hk anchor root`)
   - [ ] Merging a joining repo's root names into the user's
+  - [x] Mount points: a symlink to an anchor shown as the anchor, a directory of its own wherever it's reached, unless that would loop; directories reached twice are two inodes
+  - [x] Committing what's open once it's synced, never a file caught halfway through being written, at a pace that backs off from at once to every 10 min as an anchor's written to often
+  - [x] Every committed version kept whole: a work file's blocks moved out before it's changed, so history costs only what changed
+  - [x] Rules (`.souprules`, gitignore-like, per directory and at the top of the root): detaching application state (`.obsidian/`, `.git/`) into anchors of its own as it's made, a least pace, by name, path or application
+  - [ ] Rules for value: fewer copies of what can be made again (`__pycache__/`), by keeps that say how many
+  - [ ] Detaching files, not only directories
+  - [ ] Importing `.git` as `git-raw` blocks, packs split into objects
+  - [ ] Live anchors, which are whatever their backing is now, and anchors served by a peer, as 9P mounts
 - [ ] P2P private mesh
   - [x] Joining: swarm key, members, tickets, mDNS, identify (`hk node id/invite/join/run/peers`)
   - [x] Fetching DAGs from other nodes (`hk dag fetch`, and `cat`/`get`/`dag export` through a running node)

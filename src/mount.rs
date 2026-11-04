@@ -53,6 +53,7 @@ use crate::model::Link;
 use crate::store::Catalog;
 use crate::store::overlay;
 
+mod rules;
 mod write;
 use write::{Committer, Filler, Handle};
 
@@ -233,12 +234,21 @@ pub struct Soup {
     sizes: Mutex<HashMap<Vec<u8>, u64>>,
     /// Directory listings open, by handle.
     listings: Mutex<HashMap<u64, std::sync::Arc<Vec<Entry>>>>,
+    /// Directories' rules files as last read, by anchor and path.
+    rules: Mutex<HashMap<(Vec<u8>, PathBuf), RulesRead>>,
     next_handle: AtomicU64,
     uid: u32,
     gid: u32,
     at: SystemTime,
     /// Where it's mounted, for symlinks to anchors.
     dir: Option<PathBuf>,
+}
+
+/// A directory's rules file, as read: which it was, and its rules.
+struct RulesRead {
+    /// Its CID, or its size, mtime and inode in a work directory.
+    which: Vec<u8>,
+    rules: Arc<rules::Rules>,
 }
 
 /// The catalog, asking the node for what isn't here.
@@ -356,6 +366,7 @@ impl Soup {
             inodes: Mutex::new(Inodes::new()),
             sizes: Mutex::new(HashMap::new()),
             listings: Mutex::new(HashMap::new()),
+            rules: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             uid: rustix::process::getuid().as_raw(),
             gid: rustix::process::getgid().as_raw(),
@@ -476,6 +487,12 @@ impl Soup {
         match self.kind_kept(catalog, &inode)? {
             Kind::Symlink(target) => match self.mount_point(catalog, dir, &target, via)? {
                 Some(mounted) => {
+                    if let Inode::Path(anchor, _, _) = &mounted
+                        && self.work.is_some()
+                    {
+                        let pace = self.settings_for(catalog, dir, name, true, None)?.pace;
+                        self.committer.floor(anchor, pace.unwrap_or_default());
+                    }
                     let kind = self.kind(catalog, &mounted)?;
                     Ok((mounted, kind))
                 },
@@ -508,6 +525,91 @@ impl Soup {
             return Ok(None);
         }
         Ok(Some(Inode::Path(anchor, PathBuf::new(), via)))
+    }
+
+    /// What the rules say of what's made at a name in a directory, a
+    /// directory if `dir`, by `app` if it's known: the built-in rules,
+    /// then the root's top's rules file, then each directory's from the
+    /// top down, through mount points, a nearer one saying over a farther.
+    fn settings_for(&self, catalog: &Catalog, parent: u64, name: &[u8], dir: bool, app: Option<&str>) -> Result<rules::Settings, Errno> {
+        // Each directory up from the name, with the path to it from there
+        let mut chain: Vec<(Link, PathBuf, PathBuf)> = Vec::new();
+        let mut below = PathBuf::from(OsStr::from_bytes(name));
+        let mut at = parent;
+        let mut topped = false;
+        for _ in 0..65536 {
+            let (anchor, rel, via) = match self.inode(at)? {
+                Inode::Root => match Self::root(catalog)? {
+                    Some(root) => (root, PathBuf::new(), Some((ROOT, Vec::new()))),
+                    None => break,
+                },
+                Inode::Path(anchor, rel, via) => (anchor, rel, via),
+                _ => break,
+            };
+            let mut dir = rel.clone();
+            loop {
+                let from = rel.strip_prefix(&dir).unwrap_or(&rel).join(&below);
+                chain.push((anchor.clone(), dir.clone(), from));
+                if !dir.pop() {
+                    break;
+                }
+            }
+            below = rel.join(&below);
+            match via {
+                Some((up, point)) if !point.is_empty() => {
+                    below = Path::new(OsStr::from_bytes(&point)).join(&below);
+                    at = up;
+                },
+                // The root anchor, at the top
+                Some(_) => {
+                    topped = true;
+                    break;
+                },
+                None => break,
+            }
+        }
+        let mut settings = rules::Rules::defaults().apply(rules::Settings::default(), Path::new(OsStr::from_bytes(name)), dir, app);
+        if !topped && let Some(root) = Self::root(catalog)? {
+            settings = self.rules_at(catalog, &root, Path::new(""))?.apply(settings, &below, dir, app);
+        }
+        for (anchor, dir_rel, from) in chain.iter().rev() {
+            settings = self.rules_at(catalog, anchor, dir_rel)?.apply(settings, from, dir, app);
+        }
+        Ok(settings)
+    }
+
+    /// A directory's rules, from its rules file, read again only once
+    /// it's another file. What isn't a rule is said as it's read.
+    fn rules_at(&self, catalog: &Catalog, anchor: &Link, dir: &Path) -> Result<Arc<rules::Rules>, Errno> {
+        use std::os::unix::fs::MetadataExt as _;
+        let key = (anchor.to_bytes(), dir.to_path_buf());
+        let file = dir.join(rules::FILE);
+        let at = self.at(catalog, anchor, &file)?;
+        let which = match &at {
+            Some(At::Work(meta)) if meta.is_file() => [&meta.len().to_be_bytes()[..], &meta.mtime_nsec().to_be_bytes(), &meta.mtime().to_be_bytes(), &meta.ino().to_be_bytes()].concat(),
+            Some(At::Base(cid, _)) => cid.to_bytes(),
+            _ => Vec::new(),
+        };
+        if let Some(read) = self.rules.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key)
+            && read.which == which
+        {
+            return Ok(Arc::clone(&read.rules));
+        }
+        let text = match at {
+            Some(At::Work(meta)) if meta.is_file() => {
+                let file = std::fs::File::open(self.work_path(anchor, &file).ok_or(Errno::ENOENT)?).map_err(|e| errno(&e))?;
+                read_file(&file, 0, rules::MOST)?
+            },
+            Some(At::Base(cid, _)) => export::read_at(&Source { catalog, fetcher: self.fetcher.as_deref() }, &cid, 0, rules::MOST).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let (rules, errors) = rules::Rules::parse(&String::from_utf8_lossy(&text));
+        for e in errors {
+            eprintln!("{} in anchor {anchor}: {e}", file.display());
+        }
+        let rules = Arc::new(rules);
+        self.rules.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, RulesRead { which, rules: Arc::clone(&rules) });
+        Ok(rules)
     }
 
     /// The anchors a directory is in, from it up to the top.
@@ -951,8 +1053,8 @@ impl Filesystem for Soup {
         }
     }
 
-    fn mkdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
-        match self.mkdir(parent.0, name) {
+    fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+        match self.mkdir_by(parent.0, name, rules::app_of(req.pid()).as_deref()) {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
             Err(e) => reply.error(e),
         }
@@ -1360,6 +1462,94 @@ mod tests {
         assert_eq!(read_at(three, "note"), b"second");
         assert_eq!(read_at(three, "moved/inner"), b"inside");
         assert_eq!(read_at(four, "big").len(), 10);
+    }
+
+    #[test]
+    fn rules_detach_what_applications_keep_state_in() {
+        let scratch = Scratch::new("mount-rules");
+        let (soup, anchor, repo) = writable(&scratch);
+        let at = |path: &str| ino(&soup, path).unwrap_or_else(|e| panic!("{path}: {e:?}"));
+        let detached = |parent: u64, name: &str| -> bool {
+            let kept = soup.resolve_kept(parent, OsStr::new(name)).expect("kept");
+            let shown = soup.resolve(parent, OsStr::new(name)).expect("shown");
+            assert_eq!(shown.kind, FileType::Directory, "{name}");
+            kept.kind == FileType::Symlink
+        };
+        let top = at(&format!("anchors/{anchor}")).ino.0;
+        let write = |parent: u64, name: &str, data: &[u8]| {
+            let (_, fh) = soup.create(parent, OsStr::new(name)).expect("create");
+            soup.write(fh, 0, data).expect("write");
+            soup.release(fh);
+        };
+
+        // By the built-in rules: an application's state is an anchor of its own
+        let made = soup.mkdir(top, OsStr::new(".obsidian")).expect("mkdir");
+        assert_eq!(made.kind, FileType::Directory);
+        assert!(detached(top, ".obsidian"));
+        write(made.ino.0, "workspace.json", b"{}");
+        soup.commit();
+        let was = value(&repo, &anchor);
+        let fh = soup.open(at(&format!("anchors/{anchor}/.obsidian/workspace.json")).ino.0, true, false).expect("open");
+        soup.write(fh, 0, b"[]").expect("write");
+        soup.release(fh);
+        soup.commit();
+        assert_eq!(value(&repo, &anchor), was, "what's detached changes, not what it's in");
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/.obsidian/workspace.json")), b"[]");
+        soup.mkdir(top, OsStr::new("plain")).expect("mkdir");
+        assert!(!detached(top, "plain"));
+
+        // A directory's rules say over the built-in ones, below it
+        write(at(&format!("anchors/{anchor}/dir")).ino.0, ".souprules", b"cache/ detach\n.obsidian/ inline # kept in\n");
+        let dir = at(&format!("anchors/{anchor}/dir")).ino.0;
+        soup.mkdir(dir, OsStr::new(".obsidian")).expect("mkdir");
+        assert!(!detached(dir, ".obsidian"));
+        soup.mkdir(at(&format!("anchors/{anchor}/dir/deep")).ino.0, OsStr::new("cache")).expect("mkdir");
+        assert!(detached(at(&format!("anchors/{anchor}/dir/deep")).ino.0, "cache"), "a name anywhere below");
+        soup.mkdir(top, OsStr::new("cache")).expect("mkdir");
+        assert!(!detached(top, "cache"), "not above");
+
+        // The root's rules, through mount points, and for one application
+        soup.mkdir(ROOT, OsStr::new("wiki")).expect("mkdir");
+        write(ROOT, ".souprules", b"wiki/notes/ detach\nscratch/ detach app=obsidian\n");
+        let wiki = at("wiki").ino.0;
+        soup.mkdir(wiki, OsStr::new("notes")).expect("mkdir");
+        assert!(detached(wiki, "notes"), "a path through the mount point");
+        soup.mkdir(at("wiki/notes").ino.0, OsStr::new("notes")).expect("mkdir");
+        assert!(!detached(at("wiki/notes").ino.0, "notes"), "a path, not a name");
+        soup.mkdir_by(wiki, OsStr::new("scratch"), Some("obsidian")).expect("mkdir");
+        assert!(detached(wiki, "scratch"));
+        soup.mkdir_by(at("wiki/notes").ino.0, OsStr::new("scratch"), Some("bash")).expect("mkdir");
+        assert!(!detached(at("wiki/notes").ino.0, "scratch"));
+    }
+
+    #[test]
+    fn rules_say_how_often_an_anchor_is_committed() {
+        let scratch = Scratch::new("mount-pace");
+        let (soup, _, repo) = writable(&scratch);
+        let (_, fh) = soup.create(ROOT, OsStr::new(".souprules")).expect("create");
+        soup.write(fh, 0, b".obsidian/ pace=1m").expect("write");
+        soup.release(fh);
+        soup.commit();
+        let state = soup.mkdir(ROOT, OsStr::new(".obsidian")).expect("mkdir").ino.0;
+        let made = match soup.inode(state).expect("inode") {
+            Inode::Path(anchor, _, _) => anchor,
+            inode => panic!("{inode:?}"),
+        };
+        let later = |secs| std::time::Instant::now() + Duration::from_secs(secs);
+        let commit = |secs| soup.committer.commit_as_of(&mut Catalog::open_repo(&repo).expect("catalog"), false, later(secs));
+        let write = |data: &[u8]| {
+            let (_, fh) = soup.create(state, OsStr::new("workspace.json")).expect("create");
+            soup.write(fh, 0, data).expect("write");
+            soup.release(fh);
+        };
+        write(b"one");
+        commit(2);
+        let one = value(&repo, &made);
+        write(b"two");
+        commit(30);
+        assert_eq!(value(&repo, &made), one, "not a minute since");
+        commit(63);
+        assert_ne!(value(&repo, &made), one);
     }
 
     #[test]

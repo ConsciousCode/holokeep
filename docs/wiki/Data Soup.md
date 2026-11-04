@@ -22,6 +22,7 @@ the holokeep repository; this wiki is the reference.
 - [[Replication and Retention]]: copies, risks, trimming, garbage collection.
 - [[Protected Meshes]]: vaults, encryption, recovery.
 - [[Mount]]: the FUSE filesystem and writing through it.
+- [[Rules]]: `.souprules`, what's made through the mount becomes.
 - [[Style Guide]]: how these pages are written.
 
 ## Vocabulary
@@ -47,6 +48,8 @@ the holokeep repository; this wiki is the reference.
 | vault | An account's internal account for what it encrypts for friends to hold. |
 | keep | A claim saying to keep a DAG; what nothing keeps is collected. |
 | tomb | A claim retracting other claims. |
+| mount point | A symlink to an anchor, which the mount shows as the anchor. |
+| rules file | A `.souprules` file, saying what's made below it becomes. |
 
 ## Invariants
 

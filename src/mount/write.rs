@@ -229,6 +229,9 @@ struct Written {
     changes: u64,
     /// Which of [`PACES`] it's at.
     pace: usize,
+    /// The least time between its commits, as the rules say of where it's
+    /// mounted.
+    floor: Duration,
     /// Whether it's due for being written to so long without being quiet.
     stale: bool,
     /// When it was last committed.
@@ -237,7 +240,7 @@ struct Written {
 
 impl Written {
     const fn new(anchor: Link) -> Self {
-        Self { anchor, dirty: None, unsynced: 0, changes: 0, pace: 0, stale: false, committed: None }
+        Self { anchor, dirty: None, unsynced: 0, changes: 0, pace: 0, floor: Duration::ZERO, stale: false, committed: None }
     }
 
     /// Whether what's written is due to be committed, at `now`: written
@@ -248,7 +251,7 @@ impl Written {
         let Some((since, last)) = self.dirty else {
             return false;
         };
-        let pace = PACES.get(self.pace).copied().unwrap_or(Duration::MAX);
+        let pace = PACES.get(self.pace).copied().unwrap_or(Duration::MAX).max(self.floor);
         let whole = self.unsynced == 0;
         let paced = self.committed.is_none_or(|at| now.saturating_duration_since(at) >= pace);
         let quiet = now.saturating_duration_since(last) >= QUIET;
@@ -326,6 +329,11 @@ impl Committer {
     /// synced, if `unsynced`, or that one such has been synced or closed.
     fn unsynced(&self, anchor: &Link, unsynced: bool) {
         self.of(anchor, |it| it.unsynced = if unsynced { it.unsynced.saturating_add(1) } else { it.unsynced.saturating_sub(1) });
+    }
+
+    /// The least time between an anchor's commits, as the rules say.
+    pub(super) fn floor(&self, anchor: &Link, floor: Duration) {
+        self.of(anchor, |it| it.floor = floor);
     }
 
     /// How many times an anchor's been written to.
@@ -674,11 +682,21 @@ impl Soup {
     /// Make a directory: at the top, a new anchor, which the root anchor
     /// names.
     pub fn mkdir(&self, parent: u64, name: &OsStr) -> Result<FileAttr, Errno> {
+        self.mkdir_by(parent, name, None)
+    }
+
+    /// Make a directory, as `app` does if it's known: at the top, or
+    /// where the rules say to detach it, a new anchor, mounted there.
+    pub fn mkdir_by(&self, parent: u64, name: &OsStr, app: Option<&str>) -> Result<FileAttr, Errno> {
         if self.inode(parent)? == Inode::Root {
-            return self.name_new_anchor(name);
+            return self.anchor_at(parent, name);
         }
         let (anchor, rel) = self.overlay_of(parent)?;
         let catalog = self.catalog()?;
+        if self.settings_for(&catalog, parent, name.as_bytes(), true, app)?.detach == Some(true) {
+            drop(catalog);
+            return self.anchor_at(parent, name);
+        }
         self.prepare(&catalog, &anchor)?;
         fs::create_dir_all(self.work_path(&anchor, &rel.join(name)).ok_or(Errno::EROFS)?).map_err(|e| io_errno(&e))?;
         drop(catalog);
@@ -686,15 +704,15 @@ impl Soup {
         self.resolve(parent, name)
     }
 
-    /// A new anchor, an empty directory, named at the top.
-    fn name_new_anchor(&self, name: &OsStr) -> Result<FileAttr, Errno> {
+    /// A new anchor, an empty directory, mounted at a name in a directory.
+    fn anchor_at(&self, parent: u64, name: &OsStr) -> Result<FileAttr, Errno> {
         use crate::cid::CidVersion;
-        let (root, _) = self.overlay_of(super::ROOT)?;
-        if super::TOP.iter().any(|(top, _)| OsStr::new(top) == name) {
+        let (at, rel) = self.overlay_of(parent)?;
+        if parent == super::ROOT && super::TOP.iter().any(|(top, _)| OsStr::new(top) == name) {
             return Err(Errno::EEXIST);
         }
         let catalog = self.catalog()?;
-        if self.at(&catalog, &root, Path::new(name))?.is_some() {
+        if self.at(&catalog, &at, &rel.join(name))?.is_some() {
             return Err(Errno::EEXIST);
         }
         let empty: crate::block::Block = crate::block::Block::hash(
@@ -705,9 +723,9 @@ impl Soup {
         let anchor = catalog.new_anchor().map_err(store_errno)?;
         catalog.set_anchor(&anchor, &empty.cid().clone().into()).map_err(store_errno)?;
         drop(catalog);
-        self.symlink(super::ROOT, name, &Path::new("/anchors").join(anchor.to_string()))?;
+        self.symlink(parent, name, &Path::new("/anchors").join(anchor.to_string()))?;
         // The link, mounting the anchor
-        self.resolve(super::ROOT, name)
+        self.resolve(parent, name)
     }
 
     /// Make a symlink.

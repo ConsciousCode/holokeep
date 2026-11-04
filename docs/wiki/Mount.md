@@ -21,7 +21,8 @@ The top is the account's root anchor (see
 [[Anchors and Names]]), beside `cid`, `anchors` and
 `tags`, which hide any root entries of the same name. It's written to as
 any anchor, except that **`mkdir` at the top makes a new anchor** (an
-empty directory) and names it with a mount point.
+empty directory) and names it with a mount point. So does `mkdir`
+anywhere that [[Rules]] say to detach what's made.
 
 ## Mount points
 
