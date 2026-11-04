@@ -1,7 +1,3 @@
-# Anchors and names
-
-Back to [Data Soup](Data_Soup.md).
-
 ## Anchors
 
 An **anchor** is a stable identity whose value changes, like a Perkeep
@@ -27,7 +23,7 @@ Anchors carry everything mutable:
   node with the file and never enters the soup. A running node watches it
   (inotify on its directory, a sample each tick, and a sweep at start),
   imports it again when it changes, and moves the anchor.
-- **Overlay mounts**: anchors written through `hk mount` (see [Mount](Mount.md)).
+- **Overlay mounts**: anchors written through `hk mount` (see [[Mount]]).
 - **Names**: the root anchor, below.
 
 ## The root anchor
@@ -83,3 +79,5 @@ mesh doesn't, since it may not have the mesh's root yet, and setting it
 would overwrite the other devices' names. What it named before stays
 reachable at its old root anchor under `anchors/`. Merging the two is
 future work, alongside merging concurrent edits.
+
+Source: `src/claim.rs` (`anchor`, `root_anchor`), `src/store.rs` (`root_anchor`, `found_user`), `src/mount.rs`.

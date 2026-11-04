@@ -24,7 +24,7 @@ This is **data soup**, a content-addressable storage model where location is not
 
 ## Status
 
-Holokeep is early. What exists is the content-addressing core, each piece checked against an independent implementation (the reference is the [wiki](docs/wiki/Data_Soup.md)):
+Holokeep is early. What exists is the content-addressing core, each piece checked against an independent implementation (the reference is the [wiki](docs/wiki/Data%20Soup.md)):
 
 - **Import**: `hk add` turns files and directories into UnixFSv1 with CIDs identical to Kubo's `ipfs add` under the `unixfs-v1-2025` profile, including chunked files, nested directories, symlinks and HAMT-sharded directories.
 - **CIDs and multihashes**: v0 and v1; SHA-1, SHA-2, SHA-3, BLAKE2b-256 and murmur3 (no identity hash yet).

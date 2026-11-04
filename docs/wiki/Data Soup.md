@@ -1,5 +1,3 @@
-# Data Soup
-
 Data soup is a storage model where data has no location. Every object is
 named by a hash of its content, kept on whichever drives and machines
 happen to hold it, and organized by relationships (tags, anchors, links)
@@ -14,16 +12,17 @@ the holokeep repository; this wiki is the reference.
 
 ## Pages
 
-- [Blocks and CIDs](Blocks_and_CIDs.md): what is stored and how it's named.
-- [Importing](Importing.md): files and directories into UnixFS, identical to Kubo.
-- [Storage](Storage.md): the catalog, volumes, forms, and how a block is kept.
-- [Claims](Claims.md): sidecar blocks that say things about other blocks.
-- [Anchors and names](Anchors_and_Names.md): mutable identities, the root anchor, `~/soup`.
-- [Keys and users](Keys_and_Users.md): devices, users, signatures, sealing, accounts.
-- [Mesh](Mesh.md): joining, transport, and every wire protocol.
-- [Replication and retention](Replication_and_Retention.md): copies, risks, trimming, garbage collection.
-- [Protected meshes](Protected_Meshes.md): vaults, encryption, recovery.
-- [Mount](Mount.md): the FUSE filesystem and writing through it.
+- [[Blocks and CIDs]]: what is stored and how it's named.
+- [[Importing]]: files and directories into UnixFS, identical to Kubo.
+- [[Storage]]: the catalog, volumes, forms, and how a block is kept.
+- [[Claims]]: sidecar blocks that say things about other blocks.
+- [[Anchors and Names]]: mutable identities, the root anchor, `~/soup`.
+- [[Keys and Users]]: devices, users, signatures, sealing, accounts.
+- [[Mesh]]: joining, transport, and every wire protocol.
+- [[Replication and Retention]]: copies, risks, trimming, garbage collection.
+- [[Protected Meshes]]: vaults, encryption, recovery.
+- [[Mount]]: the FUSE filesystem and writing through it.
+- [[Style Guide]]: how these pages are written.
 
 ## Vocabulary
 

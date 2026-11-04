@@ -1,7 +1,3 @@
-# Replication and retention
-
-Back to [Data Soup](Data_Soup.md).
-
 Replication and collection pull in opposite directions: one makes copies
 until every block is safe, the other lets go of what's surplus or
 unwanted. Both run as slow trickles rather than schedules.
@@ -25,7 +21,7 @@ one disk, or in one house, count as one.
 
 ## Durability
 
-Each node audits what it holds and advertises the blocks whose tolerance
+Each node audits what it holds and advertises (see [[Mesh#Protocols|protocols]]) the blocks whose tolerance
 is below the target (`hk node run --copies`, default 2), with the
 replicas it knows of. Every member answers with what it holds of those
 (correcting the advertiser's belief, both ways) and an offer: its
@@ -71,7 +67,7 @@ members forget their sightings and audit it soon.
 ## Garbage collection
 
 A block is **condemned** when nothing here references it: no structure
-links to it and no counting keep reaches it. Tags don't keep things; a
+links to it and no counting [[Claims|keep]] reaches it. Tags don't keep things; a
 tomb's link is the opposite of a reference; claims are never collected.
 
 The node asks every member whether a keep of theirs reaches what's
@@ -90,3 +86,5 @@ member trims. Keeping again what was tombed takes a new keep (`n` + 1).
 
 `hk node collect` condemns everything unreferenced now and lets go of
 what's due; `--no-collect` turns collection off.
+
+Source: `src/net/durability.rs`, `src/net/trim.rs`, `src/net/collect.rs`.

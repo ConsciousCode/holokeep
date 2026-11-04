@@ -1,7 +1,3 @@
-# Mount
-
-Back to [Data Soup](Data_Soup.md).
-
 `hk mount <dir>` shows the soup as a filesystem over FUSE (pure Rust, via
 `fusermount3`), until interrupted. `--read-only` makes anchors read-only
 too.
@@ -21,7 +17,7 @@ the mount follows them.
 ## The top
 
 The top is the account's root anchor (see
-[Anchors and names](Anchors_and_Names.md)), beside `cid`, `anchors` and
+[[Anchors and Names]]), beside `cid`, `anchors` and
 `tags`, which hide any root entries of the same name. It's written to as
 any anchor, except that **`mkdir` at the top makes a new anchor** (an
 empty directory) and names it with a symlink to `/anchors/<anchor>`.
@@ -64,3 +60,5 @@ Writing to an anchor turns it into an **overlay mount**:
 
 Concurrent edits of one anchor from two nodes aren't merged yet: the
 later set wins.
+
+Source: `src/mount.rs`, `src/mount/write.rs`, `src/store/overlay.rs`.

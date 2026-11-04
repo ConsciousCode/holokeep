@@ -1,7 +1,3 @@
-# Importing
-
-Back to [Data Soup](Data_Soup.md).
-
 `hk add` turns files and directories into UnixFSv1 DAGs whose CIDs are
 identical to Kubo's `ipfs add` under the **`unixfs-v1-2025`** profile.
 This is checked against a real Kubo by `scripts/kubo-compare.sh` in the
@@ -34,13 +30,13 @@ child's block size plus the sum of its own links' Tsizes.
 
 By default `hk add` skips names starting with `.`, as Kubo does without
 `--hidden`. Overlay mounts import with hidden files included (see
-[Mount](Mount.md)).
+[[Mount]]).
 
 ## In place: `--nocopy`
 
 `hk add --nocopy` doesn't copy file contents. Each leaf is recorded as
 a range (blob, offset, length) of the file where it was found, and the
-file is mounted on an anchor (see [Anchors and names](Anchors_and_Names.md)).
+file is mounted on an anchor (see [[Anchors and Names]]).
 When the file changes, a running node imports it again and moves the
 anchor. A range is only served while the file's fingerprint (size,
 mtime, inode) still holds; otherwise reads fail as stale rather than
@@ -52,3 +48,5 @@ Plain `hk add` copies. A file with more than one leaf and over 64 KiB is
 written whole into the shards directory as it's read, and its leaves
 become ranges of that copy, so they stay contiguous on disk. Smaller
 files are stored block by block.
+
+Source: `src/import.rs`, `src/dag.rs`, `src/hamt.rs`, `src/chunker.rs`, `scripts/kubo-compare.sh`.

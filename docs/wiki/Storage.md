@@ -1,7 +1,3 @@
-# Storage
-
-Back to [Data Soup](Data_Soup.md).
-
 ## Shape
 
 - A **repo** is one node's share of the soup: by default `~/.holokeep`,
@@ -39,7 +35,7 @@ keeps it:
    rebuild exactly: every link named and sized, no mode or mtime, Kubo's
    field order. HAMT shard names are split into bucket and entry name, so
    the `unixfs_entries` view lists every directory alike.
-2. **Claims** (`claims`, `claim_targets`, and per-type tables): canonical
+2. **[[Claims]]** (`claims`, `claim_targets`, and per-type tables): canonical
    claims as rows; dissolved ones with no multihash.
 3. **IPLD** (`ipld_blocks`): canonical dag-cbor and dag-json as SQLite
    JSONB in dag-json form, queryable in place
@@ -52,7 +48,7 @@ keeps it:
 6. **Raw** (`raw_blocks`): anything else, as bytes.
 
 **Specialized stores must manifest exact bytes.** A store that keeps rows
-must regenerate each block byte for byte, so it admits only canonical
+must regenerate each block byte for byte, so it admits only [[Blocks and CIDs#Codecs|canonical]]
 blocks; anything valid but non-canonical falls through to raw. Every
 block is verified against its CID on the way out.
 
@@ -67,7 +63,7 @@ their own; for others the catalog reads links by codec on put into
 ## Catching up between catalogs
 
 Two nodes may share a volume (a USB drive, a network database). Writers
-tell other nodes what they wrote over the mesh; a catalog opening a
+tell other nodes what they wrote over the [[Mesh]]; a catalog opening a
 shared volume only has to notice what it wasn't told:
 
 - **flatfs**: by each shard directory's mtime, compared with what it
@@ -86,3 +82,5 @@ multihash into whatever forms the target supports.
 Each store creates its tables if missing and adds columns it needs after
 checking `pragma_table_info`, so opening an older repo upgrades it in
 place. Changes so far have all been additive.
+
+Source: `src/store.rs`, `src/store/`.

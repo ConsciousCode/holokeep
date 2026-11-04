@@ -1,7 +1,3 @@
-# Protected meshes
-
-Back to [Data Soup](Data_Soup.md).
-
 A **protected mesh** is friends holding your data encrypted, for mutual
 replication. It's separate from your private mesh: no private claim
 goes there, and the holders learn how much you keep, not what.
@@ -76,7 +72,7 @@ other: each direction is its own mesh. `hk node status` tallies use.
 
 The first `hk protect add` has the vault keep itself sealed with the
 user's passphrase (`what: "vault"`, sealing its key and secret, see
-[Keys and users](Keys_and_Users.md)), and the user's sealed root key. A
+[[Keys and Users]]), and the user's sealed root key. A
 machine that has lost everything asks a friend for a new protected
 invite, which carries those sealed blocks and the manifests. Joining
 with it and the passphrase restores the vault and the user, whose root
@@ -94,3 +90,5 @@ It's good for that block, that asker, and 300 seconds either side of
 `at`, and checked in constant time. Nothing asks for proofs yet: only
 members can reach a mesh, so sharing beyond it waits on a way in for
 non-members.
+
+Source: `src/vault.rs`.

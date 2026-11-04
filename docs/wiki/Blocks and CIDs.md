@@ -1,7 +1,3 @@
-# Blocks and CIDs
-
-Back to [Data Soup](Data_Soup.md).
-
 ## Blocks and multihashes
 
 A block is a finite byte string. Its identity is a **multihash**: a hash
@@ -51,7 +47,7 @@ the content is tiny and naming it shouldn't need a hash:
   CID `ipfs add --inline --raw-leaves` makes of the name.
 - **Anchors**: a dag-cbor identity CID of `{"anchor": <16 bytes>}`.
 - **Dissolved claims**: a claim of one target that encodes to 128 bytes
-  or less (see [Claims](Claims.md)).
+  or less (see [[Claims]]).
 - **Keys**: a libp2p-key identity CID of the protobuf ed25519 public key
   (`08 01 12 20` then 32 bytes), so a node's key and its peer ID are one.
 
@@ -63,7 +59,7 @@ bytes, list, map, link. Decoding is strict: duplicate keys, NaN,
 indefinite lengths and malformed CIDs are errors. Valid but
 non-canonical input (unsorted keys, padded integers, short floats,
 whitespace) decodes and is *reported* as non-canonical, because
-specialized stores admit only canonical blocks (see [Storage](Storage.md)).
+specialized stores admit only canonical blocks (see [[Storage]]).
 Nesting is limited to 256 levels.
 
 - **dag-cbor**: canonical per the IPLD spec: map keys sorted by length then
@@ -84,3 +80,5 @@ dag-json are differentially fuzzed against `serde_ipld_dagcbor` and
 depth-first, each block the first time it's reached. `hk dag import`
 reads CARv1 and CARv2, verifies every block, bounds sections as go-car
 does (8 MiB, headers 32 MiB), and ignores a CARv2 index.
+
+Source: `src/multihash.rs`, `src/cid/`, `src/dagcbor.rs`, `src/dagjson.rs`, `src/pb.rs`, `src/car.rs`.

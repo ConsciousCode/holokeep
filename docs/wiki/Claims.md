@@ -1,7 +1,3 @@
-# Claims
-
-Back to [Data Soup](Data_Soup.md).
-
 A **claim** is a small dag-cbor block that says something about other
 blocks, its *targets*: that they're tagged, kept, what an anchor is now,
 who vouches for them. Claims are how anything mutable or relational is
@@ -21,7 +17,7 @@ is not a claim; it's stored as ordinary data.
 | `keep` | `beyond: [Link]` (omitted if empty), `n: int` (omitted if 0) | Keep the targets and what they link to, stopping at `beyond`. `n` is which time they're kept, since a tomb is forever. |
 | `set` | `value: Link`, `at: int` | The targets (anchors) are `value` as of `at`, seconds since the epoch. |
 | `tomb` | none | Retract the target claims. |
-| `sign` | `by: Link`, `at: int`, `prev: Link` (omitted for the first), `sig: bytes` | `by` vouches for the target claims. See [Keys and users](Keys_and_Users.md). |
+| `sign` | `by: Link`, `at: int`, `prev: Link` (omitted for the first), `sig: bytes` | `by` vouches for the target claims. See [[Keys and Users]]. |
 | `device` | none | The target keys act for whoever signs this: a certificate when a user's root key signs it. |
 
 Examples, in dag-json for readability:
@@ -78,3 +74,5 @@ Every claim is a backreference of what it targets: "which claims are
 about this block?" is one lookup. Claims are stored as rows (`claims`,
 with targets in one shared `claim_targets` table), and a tag is a row,
 not a file. The `tags (target, tag, name)` SQL view names simple tags.
+
+Source: `src/claim.rs`, `src/store/claims.rs`.

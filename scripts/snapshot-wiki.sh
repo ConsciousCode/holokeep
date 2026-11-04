@@ -16,5 +16,7 @@ value=$("$hk" "$@" anchor show "$anchor" | head -1)
 rm -rf docs/wiki
 mkdir -p docs
 "$hk" "$@" get "$value" -o docs/wiki >/dev/null
+# Obsidian's settings and workspace are the reader's, not the wiki's
+rm -rf docs/wiki/.obsidian
 printf 'wiki anchor %s\nas of       %s\n' "$anchor" "$value" > docs/wiki/.snapshot
 echo "docs/wiki is $value"

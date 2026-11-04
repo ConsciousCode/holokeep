@@ -1,10 +1,6 @@
-# Mesh
-
-Back to [Data Soup](Data_Soup.md).
-
 A **mesh** is the set of nodes that replicate and serve each other's
 blocks: one user's devices (private), or a vault's holders (protected,
-see [Protected meshes](Protected_Meshes.md)). `hk node run` is the
+see [[Protected Meshes]]). `hk node run` is the
 daemon. It owns the mesh on one thread, along with the catalog's
 database, and other `hk` commands ask it over a Unix socket in the repo
 for anything that needs the network.
@@ -64,7 +60,7 @@ structs are maps keyed by field name, tuples are arrays, and `bytes`
 below are CBOR byte strings. A "key" is a multihash's bytes; a "CID" is a
 CID's binary form. A **replica** is `{label: bytes, risks: [string]}`,
 one copy of a block: the volume it's on, by its random label, and what
-that volume risks (see [Replication and retention](Replication_and_Retention.md)).
+that volume risks (see [[Replication and Retention]]).
 An **offer** is `{risks: [string], free: uint | null}`.
 
 | Protocol | Request | Response | Purpose |
@@ -102,11 +98,13 @@ spreading everything everywhere:
   here.
 
 Each member has a cursor over the catalog's generations (see
-[Storage](Storage.md)), moved only once it answers, so a member that was
+[[Storage]]), moved only once it answers, so a member that was
 away hears of what it missed. A block sent to a member, by push, fetch
 or want, takes the structure linking to it along. It's one hop: what
 links to what a member holds, not what links to that.
 
 Durability (`adverts`, `push`), trimming (`trim`, `dropped`) and garbage
 collection (`condemn`) are described in
-[Replication and retention](Replication_and_Retention.md).
+[[Replication and Retention]].
+
+Source: `src/net/node.rs`, `src/net/mesh.rs`, `src/net/blocks.rs`, `src/net/structure.rs`, `src/net/daemon.rs`.

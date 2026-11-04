@@ -1,7 +1,3 @@
-# Keys and users
-
-Back to [Data Soup](Data_Soup.md).
-
 ## Keys
 
 All keys are **ed25519**. A key is named by a CID: the identity multihash
@@ -26,7 +22,7 @@ merging meshes is certifying devices; nothing is signed again.
 
 ## Signatures
 
-A signature is itself a claim, about the claims it signs:
+A signature is itself a [[Claims|claim]], about the claims it signs:
 
 ```
 {"claim": "sign", "target": [claims…], "by": <key>, "at": <secs>, "prev": <previous sign>, "sig": <64 bytes>}
@@ -83,7 +79,7 @@ of the root than anyone.
 
 ## Accounts
 
-One repo can serve several of the host's users, each an **account** by
+One [[Storage|repo]] can serve several of the host's users, each an **account** by
 uid, with a device key in `accounts/` (the owner's is `node.key`) and,
 once in a mesh, a user. A catalog acts for one account at a time: what
 it says is signed with that account's key, and what it sees (tags,
@@ -99,3 +95,5 @@ while any account has them.
 `hk node run --shared` lets other host users use the daemon's socket,
 identified by `SO_PEERCRED`. The owner and root may ask anything;
 others may fetch, keep and tag as their own account.
+
+Source: `src/keys.rs`, `src/claim.rs` (`Sign`), `src/account.rs`, `src/store/claims.rs`.
