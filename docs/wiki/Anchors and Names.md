@@ -42,7 +42,7 @@ saying which it is. `hk anchor root` prints it and its current value.
 
 The root's value is an ordinary UnixFS directory. Its entries can be
 anything, but a directory made at the top of the mount is a **new
-anchor**, which the root names with a UnixFS symlink:
+anchor**, which the root names with a mount point, a UnixFS symlink:
 
 ```
 wiki -> /anchors/bafyqagnbmzqw4y3in5zf…
@@ -60,16 +60,26 @@ readable and private. Two users' `wiki`s don't collide. Sharing a named
 thing means passing its anchor, which the recipient names however they
 like.
 
-### Symlink convention
+### Mount points
 
 A UnixFS symlink whose target is `/anchors/<anchor>` or
 `/anchors/<anchor>/<path>`, where `<anchor>` parses as an anchor CID,
-refers to that anchor. Inside `hk mount` it's shown as an absolute path
-under wherever the soup is mounted, so it resolves however deep it sits.
+refers to that anchor. A symlink to an anchor itself is a **mount
+point**: [[Mount|hk mount]] shows it as the anchor, a directory (or file)
+of its own wherever it's reached, and what's written under it goes to
+that anchor. Outside the mount, as in `hk get`, it's an ordinary
+symlink. A mount point whose anchor is already above it, as an anchor
+naming itself or the root, is shown as the symlink instead, so the
+mount has no loops.
+
+Any other symlink to an anchor, into it (`/anchors/<anchor>/page.md`),
+stays a symlink, shown as an absolute path under wherever the soup is
+mounted, so it resolves however deep it sits.
+
 A symlink made in the mount to a path under the mount's `anchors/`, or
-through one of the root's anchor names (`~/soup/wiki/page.md`), is
-stored in this form, so links survive mounting elsewhere. Other targets
-are stored as given.
+through a mount point at the top (`~/soup/wiki/page.md`), is stored in
+this form, so links survive mounting elsewhere. Other targets are stored
+as given.
 
 ### Meshes
 

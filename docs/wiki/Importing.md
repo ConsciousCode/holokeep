@@ -5,17 +5,17 @@ repository whenever the importer changes.
 
 ## Parameters
 
-| Parameter | Value |
-|---|---|
-| CID version | 1 |
-| Hash | sha2-256 |
-| Leaves | raw (`0x55`) |
-| Chunker | fixed size, 1 MiB (1048576 bytes) |
-| File layout | balanced, 1024 links per node |
-| Directories | basic, switching to a HAMT once the directory would exceed 256 KiB (IPIP-499) |
-| HAMT | fanout 256, murmur3-x64-64 of the name, most significant bits first (boxo `hamt`) |
-| Metadata | no mode, no mtime |
-| Symlinks | UnixFS symlink nodes, target as data |
+| Parameter   | Value                                                                             |
+| ----------- | --------------------------------------------------------------------------------- |
+| CID version | 1                                                                                 |
+| Hash        | sha2-256                                                                          |
+| Leaves      | raw (`0x55`)                                                                      |
+| Chunker     | fixed size, 1 MiB (1048576 bytes)                                                 |
+| File layout | balanced, 1024 links per node                                                     |
+| Directories | basic, switching to a HAMT once the directory would exceed 256 KiB (IPIP-499)     |
+| HAMT        | fanout 256, murmur3-x64-64 of the name, most significant bits first (boxo `hamt`) |
+| Metadata    | no mode, no mtime                                                                 |
+| Symlinks    | UnixFS symlink nodes, target as data                                              |
 
 A file of one chunk is just its raw leaf. A bigger file is a tree of
 dag-pb nodes, each with UnixFS `Data` of type File, `filesize`, and

@@ -9,8 +9,9 @@ anchors/<anchor>/…  what each anchor is now, writable
 tags/<tag>/<cid>/…  what's tagged so
 ```
 
-UnixFS directories are directories, files files, symlinks symlinks; a
-block of any other codec reads as its bytes. Another account's blocks are
+UnixFS directories are directories, files files, symlinks symlinks
+(but mount points, below); a block of any other codec reads as its
+bytes. Another account's blocks are
 as good as absent. Anchors and tags are looked up again every second, so
 the mount follows them.
 
@@ -20,9 +21,36 @@ The top is the account's root anchor (see
 [[Anchors and Names]]), beside `cid`, `anchors` and
 `tags`, which hide any root entries of the same name. It's written to as
 any anchor, except that **`mkdir` at the top makes a new anchor** (an
-empty directory) and names it with a symlink to `/anchors/<anchor>`.
-Since FUSE requires `mkdir` to answer with a directory, it answers with
-the new anchor's; the kernel sees the symlink on its next lookup.
+empty directory) and names it with a mount point.
+
+## Mount points
+
+A symlink to an anchor, `/anchors/<anchor>`, is shown as the anchor
+itself (see [[Anchors and Names#Mount points]]), so the root's names are
+directories, and tools that won't follow symlinks, such as Obsidian,
+see the anchors' contents. `ln -s ~/soup/anchors/<anchor> name` makes
+one anywhere writable.
+
+- **Writes** under a mount point go to its anchor; the directory holding
+  the mount point doesn't change.
+- **Renaming** a mount point renames the link. Moving a file across one
+  is between anchors, so `rename` fails with `EXDEV` and `mv` copies.
+- **`rmdir`** of a mount point removes the link, whatever the anchor
+  holds, as an unmount; the anchor is as it was. `rm -r` removes the
+  anchor's contents first, as it would any directory's.
+- **Loops**: a mount point whose anchor is above it is shown as the
+  symlink.
+- `mkdir` must answer with a directory and `symlink` with a symlink, so
+  each answers as asked; the kernel sees what's there on its next lookup,
+  within a second.
+
+## Inodes
+
+The kernel lets a directory have only one parent, so a directory
+reached two ways is two inodes: an anchor at `anchors/<anchor>` and at
+each of its mount points, or one directory block at two paths under
+`cid/`. A file's block is one inode wherever it's reached, like a hard
+link.
 
 ## Reading
 

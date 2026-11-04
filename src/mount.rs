@@ -75,6 +75,14 @@ static SOUPS: AtomicU64 = AtomicU64::new(0);
 /// could ask.
 pub type Fetcher = Box<dyn Fn(&[Link]) -> bool + Send + Sync>;
 
+/// Where a directory is reached through, so that what's reached two ways
+/// is two directories, as the kernel needs a directory to have one
+/// parent: the inode number of the directory it's in, and its name there.
+/// For a path of an anchor, where the anchor is: the directory its mount
+/// point is in and the mount point's name, `(ROOT, "")` for the root
+/// anchor at the top, or none for `anchors/<anchor>`.
+type Via = Option<(u64, Vec<u8>)>;
+
 /// What an inode is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Inode {
@@ -83,9 +91,11 @@ enum Inode {
     Anchors,
     Tags,
     Tag(Link),
-    Node(Link),
+    /// A block: a file, the same inode wherever it's reached, or a
+    /// directory, one for each place it's reached.
+    Node(Link, Via),
     /// A path of what an anchor is, overlay and all.
-    Path(Link, PathBuf),
+    Path(Link, PathBuf, Via),
     /// A file of `anchors/` that's no anchor, as an editor writes to save
     /// over a file anchor.
     Loose(Vec<u8>),
@@ -94,14 +104,11 @@ enum Inode {
 /// The top's inode number.
 const ROOT: u64 = 1;
 
-/// `anchors/`'s inode number.
-const ANCHORS: u64 = 3;
-
 /// The top level, by inode number.
 const TOP: [(&str, u64); 3] = [("cid", 2), ("anchors", 3), ("tags", 4)];
 
 /// Inode numbers, handed out as things are looked up and kept for the
-/// mount's life: a CID is the same inode wherever it's reached.
+/// mount's life: a file's CID is the same inode wherever it's reached.
 struct Inodes {
     all: Vec<Inode>,
     by_key: HashMap<Vec<u8>, u64>,
@@ -120,7 +127,7 @@ impl Inodes {
     /// are where they moved to, as the kernel takes them to be.
     fn renamed(&mut self, anchor: &Link, from: &Path, to: &Path) {
         for (index, inode) in self.all.iter_mut().enumerate() {
-            let Inode::Path(at, rel) = &*inode else {
+            let Inode::Path(at, rel, via) = &*inode else {
                 continue;
             };
             let Ok(rest) = rel.strip_prefix(from) else {
@@ -129,7 +136,27 @@ impl Inodes {
             if at != anchor {
                 continue;
             }
-            let moved = Inode::Path(at.clone(), if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) });
+            let moved = Inode::Path(at.clone(), if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) }, via.clone());
+            self.by_key.remove(&Self::key(inode));
+            self.by_key.insert(Self::key(&moved), u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1));
+            *inode = moved;
+        }
+    }
+
+    /// What's reached through a name in a directory reached through
+    /// another, as the kernel takes a renamed mount point to be.
+    fn via_moved(&mut self, from: &(u64, Vec<u8>), to: &(u64, Vec<u8>)) {
+        for (index, inode) in self.all.iter_mut().enumerate() {
+            let (Inode::Path(_, _, via) | Inode::Node(_, via)) = &*inode else {
+                continue;
+            };
+            if via.as_ref() != Some(from) {
+                continue;
+            }
+            let mut moved = inode.clone();
+            if let Inode::Path(_, _, via) | Inode::Node(_, via) = &mut moved {
+                *via = Some(to.clone());
+            }
             self.by_key.remove(&Self::key(inode));
             self.by_key.insert(Self::key(&moved), u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1));
             *inode = moved;
@@ -151,16 +178,24 @@ impl Inodes {
     fn key(inode: &Inode) -> Vec<u8> {
         match inode {
             Inode::Tag(tag) => [b"t".as_slice(), &tag.to_bytes()].concat(),
-            Inode::Node(cid) => [b"n".as_slice(), &cid.to_bytes()].concat(),
-            Inode::Path(anchor, rel) => [b"p".as_slice(), &anchor.to_bytes(), &[0], rel.as_os_str().as_bytes()].concat(),
+            Inode::Node(cid, via) => [b"n".as_slice(), &cid.to_bytes(), &Self::via_key(via)].concat(),
+            Inode::Path(anchor, rel, via) => [b"p".as_slice(), &anchor.to_bytes(), &Self::via_key(via), &[0], rel.as_os_str().as_bytes()].concat(),
             Inode::Loose(name) => [b"l".as_slice(), name].concat(),
             Inode::Root | Inode::Cids | Inode::Anchors | Inode::Tags => Vec::new(),
         }
     }
 
+    /// A via as part of a key: 1, its directory's number, its name's
+    /// length and its name; or 0.
+    fn via_key(via: &Via) -> Vec<u8> {
+        via.as_ref().map_or_else(|| vec![0], |(dir, name)| {
+            [&[1][..], &dir.to_be_bytes(), &u64::try_from(name.len()).unwrap_or(u64::MAX).to_be_bytes(), name].concat()
+        })
+    }
+
     fn of(&mut self, inode: Inode) -> u64 {
         let key = match &inode {
-            Inode::Tag(_) | Inode::Node(_) | Inode::Path(..) | Inode::Loose(_) => Self::key(&inode),
+            Inode::Tag(_) | Inode::Node(..) | Inode::Path(..) | Inode::Loose(_) => Self::key(&inode),
             Inode::Root => return 1,
             Inode::Cids => return 2,
             Inode::Anchors => return 3,
@@ -364,7 +399,7 @@ impl Soup {
         let mut names = rest.components();
         if let (Some(std::path::Component::Normal(name)), Some(root)) = (names.next(), Self::root(catalog)?)
             && let Some(At::Work(_) | At::Base(..)) = self.at(catalog, &root, Path::new(name))?
-            && let Kind::Symlink(named) = self.kind_kept(catalog, &Inode::Path(root, PathBuf::from(name)))?
+            && let Kind::Symlink(named) = self.kind_kept(catalog, &Inode::Path(root, PathBuf::from(name), None))?
             && to_anchor(&named)
         {
             return Ok(Path::new(OsStr::from_bytes(&named)).join(names.as_path()));
@@ -431,23 +466,93 @@ impl Soup {
         })
     }
 
+    /// What's at a name in a directory, as it's shown there. A link to an
+    /// anchor is a mount point: the anchor, as a directory (or file) of
+    /// that place's own, unless the anchor's already above it, or isn't
+    /// anything here, when it's the link. A directory is one of that
+    /// place's own too.
+    fn placed(&self, catalog: &Catalog, dir: u64, name: &[u8], inode: Inode) -> Result<(Inode, Kind), Errno> {
+        let via = Some((dir, name.to_vec()));
+        match self.kind_kept(catalog, &inode)? {
+            Kind::Symlink(target) => match self.mount_point(catalog, dir, &target, via)? {
+                Some(mounted) => {
+                    let kind = self.kind(catalog, &mounted)?;
+                    Ok((mounted, kind))
+                },
+                None => Ok((inode, Kind::Symlink(self.shown(target)))),
+            },
+            Kind::Directory => Ok((
+                match inode {
+                    Inode::Node(cid, None) => Inode::Node(cid, via),
+                    inode => inode,
+                },
+                Kind::Directory,
+            )),
+            kind @ Kind::File(_) => Ok((inode, kind)),
+        }
+    }
+
+    /// What a link in `dir` mounts, if it's to an anchor itself (not into
+    /// one), which is something here and isn't above `dir`.
+    fn mount_point(&self, catalog: &Catalog, dir: u64, target: &[u8], via: Via) -> Result<Option<Inode>, Errno> {
+        let Some(name) = target.strip_prefix(b"/anchors/").map(|name| name.strip_suffix(b"/").unwrap_or(name)) else {
+            return Ok(None);
+        };
+        let Some(anchor) = std::str::from_utf8(name).ok().and_then(|name| name.parse::<Link>().ok()).filter(crate::claim::is_anchor) else {
+            return Ok(None);
+        };
+        let Some(value) = Self::anchor_root(catalog, &anchor)? else {
+            return Ok(None);
+        };
+        if !self.reachable(catalog, &value)? || self.above(catalog, dir)?.contains(&anchor) {
+            return Ok(None);
+        }
+        Ok(Some(Inode::Path(anchor, PathBuf::new(), via)))
+    }
+
+    /// The anchors a directory is in, from it up to the top.
+    fn above(&self, catalog: &Catalog, dir: u64) -> Result<Vec<Link>, Errno> {
+        let mut anchors = Vec::new();
+        let mut at = dir;
+        // A directory's reached in finitely many steps; the bound's only
+        // against a mistake
+        for _ in 0..65536 {
+            match self.inode(at)? {
+                Inode::Root => {
+                    anchors.extend(Self::root(catalog)?);
+                    break;
+                },
+                Inode::Path(anchor, _, via) => {
+                    anchors.push(anchor);
+                    match via {
+                        Some((up, _)) => at = up,
+                        None => break,
+                    }
+                },
+                Inode::Node(_, Some((up, _))) => at = up,
+                _ => break,
+            }
+        }
+        Ok(anchors)
+    }
+
     fn kind_kept(&self, catalog: &Catalog, inode: &Inode) -> Result<Kind, Errno> {
         match inode {
-            Inode::Node(cid) if cid.codec() == crate::cid::RAW_CODEC => {
+            Inode::Node(cid, _) if cid.codec() == crate::cid::RAW_CODEC => {
                 let said = self.sizes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&cid.to_bytes()).copied();
                 said.map_or_else(
                     || export::stat(&Source { catalog, fetcher: self.fetcher.as_deref() }, cid).map_err(|e| errno(&e)),
                     |size| Ok(Kind::File(size)),
                 )
             },
-            Inode::Node(cid) => export::stat(&Source { catalog, fetcher: self.fetcher.as_deref() }, cid).map_err(|e| errno(&e)),
-            Inode::Path(anchor, rel) => match self.at(catalog, anchor, rel)?.ok_or(Errno::ENOENT)? {
+            Inode::Node(cid, _) => export::stat(&Source { catalog, fetcher: self.fetcher.as_deref() }, cid).map_err(|e| errno(&e)),
+            Inode::Path(anchor, rel, _) => match self.at(catalog, anchor, rel)?.ok_or(Errno::ENOENT)? {
                 At::Work(meta) => work_kind(&self.work_path(anchor, rel).unwrap_or_default(), &meta),
                 At::Base(cid, size) => {
                     if let Some(size) = size.filter(|_| cid.codec() == crate::cid::RAW_CODEC) {
                         return Ok(Kind::File(size));
                     }
-                    self.kind_kept(catalog, &Inode::Node(cid))
+                    self.kind_kept(catalog, &Inode::Node(cid, None))
                 },
             },
             Inode::Loose(name) => {
@@ -493,7 +598,7 @@ impl Soup {
 
     /// A directory of an anchor's entries: its work directory's over what
     /// the anchor had there.
-    fn overlay_entries(&self, catalog: &Catalog, anchor: &Link, rel: &Path) -> Result<Vec<(Vec<u8>, Inode)>, Errno> {
+    fn overlay_entries(&self, catalog: &Catalog, anchor: &Link, rel: &Path, via: &Via) -> Result<Vec<(Vec<u8>, Inode)>, Errno> {
         let marks = catalog.overlay_marks(anchor).map_err(store_errno)?;
         let root = Self::anchor_root(catalog, anchor)?;
         let source = Source { catalog, fetcher: self.fetcher.as_deref() };
@@ -515,7 +620,7 @@ impl Soup {
         }
         Ok(names.into_iter().map(|name| {
             let child = rel.join(OsStr::from_bytes(&name));
-            (name, Inode::Path(anchor.clone(), child))
+            (name, Inode::Path(anchor.clone(), child, via.clone()))
         }).collect())
     }
 
@@ -562,8 +667,19 @@ impl Soup {
         self.work.is_some() && matches!(inode, Inode::Root | Inode::Path(..) | Inode::Loose(_))
     }
 
-    /// What a name in a directory is.
+    /// What a name in a directory is, as it's shown there.
     pub fn resolve(&self, parent: u64, name: &OsStr) -> Result<FileAttr, Errno> {
+        self.resolve_with(parent, name, true)
+    }
+
+    /// What a name in a directory is, as it's kept: a link to an anchor a
+    /// link.
+    fn resolve_kept(&self, parent: u64, name: &OsStr) -> Result<FileAttr, Errno> {
+        self.resolve_with(parent, name, false)
+    }
+
+    fn resolve_with(&self, parent: u64, name: &OsStr, place: bool) -> Result<FileAttr, Errno> {
+        let dir = parent;
         let parent = self.inode(parent)?;
         let catalog = self.catalog()?;
         let cid = |name: &OsStr| name.to_str().and_then(|name| name.parse::<Link>().ok()).ok_or(Errno::ENOENT);
@@ -572,7 +688,7 @@ impl Soup {
                 if let Some(&(_, ino)) = TOP.iter().find(|(top, _)| OsStr::new(top) == name) {
                     return Ok(self.attr_of(ino, &Kind::Directory));
                 }
-                Inode::Path(Self::root(&catalog)?.ok_or(Errno::ENOENT)?, PathBuf::new())
+                Inode::Path(Self::root(&catalog)?.ok_or(Errno::ENOENT)?, PathBuf::new(), Some((ROOT, Vec::new())))
             },
             parent => parent,
         };
@@ -583,25 +699,25 @@ impl Soup {
                 if !self.reachable(&catalog, &cid)? {
                     return Err(Errno::ENOENT);
                 }
-                Inode::Node(cid)
+                Inode::Node(cid, None)
             },
             Inode::Anchors => match cid(name).ok().map(|anchor| Ok::<_, Errno>((Self::anchor_root(&catalog, &anchor)?, anchor))).transpose()? {
                 Some((Some(value), anchor)) => {
                     if !self.reachable(&catalog, &value)? {
                         return Err(Errno::ENOENT);
                     }
-                    Inode::Path(anchor, PathBuf::new())
+                    Inode::Path(anchor, PathBuf::new(), None)
                 },
                 _ if self.loose_path(name.as_bytes()).is_some_and(|path| path.exists()) => Inode::Loose(name.as_bytes().to_vec()),
                 _ => return Err(Errno::ENOENT),
             },
             Inode::Loose(_) => return Err(Errno::ENOTDIR),
-            Inode::Path(anchor, rel) => {
+            Inode::Path(anchor, rel, via) => {
                 let child = rel.join(name);
                 if self.at(&catalog, &anchor, &child)?.is_none() {
                     return Err(Errno::ENOENT);
                 }
-                Inode::Path(anchor, child)
+                Inode::Path(anchor, child, via)
             },
             Inode::Tags => {
                 let claims = catalog.claims().ok_or(Errno::ENOENT)?;
@@ -617,16 +733,16 @@ impl Soup {
                 if !claims.tagged(tag.multihash()).map_err(store_errno)?.contains(&cid) || !self.reachable(&catalog, &cid)? {
                     return Err(Errno::ENOENT);
                 }
-                Inode::Node(cid)
+                Inode::Node(cid, None)
             },
-            Inode::Node(dir) => {
+            Inode::Node(dir, _) => {
                 let entries = export::list(&Source { catalog: &catalog, fetcher: self.fetcher.as_deref() }, &dir).map_err(|e| errno(&e))?;
                 self.note_sizes(&entries);
                 let entry = entries.into_iter().find(|entry| entry.name.as_slice() == name.as_bytes()).ok_or(Errno::ENOENT)?;
-                Inode::Node(entry.cid)
+                Inode::Node(entry.cid, None)
             },
         };
-        let kind = self.kind(&catalog, &inode)?;
+        let (inode, kind) = if place { self.placed(&catalog, dir, name.as_bytes(), inode)? } else { (inode.clone(), self.kind(&catalog, &inode)?) };
         drop(catalog);
         let writable = self.writes(&inode);
         let ino = self.inodes().of(inode);
@@ -638,13 +754,16 @@ impl Soup {
         let inode = self.inode(ino)?;
         let catalog = self.catalog()?;
         let with_kinds = |names: Vec<(Vec<u8>, Inode)>| -> Result<Vec<(Vec<u8>, Inode, Kind)>, Errno> {
-            names.into_iter().map(|(name, inode)| Ok((name, inode.clone(), self.kind(&catalog, &inode)?))).collect()
+            names.into_iter().map(|(name, inode)| {
+                let (inode, kind) = self.placed(&catalog, ino, &name, inode)?;
+                Ok((name, inode, kind))
+            }).collect()
         };
         let children = match inode {
             Inode::Root => {
                 let mut top: Vec<_> = TOP.iter().map(|&(name, _)| (name.as_bytes().to_vec(), Inode::Root, Kind::Directory)).collect();
                 if let Some(root) = Self::root(&catalog)? {
-                    let named = self.overlay_entries(&catalog, &root, Path::new(""))?;
+                    let named = self.overlay_entries(&catalog, &root, Path::new(""), &Some((ROOT, Vec::new())))?;
                     top.extend(with_kinds(named.into_iter().filter(|(name, _)| !TOP.iter().any(|(top, _)| top.as_bytes() == name)).collect())?);
                 }
                 top
@@ -656,7 +775,7 @@ impl Soup {
                 let mut found = Vec::new();
                 for (anchor, value) in anchors {
                     if self.reachable(&catalog, &value)? {
-                        found.push((anchor.to_string().into_bytes(), Inode::Path(anchor, PathBuf::new())));
+                        found.push((anchor.to_string().into_bytes(), Inode::Path(anchor, PathBuf::new(), None)));
                     }
                 }
                 found.extend(self.loose().into_iter().map(|name| (name.clone(), Inode::Loose(name))));
@@ -676,18 +795,18 @@ impl Soup {
                 let mut found = Vec::new();
                 for cid in tagged {
                     if self.reachable(&catalog, &cid)? {
-                        found.push((cid.to_string().into_bytes(), Inode::Node(cid)));
+                        found.push((cid.to_string().into_bytes(), Inode::Node(cid, None)));
                     }
                 }
                 with_kinds(found)?
             },
-            Inode::Node(dir) => {
+            Inode::Node(dir, _) => {
                 let entries = export::list(&Source { catalog: &catalog, fetcher: self.fetcher.as_deref() }, &dir).map_err(|e| errno(&e))?;
                 self.note_sizes(&entries);
-                with_kinds(entries.into_iter().map(|entry| (entry.name, Inode::Node(entry.cid))).collect())?
+                with_kinds(entries.into_iter().map(|entry| (entry.name, Inode::Node(entry.cid, None))).collect())?
             },
-            Inode::Path(anchor, rel) => {
-                let entries = self.overlay_entries(&catalog, &anchor, &rel)?;
+            Inode::Path(anchor, rel, via) => {
+                let entries = self.overlay_entries(&catalog, &anchor, &rel, &via)?;
                 with_kinds(entries)?
             },
             Inode::Loose(_) => return Err(Errno::ENOTDIR),
@@ -714,7 +833,7 @@ impl Soup {
     /// Up to `size` bytes of a file from `offset`.
     pub fn read(&self, ino: u64, offset: u64, size: usize) -> Result<Vec<u8>, Errno> {
         match self.inode(ino)? {
-            Inode::Node(cid) => {
+            Inode::Node(cid, _) => {
                 let catalog = self.catalog()?;
                 export::read_at(&Source { catalog: &catalog, fetcher: self.fetcher.as_deref() }, &cid, offset, size).map_err(|e| errno(&e))
             },
@@ -722,7 +841,7 @@ impl Soup {
                 let file = std::fs::File::open(self.loose_path(&name).ok_or(Errno::ENOENT)?).map_err(|e| errno(&e))?;
                 read_file(&file, offset, size)
             },
-            Inode::Path(anchor, rel) => {
+            Inode::Path(anchor, rel, _) => {
                 let catalog = self.catalog()?;
                 match self.at(&catalog, &anchor, &rel)?.ok_or(Errno::ENOENT)? {
                     At::Work(meta) if meta.is_dir() => Err(Errno::EISDIR),
@@ -1199,25 +1318,27 @@ mod tests {
         assert_eq!(names(&soup, ""), ["cid", "anchors", "tags"], "naming nothing yet");
         assert_eq!(ino(&soup, "").expect("top").perm, 0o755);
 
-        // A directory made at the top is a new anchor, named by a symlink
+        // A directory made at the top is a new anchor, mounted where it's
+        // named, by a link to it
         let dir = soup.mkdir(ROOT, OsStr::new("wiki")).expect("mkdir");
         assert_eq!(dir.kind, FileType::Directory, "a directory, as mkdir must make");
         let wiki = ino(&soup, "wiki").expect("wiki");
-        assert_eq!(wiki.kind, FileType::Symlink);
-        let target = String::from_utf8(soup.link(wiki.ino.0).expect("readlink")).expect("utf-8");
+        assert_eq!((wiki.kind, wiki.ino), (FileType::Directory, dir.ino), "what mkdir made");
+        let link = soup.resolve_kept(ROOT, OsStr::new("wiki")).expect("link");
+        assert_eq!(link.kind, FileType::Symlink, "kept as a link");
+        let target = String::from_utf8(soup.link(link.ino.0).expect("readlink")).expect("utf-8");
         let made: Link = target.strip_prefix("/mnt/soup/anchors/").expect("to an anchor in the mount").parse().expect("anchor");
         assert!(crate::claim::is_anchor(&made));
-        assert_eq!(ino(&soup, &format!("anchors/{made}")).expect("anchor").ino, dir.ino, "the anchor's");
-        assert_eq!(wiki.size, u64::try_from(target.len()).expect("len"), "as long as it's shown");
+        assert_eq!(link.size, u64::try_from(target.len()).expect("len"), "as long as it's shown");
+        assert_ne!(ino(&soup, &format!("anchors/{made}")).expect("anchor").ino, wiki.ino, "a directory of its own in each place");
         assert_eq!(names(&soup, ""), ["cid", "anchors", "tags", "wiki"]);
-        assert!(names(&soup, &format!("anchors/{made}")).is_empty(), "an empty directory");
+        assert!(names(&soup, "wiki").is_empty(), "an empty directory");
         for taken in ["wiki", "cid"] {
             assert_eq!(soup.mkdir(ROOT, OsStr::new(taken)).err(), Some(Errno::EEXIST), "{taken}");
         }
 
-        // Written to as any anchor, the root unchanged by it
-        let dir = ino(&soup, &format!("anchors/{made}")).expect("dir").ino.0;
-        let (_, fh) = soup.create(dir, OsStr::new("page.md")).expect("create");
+        // Written to as the anchor, the root unchanged by it
+        let (_, fh) = soup.create(wiki.ino.0, OsStr::new("page.md")).expect("create");
         soup.write(fh, 0, b"# Data soup").expect("write");
         soup.release(fh);
         soup.commit();
@@ -1228,29 +1349,87 @@ mod tests {
         soup.release(fh);
         soup.commit();
         assert_eq!(value(&repo, &root), named, "late bound: naming the anchor, not what it is");
+        assert_eq!(read(&soup, "wiki/page.md"), b"# Data soup", "the same anchor wherever it's reached");
 
         // The root's an anchor of its own: files, renames, links into the mount
         let (_, fh) = soup.create(ROOT, OsStr::new("notes")).expect("create");
         soup.write(fh, 0, b"todo").expect("write");
         soup.release(fh);
         soup.rename(ROOT, OsStr::new("wiki"), ROOT, OsStr::new("docs"), false).expect("rename");
+        assert_eq!(ino(&soup, "docs").expect("docs").ino, wiki.ino, "where the kernel takes it to have moved");
+        assert_eq!(ino(&soup, "wiki").err(), Some(Errno::ENOENT));
         soup.symlink(ROOT, OsStr::new("first"), Path::new(&format!("/mnt/soup/anchors/{anchor}/a"))).expect("symlink");
         soup.symlink(ROOT, OsStr::new("page"), Path::new("/mnt/soup/docs/page.md")).expect("symlink");
         soup.symlink(ROOT, OsStr::new("host"), Path::new("/etc/hostname")).expect("symlink");
+        let made_link = soup.symlink(ROOT, OsStr::new("again"), Path::new(&format!("/mnt/soup/anchors/{anchor}"))).expect("symlink");
+        assert_eq!(made_link.kind, FileType::Symlink, "a symlink, as symlink must make");
         soup.commit();
-        assert_eq!(names(&soup, ""), ["cid", "anchors", "tags", "docs", "first", "host", "notes", "page"]);
+        assert_eq!(names(&soup, ""), ["cid", "anchors", "tags", "again", "docs", "first", "host", "notes", "page"]);
         assert_eq!(read(&soup, "notes"), b"todo");
+        assert_eq!(names(&soup, "again"), ["a", "big", "dir"], "a link made to an anchor mounts it");
         // Kept as to the anchor wherever the soup's mounted next
         let elsewhere = Soup::new(Box::new(move || Catalog::open_repo(&repo)), None).at_dir(PathBuf::from("/elsewhere"));
         let first = ino(&elsewhere, "first").expect("first");
-        assert_eq!(elsewhere.link(first.ino.0).expect("readlink"), format!("/elsewhere/anchors/{anchor}/a").into_bytes());
-        let docs = ino(&elsewhere, "docs").expect("docs");
+        assert_eq!(elsewhere.link(first.ino.0).expect("readlink"), format!("/elsewhere/anchors/{anchor}/a").into_bytes(), "into an anchor, a link");
+        let docs = elsewhere.resolve_kept(ROOT, OsStr::new("docs")).expect("docs");
         assert_eq!(elsewhere.link(docs.ino.0).expect("readlink"), format!("/elsewhere/anchors/{made}").into_bytes());
-        assert_eq!(read(&elsewhere, &format!("anchors/{made}/page.md")), b"# Data soup");
+        assert_eq!(read(&elsewhere, "docs/page.md"), b"# Data soup");
         let page = ino(&elsewhere, "page").expect("page");
         assert_eq!(elsewhere.link(page.ino.0).expect("readlink"), format!("/elsewhere/anchors/{made}/page.md").into_bytes(), "through the anchor its name was for");
         let host = ino(&elsewhere, "host").expect("host");
         assert_eq!(elsewhere.link(host.ino.0).expect("readlink"), b"/etc/hostname", "what's outside the soup as it was");
+
+        // Removing a mount point unmounts it, the anchor as it was
+        soup.rmdir(ROOT, OsStr::new("docs")).expect("rmdir");
+        assert_eq!(names(&soup, ""), ["cid", "anchors", "tags", "again", "first", "host", "notes", "page"]);
+        assert_eq!(read(&soup, &format!("anchors/{made}/page.md")), b"# Data soup");
+    }
+
+    #[test]
+    fn a_mount_point_is_a_link_where_its_anchor_is_above() {
+        let scratch = Scratch::new("mount-loops");
+        let (soup, anchor, repo) = writable(&scratch);
+        let soup = soup.at_dir(PathBuf::from("/mnt/soup"));
+        let root = Catalog::open_repo(&repo).expect("catalog").root_anchor().expect("root").expect("root");
+        let wiki = soup.mkdir(ROOT, OsStr::new("wiki")).expect("mkdir").ino.0;
+        let made_anchor = match soup.inode(wiki).expect("inode") {
+            Inode::Path(anchor, _, _) => anchor,
+            inode => panic!("{inode:?}"),
+        };
+        let anchor_dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        for (dir, name, to) in [(wiki, "up", root), (wiki, "itself", made_anchor.clone()), (wiki, "other", anchor.clone()), (anchor_dir, "back", made_anchor)] {
+            soup.symlink(dir, OsStr::new(name), Path::new(&format!("/anchors/{to}"))).expect("symlink");
+        }
+        soup.commit();
+        let kind = |path: &str| ino(&soup, path).expect(path).kind;
+        assert_eq!(kind("wiki/up"), FileType::Symlink, "the root's above");
+        assert_eq!(kind("wiki/itself"), FileType::Symlink, "it's itself");
+        assert_eq!(kind("wiki/other"), FileType::Directory);
+        assert_eq!(kind(&format!("anchors/{anchor}/back")), FileType::Directory, "nothing above anchors/");
+        assert_eq!(kind("wiki/other/back"), FileType::Symlink, "wiki's above, through other");
+        assert_eq!(names(&soup, "wiki/other"), ["a", "back", "big", "dir"]);
+        assert_ne!(ino(&soup, "wiki/other/dir").expect("dir").ino, ino(&soup, &format!("anchors/{anchor}/dir")).expect("dir").ino);
+        assert_eq!(read(&soup, "wiki/other/dir/b"), b"bee");
+    }
+
+    #[test]
+    fn a_directory_reached_twice_is_two() {
+        let scratch = Scratch::new("mount-twice");
+        let t = scratch.path().join("t");
+        for dir in ["x", "y"] {
+            std::fs::create_dir_all(t.join(dir)).expect("mkdir");
+            std::fs::write(t.join(dir).join("f"), "same").expect("write");
+        }
+        let repo = scratch.path().join("repo");
+        let mut catalog = Catalog::open_repo(&repo).expect("catalog");
+        let root = AnyCid::V1(Importer::default().add_path(&t, &mut catalog, &mut |_, _| {}).expect("import").expect("root").cid);
+        drop(catalog);
+        let soup = Soup::new(Box::new(move || Catalog::open_repo(&repo)), None);
+        let (x, y) = (ino(&soup, &format!("cid/{root}/x")).expect("x"), ino(&soup, &format!("cid/{root}/y")).expect("y"));
+        assert_ne!(x.ino, y.ino, "one parent each, as the kernel needs");
+        let listed: Vec<u64> = soup.list(ino(&soup, &format!("cid/{root}")).expect("root").ino.0).expect("list").into_iter().map(|(_, ino, _)| ino).collect();
+        assert_eq!(listed, [x.ino.0, y.ino.0], "listed as looked up");
+        assert_eq!(ino(&soup, &format!("cid/{root}/x/f")).expect("f").ino, ino(&soup, &format!("cid/{root}/y/f")).expect("f").ino, "a file's one, as a hard link");
     }
 
     /// What of a file of an anchor is still to be copied, by chunk.

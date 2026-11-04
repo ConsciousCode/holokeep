@@ -43,13 +43,13 @@ offset 43  …         XChaCha20-Poly1305 ciphertext, with the 43-byte header as
 
 A vault keeps a **manifest** of what it encrypted, as a dag-cbor map:
 
-| Key | Value |
-|---|---|
-| `manifest` | the string `"holokeep-vault-1"` |
-| `blocks` | plain links to the ciphertext blocks, at most 1024, so a holder keeps all of it from one keep |
-| `next` | plain links to further manifests (omitted if none) |
-| `sealed` | a random 24-byte nonce, then XChaCha20-Poly1305 of dag-cbor `{plain: [CID bytes…], root: CID bytes}` under the `"manifest"` key, with associated data `"holokeep-vault-1"` |
-| `bats` | a list of one token: `derive("bat", sealed)` |
+| Key        | Value                                                                                                                                                                      |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `manifest` | the string `"holokeep-vault-1"`                                                                                                                                            |
+| `blocks`   | plain links to the ciphertext blocks, at most 1024, so a holder keeps all of it from one keep                                                                              |
+| `next`     | plain links to further manifests (omitted if none)                                                                                                                         |
+| `sealed`   | a random 24-byte nonce, then XChaCha20-Poly1305 of dag-cbor `{plain: [CID bytes…], root: CID bytes}` under the `"manifest"` key, with associated data `"holokeep-vault-1"` |
+| `bats`     | a list of one token: `derive("bat", sealed)`                                                                                                                               |
 
 `plain` says which plaintext CID each entry of `blocks` is, in order,
 and the first manifest's `root` says the DAG's root.

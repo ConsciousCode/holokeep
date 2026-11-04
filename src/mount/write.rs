@@ -19,7 +19,7 @@ use crate::model::Link;
 use crate::store::overlay::{CHUNK, Partial};
 use crate::store::{Catalog, Mount};
 
-use super::{At, Inode, Soup, Source, errno, store_errno};
+use super::{At, Inode, Soup, Source, errno, store_errno, to_anchor};
 
 /// An empty UnixFS directory, as dag-pb.
 const EMPTY_DIR: &[u8] = &[0x0a, 0x02, 0x08, 0x01];
@@ -331,7 +331,7 @@ impl Soup {
     /// The anchor and path of an inode which can be written to.
     fn overlay_of(&self, ino: u64) -> Result<(Link, PathBuf), Errno> {
         match self.inode(ino)? {
-            Inode::Path(anchor, rel) if self.work.is_some() => Ok((anchor, rel)),
+            Inode::Path(anchor, rel, _) if self.work.is_some() => Ok((anchor, rel)),
             Inode::Root if self.work.is_some() => Ok((Self::root(&*self.catalog()?)?.ok_or(Errno::EROFS)?, PathBuf::new())),
             _ => Err(Errno::EROFS),
         }
@@ -412,7 +412,7 @@ impl Soup {
             return Ok(self.handle(file, None, PathBuf::new(), write));
         }
         if !write {
-            if let Inode::Path(anchor, rel) = self.inode(ino)?
+            if let Inode::Path(anchor, rel, _) = self.inode(ino)?
                 && let Some(path) = self.work_path(&anchor, &rel)
                 && let Ok(file) = File::open(path)
             {
@@ -530,9 +530,8 @@ impl Soup {
         catalog.set_anchor(&anchor, &empty.cid().clone().into()).map_err(store_errno)?;
         drop(catalog);
         self.symlink(super::ROOT, name, &Path::new("/anchors").join(anchor.to_string()))?;
-        // What mkdir makes must be a directory, so it's the anchor's, as
-        // the name's taken to be until the kernel looks it up again
-        self.resolve(super::ANCHORS, OsStr::new(&anchor.to_string()))
+        // The link, mounting the anchor
+        self.resolve(super::ROOT, name)
     }
 
     /// Make a symlink.
@@ -545,7 +544,9 @@ impl Soup {
         std::os::unix::fs::symlink(self.stored(&catalog, target)?, path).map_err(|e| io_errno(&e))?;
         drop(catalog);
         self.committer.touched(&anchor);
-        self.resolve(parent, name)
+        // What symlink makes must be a symlink, though the kernel's next
+        // look finds a mount point, if it's to an anchor
+        self.resolve_kept(parent, name)
     }
 
     /// Mark a path gone if the anchor had anything there, else forget its
@@ -582,15 +583,21 @@ impl Soup {
         Ok(())
     }
 
-    /// Remove an empty directory.
+    /// Remove an empty directory, or a mount point, whatever's in it: the
+    /// link goes, and the anchor is as it was, as an unmount.
     pub fn rmdir(&self, parent: u64, name: &OsStr) -> Result<(), Errno> {
         let (anchor, rel) = self.overlay_of(parent)?;
         let rel = rel.join(name);
         let catalog = self.catalog()?;
-        if self.kind(&catalog, &Inode::Path(anchor.clone(), rel.clone()))? != Kind::Directory {
-            return Err(Errno::ENOTDIR);
+        match self.kind_kept(&catalog, &Inode::Path(anchor.clone(), rel.clone(), None))? {
+            Kind::Symlink(target) if to_anchor(&target) => {
+                drop(catalog);
+                return self.unlink(parent, name);
+            },
+            Kind::Directory => {},
+            _ => return Err(Errno::ENOTDIR),
         }
-        if !self.overlay_entries(&catalog, &anchor, &rel)?.is_empty() {
+        if !self.overlay_entries(&catalog, &anchor, &rel, &None)?.is_empty() {
             return Err(Errno::ENOTEMPTY);
         }
         if let Some(path) = self.work_path(&anchor, &rel)
@@ -624,16 +631,16 @@ impl Soup {
             return Err(Errno::EINVAL);
         }
         let catalog = self.catalog()?;
-        let source = self.kind(&catalog, &Inode::Path(anchor.clone(), from.clone()))?;
+        let source = self.kind(&catalog, &Inode::Path(anchor.clone(), from.clone(), None))?;
         if self.at(&catalog, &anchor, &to)?.is_some() {
             if no_replace {
                 return Err(Errno::EEXIST);
             }
-            let replaced = self.kind(&catalog, &Inode::Path(anchor.clone(), to.clone()))?;
+            let replaced = self.kind(&catalog, &Inode::Path(anchor.clone(), to.clone(), None))?;
             match (source == Kind::Directory, replaced == Kind::Directory) {
                 (false, true) => return Err(Errno::EISDIR),
                 (true, false) => return Err(Errno::ENOTDIR),
-                (true, true) if !self.overlay_entries(&catalog, &anchor, &to)?.is_empty() => return Err(Errno::ENOTEMPTY),
+                (true, true) if !self.overlay_entries(&catalog, &anchor, &to, &None)?.is_empty() => return Err(Errno::ENOTEMPTY),
                 _ => {},
             }
         }
@@ -661,7 +668,10 @@ impl Soup {
             catalog.set_overlay_mark(&anchor, &from, &None).map_err(store_errno)?;
         }
         drop(catalog);
-        self.inodes().renamed(&anchor, &from, &to);
+        let mut inodes = self.inodes();
+        inodes.renamed(&anchor, &from, &to);
+        inodes.via_moved(&(parent, name.as_bytes().to_vec()), &(new_parent, new_name.as_bytes().to_vec()));
+        drop(inodes);
         self.committer.touched(&anchor);
         Ok(())
     }
@@ -691,8 +701,8 @@ impl Soup {
         if no_replace && replaced.is_some() {
             return Err(Errno::EEXIST);
         }
-        if let Some(Inode::Path(anchor, rel)) = replaced.map(|ino| self.inode(ino)).transpose()? {
-            if self.kind(&*self.catalog()?, &Inode::Path(anchor.clone(), rel.clone()))? == Kind::Directory {
+        if let Some(Inode::Path(anchor, rel, _)) = replaced.map(|ino| self.inode(ino)).transpose()? {
+            if self.kind(&*self.catalog()?, &Inode::Path(anchor.clone(), rel.clone(), None))? == Kind::Directory {
                 return Err(Errno::EISDIR);
             }
             let catalog = self.catalog()?;
@@ -701,7 +711,7 @@ impl Soup {
             drop(catalog);
             Self::parents(&to)?;
             fs::rename(&from, &to).map_err(|e| io_errno(&e))?;
-            self.inodes().became(&Inode::Loose(name.as_bytes().to_vec()), Inode::Path(anchor.clone(), rel));
+            self.inodes().became(&Inode::Loose(name.as_bytes().to_vec()), Inode::Path(anchor.clone(), rel, None));
             self.committer.touched(&anchor);
         } else {
             let to = self.loose_path(new_name.as_bytes()).ok_or(Errno::EROFS)?;
