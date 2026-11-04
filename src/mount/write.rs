@@ -968,6 +968,12 @@ impl Soup {
     /// was written before.
     pub fn start(&self) {
         if self.work.is_some() {
+            // What the root names is kept through it
+            match (self.open)().and_then(|catalog| catalog.keep_root()) {
+                Ok(Some(keep)) => eprintln!("the root anchor is kept now, by {keep}"),
+                Ok(None) => {},
+                Err(e) => eprintln!("the root anchor couldn't be kept, so what it names may be collected: {e}"),
+            }
             self.committer.recover();
             Arc::clone(&self.committer).run();
         }

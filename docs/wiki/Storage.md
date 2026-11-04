@@ -57,7 +57,8 @@ block is verified against its CID on the way out.
 Every block's links are indexed, by multihash, so "what links to this?"
 is a query. Stores that keep link rows (UnixFS, IPLD, claims) serve
 their own; for others the catalog reads links by codec on put into
-`refs`. The `links (source, target)` view is the union.
+`refs`. A mount point's link to its anchor goes into `refs` too, from
+whichever store. The `links (source, target)` view is the union.
 `hk refs --back <cid>`.
 
 ## Catching up between catalogs
@@ -81,6 +82,11 @@ multihash into whatever forms the target supports.
 
 Each store creates its tables if missing and adds columns it needs after
 checking `pragma_table_info`, so opening an older repo upgrades it in
-place. Changes so far have all been additive.
+place. A change to what's already in a repo is made once, in one
+transaction, and recorded by name in `migrations (name, at)`:
+
+| Migration | Change |
+|---|---|
+| `mount points link to their anchors` | Index every UnixFS symlink to `/anchors/<anchor>` as a link (in `refs`) to the anchor. |
 
 Source: `src/store.rs`, `src/store/`.

@@ -865,3 +865,43 @@ async fn another_accounts_blocks_arent_this_meshs() {
     a.catalog().put_block(&theirs, CidVersion::V1).expect("put");
     assert_eq!(fetch(&mut a, &mut b, link(&theirs)).await, (1, vec![]));
 }
+
+#[tokio::test]
+async fn what_a_kept_root_mounts_stays_till_its_mount_point_goes() {
+    use crate::cid::BaseCid as _;
+    use crate::store::Catalog;
+    let (mut a, mut b, _) = Box::pin(holding()).await;
+    a.set_grace(Duration::ZERO).expect("grace");
+    let inside = raw(b"inside");
+    a.catalog().put_block(&inside, CidVersion::V1).expect("put");
+    let anchor = a.catalog().new_anchor().expect("anchor");
+    a.catalog().set_anchor(&anchor, &link(&inside)).expect("set");
+    // The root names the anchor by a mount point, imported elsewhere and
+    // put here block by block
+    let scratch = crate::testutil::Scratch::new("node-mounted");
+    let t = scratch.path().join("t");
+    std::fs::create_dir_all(&t).expect("mkdir");
+    std::os::unix::fs::symlink(format!("/anchors/{anchor}"), t.join("wiki")).expect("symlink");
+    let mut there = Catalog::open_repo(&scratch.path().join("there")).expect("open");
+    let top = AnyCid::V1(crate::import::Importer::default().add_path(&t, &mut there, &mut |_, _| {}).expect("import").expect("top").cid);
+    for key in there.keys().expect("keys") {
+        let cid = there.cid_of(key.as_ref()).expect("cid").expect("cid");
+        if cid.codec() == crate::cid::DAG_PB_CODEC {
+            a.catalog().put_block(&there.get_block(&cid).expect("get").expect("block"), CidVersion::V1).expect("put");
+        }
+    }
+    // A kept anchor naming it, as a root is
+    let root = a.catalog().new_anchor().expect("anchor");
+    a.catalog().set_anchor(&root, &top).expect("set");
+    a.catalog().keep(&root).expect("keep");
+    let top_block = a.catalog().get_block(&top).expect("get").expect("top");
+    condemn(&mut [&mut a, &mut b]).await;
+    assert!(has(&a, &inside) && has(&a, &top_block), "kept through the root and its mount point");
+
+    // Once the root names nothing, the mount point goes, and what it mounted after it
+    let empty = raw(b"");
+    a.catalog().set_anchor(&root, &link(&empty)).expect("set");
+    condemn(&mut [&mut a, &mut b]).await;
+    assert!(!has(&a, &top_block), "what the root named");
+    assert!(!has(&a, &inside), "and what that mounted, in the same cascade");
+}

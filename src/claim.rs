@@ -436,6 +436,15 @@ pub fn is_anchor(cid: &Link) -> bool {
     matches!(dagcbor::from_slice(cid.digest_ref()), Ok(Ipld::Map(map)) if map.len() == 1 && matches!(map.get("anchor"), Some(Ipld::Bytes(nonce)) if nonce.len() == 16))
 }
 
+/// The anchor a symlink's target is, if it's `/anchors/<anchor>`: one
+/// to the anchor itself, not into it, which the mount shows as the anchor
+/// and which references it.
+pub fn anchor_target(target: &[u8]) -> Option<Link> {
+    let name = target.strip_prefix(b"/anchors/")?;
+    let name = name.strip_suffix(b"/").unwrap_or(name);
+    std::str::from_utf8(name).ok()?.parse::<Link>().ok().filter(is_anchor)
+}
+
 /// The CID of a simple tag: its name, as a raw identity CID.
 pub fn tag(name: &str) -> Option<Link> {
     (!name.is_empty()).then_some(())?;

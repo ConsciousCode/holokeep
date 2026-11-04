@@ -759,6 +759,7 @@ impl Catalog {
         if let (Some(value), Some(anchor)) = (named, self.root_anchor()?) {
             self.set_anchor(&anchor, &value)?;
         }
+        self.keep_root()?;
         self.seal(&root, passphrase, cost)?;
         Ok(root)
     }
@@ -875,8 +876,14 @@ impl Catalog {
                      WHERE c.claim IS NOT NULL
                  UNION SELECT c.claim, g.into_ FROM group_claims g JOIN claims c ON c.id = g.id
                      WHERE c.claim IS NOT NULL
-                 UNION SELECT source, target FROM refs;",
+                 UNION SELECT source, target FROM refs;
+             -- Changes made once to what's in a repo, by name, as made.
+             CREATE TABLE IF NOT EXISTS migrations (
+                 name TEXT PRIMARY KEY,
+                 at INTEGER NOT NULL
+             );",
         )?;
+        catalog.migrate("mount points link to their anchors", Self::index_mount_points)?;
         catalog.db.conn().execute_batch(
             "-- Files and directories imported in place, by the anchor each is
              -- mounted on, and how they were imported, to import them again
@@ -1626,6 +1633,8 @@ impl Catalog {
                  WHERE a.value = ?1 AND c.kind = 'keep' AND {}",
                 claims::LIVE_ANY,
             ));
+            // What a mounted anchor is now: a mount point here references it
+            sources.push("SELECT 1 FROM anchor_values_any a JOIN refs r ON r.target = a.anchor WHERE a.value = ?1".to_owned());
         }
         let query = sources.iter().map(|source| format!("EXISTS ({source})")).collect::<Vec<_>>().join(" OR ");
         Ok(conn.prepare_cached(&format!("SELECT {query}"))?.query_row([id], |row| row.get(0))?)
@@ -1645,6 +1654,13 @@ impl Catalog {
             };
             for link in crate::links::links(block.cid().codec(), block.data()).unwrap_or_default() {
                 let child = owned(link.multihash())?;
+                children.insert(child.to_bytes(), child);
+            }
+            // A mount point's child is what its anchor is now
+            if let Some(anchor) = mount_point(block.cid().codec(), block.data())
+                && let Some(value) = self.anchor_value(&anchor)?
+            {
+                let child = owned(value.multihash())?;
                 children.insert(child.to_bytes(), child);
             }
         }
@@ -2407,6 +2423,9 @@ impl Catalog {
             if new_cid && self.named(&placed)?.refs().is_none() {
                 self.index_links(id, block.cid().codec(), block.data())?;
             }
+            if new_cid && let Some(anchor) = mount_point(block.cid().codec(), block.data()) {
+                self.index_mount_point(id, &anchor)?;
+            }
             self.db.conn()
                 .prepare_cached(
                     "INSERT INTO holdings (uid, block, since, size) VALUES (?1, ?2, ?3, ?4)
@@ -2428,6 +2447,63 @@ impl Catalog {
             stmt.execute(params![id, self.db.intern(link.multihash())?])?;
         }
         Ok(())
+    }
+
+    /// Make a change to what's in the repo once, if it hasn't been.
+    fn migrate<T>(&self, name: &str, change: impl FnOnce(&Self) -> Result<T>) -> Result<()> {
+        let done = self.db.conn().prepare_cached("SELECT 1 FROM migrations WHERE name = ?1")?.exists([name])?;
+        if done {
+            return Ok(());
+        }
+        self.db.atomically(|| {
+            change(self)?;
+            self.db.conn()
+                .prepare_cached("INSERT INTO migrations (name, at) VALUES (?1, ?2)")?
+                .execute(params![name, i64::try_from(now()).unwrap_or(i64::MAX)])?;
+            Ok(())
+        })
+    }
+
+    /// Note a mount point's link to the anchor it mounts, as a link: what
+    /// keeps a directory keeps what it mounts.
+    fn index_mount_point(&self, id: Id, anchor: &Link) -> Result<()> {
+        self.db.conn()
+            .prepare_cached("INSERT OR IGNORE INTO refs (source, target) VALUES (?1, ?2)")?
+            .execute(params![id, self.db.intern(anchor.multihash())?])?;
+        Ok(())
+    }
+
+    /// Note every mount point the UnixFS store holds, as a link to the
+    /// anchor it mounts. Returns how many there are.
+    fn index_mount_points(&self) -> Result<usize> {
+        let found: Vec<(Id, Vec<u8>)> = self.db.conn()
+            .prepare(&format!(
+                "SELECT block, data FROM unixfs_nodes WHERE type = {} AND substr(data, 1, 9) = CAST('/anchors/' AS BLOB)",
+                u64::from(crate::unixfs::DataType::Symlink)
+            ))?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut count = 0usize;
+        for (id, target) in found {
+            if let Some(anchor) = crate::claim::anchor_target(&target) {
+                self.index_mount_point(id, &anchor)?;
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
+    }
+
+    /// Keep the root anchor of who this acts for, if it isn't kept: what it
+    /// names, and what they mount, is kept through it. Returns the keep's
+    /// CID, if it made one.
+    pub fn keep_root(&self) -> Result<Option<Link>> {
+        let (Some(root), Some(claims)) = (self.root_anchor()?, &self.claims) else {
+            return Ok(None);
+        };
+        if claims.kept(root.multihash())? {
+            return Ok(None);
+        }
+        self.keep(&root).map(Some)
     }
 
     /// Every CID a block was put under.
@@ -2542,6 +2618,7 @@ impl Catalog {
                     }
                 }
             }
+            self.index_mount_points()?;
             Ok(count)
         })
     }
@@ -2685,6 +2762,20 @@ impl<T: BlockStore + ?Sized> BlockStore for Rc<T> {
     fn put_from(&self, block: &Block, provenance: Provenance<'_>) -> Result<Put> {
         (**self).put_from(block, provenance)
     }
+}
+
+/// The anchor a block mounts, if it's a mount point: a UnixFS symlink to
+/// `/anchors/<anchor>`.
+pub fn mount_point(codec: u64, data: &[u8]) -> Option<Link> {
+    if codec != crate::cid::DAG_PB_CODEC {
+        return None;
+    }
+    let node = crate::pb::PbNode::decode(data).ok()?;
+    let unixfs = crate::unixfs::DataBuf::decode(node.data?).ok()?;
+    if unixfs.data_type != crate::unixfs::DataType::Symlink {
+        return None;
+    }
+    crate::claim::anchor_target(unixfs.data.as_deref()?)
 }
 
 fn io_error(e: Error) -> io::Error {

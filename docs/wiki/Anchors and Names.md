@@ -40,6 +40,10 @@ anchor = identity CID of dag-cbor {"anchor": nonce}
 So every device of a user finds the same root anchor without any claim
 saying which it is. `hk anchor root` prints it and its current value.
 
+The root anchor is **kept**: `hk mount`, starting writable, and making a
+user each put a keep of it if there's none that counts. Through it and
+its mount points, everything the root names is kept.
+
 The root's value is an ordinary UnixFS directory. Its entries can be
 anything, but a directory made at the top of the mount is a **new
 anchor**, which the root names with a mount point, a UnixFS symlink:
@@ -68,7 +72,9 @@ refers to that anchor. A symlink to an anchor itself is a **mount
 point**: [[Mount|hk mount]] shows it as the anchor, a directory (or file)
 of its own wherever it's reached, and what's written under it goes to
 that anchor. Outside the mount, as in `hk get`, it's an ordinary
-symlink. A mount point whose anchor is already above it, as an anchor
+symlink. In the catalog it's a **link** to the anchor, so whatever keeps
+or references the mount point does the same for what the anchor is now
+(see [[Replication and Retention#Garbage collection]]). A mount point whose anchor is already above it, as an anchor
 naming itself or the root, is shown as the symlink instead, so the
 mount has no loops.
 

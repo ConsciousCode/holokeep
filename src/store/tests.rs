@@ -1810,6 +1810,41 @@ fn a_root_anchor_is_the_devices_then_the_users_naming_the_same() {
 }
 
 #[test]
+fn what_the_root_names_is_kept_through_mount_points() {
+    let scratch = Scratch::new("root-kept");
+    let mut repo = Catalog::open_repo(&scratch.path().join("repo")).expect("open");
+    let (inside, elsewhere) = (raw(b"inside"), raw(b"elsewhere"));
+    let (mounted, other) = (repo.new_anchor().expect("anchor"), repo.new_anchor().expect("anchor"));
+    for (anchor, block) in [(&mounted, &inside), (&other, &elsewhere)] {
+        repo.put_block(block, CidVersion::V1).expect("put");
+        repo.set_anchor(anchor, &link(block)).expect("set");
+    }
+    let t = scratch.path().join("t");
+    std::fs::create_dir_all(&t).expect("mkdir");
+    std::os::unix::fs::symlink(format!("/anchors/{mounted}"), t.join("wiki")).expect("symlink");
+    std::os::unix::fs::symlink(format!("/anchors/{other}/x"), t.join("into")).expect("symlink");
+    let top = AnyCid::V1(Importer::default().add_path(&t, &mut repo, &mut |_, _| {}).expect("import").expect("top").cid);
+    let root = repo.root_anchor().expect("root").expect("root");
+    repo.set_anchor(&root, &top).expect("set");
+    assert!(!repo.kept_under(inside.cid().multihash()).expect("kept"), "nothing keeps the root yet");
+    assert!(repo.referenced(inside.cid().multihash()).expect("referenced"), "what a mount point here mounts isn't collected before it");
+    assert!(!repo.referenced(elsewhere.cid().multihash()).expect("referenced"));
+
+    assert!(repo.keep_root().expect("keep").is_some());
+    assert!(repo.keep_root().expect("keep").is_none(), "kept already");
+    assert!(repo.kept_under(top.multihash()).expect("kept"));
+    assert!(repo.kept_under(inside.cid().multihash()).expect("kept"), "through the mount point");
+    assert!(!repo.kept_under(elsewhere.cid().multihash()).expect("kept"), "a link into an anchor isn't a mount point");
+
+    // Indexed again from what's stored, as an older repo is once
+    repo.db().conn().execute("DELETE FROM refs", []).expect("forget");
+    assert!(!repo.kept_under(inside.cid().multihash()).expect("kept"));
+    assert!(!repo.referenced(inside.cid().multihash()).expect("referenced"));
+    assert_eq!(repo.index_mount_points().expect("index"), 1);
+    assert!(repo.kept_under(inside.cid().multihash()).expect("kept"));
+}
+
+#[test]
 fn claims_count_only_when_an_authorized_key_signs_them() {
     let root = crate::keys::Key::generate().expect("key");
     let (router, _) = signed_router(&root);
@@ -2163,6 +2198,7 @@ fn repos_earlier_builds_made_still_open() {
         assert_eq!(repo.anchor_value(&expect["anchor"]).expect("value").as_ref(), Some(&expect["tree"]), "{name}");
         assert_eq!(repo.root_anchor().expect("root").as_ref(), Some(&expect["root"]), "{name}: the same root, from the same key");
         assert_eq!(repo.anchor_value(&expect["root"]).expect("value").as_ref(), Some(&expect["top"]), "{name}");
+        assert!(!repo.backrefs(expect["anchor"].multihash()).expect("backrefs").is_empty(), "{name}: the root's mount point links to the anchor it mounts");
 
         // And it takes more as ever
         let added = AnyCid::V1(Importer::default().add_path(&fixture.join("expect.txt"), &mut repo, &mut |_, _| {}).expect("add").expect("root").cid);

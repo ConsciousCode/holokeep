@@ -512,10 +512,7 @@ impl Soup {
     /// What a link in `dir` mounts, if it's to an anchor itself (not into
     /// one), which is something here and isn't above `dir`.
     fn mount_point(&self, catalog: &Catalog, dir: u64, target: &[u8], via: Via) -> Result<Option<Inode>, Errno> {
-        let Some(name) = target.strip_prefix(b"/anchors/").map(|name| name.strip_suffix(b"/").unwrap_or(name)) else {
-            return Ok(None);
-        };
-        let Some(anchor) = std::str::from_utf8(name).ok().and_then(|name| name.parse::<Link>().ok()).filter(crate::claim::is_anchor) else {
+        let Some(anchor) = crate::claim::anchor_target(target) else {
             return Ok(None);
         };
         let Some(value) = Self::anchor_root(catalog, &anchor)? else {
