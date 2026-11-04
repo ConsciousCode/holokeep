@@ -249,6 +249,14 @@ impl Catalog {
     /// Import an overlay mount, setting its anchor to what it now is, if
     /// that's anything new, and saying what it is.
     pub fn import_overlay(&mut self, mount: &Mount) -> Result<Link> {
+        self.import_overlay_if(mount, &|| true)?.ok_or_else(|| Error::User("the overlay changed as it was imported".into()))
+    }
+
+    /// Import an overlay mount as [`Self::import_overlay`] does, but set
+    /// its anchor only if `still()` says, once it's imported, that nothing
+    /// was written to it meanwhile, so what's set is never a file caught
+    /// halfway through being written. Otherwise none.
+    pub fn import_overlay_if(&mut self, mount: &Mount, still: &dyn Fn() -> bool) -> Result<Option<Link>> {
         let marks = self.overlay_marks(&mount.anchor)?;
         let root = self.anchor_value(&mount.anchor)?;
         let importer = mount.importer();
@@ -258,10 +266,13 @@ impl Catalog {
             // Everything's gone: an empty directory
             None => importer.directory.builder().finalize(&mut InPlace::new(self))?.cid.into(),
         };
+        if !still() {
+            return Ok(None);
+        }
         if root.as_ref() != Some(&value) {
             self.set_anchor(&mount.anchor, &value)?;
         }
-        Ok(value)
+        Ok(Some(value))
     }
 
     /// What's at a path of an overlay now, built over what the anchor had

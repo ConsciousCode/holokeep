@@ -337,6 +337,16 @@ impl OffsetStore {
         self.query_external("AND e.path = ?1", params![path_bytes(path)])
     }
 
+    /// The files imported in place from a path or from under it, as a
+    /// directory, one for each version recorded.
+    pub fn external_under(&self, path: &Path) -> Result<Vec<ExternalFile>> {
+        let under = [path_bytes(path), b"/"].concat();
+        self.query_external(
+            "AND (e.path = ?1 OR substr(e.path, 1, ?2) = ?3)",
+            params![path_bytes(path), i64::try_from(under.len()).unwrap_or(i64::MAX), under],
+        )
+    }
+
     fn query_external(&self, tail: &str, args: impl rusqlite::Params) -> Result<Vec<ExternalFile>> {
         let sql = format!(
             "SELECT m.multihash, e.path, e.size, e.mtime, e.inode FROM external_files e

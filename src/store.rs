@@ -1747,6 +1747,47 @@ impl Catalog {
         })
     }
 
+    /// Before files at or under `path` imported in place are changed,
+    /// moved or removed, keep what they were imported as, as blocks of
+    /// their own, so the DAGs they're of stay whole, and forget them as
+    /// imported in place. An overlay mount's work files are imported in
+    /// place as it's committed, and written to again after. Returns how
+    /// many blocks were moved out.
+    pub fn preserve_in_place(&self, path: &Path) -> Result<usize> {
+        let Some(offsets) = &self.offsets else {
+            return Ok(0);
+        };
+        let files = offsets.external_under(path)?;
+        if files.is_empty() {
+            return Ok(0);
+        }
+        self.db.atomically(|| {
+            // What's changed already is gone, and goes first, so what's
+            // left elsewhere is somewhere it can be read
+            let (gone, here): (Vec<&ExternalFile>, Vec<&ExternalFile>) = files.iter().partition(|file| file.changed());
+            let mut moved = 0usize;
+            for file in gone.into_iter().chain(here.iter().copied()) {
+                if !file.changed() {
+                    for (block, elsewhere) in offsets.ranges_of(file.blob.as_ref())? {
+                        if !elsewhere && self.placements(block.as_ref())?.iter().any(|(_, form)| form == "offset") {
+                            self.move_out(block.as_ref())?;
+                            moved = moved.saturating_add(1);
+                        }
+                    }
+                }
+                for key in offsets.forget_external(file)? {
+                    let Some(id) = self.db.lookup(key.as_ref())? else {
+                        continue;
+                    };
+                    for (volume, _) in self.placements(key.as_ref())?.into_iter().filter(|(_, form)| form == "offset") {
+                        self.unrecord(id, volume)?;
+                    }
+                }
+            }
+            Ok(moved)
+        })
+    }
+
     /// Move a block out of the kept file it's a range of, to be a block of
     /// its own, returning its size.
     fn move_out(&self, key: Key<'_>) -> Result<u64> {
@@ -2219,6 +2260,13 @@ impl Catalog {
             self.set_anchor(&mount.anchor, &root)?;
         }
         Ok((mount, root))
+    }
+
+    /// Import an overlay mount again as [`Self::remount`] does, setting
+    /// its anchor only if `still()` says nothing was written to it while
+    /// it was imported. Returns what it's now, or none if something was.
+    pub fn remount_if(&mut self, mount: &Mount, still: &dyn Fn() -> bool) -> Result<Option<Link>> {
+        self.batch(|catalog| catalog.import_overlay_if(mount, still))
     }
 
     /// Import a mount again, as it's changed. Returns what it's now.

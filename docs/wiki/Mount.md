@@ -74,19 +74,50 @@ Writing to an anchor turns it into an **overlay mount**:
   longer shows (removed, or renamed away) is recorded as **marks** on its
   paths: gone, or a block already in the soup. Renaming something big
   copies nothing.
-- Once nothing of an anchor is open to write and it has been quiet for a
-  second, the overlay is imported: the work directory in place like any
-  mount, rebuilding only the directories over what changed, exactly as
-  the importer builds them. The anchor's new value is what `hk add` of
-  the tree as it now is would make (hidden files included), and one
-  burst, like an editor's save, is one set.
+- When it's due (see [[#Committing]]), the overlay is imported: the work
+  directory in place like any mount, rebuilding only the directories
+  over what changed, exactly as the importer builds them. The anchor's
+  new value is what `hk add` of the tree as it now is would make (hidden
+  files included), and one burst, like an editor's save, is one set.
+- Before a work file that's been committed is written to, truncated,
+  replaced, moved or removed, the blocks it was imported as in place are
+  **moved out**, to be blocks of their own. So every value the anchor has
+  had stays whole, while what it is now is stored once, in the work
+  directory: history costs only what changed.
 - An anchor can be a single file. Editors save by writing a file beside
   it and renaming that over it, so `anchors/` accepts loose files, which
   become the anchor when renamed over it.
 - Unmounting commits what's left; mounting again commits what an
   interrupted mount didn't.
 
+## Committing
+
+An anchor written to is committed when what's written is **whole**,
+**quiet** and **paced**:
+
+- **Whole**: no file of it is open and written to since it was last
+  synced. A closed file is whole, and an application `fsync`s once what
+  it's written is consistent, as a database does after each transaction,
+  so a database left open is committed too. Renaming and removing are
+  atomic and don't count; a journal's removal doesn't hold a commit back.
+- **Quiet**: nothing's been written for 1 s, so a burst is one set; or,
+  if it's never quiet, it's been written to for the longer of 5 s and
+  its pace.
+- **Paced**: its pace has passed since it was last committed.
+
+The pace starts at nothing and steps through 5 s, 30 s, 2 min and 10
+min. A commit that comes within twice the pace plus 2 s of the last, or
+because the anchor was never quiet, steps it slower; one more than ten
+times the pace plus a minute after the last steps it faster. So notes
+saved now and then are committed at once, and a database written
+continuously settles at every 10 min. The mount says when an anchor's
+pace changes.
+
+A file is never committed halfway through being written: if the anchor
+is written to while it's being imported, nothing is set, and it's
+committed once it's whole again.
+
 Concurrent edits of one anchor from two nodes aren't merged yet: the
 later set wins.
 
-Source: `src/mount.rs`, `src/mount/write.rs`, `src/store/overlay.rs`.
+Source: `src/mount.rs`, `src/mount/write.rs`, `src/store/overlay.rs`, `src/store.rs` (`preserve_in_place`).

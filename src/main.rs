@@ -116,8 +116,9 @@ enum Command {
     /// Mount the soup as a filesystem until interrupted: the root anchor's
     /// names, beside cid/<cid>, anchors/<anchor> and tags/<tag>/<cid>.
     /// What's written to an anchor is committed, setting it, once it's
-    /// closed and quiet a second; a directory made at the top is a new
-    /// anchor.
+    /// closed or synced and quiet a second, less often if it's written to
+    /// often; a directory made at the top is a new anchor, and a link to
+    /// an anchor mounts it.
     #[cfg(feature = "fuse")]
     Mount {
         /// An empty directory to mount it on

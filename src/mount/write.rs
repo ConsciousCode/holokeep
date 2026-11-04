@@ -45,6 +45,22 @@ pub struct Handle {
     /// Its path within the anchor.
     rel: PathBuf,
     writable: bool,
+    /// Whether it's been written to since it was last synced or opened.
+    unsynced: bool,
+}
+
+impl Handle {
+    /// Written to: the anchor it's of, if that makes it unsynced.
+    fn written(&mut self) -> Option<&Link> {
+        let was = std::mem::replace(&mut self.unsynced, true);
+        self.anchor.as_ref().filter(|_| !was)
+    }
+
+    /// Synced, or closed: the anchor it's of, if it was unsynced.
+    fn settled(&mut self) -> Option<&Link> {
+        let was = std::mem::replace(&mut self.unsynced, false);
+        self.anchor.as_ref().filter(|_| was)
+    }
 }
 
 /// Copies files of overlays from what their anchors had as they're read
@@ -183,66 +199,165 @@ impl Filler {
     }
 }
 
-/// What's been written to and not committed yet.
-#[derive(Default)]
-struct Pending {
-    /// Anchors written to, as of when last.
-    dirty: HashMap<Vec<u8>, (Link, Instant)>,
-    /// How many files of each anchor are open to write.
-    writers: HashMap<Vec<u8>, usize>,
+/// How far apart an anchor's commits are kept, by how often it's been
+/// written to: at first only [`QUIET`], then further apart, a step at a
+/// time, the while it's written to again as soon as it's committed.
+const PACES: [Duration; 5] = [
+    Duration::ZERO,
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_mins(2),
+    Duration::from_mins(10),
+];
+
+/// How long what's written to an anchor without its ever being quiet waits
+/// at most, at its pace's first step, before it's committed anyway.
+const STALE: Duration = Duration::from_secs(5);
+
+/// What's known of an anchor written to.
+struct Written {
+    anchor: Link,
+    /// Since when, and when last, if it's written to and not committed.
+    dirty: Option<(Instant, Instant)>,
+    /// How many of its files are open and written to since they were
+    /// synced: what's in them may be halfway through being written. An
+    /// application syncs what it's written once it's whole, as a database
+    /// does after each transaction; a file closed is whole.
+    unsynced: usize,
+    /// How many times it's been written to, ever, to tell whether it was
+    /// as it was committed.
+    changes: u64,
+    /// Which of [`PACES`] it's at.
+    pace: usize,
+    /// Whether it's due for being written to so long without being quiet.
+    stale: bool,
+    /// When it was last committed.
+    committed: Option<Instant>,
 }
 
-/// Commits anchors once what's written to them settles.
+impl Written {
+    const fn new(anchor: Link) -> Self {
+        Self { anchor, dirty: None, unsynced: 0, changes: 0, pace: 0, stale: false, committed: None }
+    }
+
+    /// Whether what's written is due to be committed, at `now`: written
+    /// to and whole (no file of it open and written to since synced), its
+    /// pace's time since it was last committed, and quiet for a
+    /// moment, or written to for long enough without being.
+    fn due(&mut self, now: Instant) -> bool {
+        let Some((since, last)) = self.dirty else {
+            return false;
+        };
+        let pace = PACES.get(self.pace).copied().unwrap_or(Duration::MAX);
+        let whole = self.unsynced == 0;
+        let paced = self.committed.is_none_or(|at| now.saturating_duration_since(at) >= pace);
+        let quiet = now.saturating_duration_since(last) >= QUIET;
+        let stale = now.saturating_duration_since(since) >= pace.max(STALE);
+        self.stale = !quiet && stale;
+        whole && paced && (quiet || stale)
+    }
+
+    /// Committed at `now`: soon after it was last, or for never being
+    /// quiet, a step slower; long after, a step faster.
+    fn committed(&mut self, now: Instant) {
+        if let Some(at) = self.committed {
+            let gap = now.saturating_duration_since(at);
+            let pace = PACES.get(self.pace).copied().unwrap_or_default();
+            if self.stale || gap < pace.saturating_mul(2).saturating_add(QUIET.saturating_mul(2)) {
+                self.pace = self.pace.saturating_add(1).min(PACES.len().saturating_sub(1));
+            } else if gap > pace.saturating_mul(10).saturating_add(Duration::from_mins(1)) {
+                self.pace = self.pace.saturating_sub(1);
+            }
+        }
+        self.committed = Some(now);
+    }
+}
+
+/// Commits anchors once what's written to them settles, and is whole.
 pub struct Committer {
     open: Arc<dyn Fn() -> crate::store::Result<Catalog> + Send + Sync>,
     filler: Arc<Filler>,
-    pending: Mutex<Pending>,
+    written: Mutex<HashMap<Vec<u8>, Written>>,
+    /// Paths in work directories, and what's under them, known not to be
+    /// imported in place since last committed, so needn't be kept before
+    /// they're changed.
+    fresh: Mutex<std::collections::HashSet<PathBuf>>,
     stop: AtomicBool,
 }
 
 impl Committer {
     pub fn new(open: Arc<dyn Fn() -> crate::store::Result<Catalog> + Send + Sync>, filler: Arc<Filler>) -> Self {
-        Self { open, filler, pending: Mutex::new(Pending::default()), stop: AtomicBool::new(false) }
+        Self { open, filler, written: Mutex::new(HashMap::new()), fresh: Mutex::new(std::collections::HashSet::new()), stop: AtomicBool::new(false) }
     }
 
-    fn pending(&self) -> std::sync::MutexGuard<'_, Pending> {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    fn fresh(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<PathBuf>> {
+        self.fresh.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A work directory imported in place, as committed: what's in it
+    /// must be kept before it's changed.
+    fn imported(&self, dir: &Path) {
+        self.fresh().retain(|path| !path.starts_with(dir));
+    }
+
+    fn written(&self) -> std::sync::MutexGuard<'_, HashMap<Vec<u8>, Written>> {
+        self.written.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What's known of an anchor, changed by `change`.
+    fn of<T>(&self, anchor: &Link, change: impl FnOnce(&mut Written) -> T) -> T {
+        let mut written = self.written();
+        let it = written.entry(anchor.to_bytes()).or_insert_with(|| Written::new(anchor.clone()));
+        let changed = change(it);
+        drop(written);
+        changed
     }
 
     /// Note an anchor's been written to.
     fn touched(&self, anchor: &Link) {
-        self.pending().dirty.insert(anchor.to_bytes(), (anchor.clone(), Instant::now()));
-    }
-
-    /// Note a file of an anchor opened or closed to write.
-    fn writing(&self, anchor: &Link, open: bool) {
-        let mut pending = self.pending();
-        let writers = pending.writers.entry(anchor.to_bytes()).or_default();
-        *writers = if open { writers.saturating_add(1) } else { writers.saturating_sub(1) };
-        drop(pending);
-    }
-
-    /// The anchors due to be committed, no longer pending: quiet long
-    /// enough, nothing of theirs open to write, or every one if `all`.
-    fn due(&self, all: bool) -> Vec<Link> {
-        let mut pending = self.pending();
-        let Pending { dirty, writers } = &mut *pending;
-        let mut due = Vec::new();
-        dirty.retain(|key, (anchor, at)| {
-            let ready = all || (writers.get(key).copied().unwrap_or_default() == 0 && at.elapsed() >= QUIET);
-            if ready {
-                due.push(anchor.clone());
-            }
-            !ready
+        let now = Instant::now();
+        self.of(anchor, |it| {
+            it.dirty = Some((it.dirty.map_or(now, |(since, _)| since), now));
+            it.changes = it.changes.wrapping_add(1);
         });
-        drop(pending);
+    }
+
+    /// Note an open file of an anchor's been written to since it was
+    /// synced, if `unsynced`, or that one such has been synced or closed.
+    fn unsynced(&self, anchor: &Link, unsynced: bool) {
+        self.of(anchor, |it| it.unsynced = if unsynced { it.unsynced.saturating_add(1) } else { it.unsynced.saturating_sub(1) });
+    }
+
+    /// How many times an anchor's been written to.
+    fn changes(&self, anchor: &Link) -> u64 {
+        self.of(anchor, |it| it.changes)
+    }
+
+    /// The anchors due to be committed, no longer dirty, with how many
+    /// times each had been written to: every one written to if `all`.
+    fn due(&self, all: bool, now: Instant) -> Vec<(Link, u64)> {
+        let mut written = self.written();
+        let mut due = Vec::new();
+        for it in written.values_mut() {
+            if it.dirty.is_some() && (all || it.due(now)) {
+                it.dirty = None;
+                due.push((it.anchor.clone(), it.changes));
+            }
+        }
+        drop(written);
         due
     }
 
     /// Commit what's due, with a catalog opened on this thread: import
-    /// each anchor's overlay and set it. What fails is tried again later.
+    /// each anchor's overlay and set it, unless it's written to as it's
+    /// imported. What fails is tried again later.
     pub fn commit(&self, catalog: &mut Catalog, all: bool) {
-        for anchor in self.due(all) {
+        self.commit_as_of(catalog, all, Instant::now());
+    }
+
+    /// Commit what's due as of `now`.
+    pub(super) fn commit_as_of(&self, catalog: &mut Catalog, all: bool, now: Instant) {
+        for (anchor, changes) in self.due(all, now) {
             let mount = catalog.mounts().ok().and_then(|mounts| mounts.into_iter().find(|mount| mount.anchor == anchor && mount.overlay));
             let Some(mount) = mount else {
                 continue;
@@ -253,8 +368,25 @@ impl Committer {
                 self.touched(&anchor);
                 continue;
             }
-            match catalog.remount(&mount) {
-                Ok(value) => eprintln!("{anchor} is {value} now"),
+            let imported = catalog.remount_if(&mount, &|| self.changes(&anchor) == changes);
+            self.imported(&mount.path);
+            match imported {
+                Ok(Some(value)) => {
+                    let pace = self.of(&anchor, |it| {
+                        let was = it.pace;
+                        it.committed(now);
+                        (was != it.pace).then_some(it.pace)
+                    });
+                    eprintln!("{anchor} is {value} now");
+                    match pace.and_then(|pace| PACES.get(pace)) {
+                        Some(&Duration::ZERO) => eprintln!("{anchor} is committed as soon as it's quiet again"),
+                        Some(pace) => eprintln!("{anchor} is written to often, so it's committed at most every {}s", pace.as_secs()),
+                        None => {},
+                    }
+                },
+                // Written to meanwhile, and so dirty again: it's committed
+                // once that's whole
+                Ok(None) => {},
                 Err(e) => {
                     eprintln!("{anchor} couldn't be committed, so it stays as it was for now: {e}");
                     self.touched(&anchor);
@@ -277,6 +409,7 @@ impl Committer {
                     if let Err(e) = catalog.remount(&mount) {
                         eprintln!("{} couldn't be committed: {e}", mount.anchor);
                     }
+                    self.imported(&mount.path);
                 }
             },
             Err(e) => eprintln!("not committing what was written before: {e}"),
@@ -290,7 +423,7 @@ impl Committer {
             let mut catalog = None;
             while !self.stop.load(Ordering::Relaxed) {
                 std::thread::sleep(super::write::TICK);
-                if self.pending().dirty.is_empty() && self.filler.partials().is_empty() {
+                if !self.written().values().any(|it| it.dirty.is_some()) && self.filler.partials().is_empty() {
                     continue;
                 }
                 if catalog.is_none() {
@@ -337,6 +470,22 @@ impl Soup {
         }
     }
 
+    /// Before what's at a path of an anchor's work directory, or under it,
+    /// is changed, moved or removed: what it was committed as, imported in
+    /// place, is kept as blocks of its own, so the anchor's history stays
+    /// whole.
+    fn keep_committed(&self, catalog: &Catalog, anchor: &Link, rel: &Path) -> Result<(), Errno> {
+        let Some(path) = self.work_path(anchor, rel) else {
+            return Ok(());
+        };
+        if self.committer.fresh().iter().any(|fresh| path.starts_with(fresh)) {
+            return Ok(());
+        }
+        catalog.preserve_in_place(&path).map_err(store_errno)?;
+        self.committer.fresh().insert(path);
+        Ok(())
+    }
+
     /// An anchor's work directory, making it an overlay mount if it isn't
     /// one yet. An anchor mounted on files imported in place is theirs to
     /// change, not this.
@@ -368,6 +517,7 @@ impl Soup {
         let path = self.work_path(anchor, rel).ok_or(Errno::EROFS)?;
         if fs::symlink_metadata(&path).is_ok() {
             if truncate {
+                self.keep_committed(catalog, anchor, rel)?;
                 self.filler.cut(catalog, anchor, rel, 0).map_err(|e| io_errno(&e))?;
                 File::options().write(true).truncate(true).open(&path).map_err(|e| io_errno(&e))?;
             }
@@ -393,12 +543,13 @@ impl Soup {
         Ok(path)
     }
 
-    fn handle(&self, file: File, anchor: Option<Link>, rel: PathBuf, writable: bool) -> u64 {
+    /// A handle for a file open, `unsynced` if opening it changed it.
+    fn handle(&self, file: File, anchor: Option<Link>, rel: PathBuf, writable: bool, unsynced: bool) -> u64 {
         let fh = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        if writable && let Some(anchor) = &anchor {
-            self.committer.writing(anchor, true);
+        if unsynced && let Some(anchor) = &anchor {
+            self.committer.unsynced(anchor, true);
         }
-        self.handles().insert(fh, Handle { file, anchor, rel, writable });
+        self.handles().insert(fh, Handle { file, anchor, rel, writable, unsynced });
         fh
     }
 
@@ -409,14 +560,14 @@ impl Soup {
         if let Inode::Loose(name) = self.inode(ino)? {
             let path = self.loose_path(&name).ok_or(Errno::ENOENT)?;
             let file = File::options().read(true).write(write).truncate(truncate).open(path).map_err(|e| io_errno(&e))?;
-            return Ok(self.handle(file, None, PathBuf::new(), write));
+            return Ok(self.handle(file, None, PathBuf::new(), write, false));
         }
         if !write {
             if let Inode::Path(anchor, rel, _) = self.inode(ino)?
                 && let Some(path) = self.work_path(&anchor, &rel)
                 && let Ok(file) = File::open(path)
             {
-                return Ok(self.handle(file, Some(anchor), rel, false));
+                return Ok(self.handle(file, Some(anchor), rel, false, false));
             }
             return Ok(0);
         }
@@ -427,7 +578,7 @@ impl Soup {
         if truncate {
             self.committer.touched(&anchor);
         }
-        Ok(self.handle(file, Some(anchor), rel, true))
+        Ok(self.handle(file, Some(anchor), rel, true, truncate))
     }
 
     /// Read from an open file, if it's one with a handle.
@@ -444,11 +595,16 @@ impl Soup {
 
     /// Write to an open file.
     pub fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<usize, Errno> {
-        let handles = self.handles();
-        let handle = handles.get(&fh).filter(|handle| handle.writable).ok_or(Errno::EBADF)?;
+        let mut handles = self.handles();
+        let handle = handles.get_mut(&fh).filter(|handle| handle.writable).ok_or(Errno::EBADF)?;
         if let Some(anchor) = &handle.anchor {
+            let catalog = self.catalog()?;
+            self.keep_committed(&catalog, anchor, &handle.rel)?;
             let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-            self.filler.fill(&*self.catalog()?, anchor, &handle.rel, offset, data.len(), Some((offset, len))).map_err(|e| errno(&e))?;
+            self.filler.fill(&catalog, anchor, &handle.rel, offset, data.len(), Some((offset, len))).map_err(|e| errno(&e))?;
+        }
+        if let Some(anchor) = handle.written() {
+            self.committer.unsynced(anchor, true);
         }
         let written = handle.file.write_all_at(data, offset);
         let anchor = handle.anchor.clone();
@@ -460,14 +616,33 @@ impl Soup {
         Ok(data.len())
     }
 
+    /// Sync an open file, its data alone if `data_only`: what's written
+    /// to it is whole, so its anchor can be committed though it's open.
+    pub fn fsync(&self, fh: u64, data_only: bool) -> Result<(), Errno> {
+        let mut handles = self.handles();
+        let Some(handle) = handles.get_mut(&fh) else {
+            // Read straight from the soup: nothing to sync
+            return Ok(());
+        };
+        if data_only { handle.file.sync_data() } else { handle.file.sync_all() }.map_err(|e| io_errno(&e))?;
+        if let Some(anchor) = handle.settled() {
+            self.committer.unsynced(anchor, false);
+        }
+        drop(handles);
+        Ok(())
+    }
+
     /// Close a file.
     pub fn release(&self, fh: u64) {
-        if let Some(handle) = self.handles().remove(&fh)
+        if let Some(mut handle) = self.handles().remove(&fh)
             && handle.writable
-            && let Some(anchor) = handle.anchor
         {
-            self.committer.writing(&anchor, false);
-            self.committer.touched(&anchor);
+            if let Some(anchor) = handle.settled() {
+                self.committer.unsynced(anchor, false);
+            }
+            if let Some(anchor) = &handle.anchor {
+                self.committer.touched(anchor);
+            }
         }
     }
 
@@ -479,19 +654,20 @@ impl Soup {
             let path = self.loose_path(name.as_bytes()).ok_or(Errno::EROFS)?;
             Self::parents(&path)?;
             let file = File::options().read(true).write(true).create(true).truncate(true).open(&path).map_err(|e| io_errno(&e))?;
-            let fh = self.handle(file, None, PathBuf::new(), true);
+            let fh = self.handle(file, None, PathBuf::new(), true, false);
             return Ok((self.resolve(parent, name)?, fh));
         }
         let (anchor, rel) = self.overlay_of(parent)?;
         let rel = rel.join(name);
         let catalog = self.catalog()?;
         self.prepare(&catalog, &anchor)?;
+        self.keep_committed(&catalog, &anchor, &rel)?;
         let path = self.work_path(&anchor, &rel).ok_or(Errno::EROFS)?;
         Self::parents(&path)?;
         let file = File::options().read(true).write(true).create(true).truncate(true).open(&path).map_err(|e| io_errno(&e))?;
         drop(catalog);
         self.committer.touched(&anchor);
-        let fh = self.handle(file, Some(anchor), rel, true);
+        let fh = self.handle(file, Some(anchor), rel, true, false);
         Ok((self.resolve(parent, name)?, fh))
     }
 
@@ -571,6 +747,7 @@ impl Soup {
         match self.at(&catalog, &anchor, &rel)?.ok_or(Errno::ENOENT)? {
             At::Work(meta) if meta.is_dir() => return Err(Errno::EISDIR),
             At::Work(_) => {
+                self.keep_committed(&catalog, &anchor, &rel)?;
                 self.filler.moved(&catalog, &anchor, &rel, None).map_err(|e| io_errno(&e))?;
                 fs::remove_file(self.work_path(&anchor, &rel).ok_or(Errno::EROFS)?).map_err(|e| io_errno(&e))?;
             },
@@ -645,6 +822,9 @@ impl Soup {
             }
         }
         self.prepare(&catalog, &anchor)?;
+        // What's moved and what's replaced leave their paths
+        self.keep_committed(&catalog, &anchor, &from)?;
+        self.keep_committed(&catalog, &anchor, &to)?;
         let base = self.base_at(&catalog, &anchor, &from)?;
         let (work_from, work_to) = (self.work_path(&anchor, &from).ok_or(Errno::EROFS)?, self.work_path(&anchor, &to).ok_or(Errno::EROFS)?);
         // What's replaced goes first
@@ -707,6 +887,7 @@ impl Soup {
             }
             let catalog = self.catalog()?;
             let to = self.prepare(&catalog, &anchor)?;
+            self.keep_committed(&catalog, &anchor, &rel)?;
             self.filler.moved(&catalog, &anchor, &rel, None).map_err(|e| io_errno(&e))?;
             drop(catalog);
             Self::parents(&to)?;
@@ -725,10 +906,15 @@ impl Soup {
     /// there yet.
     pub fn truncate(&self, ino: u64, fh: Option<u64>, size: u64) -> Result<(), Errno> {
         if let Some(fh) = fh {
-            let handles = self.handles();
-            if let Some(handle) = handles.get(&fh).filter(|handle| handle.writable) {
+            let mut handles = self.handles();
+            if let Some(handle) = handles.get_mut(&fh).filter(|handle| handle.writable) {
                 if let Some(anchor) = &handle.anchor {
-                    self.filler.cut(&*self.catalog()?, anchor, &handle.rel, size).map_err(|e| io_errno(&e))?;
+                    let catalog = self.catalog()?;
+                    self.keep_committed(&catalog, anchor, &handle.rel)?;
+                    self.filler.cut(&catalog, anchor, &handle.rel, size).map_err(|e| io_errno(&e))?;
+                }
+                if let Some(anchor) = handle.written() {
+                    self.committer.unsynced(anchor, true);
                 }
                 handle.file.set_len(size).map_err(|e| io_errno(&e))?;
                 if let Some(anchor) = &handle.anchor {
@@ -743,6 +929,7 @@ impl Soup {
         }
         let (anchor, rel) = self.overlay_of(ino)?;
         let catalog = self.catalog()?;
+        self.keep_committed(&catalog, &anchor, &rel)?;
         let path = self.materialize(&catalog, &anchor, &rel, size == 0)?;
         self.filler.cut(&catalog, &anchor, &rel, size).map_err(|e| io_errno(&e))?;
         File::options().write(true).open(path).and_then(|file| file.set_len(size)).map_err(|e| io_errno(&e))?;
@@ -773,5 +960,84 @@ impl Soup {
         if self.work.is_some() {
             self.committer.finish();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn written() -> Written {
+        Written::new(crate::claim::anchor().expect("anchor"))
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn whats_open_is_committed_once_synced() {
+        let t = Instant::now();
+        let mut it = written();
+        it.unsynced = 1;
+        it.dirty = Some((t, t));
+        assert!(!it.due(t + secs(3600)), "open and written, never synced: maybe not whole");
+        it.unsynced = 0;
+        it.dirty = Some((t, t + secs(1)));
+        assert!(!it.due(t + secs(1)), "synced, but not yet quiet");
+        assert!(it.due(t + secs(2)));
+    }
+
+    #[test]
+    fn whats_never_quiet_is_committed_when_stale() {
+        let t = Instant::now();
+        let mut it = written();
+        it.dirty = Some((t, t + secs(4)));
+        assert!(!it.due(t + secs(4)));
+        it.dirty = Some((t, t + secs(5)));
+        assert!(it.due(t + secs(5)), "written to for STALE without a break");
+        // Which, again and again, is written to often: never quiet, each
+        // commit waits its pace, and the next is slower
+        it.committed(t + secs(5));
+        let mut last = 5;
+        for (at, pace) in [(10, 1), (15, 2), (45, 3), (165, 4), (765, 4)] {
+            it.dirty = Some((t + secs(last), t + secs(at)));
+            assert!(!it.due(t + secs(at - 1)), "{at}: not before its pace");
+            assert!(it.due(t + secs(at)), "{at}");
+            it.committed(t + secs(at));
+            assert_eq!(it.pace, pace, "{at}");
+            last = at;
+        }
+    }
+
+    #[test]
+    fn whats_often_written_is_committed_less_often() {
+        let t = Instant::now();
+        let mut it = written();
+        let mut at = t;
+        // Committed again as soon as it's allowed each time: slower and slower
+        for pace in 0..PACES.len() {
+            it.committed(at);
+            at += PACES.get(pace).copied().expect("pace") + secs(1);
+        }
+        assert_eq!(it.pace, PACES.len() - 1, "at the slowest");
+        it.committed(at);
+        assert_eq!(it.pace, PACES.len() - 1, "and no slower");
+        it.dirty = Some((at, at));
+        assert!(!it.due(at + secs(60)), "not till its pace");
+        assert!(it.due(at + secs(600)));
+        // Left a long while: a step faster each time
+        let mut at = at + secs(7200);
+        it.committed(at);
+        assert_eq!(it.pace, PACES.len() - 2);
+        at += secs(7200);
+        it.committed(at);
+        assert_eq!(it.pace, PACES.len() - 3);
+        // An editor's saves, minutes apart, stay prompt
+        let mut it = written();
+        for minute in 0..10 {
+            it.committed(t + secs(60 * minute));
+        }
+        assert_eq!(it.pace, 0);
     }
 }

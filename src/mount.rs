@@ -937,8 +937,11 @@ impl Filesystem for Soup {
         reply.ok();
     }
 
-    fn fsync(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
-        reply.ok();
+    fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+        match self.fsync(fh.0, datasync) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
     }
 
     fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
@@ -1246,6 +1249,117 @@ mod tests {
 
     fn value(repo: &Path, anchor: &Link) -> Link {
         Catalog::open_repo(repo).expect("catalog").anchor_value(anchor).expect("value").expect("set")
+    }
+
+    #[test]
+    fn a_file_left_open_is_committed_as_it_was_synced() {
+        let scratch = Scratch::new("mount-fsync");
+        let (soup, anchor, repo) = writable(&scratch);
+        let was = value(&repo, &anchor);
+        let later = |secs| std::time::Instant::now() + Duration::from_secs(secs);
+        let commit = |secs| soup.committer.commit_as_of(&mut Catalog::open_repo(&repo).expect("catalog"), false, later(secs));
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let (_, fh) = soup.create(dir, OsStr::new("db")).expect("create");
+        soup.write(fh, 0, b"one").expect("write");
+        commit(3600);
+        assert_eq!(value(&repo, &anchor), was, "open, and never said to be whole");
+
+        // Synced, as a database does each transaction
+        soup.fsync(fh, true).expect("fsync");
+        commit(2);
+        let one = value(&repo, &anchor);
+        assert_ne!(one, was);
+        assert_eq!(read(&soup, &format!("cid/{one}/db")), b"one");
+
+        // Written to since: not whole till it's synced again
+        soup.write(fh, 3, b" two").expect("write");
+        commit(3600);
+        assert_eq!(value(&repo, &anchor), one);
+        soup.fsync(fh, false).expect("fsync");
+        commit(3600);
+        let two = value(&repo, &anchor);
+        assert_eq!(read(&soup, &format!("cid/{two}/db")), b"one two");
+
+        // What's whole is whatever's open to write but unwritten, and
+        // whatever's renamed or removed, as a database's journal is
+        let (_, journal) = soup.create(dir, OsStr::new("db-journal")).expect("create");
+        soup.write(journal, 0, b"undo").expect("write");
+        soup.fsync(journal, true).expect("fsync");
+        let (_, idle) = soup.create(dir, OsStr::new("idle")).expect("create");
+        soup.release(journal);
+        soup.unlink(dir, OsStr::new("db-journal")).expect("unlink");
+        commit(3600);
+        let two = value(&repo, &anchor);
+        assert_eq!(names(&soup, &format!("cid/{two}")), ["a", "big", "db", "dir", "idle"]);
+        soup.release(idle);
+
+        // Not set if it's written to as it's imported
+        soup.write(fh, 7, b" three").expect("write");
+        let mount = Catalog::open_repo(&repo).expect("catalog").mounts().expect("mounts").into_iter().find(|mount| mount.anchor == anchor).expect("mount");
+        assert_eq!(Catalog::open_repo(&repo).expect("catalog").remount_if(&mount, &|| false).expect("remount"), None);
+        assert_eq!(value(&repo, &anchor), two, "as it was");
+        soup.release(fh);
+        soup.commit();
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/db")), b"one two three");
+        assert_ne!(value(&repo, &anchor), two);
+    }
+
+    #[test]
+    fn every_version_committed_stays_whole() {
+        let scratch = Scratch::new("mount-history");
+        let (soup, anchor, repo) = writable(&scratch);
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let write = |parent: u64, name: &str, data: &[u8]| {
+            let (_, fh) = soup.create(parent, OsStr::new(name)).expect("create");
+            soup.write(fh, 0, data).expect("write");
+            soup.release(fh);
+        };
+        let big: Vec<u8> = (0..2_500_000u32).map(|i| u8::try_from(i % 251).expect("byte")).collect();
+        write(dir, "note", b"first");
+        write(dir, "big", &big);
+        soup.mkdir(dir, OsStr::new("folder")).expect("mkdir");
+        let folder = ino(&soup, &format!("anchors/{anchor}/folder")).expect("folder").ino.0;
+        write(folder, "inner", b"inside");
+        soup.commit();
+        // Changed in place, as a database does
+        let fh = soup.open(ino(&soup, &format!("anchors/{anchor}/note")).expect("note").ino.0, true, false).expect("open");
+        soup.write(fh, 0, b"FIRST").expect("write");
+        soup.release(fh);
+        let fh = soup.open(ino(&soup, &format!("anchors/{anchor}/big")).expect("big").ino.0, true, false).expect("open");
+        soup.write(fh, 1_500_000, b"changed").expect("write");
+        soup.release(fh);
+        soup.commit();
+        // Saved over by a rename, as an editor does; a directory moved
+        write(dir, ".note.swp", b"second");
+        soup.rename(dir, OsStr::new(".note.swp"), dir, OsStr::new("note"), false).expect("rename");
+        soup.rename(dir, OsStr::new("folder"), dir, OsStr::new("moved"), false).expect("rename");
+        soup.commit();
+        // Cut short, then gone
+        soup.truncate(ino(&soup, &format!("anchors/{anchor}/big")).expect("big").ino.0, None, 10).expect("truncate");
+        soup.commit();
+        soup.unlink(dir, OsStr::new("note")).expect("unlink");
+        soup.unlink(dir, OsStr::new("big")).expect("unlink");
+        soup.commit();
+
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let history = catalog.anchor_history(&anchor).expect("history");
+        assert_eq!(history.len(), 6, "set, then five commits");
+        for (at, value) in &history {
+            let out = scratch.path().join(format!("out-{at}-{value}"));
+            crate::export::get(&catalog, value, &out).unwrap_or_else(|e| panic!("{value} isn't whole: {e}"));
+        }
+        let read_at = |value: &Link, path: &str| std::fs::read(scratch.path().join(format!("out-{}-{value}", history.iter().find(|(_, v)| v == value).expect("value").0)).join(path)).expect(path);
+        let [_, (_, one), (_, two), (_, three), (_, four), _] = &history[..] else {
+            panic!("{history:?}");
+        };
+        assert_eq!(read_at(one, "note"), b"first");
+        assert_eq!(read_at(one, "big"), big);
+        assert_eq!(read_at(one, "folder/inner"), b"inside");
+        assert_eq!(read_at(two, "note"), b"FIRST");
+        assert_eq!(read_at(two, "big").get(1_500_000..1_500_007), Some(b"changed".as_slice()));
+        assert_eq!(read_at(three, "note"), b"second");
+        assert_eq!(read_at(three, "moved/inner"), b"inside");
+        assert_eq!(read_at(four, "big").len(), 10);
     }
 
     #[test]
