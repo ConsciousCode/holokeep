@@ -24,7 +24,7 @@ This is **data soup**, a content-addressable storage model where location is not
 
 ## Status
 
-Holokeep is early. What exists is the content-addressing core, each piece checked against an independent implementation:
+Holokeep is early. What exists is the content-addressing core, each piece checked against an independent implementation (the reference is the [wiki](docs/wiki/Data_Soup.md)):
 
 - **Import**: `hk add` turns files and directories into UnixFSv1 with CIDs identical to Kubo's `ipfs add` under the `unixfs-v1-2025` profile, including chunked files, nested directories, symlinks and HAMT-sharded directories.
 - **CIDs and multihashes**: v0 and v1; SHA-1, SHA-2, SHA-3, BLAKE2b-256 and murmur3 (no identity hash yet).
@@ -493,6 +493,10 @@ PROPTEST_CASES=1000000 cargo test --release differential   # long fuzzing
 scripts/kubo-compare.sh             # every CID vs Kubo, then store and get back; needs `ipfs`
 LARGE=1 scripts/kubo-compare.sh     # adds >1 GiB files
 ```
+
+Repos made by earlier builds must keep opening. Each store creates its tables if they're missing and adds the columns it needs, so opening upgrades a repo in place; `tests/fixtures/repos/` holds a repo made by each schema since there were real ones, and a test opens every one and checks it has all it had. Whenever the schema changes, add one with `scripts/make-repo-fixture.sh <date>` and keep the old.
+
+The reference documentation is a wiki kept in the soup itself, the anchor its author's root names `wiki` (`~/soup/wiki` under `hk mount ~/soup`), and snapshotted into `docs/wiki` from time to time with `scripts/snapshot-wiki.sh`, a fallback while the soup earns trust. Edit it there, not in `docs/`.
 
 | Module | |
 |---|---|

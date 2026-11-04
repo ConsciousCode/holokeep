@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Make a repo with this build of hk, as a fixture every later build must
+# still open: tests/fixtures/repos/<name>/, with what it should find in
+# expect.txt. Make a new one whenever the schema changes, and keep the old.
+# Usage: scripts/make-repo-fixture.sh <name>   (eg the date)
+set -euo pipefail
+name=${1:?usage: $0 <name>}
+cd "$(dirname "$0")/.."
+cargo build --release --quiet
+hk="$PWD/target/release/hk"
+out="tests/fixtures/repos/$name"
+[ ! -e "$out" ] || { echo "$out exists" >&2; exit 1; }
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+repo="$tmp/repo"
+h() { "$hk" --repo "$repo" "$@"; }
+
+mkdir -p "$tmp/tree/sub"
+printf 'hello from %s\n' "$name" > "$tmp/tree/hello.txt"
+# Over 64 KiB, so the shards hold it
+head -c 100000 /dev/zero | tr '\0' 'x' > "$tmp/tree/sub/big.txt"
+tree=$(h add -q "$tmp/tree")
+hello=$(h add -q -n "$tmp/tree/hello.txt")
+big=$(h add -q -n "$tmp/tree/sub/big.txt")
+h tag add fixture "$hello" >/dev/null
+anchor=$(h anchor new)
+h anchor set "$anchor" "$tree" >/dev/null
+# The root names the anchor, as hk mount would
+mkdir "$tmp/top"
+ln -s "/anchors/$anchor" "$tmp/top/named"
+top=$(h add -q "$tmp/top")
+root=$(h anchor root | head -1)
+h anchor set "$root" "$top" >/dev/null
+
+mkdir -p "$out"
+cp -a "$repo/." "$out/"
+rm -f "$out"/*.sock
+cat > "$out/expect.txt" <<EXPECT
+tree $tree
+hello $hello
+big $big
+anchor $anchor
+root $root
+top $top
+EXPECT
+echo "made $out"
+du -sh "$out"

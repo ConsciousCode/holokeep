@@ -2113,3 +2113,61 @@ fn another_accounts_dissolved_claims_are_withheld_too() {
     repo.act_for(me, owner).expect("act");
     assert!(repo.visible(mine.multihash()).expect("visible"));
 }
+
+/// Copy a directory tree, as a fixture is copied before opening, since
+/// opening upgrades a repo in place.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("mkdir");
+    for entry in std::fs::read_dir(from).expect("read_dir") {
+        let entry = entry.expect("entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy");
+        }
+    }
+}
+
+/// Every repo an earlier build made (`scripts/make-repo-fixture.sh`)
+/// still opens, upgraded in place, with all it had.
+#[test]
+fn repos_earlier_builds_made_still_open() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/repos");
+    let mut seen = 0;
+    for fixture in std::fs::read_dir(&fixtures).expect("fixtures") {
+        let fixture = fixture.expect("fixture").path();
+        let name = fixture.file_name().expect("name").to_string_lossy().into_owned();
+        let expect: std::collections::HashMap<String, crate::model::Link> = std::fs::read_to_string(fixture.join("expect.txt"))
+            .expect("expect.txt")
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(key, cid)| (key.to_owned(), cid.parse().expect("cid")))
+            .collect();
+        let scratch = Scratch::new("old-repo");
+        let dir = scratch.path().join(&name);
+        copy_tree(&fixture, &dir);
+        let mut repo = Catalog::open_repo(&dir).unwrap_or_else(|e| panic!("{name}: {e}"));
+
+        let hello = repo.get_block(&expect["hello"]).expect("get").unwrap_or_else(|| panic!("{name}: hello"));
+        assert!(String::from_utf8_lossy(hello.data()).starts_with("hello from "), "{name}");
+        let big = repo.get_block(&expect["big"]).expect("get").unwrap_or_else(|| panic!("{name}: big, in the shards"));
+        assert_eq!(big.data().len(), 100_000, "{name}");
+        let tree = crate::export::list(&repo, &expect["tree"]).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(tree.iter().map(|entry| entry.name.as_slice()).collect::<Vec<_>>(), [b"hello.txt".as_slice(), b"sub"], "{name}");
+
+        let claims = repo.claims().expect("claims");
+        assert!(claims.kept(expect["tree"].multihash()).expect("kept"), "{name}: what hk add kept");
+        let fixture_tag = crate::claim::tag("fixture").expect("tag");
+        assert_eq!(claims.tagged(fixture_tag.multihash()).expect("tagged"), [expect["hello"].clone()], "{name}");
+        assert_eq!(repo.anchor_value(&expect["anchor"]).expect("value").as_ref(), Some(&expect["tree"]), "{name}");
+        assert_eq!(repo.root_anchor().expect("root").as_ref(), Some(&expect["root"]), "{name}: the same root, from the same key");
+        assert_eq!(repo.anchor_value(&expect["root"]).expect("value").as_ref(), Some(&expect["top"]), "{name}");
+
+        // And it takes more as ever
+        let added = AnyCid::V1(Importer::default().add_path(&fixture.join("expect.txt"), &mut repo, &mut |_, _| {}).expect("add").expect("root").cid);
+        assert!(repo.get_block(&added).expect("get").is_some(), "{name}");
+        seen += 1;
+    }
+    assert!(seen > 0, "no fixtures in {}", fixtures.display());
+}
