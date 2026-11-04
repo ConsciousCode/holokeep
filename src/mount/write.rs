@@ -21,6 +21,9 @@ use crate::store::{Catalog, Mount};
 
 use super::{At, Inode, Soup, Source, errno, store_errno};
 
+/// An empty UnixFS directory, as dag-pb.
+const EMPTY_DIR: &[u8] = &[0x0a, 0x02, 0x08, 0x01];
+
 /// How long an anchor's left quiet, nothing of it open to write, before
 /// what's been written is committed: long enough for an editor's save,
 /// which writes, renames and removes in a burst, to be one.
@@ -329,6 +332,7 @@ impl Soup {
     fn overlay_of(&self, ino: u64) -> Result<(Link, PathBuf), Errno> {
         match self.inode(ino)? {
             Inode::Path(anchor, rel) if self.work.is_some() => Ok((anchor, rel)),
+            Inode::Root if self.work.is_some() => Ok((Self::root(&*self.catalog()?)?.ok_or(Errno::EROFS)?, PathBuf::new())),
             _ => Err(Errno::EROFS),
         }
     }
@@ -491,8 +495,12 @@ impl Soup {
         Ok((self.resolve(parent, name)?, fh))
     }
 
-    /// Make a directory.
+    /// Make a directory: at the top, a new anchor, which the root anchor
+    /// names.
     pub fn mkdir(&self, parent: u64, name: &OsStr) -> Result<FileAttr, Errno> {
+        if self.inode(parent)? == Inode::Root {
+            return self.name_new_anchor(name);
+        }
         let (anchor, rel) = self.overlay_of(parent)?;
         let catalog = self.catalog()?;
         self.prepare(&catalog, &anchor)?;
@@ -502,6 +510,31 @@ impl Soup {
         self.resolve(parent, name)
     }
 
+    /// A new anchor, an empty directory, named at the top.
+    fn name_new_anchor(&self, name: &OsStr) -> Result<FileAttr, Errno> {
+        use crate::cid::CidVersion;
+        let (root, _) = self.overlay_of(super::ROOT)?;
+        if super::TOP.iter().any(|(top, _)| OsStr::new(top) == name) {
+            return Err(Errno::EEXIST);
+        }
+        let catalog = self.catalog()?;
+        if self.at(&catalog, &root, Path::new(name))?.is_some() {
+            return Err(Errno::EEXIST);
+        }
+        let empty: crate::block::Block = crate::block::Block::hash(
+            crate::cid::Cidv1Spec::new(crate::cid::DAG_PB_CODEC, crate::multihash::MultihashFunc::Sha2_256),
+            EMPTY_DIR.into(),
+        );
+        catalog.put_block(&empty, CidVersion::V1).map_err(store_errno)?;
+        let anchor = catalog.new_anchor().map_err(store_errno)?;
+        catalog.set_anchor(&anchor, &empty.cid().clone().into()).map_err(store_errno)?;
+        drop(catalog);
+        self.symlink(super::ROOT, name, &Path::new("/anchors").join(anchor.to_string()))?;
+        // What mkdir makes must be a directory, so it's the anchor's, as
+        // the name's taken to be until the kernel looks it up again
+        self.resolve(super::ANCHORS, OsStr::new(&anchor.to_string()))
+    }
+
     /// Make a symlink.
     pub fn symlink(&self, parent: u64, name: &OsStr, target: &Path) -> Result<FileAttr, Errno> {
         let (anchor, rel) = self.overlay_of(parent)?;
@@ -509,7 +542,7 @@ impl Soup {
         self.prepare(&catalog, &anchor)?;
         let path = self.work_path(&anchor, &rel.join(name)).ok_or(Errno::EROFS)?;
         Self::parents(&path)?;
-        std::os::unix::fs::symlink(target, path).map_err(|e| io_errno(&e))?;
+        std::os::unix::fs::symlink(self.stored(&catalog, target)?, path).map_err(|e| io_errno(&e))?;
         drop(catalog);
         self.committer.touched(&anchor);
         self.resolve(parent, name)

@@ -113,9 +113,11 @@ enum Command {
     /// Link this repo's machines into a private mesh
     #[cfg(feature = "net")]
     Node(NodeArgs),
-    /// Mount the soup as a filesystem until interrupted: cid/<cid>,
-    /// anchors/<anchor> and tags/<tag>/<cid>. What's written to an anchor
-    /// is committed, setting it, once it's closed and quiet a second.
+    /// Mount the soup as a filesystem until interrupted: the root anchor's
+    /// names, beside cid/<cid>, anchors/<anchor> and tags/<tag>/<cid>.
+    /// What's written to an anchor is committed, setting it, once it's
+    /// closed and quiet a second; a directory made at the top is a new
+    /// anchor.
     #[cfg(feature = "fuse")]
     Mount {
         /// An empty directory to mount it on
@@ -357,6 +359,9 @@ enum AnchorCommand {
     /// Print what an anchor is now, then every value it's had, oldest
     /// first, with when
     Show { anchor: Link },
+    /// Print this account's root anchor, the top of `hk mount`, and what
+    /// it is now
+    Root,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1347,6 +1352,14 @@ fn anchor(dir: Option<&PathBuf>, mut repo: Catalog, command: AnchorCommand) -> a
             }
             let set = repo.batch(|repo| repo.set_anchor(&anchor, &cid))?;
             out!("{set}");
+        },
+        AnchorCommand::Root => {
+            let root = repo.root_anchor()?.ok_or_else(|| anyhow::anyhow!("this account has no key yet, so no root anchor"))?;
+            out!("{root}");
+            match repo.anchor_value(&root)? {
+                Some(value) => out!("{value}"),
+                None => out!("unset"),
+            }
         },
         AnchorCommand::Show { anchor } => {
             anyhow::ensure!(holokeep::claim::is_anchor(&anchor), "{anchor} isn't an anchor");

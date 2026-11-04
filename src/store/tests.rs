@@ -1792,6 +1792,24 @@ fn a_repo_has_no_user_until_it_founds_one_with_a_sealed_root() {
 }
 
 #[test]
+fn a_root_anchor_is_the_devices_then_the_users_naming_the_same() {
+    let scratch = Scratch::new("root-anchor");
+    let repo = Catalog::open_repo(scratch.path()).expect("open");
+    let device = repo.signer().expect("signer").id();
+    let before = repo.root_anchor().expect("root").expect("a key, so a root");
+    assert!(crate::claim::is_anchor(&before));
+    assert_eq!(before, crate::claim::root_anchor(&device).expect("root"), "found from the key alone");
+    let named = link(&raw(b"named"));
+    repo.set_anchor(&before, &named).expect("set");
+
+    let user = repo.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let after = repo.root_anchor().expect("root").expect("root");
+    assert_eq!(after, crate::claim::root_anchor(&user.id()).expect("root"), "the user's, so every device's");
+    assert_ne!(after, before);
+    assert_eq!(repo.anchor_value(&after).expect("value"), Some(named), "naming what the repo named");
+}
+
+#[test]
 fn claims_count_only_when_an_authorized_key_signs_them() {
     let root = crate::keys::Key::generate().expect("key");
     let (router, _) = signed_router(&root);

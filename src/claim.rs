@@ -408,6 +408,19 @@ fn link_list(list: Vec<Ipld>) -> Option<Vec<Link>> {
 pub fn anchor() -> std::io::Result<Link> {
     let mut nonce = [0u8; 16];
     getrandom::getrandom(&mut nonce).map_err(std::io::Error::other)?;
+    anchor_of(nonce)
+}
+
+/// A user's root anchor, the top of what they've named: the anchor whose
+/// nonce is a hash of their key, so every device of theirs finds the same
+/// one, and no claim need say which it is.
+pub fn root_anchor(key: &Link) -> std::io::Result<Link> {
+    use sha2::Digest as _;
+    let hash = sha2::Sha256::new().chain_update(b"holokeep root anchor\0").chain_update(key.to_bytes()).finalize();
+    anchor_of(hash.first_chunk::<16>().copied().unwrap_or_default())
+}
+
+fn anchor_of(nonce: [u8; 16]) -> std::io::Result<Link> {
     let value = Ipld::Map(BTreeMap::from([("anchor".to_owned(), Ipld::Bytes(nonce.to_vec()))]));
     let data = dagcbor::to_vec(&value).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
     Block::identity(DAG_CBOR_CODEC, data.into())

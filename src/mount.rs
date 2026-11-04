@@ -1,10 +1,20 @@
 //! `hk mount`: the soup as a filesystem, over FUSE.
 //!
 //! ```text
+//! <name>/…            what the account's root anchor is: its names
 //! cid/<cid>/…         whatever's at a CID; looked up by name, not listed
 //! anchors/<anchor>/…  what each anchor is now, and writable
 //! tags/<tag>/<cid>/…  what's tagged so
 //! ```
+//!
+//! The top is the account's root anchor (`Catalog::root_anchor`), beside
+//! `cid`, `anchors` and `tags`, which hide whatever the root names so.
+//! It's an anchor like any other, a directory written to as one, but a
+//! directory made at the top is a new anchor, the root naming it with a
+//! symlink to `/anchors/<anchor>`: so each name there is versioned on its
+//! own, the root changing only when what it names does. A symlink to
+//! `/anchors/…` anywhere is to that anchor in the mount, wherever it's
+//! mounted; one made to an anchor in the mount is kept as such.
 //!
 //! Writing to an anchor writes to its overlay (see `store::overlay`): a
 //! file opened to write is copied into the anchor's work directory, and
@@ -80,6 +90,12 @@ enum Inode {
     /// over a file anchor.
     Loose(Vec<u8>),
 }
+
+/// The top's inode number.
+const ROOT: u64 = 1;
+
+/// `anchors/`'s inode number.
+const ANCHORS: u64 = 3;
 
 /// The top level, by inode number.
 const TOP: [(&str, u64); 3] = [("cid", 2), ("anchors", 3), ("tags", 4)];
@@ -186,6 +202,8 @@ pub struct Soup {
     uid: u32,
     gid: u32,
     at: SystemTime,
+    /// Where it's mounted, for symlinks to anchors.
+    dir: Option<PathBuf>,
 }
 
 /// The catalog, asking the node for what isn't here.
@@ -218,6 +236,16 @@ impl Fetch for Source<'_> {
             fetcher(&missing);
         }
     }
+}
+
+/// Whether a symlink's target is to an anchor: `/anchors/<anchor>`, or
+/// under it.
+fn to_anchor(target: &[u8]) -> bool {
+    let Some(rest) = target.strip_prefix(b"/anchors/") else {
+        return false;
+    };
+    let name = rest.split(|&byte| byte == b'/').next().unwrap_or_default();
+    std::str::from_utf8(name).ok().and_then(|name| name.parse::<Link>().ok()).is_some_and(|cid| crate::claim::is_anchor(&cid))
 }
 
 /// Where a path of an anchor is in its work directory, under `work`.
@@ -297,7 +325,51 @@ impl Soup {
             uid: rustix::process::getuid().as_raw(),
             gid: rustix::process::getgid().as_raw(),
             at: SystemTime::now(),
+            dir: None,
         }
+    }
+
+    /// Mounted at `dir`, so symlinks to `/anchors/…` are to anchors there.
+    #[must_use]
+    pub fn at_dir(mut self, dir: PathBuf) -> Self {
+        self.dir = Some(dir);
+        self
+    }
+
+    /// The root anchor of the account this acts for, if it has one.
+    fn root(catalog: &Catalog) -> Result<Option<Link>, Errno> {
+        catalog.root_anchor().map_err(store_errno)
+    }
+
+    /// A symlink's target as it's shown: one to `/anchors/<anchor>` is to
+    /// it where the soup's mounted.
+    fn shown(&self, target: Vec<u8>) -> Vec<u8> {
+        match &self.dir {
+            Some(dir) if to_anchor(&target) => [dir.as_os_str().as_bytes(), &target].concat(),
+            _ => target,
+        }
+    }
+
+    /// A symlink's target as it's kept: one to an anchor where the soup's
+    /// mounted, or through a name of the root's for one, is to
+    /// `/anchors/<anchor>`, wherever it's mounted next.
+    pub(crate) fn stored(&self, catalog: &Catalog, target: &Path) -> Result<PathBuf, Errno> {
+        let Some(rest) = self.dir.as_ref().and_then(|dir| target.strip_prefix(dir).ok()) else {
+            return Ok(target.to_path_buf());
+        };
+        let kept = Path::new("/").join(rest);
+        if to_anchor(kept.as_os_str().as_bytes()) {
+            return Ok(kept);
+        }
+        let mut names = rest.components();
+        if let (Some(std::path::Component::Normal(name)), Some(root)) = (names.next(), Self::root(catalog)?)
+            && let Some(At::Work(_) | At::Base(..)) = self.at(catalog, &root, Path::new(name))?
+            && let Kind::Symlink(named) = self.kind_kept(catalog, &Inode::Path(root, PathBuf::from(name)))?
+            && to_anchor(&named)
+        {
+            return Ok(Path::new(OsStr::from_bytes(&named)).join(names.as_path()));
+        }
+        Ok(target.to_path_buf())
     }
 
     /// Anchors writable, their work directories under `work`.
@@ -351,7 +423,15 @@ impl Soup {
         }
     }
 
+    /// What an inode is, symlinks' targets as they're shown.
     fn kind(&self, catalog: &Catalog, inode: &Inode) -> Result<Kind, Errno> {
+        Ok(match self.kind_kept(catalog, inode)? {
+            Kind::Symlink(target) => Kind::Symlink(self.shown(target)),
+            kind => kind,
+        })
+    }
+
+    fn kind_kept(&self, catalog: &Catalog, inode: &Inode) -> Result<Kind, Errno> {
         match inode {
             Inode::Node(cid) if cid.codec() == crate::cid::RAW_CODEC => {
                 let said = self.sizes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&cid.to_bytes()).copied();
@@ -367,7 +447,7 @@ impl Soup {
                     if let Some(size) = size.filter(|_| cid.codec() == crate::cid::RAW_CODEC) {
                         return Ok(Kind::File(size));
                     }
-                    self.kind(catalog, &Inode::Node(cid))
+                    self.kind_kept(catalog, &Inode::Node(cid))
                 },
             },
             Inode::Loose(name) => {
@@ -479,7 +559,7 @@ impl Soup {
 
     /// Whether an inode can be written to.
     const fn writes(&self, inode: &Inode) -> bool {
-        self.work.is_some() && matches!(inode, Inode::Path(..) | Inode::Loose(_))
+        self.work.is_some() && matches!(inode, Inode::Root | Inode::Path(..) | Inode::Loose(_))
     }
 
     /// What a name in a directory is.
@@ -487,11 +567,17 @@ impl Soup {
         let parent = self.inode(parent)?;
         let catalog = self.catalog()?;
         let cid = |name: &OsStr| name.to_str().and_then(|name| name.parse::<Link>().ok()).ok_or(Errno::ENOENT);
-        let inode = match parent {
+        let parent = match parent {
             Inode::Root => {
-                let &(_, ino) = TOP.iter().find(|(top, _)| OsStr::new(top) == name).ok_or(Errno::ENOENT)?;
-                return Ok(self.attr_of(ino, &Kind::Directory));
+                if let Some(&(_, ino)) = TOP.iter().find(|(top, _)| OsStr::new(top) == name) {
+                    return Ok(self.attr_of(ino, &Kind::Directory));
+                }
+                Inode::Path(Self::root(&catalog)?.ok_or(Errno::ENOENT)?, PathBuf::new())
             },
+            parent => parent,
+        };
+        let inode = match parent {
+            Inode::Root => return Err(Errno::ENOENT),
             Inode::Cids => {
                 let cid = cid(name)?;
                 if !self.reachable(&catalog, &cid)? {
@@ -555,7 +641,14 @@ impl Soup {
             names.into_iter().map(|(name, inode)| Ok((name, inode.clone(), self.kind(&catalog, &inode)?))).collect()
         };
         let children = match inode {
-            Inode::Root => TOP.iter().map(|&(name, _)| (name.as_bytes().to_vec(), Inode::Root, Kind::Directory)).collect(),
+            Inode::Root => {
+                let mut top: Vec<_> = TOP.iter().map(|&(name, _)| (name.as_bytes().to_vec(), Inode::Root, Kind::Directory)).collect();
+                if let Some(root) = Self::root(&catalog)? {
+                    let named = self.overlay_entries(&catalog, &root, Path::new(""))?;
+                    top.extend(with_kinds(named.into_iter().filter(|(name, _)| !TOP.iter().any(|(top, _)| top.as_bytes() == name)).collect())?);
+                }
+                top
+            },
             // Every CID is in it, so none are listed
             Inode::Cids => Vec::new(),
             Inode::Anchors => {
@@ -844,6 +937,7 @@ impl Filesystem for Soup {
 /// Mount the soup at `dir` until interrupted, or unmounted
 /// (`fusermount3 -u`), then unmount it.
 pub fn mount(soup: Soup, dir: &Path) -> io::Result<()> {
+    let soup = soup.at_dir(dir.canonicalize()?);
     let mut config = fuser::Config::default();
     config.mount_options = vec![MountOption::FSName("holokeep".into()), MountOption::Subtype("hk".into())];
     if soup.work.is_none() {
@@ -1094,6 +1188,69 @@ mod tests {
         let by_cid = ino(&soup, &format!("cid/{root}/a")).expect("a");
         assert_eq!(soup.open(by_cid.ino.0, true, false).err(), Some(Errno::EROFS));
         assert_eq!(by_cid.perm, 0o444);
+    }
+
+    #[test]
+    fn the_top_is_the_root_anchor_naming_anchors() {
+        let scratch = Scratch::new("mount-root");
+        let (soup, anchor, repo) = writable(&scratch);
+        let soup = soup.at_dir(PathBuf::from("/mnt/soup"));
+        let root = Catalog::open_repo(&repo).expect("catalog").root_anchor().expect("root").expect("root");
+        assert_eq!(names(&soup, ""), ["cid", "anchors", "tags"], "naming nothing yet");
+        assert_eq!(ino(&soup, "").expect("top").perm, 0o755);
+
+        // A directory made at the top is a new anchor, named by a symlink
+        let dir = soup.mkdir(ROOT, OsStr::new("wiki")).expect("mkdir");
+        assert_eq!(dir.kind, FileType::Directory, "a directory, as mkdir must make");
+        let wiki = ino(&soup, "wiki").expect("wiki");
+        assert_eq!(wiki.kind, FileType::Symlink);
+        let target = String::from_utf8(soup.link(wiki.ino.0).expect("readlink")).expect("utf-8");
+        let made: Link = target.strip_prefix("/mnt/soup/anchors/").expect("to an anchor in the mount").parse().expect("anchor");
+        assert!(crate::claim::is_anchor(&made));
+        assert_eq!(ino(&soup, &format!("anchors/{made}")).expect("anchor").ino, dir.ino, "the anchor's");
+        assert_eq!(wiki.size, u64::try_from(target.len()).expect("len"), "as long as it's shown");
+        assert_eq!(names(&soup, ""), ["cid", "anchors", "tags", "wiki"]);
+        assert!(names(&soup, &format!("anchors/{made}")).is_empty(), "an empty directory");
+        for taken in ["wiki", "cid"] {
+            assert_eq!(soup.mkdir(ROOT, OsStr::new(taken)).err(), Some(Errno::EEXIST), "{taken}");
+        }
+
+        // Written to as any anchor, the root unchanged by it
+        let dir = ino(&soup, &format!("anchors/{made}")).expect("dir").ino.0;
+        let (_, fh) = soup.create(dir, OsStr::new("page.md")).expect("create");
+        soup.write(fh, 0, b"# Data soup").expect("write");
+        soup.release(fh);
+        soup.commit();
+        assert_eq!(value(&repo, &made), expect_tree(&scratch, &[("page.md", b"# Data soup")]));
+        let named = value(&repo, &root);
+        let fh = soup.open(ino(&soup, &format!("anchors/{made}/page.md")).expect("page").ino.0, true, false).expect("open");
+        soup.write(fh, 0, b"#").expect("write");
+        soup.release(fh);
+        soup.commit();
+        assert_eq!(value(&repo, &root), named, "late bound: naming the anchor, not what it is");
+
+        // The root's an anchor of its own: files, renames, links into the mount
+        let (_, fh) = soup.create(ROOT, OsStr::new("notes")).expect("create");
+        soup.write(fh, 0, b"todo").expect("write");
+        soup.release(fh);
+        soup.rename(ROOT, OsStr::new("wiki"), ROOT, OsStr::new("docs"), false).expect("rename");
+        soup.symlink(ROOT, OsStr::new("first"), Path::new(&format!("/mnt/soup/anchors/{anchor}/a"))).expect("symlink");
+        soup.symlink(ROOT, OsStr::new("page"), Path::new("/mnt/soup/docs/page.md")).expect("symlink");
+        soup.symlink(ROOT, OsStr::new("host"), Path::new("/etc/hostname")).expect("symlink");
+        soup.commit();
+        assert_eq!(names(&soup, ""), ["cid", "anchors", "tags", "docs", "first", "host", "notes", "page"]);
+        assert_eq!(read(&soup, "notes"), b"todo");
+        // Kept as to the anchor wherever the soup's mounted next
+        let elsewhere = Soup::new(Box::new(move || Catalog::open_repo(&repo)), None).at_dir(PathBuf::from("/elsewhere"));
+        let first = ino(&elsewhere, "first").expect("first");
+        assert_eq!(elsewhere.link(first.ino.0).expect("readlink"), format!("/elsewhere/anchors/{anchor}/a").into_bytes());
+        let docs = ino(&elsewhere, "docs").expect("docs");
+        assert_eq!(elsewhere.link(docs.ino.0).expect("readlink"), format!("/elsewhere/anchors/{made}").into_bytes());
+        assert_eq!(read(&elsewhere, &format!("anchors/{made}/page.md")), b"# Data soup");
+        let page = ino(&elsewhere, "page").expect("page");
+        assert_eq!(elsewhere.link(page.ino.0).expect("readlink"), format!("/elsewhere/anchors/{made}/page.md").into_bytes(), "through the anchor its name was for");
+        let host = ino(&elsewhere, "host").expect("host");
+        assert_eq!(elsewhere.link(host.ino.0).expect("readlink"), b"/etc/hostname", "what's outside the soup as it was");
     }
 
     /// What of a file of an anchor is still to be copied, by chunk.

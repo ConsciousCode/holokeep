@@ -636,6 +636,19 @@ impl Catalog {
         self.refresh_acting()
     }
 
+    /// The root anchor of who this acts for, the top of what they've
+    /// named: their user's, or until there's one, their device's.
+    pub fn root_anchor(&self) -> Result<Option<Link>> {
+        let key = match self.account()?.and_then(|account| account.acts_for().cloned()) {
+            Some(key) => key,
+            None => match &self.signer {
+                Some(signer) => signer.id(),
+                None => return Ok(None),
+            },
+        };
+        Ok(Some(crate::claim::root_anchor(&key)?))
+    }
+
     /// See what counts for the account's user.
     fn refresh_acting(&self) -> Result<()> {
         if let Some(claims) = &self.claims {
@@ -730,14 +743,22 @@ impl Catalog {
     /// Make a user for this repo, as a mesh is made: a new root key, which
     /// certifies this device, sealed with a passphrase. Returns the root,
     /// which is nowhere else unsealed.
+    ///
+    /// What the repo's root anchor was, the new user's is: what it named
+    /// before it was in a mesh, it still names. (A repo joining a mesh
+    /// can't do the same, the user's root being whatever the mesh says.)
     pub fn found_user(&self, passphrase: &[u8], cost: crate::keys::Cost) -> Result<crate::keys::Key> {
         let device = self.signer.as_ref().ok_or_else(|| Error::User("this repo has no key to sign with".into()))?.id();
         if self.user()?.is_some() {
             return Err(Error::User("this repo has a user already".into()));
         }
+        let named = self.root_anchor()?.map(|anchor| self.anchor_value(&anchor)).transpose()?.flatten();
         let root = crate::keys::Key::generate()?;
         self.set_user(&root.id())?;
         self.certify(&root, &device)?;
+        if let (Some(value), Some(anchor)) = (named, self.root_anchor()?) {
+            self.set_anchor(&anchor, &value)?;
+        }
         self.seal(&root, passphrase, cost)?;
         Ok(root)
     }
