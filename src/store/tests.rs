@@ -1828,7 +1828,18 @@ fn what_the_root_names_is_kept_through_mount_points() {
     repo.set_anchor(&root, &top).expect("set");
     assert!(!repo.kept_under(inside.cid().multihash()).expect("kept"), "nothing keeps the root yet");
     assert!(repo.referenced(inside.cid().multihash()).expect("referenced"), "what a mount point here mounts isn't collected before it");
-    assert!(!repo.referenced(elsewhere.cid().multihash()).expect("referenced"));
+    assert!(!repo.referenced(elsewhere.cid().multihash()).expect("referenced"), "an anchor's own set doesn't reference what it is");
+    // An IPLD document's link to an anchor is a link already
+    let linked = raw(b"linked");
+    let doc_anchor = repo.new_anchor().expect("anchor");
+    repo.put_block(&linked, CidVersion::V1).expect("put");
+    repo.set_anchor(&doc_anchor, &link(&linked)).expect("set");
+    assert!(!repo.referenced(linked.cid().multihash()).expect("referenced"));
+    let doc = ipld_block(DAG_CBOR_CODEC, &crate::model::Ipld::Map(std::iter::once(("notes".to_owned(), crate::model::Ipld::Link(doc_anchor))).collect()));
+    repo.put_block(&doc, CidVersion::V1).expect("put");
+    assert!(repo.referenced(linked.cid().multihash()).expect("referenced"), "what a document here links to is now");
+    repo.keep(&link(&doc)).expect("keep");
+    assert!(repo.kept_under(linked.cid().multihash()).expect("kept"), "and kept through it");
 
     assert!(repo.keep_root().expect("keep").is_some());
     assert!(repo.keep_root().expect("keep").is_none(), "kept already");

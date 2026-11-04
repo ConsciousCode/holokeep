@@ -1633,8 +1633,22 @@ impl Catalog {
                  WHERE a.value = ?1 AND c.kind = 'keep' AND {}",
                 claims::LIVE_ANY,
             ));
-            // What a mounted anchor is now: a mount point here references it
-            sources.push("SELECT 1 FROM anchor_values_any a JOIN refs r ON r.target = a.anchor WHERE a.value = ?1".to_owned());
+            // What a linked anchor is now: a block here linking to the
+            // anchor, as an IPLD link or a mount point, references it.
+            // Claims don't: a set links to its own anchor
+            for table in ["refs", "unixfs_links", "ipld_links"] {
+                let (source, target) = match table {
+                    "unixfs_links" => ("node", "target"),
+                    "ipld_links" => ("block", "target"),
+                    _ => ("source", "target"),
+                };
+                if table == "refs" || conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?.exists([table])? {
+                    sources.push(format!(
+                        "SELECT 1 FROM anchor_values_any a JOIN {table} l ON l.{target} = a.anchor
+                         WHERE a.value = ?1 AND EXISTS (SELECT 1 FROM blocks b WHERE b.block = l.{source})"
+                    ));
+                }
+            }
         }
         let query = sources.iter().map(|source| format!("EXISTS ({source})")).collect::<Vec<_>>().join(" OR ");
         Ok(conn.prepare_cached(&format!("SELECT {query}"))?.query_row([id], |row| row.get(0))?)
@@ -1652,16 +1666,19 @@ impl Catalog {
             let Some(block) = self.readable(key.as_ref())? else {
                 continue;
             };
-            for link in crate::links::links(block.cid().codec(), block.data()).unwrap_or_default() {
+            // A linked anchor's child is what the anchor is now, linked by an
+            // IPLD link or a mount point
+            let links = crate::links::links(block.cid().codec(), block.data()).unwrap_or_default();
+            let mounted = mount_point(block.cid().codec(), block.data());
+            for link in links.iter().chain(mounted.as_ref()) {
                 let child = owned(link.multihash())?;
                 children.insert(child.to_bytes(), child);
-            }
-            // A mount point's child is what its anchor is now
-            if let Some(anchor) = mount_point(block.cid().codec(), block.data())
-                && let Some(value) = self.anchor_value(&anchor)?
-            {
-                let child = owned(value.multihash())?;
-                children.insert(child.to_bytes(), child);
+                if crate::claim::is_anchor(link)
+                    && let Some(value) = self.anchor_value(link)?
+                {
+                    let child = owned(value.multihash())?;
+                    children.insert(child.to_bytes(), child);
+                }
             }
         }
         let dropping = self.let_go(keys, Self::collectable)?;

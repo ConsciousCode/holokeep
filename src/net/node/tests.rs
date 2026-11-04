@@ -905,3 +905,22 @@ async fn what_a_kept_root_mounts_stays_till_its_mount_point_goes() {
     assert!(!has(&a, &top_block), "what the root named");
     assert!(!has(&a, &inside), "and what that mounted, in the same cascade");
 }
+
+#[tokio::test]
+async fn what_a_document_links_to_by_anchor_goes_after_it() {
+    let (mut a, mut b, _) = Box::pin(holding()).await;
+    a.set_grace(Duration::ZERO).expect("grace");
+    let linked = raw(b"linked");
+    a.catalog().put_block(&linked, CidVersion::V1).expect("put");
+    let anchor = a.catalog().new_anchor().expect("anchor");
+    a.catalog().set_anchor(&anchor, &link(&linked)).expect("set");
+    let doc = cbor(&Ipld::List(vec![Ipld::Link(anchor)]));
+    a.catalog().put_block(&doc, CidVersion::V1).expect("put");
+    a.catalog().keep(&link(&doc)).expect("keep");
+    condemn(&mut [&mut a, &mut b]).await;
+    assert!(has(&a, &doc) && has(&a, &linked), "kept through the document");
+    a.catalog().unkeep(&link(&doc)).expect("unkeep");
+    condemn(&mut [&mut a, &mut b]).await;
+    assert!(!has(&a, &doc));
+    assert!(!has(&a, &linked), "in the same cascade");
+}

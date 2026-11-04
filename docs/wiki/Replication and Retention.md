@@ -71,11 +71,13 @@ links to it and no counting [[Claims|keep]] reaches it. Tags don't keep things; 
 tomb's link is the opposite of a reference; claims are never collected.
 
 An anchor's current value is referenced while a keep targets the anchor,
-or while a **mount point** here links to it (see
-[[Anchors and Names#Mount points]]); what it was before isn't. A mount
-point is indexed as a link from its block to the anchor, so a keep
-reaches through it, and when it goes, what it mounted is condemned in
-the same cascade. Each account's root anchor is kept by a keep of its
+or while a block here links to the anchor: an IPLD link
+(`{"/": "bafyqag…"}` in dag-cbor, a PBLink) or a **mount point** (see
+[[Anchors and Names#Mount points]]), which is indexed as a link from its
+block to the anchor. Claims don't count, as a `set` links to its own
+anchor. What an anchor was before isn't referenced. A keep reaches
+through any of these links, and when the block linking goes, what the
+anchor is now is condemned in the same cascade. Each account's root anchor is kept by a keep of its
 own (see [[Anchors and Names#The root anchor]]), so everything the root
 names, however deep, is kept, and an anchor nothing names any more is
 collected after the grace period, as a deleted file would be.
