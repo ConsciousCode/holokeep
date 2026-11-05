@@ -374,7 +374,17 @@ pub struct Catalog {
     batching: usize,
     /// Forked anchors' merges, by their heads.
     merges: std::cell::RefCell<std::collections::HashMap<Vec<u8>, Link>>,
+    /// Asks a running node for blocks that aren't here, if this fetches
+    /// through one.
+    fetcher: Option<Fetcher>,
+    /// Blocks found missing in a transaction, which can't wait on the node
+    /// writing them, to fetch once it's over.
+    missed: std::cell::RefCell<Vec<Link>>,
 }
+
+/// Asks a running node to fetch blocks, just them, saying whether it
+/// could ask.
+pub type Fetcher = std::sync::Arc<dyn Fn(&[Link]) -> bool + Send + Sync>;
 
 /// A set of an anchor in its history: the set, what it says the anchor
 /// is, as of when, and the sets it replaces, if it says.
@@ -973,7 +983,7 @@ impl Catalog {
         if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
             return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
         }
-        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, merges: std::cell::RefCell::default() };
+        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, merges: std::cell::RefCell::default(), fetcher: None, missed: std::cell::RefCell::default() };
         for volume in volumes {
             catalog.attach(volume)?;
         }
@@ -2427,6 +2437,33 @@ impl Catalog {
     /// `at`: its history, as a graph.
     pub fn sets_of(&self, anchor: &Link) -> Result<Vec<SetOf>> {
         self.claims.as_ref().ok_or(Error::NoClaims)?.sets(anchor.multihash())
+    }
+
+    /// Fetch what isn't here through a running node, as read: as the mount
+    /// does, whose overlays and forks are of what may be only elsewhere.
+    pub fn fetch_through(&mut self, fetcher: Fetcher) {
+        self.fetcher = Some(fetcher);
+    }
+
+    /// Ask the node for blocks that aren't here, if this fetches through
+    /// one, saying whether it could ask. In a transaction, the node's
+    /// writing them would wait on it, so they're noted instead, for
+    /// whoever's in it to fetch once it's over (see `take_missed`).
+    pub fn fetch_missing(&self, cids: &[Link]) -> bool {
+        let Some(fetcher) = &self.fetcher else {
+            return false;
+        };
+        if !self.db.conn().is_autocommit() {
+            self.missed.borrow_mut().extend_from_slice(cids);
+            return false;
+        }
+        fetcher(cids)
+    }
+
+    /// What was found missing in a transaction since last asked, to fetch
+    /// now it's over and try again.
+    pub fn take_missed(&self) -> Vec<Link> {
+        std::mem::take(&mut *self.missed.borrow_mut())
     }
 
     /// An anchor's heads, as (set, value, at), by `at`: more than one where

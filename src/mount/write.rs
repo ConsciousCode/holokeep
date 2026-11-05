@@ -19,7 +19,7 @@ use crate::model::Link;
 use crate::store::overlay::{CHUNK, Partial};
 use crate::store::{Catalog, Mount};
 
-use super::{At, Inode, Soup, Source, errno, store_errno, to_anchor};
+use super::{At, Inode, Soup, errno, store_errno, to_anchor};
 
 /// An empty UnixFS directory, as dag-pb.
 const EMPTY_DIR: &[u8] = &[0x0a, 0x02, 0x08, 0x01];
@@ -31,6 +31,10 @@ const QUIET: Duration = Duration::from_secs(1);
 
 /// How often the committer looks.
 const TICK: Duration = Duration::from_millis(250);
+
+/// How many times a commit fetches what it found missing and tries
+/// again, before it's left to the next tick: a level of a deep tree each.
+const FETCH_ROUNDS: usize = 64;
 
 /// How many chunks of partial files are filled each tick, in the
 /// background: what's read and written is filled as it is.
@@ -68,13 +72,14 @@ impl Handle {
 /// write needn't be copied before it can be.
 pub struct Filler {
     work: Option<PathBuf>,
-    fetcher: Option<Arc<super::Fetcher>>,
     partials: Mutex<HashMap<(Vec<u8>, PathBuf), Partial>>,
 }
 
 impl Filler {
-    pub fn new(work: Option<PathBuf>, fetcher: Option<Arc<super::Fetcher>>) -> Self {
-        Self { work, fetcher, partials: Mutex::new(HashMap::new()) }
+    /// Filling files in work directories under `work`, from catalogs which
+    /// fetch what isn't here.
+    pub fn new(work: Option<PathBuf>) -> Self {
+        Self { work, partials: Mutex::new(HashMap::new()) }
     }
 
     fn partials(&self) -> std::sync::MutexGuard<'_, HashMap<(Vec<u8>, PathBuf), Partial>> {
@@ -125,8 +130,7 @@ impl Filler {
         let overwritten = writing.is_some_and(|(at, len)| at <= start && at.saturating_add(len) >= end);
         if !overwritten {
             let work = self.work.as_ref().ok_or_else(|| io::Error::other("not writable"))?;
-            let source = Source { catalog, fetcher: self.fetcher.as_deref() };
-            let data = export::read_at(&source, &partial.base, start, usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX))?;
+            let data = export::read_at(catalog, &partial.base, start, usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX))?;
             File::options().write(true).open(super::work_path(work, &partial.anchor, &partial.path))?.write_all_at(&data, start)?;
         }
         partial.fill(chunk);
@@ -376,7 +380,7 @@ impl Committer {
                 self.touched(&anchor);
                 continue;
             }
-            let imported = catalog.remount_if(&mount, &|| self.changes(&anchor) == changes);
+            let imported = import(catalog, &mount, &|| self.changes(&anchor) == changes);
             self.imported(&mount.path);
             match imported {
                 Ok(Some(value)) => {
@@ -414,7 +418,7 @@ impl Committer {
                         eprintln!("{} couldn't be committed, not all of it having been copied: {e}", mount.anchor);
                         continue;
                     }
-                    if let Err(e) = catalog.remount(&mount) {
+                    if let Err(e) = import(&mut catalog, &mount, &|| true) {
                         eprintln!("{} couldn't be committed: {e}", mount.anchor);
                     }
                     self.imported(&mount.path);
@@ -453,6 +457,23 @@ impl Committer {
             Err(e) => eprintln!("what was written isn't committed yet, and will be when next mounted: {e}"),
         }
     }
+}
+
+/// Import an overlay and set its anchor, unless `still()` says it was
+/// written to meanwhile. What it's over may be elsewhere: what's found
+/// missing as it's imported is fetched, outside the import's transaction,
+/// since the node writing it would wait on that, and it's imported again,
+/// as deep as that goes.
+fn import(catalog: &mut Catalog, mount: &Mount, still: &dyn Fn() -> bool) -> crate::store::Result<Option<Link>> {
+    let mut imported = catalog.remount_if(mount, still);
+    for _ in 0..FETCH_ROUNDS {
+        let missed = catalog.take_missed();
+        if imported.is_ok() || missed.is_empty() || !catalog.fetch_missing(&missed) {
+            break;
+        }
+        imported = catalog.remount_if(mount, still);
+    }
+    imported
 }
 
 fn io_errno(e: &io::Error) -> Errno {
@@ -531,11 +552,11 @@ impl Soup {
             }
             return Ok(path);
         }
-        let (cid, _) = self.base_at(catalog, anchor, rel)?.ok_or(Errno::ENOENT)?;
+        let (cid, _) = Self::base_at(catalog, anchor, rel)?.ok_or(Errno::ENOENT)?;
         let size = if truncate {
             0
         } else {
-            match export::stat(&Source { catalog, fetcher: self.fetcher.as_deref() }, &cid).map_err(|e| errno(&e))? {
+            match export::stat(catalog, &cid).map_err(|e| errno(&e))? {
                 Kind::File(size) => size,
                 Kind::Directory => return Err(Errno::EISDIR),
                 Kind::Symlink(_) => return Err(Errno::EINVAL),
@@ -751,9 +772,9 @@ impl Soup {
 
     /// Mark a path gone if the anchor had anything there, else forget its
     /// marks.
-    fn gone(&self, catalog: &Catalog, anchor: &Link, rel: &Path) -> Result<(), Errno> {
+    fn gone(catalog: &Catalog, anchor: &Link, rel: &Path) -> Result<(), Errno> {
         catalog.clear_overlay_marks(anchor, rel).map_err(store_errno)?;
-        if self.base_at(catalog, anchor, rel)?.is_some() {
+        if Self::base_at(catalog, anchor, rel)?.is_some() {
             catalog.set_overlay_mark(anchor, rel, &None).map_err(store_errno)?;
         }
         Ok(())
@@ -778,7 +799,7 @@ impl Soup {
             At::Base(..) => {},
         }
         self.prepare(&catalog, &anchor)?;
-        self.gone(&catalog, &anchor, &rel)?;
+        Self::gone(&catalog, &anchor, &rel)?;
         drop(catalog);
         self.committer.touched(&anchor);
         Ok(())
@@ -807,7 +828,7 @@ impl Soup {
             fs::remove_dir(path).map_err(|e| io_errno(&e))?;
         }
         self.prepare(&catalog, &anchor)?;
-        self.gone(&catalog, &anchor, &rel)?;
+        Self::gone(&catalog, &anchor, &rel)?;
         drop(catalog);
         self.committer.touched(&anchor);
         Ok(())
@@ -849,7 +870,7 @@ impl Soup {
         // What's moved and what's replaced leave their paths
         self.keep_committed(&catalog, &anchor, &from)?;
         self.keep_committed(&catalog, &anchor, &to)?;
-        let base = self.base_at(&catalog, &anchor, &from)?;
+        let base = Self::base_at(&catalog, &anchor, &from)?;
         let (work_from, work_to) = (self.work_path(&anchor, &from).ok_or(Errno::EROFS)?, self.work_path(&anchor, &to).ok_or(Errno::EROFS)?);
         // What's replaced goes first
         self.filler.moved(&catalog, &anchor, &to, None).map_err(|e| io_errno(&e))?;
@@ -868,7 +889,7 @@ impl Soup {
         // It's exactly what was there: what the anchor had, or nothing
         let mark = base.map(|(cid, size)| (cid, size.unwrap_or_default()));
         catalog.set_overlay_mark(&anchor, &to, &mark).map_err(store_errno)?;
-        if self.base_at(&catalog, &anchor, &from)?.is_some() {
+        if Self::base_at(&catalog, &anchor, &from)?.is_some() {
             catalog.set_overlay_mark(&anchor, &from, &None).map_err(store_errno)?;
         }
         drop(catalog);

@@ -59,7 +59,11 @@ link.
   link `Tsize`s. They're advisory, as a stat's size is.
 - A read fetches only the chunks its range covers.
 - What isn't here is asked of the running node, which fetches just those
-  blocks from members, all of a read's or a listing's at once.
+  blocks from members, all of a read's or a listing's at once. So is what
+  committing an overlay or merging a fork needs: what's found missing
+  inside the commit's transaction is fetched once it's over (the node
+  writing it would wait on it), and the commit tried again at once, a
+  level of the tree each time.
 
 ## Writing: overlays
 

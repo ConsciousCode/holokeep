@@ -48,7 +48,7 @@ use fuser::{
 };
 
 use crate::cid::{BaseCid as _, CidRef as _};
-use crate::export::{self, Fetch, Kind};
+use crate::export::{self, Kind};
 use crate::model::Link;
 use crate::store::Catalog;
 use crate::store::overlay;
@@ -251,38 +251,6 @@ struct RulesRead {
     rules: Arc<rules::Rules>,
 }
 
-/// The catalog, asking the node for what isn't here.
-struct Source<'a> {
-    catalog: &'a Catalog,
-    fetcher: Option<&'a Fetcher>,
-}
-
-impl Fetch for Source<'_> {
-    fn fetch(&self, cid: &Link) -> io::Result<Vec<u8>> {
-        match self.catalog.fetch(cid) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => match self.fetcher {
-                Some(fetcher) if fetcher(std::slice::from_ref(cid)) => self.catalog.fetch(cid),
-                _ => Err(e),
-            },
-            result => result,
-        }
-    }
-
-    fn prefetch(&self, cids: &[Link]) {
-        use crate::store::BlockIndex as _;
-        let Some(fetcher) = self.fetcher else {
-            return;
-        };
-        let missing: Vec<Link> = cids.iter()
-            .filter(|cid| cid.hashcode() != crate::block::IDENTITY && !self.catalog.has(cid.multihash()).unwrap_or(true))
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            fetcher(&missing);
-        }
-    }
-}
-
 /// Whether a symlink's target is to an anchor: `/anchors/<anchor>`, or
 /// under it.
 fn to_anchor(target: &[u8]) -> bool {
@@ -352,9 +320,18 @@ impl Soup {
     /// The soup as the account the catalog `open` opens acts for sees
     /// it, asking `fetcher` for what isn't here, if there's a node to ask.
     pub fn new(open: Opener, fetcher: Option<Fetcher>) -> Self {
-        let open: Arc<dyn Fn() -> crate::store::Result<Catalog> + Send + Sync> = Arc::from(open);
         let fetcher = fetcher.map(Arc::new);
-        let filler = Arc::new(Filler::new(None, fetcher.clone()));
+        // Every catalog it opens, the committer's too, fetches what isn't
+        // here: what an overlay's over, or a fork's heads, may be elsewhere
+        let through: Option<crate::store::Fetcher> = fetcher.clone().map(|fetcher| -> crate::store::Fetcher { fetcher });
+        let open: Arc<dyn Fn() -> crate::store::Result<Catalog> + Send + Sync> = Arc::new(move || {
+            let mut catalog = open()?;
+            if let Some(through) = &through {
+                catalog.fetch_through(Arc::clone(through));
+            }
+            Ok(catalog)
+        });
+        let filler = Arc::new(Filler::new(None));
         Self {
             id: SOUPS.fetch_add(1, Ordering::Relaxed),
             committer: Arc::new(Committer::new(Arc::clone(&open), Arc::clone(&filler))),
@@ -421,7 +398,7 @@ impl Soup {
     /// Anchors writable, their work directories under `work`.
     #[must_use]
     pub fn writable(mut self, work: PathBuf) -> Self {
-        self.filler = Arc::new(Filler::new(Some(work.clone()), self.fetcher.clone()));
+        self.filler = Arc::new(Filler::new(Some(work.clone())));
         self.committer = Arc::new(Committer::new(Arc::clone(&self.open), Arc::clone(&self.filler)));
         self.work = Some(work);
         self
@@ -597,7 +574,7 @@ impl Soup {
                 let file = std::fs::File::open(self.work_path(anchor, &file).ok_or(Errno::ENOENT)?).map_err(|e| errno(&e))?;
                 read_file(&file, 0, rules::MOST)?
             },
-            Some(At::Base(cid, _)) => export::read_at(&Source { catalog, fetcher: self.fetcher.as_deref() }, &cid, 0, rules::MOST).unwrap_or_default(),
+            Some(At::Base(cid, _)) => export::read_at(catalog, &cid, 0, rules::MOST).unwrap_or_default(),
             _ => Vec::new(),
         };
         let (rules, errors) = rules::Rules::parse(&String::from_utf8_lossy(&text));
@@ -640,11 +617,11 @@ impl Soup {
             Inode::Node(cid, _) if cid.codec() == crate::cid::RAW_CODEC => {
                 let said = self.sizes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&cid.to_bytes()).copied();
                 said.map_or_else(
-                    || export::stat(&Source { catalog, fetcher: self.fetcher.as_deref() }, cid).map_err(|e| errno(&e)),
+                    || export::stat(catalog, cid).map_err(|e| errno(&e)),
                     |size| Ok(Kind::File(size)),
                 )
             },
-            Inode::Node(cid, _) => export::stat(&Source { catalog, fetcher: self.fetcher.as_deref() }, cid).map_err(|e| errno(&e)),
+            Inode::Node(cid, _) => export::stat(catalog, cid).map_err(|e| errno(&e)),
             Inode::Path(anchor, rel, _) => match self.at(catalog, anchor, rel)?.ok_or(Errno::ENOENT)? {
                 At::Work(meta) => work_kind(&self.work_path(anchor, rel).unwrap_or_default(), &meta),
                 At::Base(cid, size) => {
@@ -684,15 +661,15 @@ impl Soup {
                 Err(e) => return Err(errno(&e)),
             }
         }
-        Ok(self.base_at(catalog, anchor, rel)?.map(|(cid, size)| At::Base(cid, size)))
+        Ok(Self::base_at(catalog, anchor, rel)?.map(|(cid, size)| At::Base(cid, size)))
     }
 
     /// What the anchor had at a path, after marks, whatever's in the work
     /// directory.
-    fn base_at(&self, catalog: &Catalog, anchor: &Link, rel: &Path) -> Result<overlay::Base, Errno> {
+    fn base_at(catalog: &Catalog, anchor: &Link, rel: &Path) -> Result<overlay::Base, Errno> {
         let marks = catalog.overlay_marks(anchor).map_err(store_errno)?;
         let root = Self::anchor_root(catalog, anchor)?;
-        overlay::resolve(&Source { catalog, fetcher: self.fetcher.as_deref() }, root, rel, &marks).map_err(|e| errno(&e))
+        overlay::resolve(catalog, root, rel, &marks).map_err(|e| errno(&e))
     }
 
     /// A directory of an anchor's entries: its work directory's over what
@@ -700,12 +677,11 @@ impl Soup {
     fn overlay_entries(&self, catalog: &Catalog, anchor: &Link, rel: &Path, via: &Via) -> Result<Vec<(Vec<u8>, Inode)>, Errno> {
         let marks = catalog.overlay_marks(anchor).map_err(store_errno)?;
         let root = Self::anchor_root(catalog, anchor)?;
-        let source = Source { catalog, fetcher: self.fetcher.as_deref() };
         let mut names: BTreeSet<Vec<u8>> = BTreeSet::new();
         // Under a file in the work directory, the anchor's had nothing
         let shadowed = self.work_path(anchor, rel).is_some_and(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_dir()));
         if !shadowed {
-            let entries = overlay::base_entries(&source, root, rel, &marks).map_err(|e| errno(&e))?;
+            let entries = overlay::base_entries(catalog, root, rel, &marks).map_err(|e| errno(&e))?;
             let listed: Vec<export::Listed> = entries.iter().map(|(name, (cid, size))| export::Listed { name: name.clone(), cid: cid.clone(), size: *size }).collect();
             self.note_sizes(&listed);
             names.extend(entries.into_keys());
@@ -835,7 +811,7 @@ impl Soup {
                 Inode::Node(cid, None)
             },
             Inode::Node(dir, _) => {
-                let entries = export::list(&Source { catalog: &catalog, fetcher: self.fetcher.as_deref() }, &dir).map_err(|e| errno(&e))?;
+                let entries = export::list(&*catalog, &dir).map_err(|e| errno(&e))?;
                 self.note_sizes(&entries);
                 let entry = entries.into_iter().find(|entry| entry.name.as_slice() == name.as_bytes()).ok_or(Errno::ENOENT)?;
                 Inode::Node(entry.cid, None)
@@ -900,7 +876,7 @@ impl Soup {
                 with_kinds(found)?
             },
             Inode::Node(dir, _) => {
-                let entries = export::list(&Source { catalog: &catalog, fetcher: self.fetcher.as_deref() }, &dir).map_err(|e| errno(&e))?;
+                let entries = export::list(&*catalog, &dir).map_err(|e| errno(&e))?;
                 self.note_sizes(&entries);
                 with_kinds(entries.into_iter().map(|entry| (entry.name, Inode::Node(entry.cid, None))).collect())?
             },
@@ -934,7 +910,7 @@ impl Soup {
         match self.inode(ino)? {
             Inode::Node(cid, _) => {
                 let catalog = self.catalog()?;
-                export::read_at(&Source { catalog: &catalog, fetcher: self.fetcher.as_deref() }, &cid, offset, size).map_err(|e| errno(&e))
+                export::read_at(&*catalog, &cid, offset, size).map_err(|e| errno(&e))
             },
             Inode::Loose(name) => {
                 let file = std::fs::File::open(self.loose_path(&name).ok_or(Errno::ENOENT)?).map_err(|e| errno(&e))?;
@@ -949,7 +925,7 @@ impl Soup {
                         let file = std::fs::File::open(self.work_path(&anchor, &rel).ok_or(Errno::ENOENT)?).map_err(|e| errno(&e))?;
                         read_file(&file, offset, size)
                     },
-                    At::Base(cid, _) => export::read_at(&Source { catalog: &catalog, fetcher: self.fetcher.as_deref() }, &cid, offset, size).map_err(|e| errno(&e)),
+                    At::Base(cid, _) => export::read_at(&*catalog, &cid, offset, size).map_err(|e| errno(&e)),
                 }
             },
             _ => Err(Errno::EISDIR),
@@ -1614,6 +1590,60 @@ mod tests {
         prev.sort_by_key(Link::to_bytes);
         let set = catalog.sets_of(&anchor).expect("sets").pop().expect("set");
         assert_eq!(set.3.as_deref(), Some(prev.as_slice()), "naming both heads");
+    }
+
+    #[test]
+    fn whats_only_elsewhere_is_fetched_to_commit_over_and_merge() {
+        use crate::store::BlockIndex as _;
+        let scratch = Scratch::new("mount-elsewhere");
+        let (here, there) = (scratch.path().join("here"), scratch.path().join("there"));
+        // What the anchor is, and another device's fork of it, are there
+        let mut far = Catalog::open_repo(&there).expect("catalog");
+        let t = scratch.path().join("t");
+        std::fs::create_dir_all(t.join("sub")).expect("mkdir");
+        std::fs::write(t.join("sub/old"), "old").expect("write");
+        let base = AnyCid::V1(Importer::default().add_path(&t, &mut far, &mut |_, _| {}).expect("import").expect("root").cid);
+        std::fs::write(t.join("theirs"), "theirs").expect("write");
+        let theirs = AnyCid::V1(Importer::default().add_path(&t, &mut far, &mut |_, _| {}).expect("import").expect("root").cid);
+        drop(far);
+        let catalog = Catalog::open_repo(&here).expect("catalog");
+        let anchor = catalog.new_anchor().expect("anchor");
+        let start = catalog.set_anchor(&anchor, &base).expect("set");
+        assert!(!catalog.has(base.multihash()).expect("has"), "not here");
+        drop(catalog);
+        let asked = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&asked);
+        let (from, to) = (there, here.clone());
+        let fetcher: Fetcher = Box::new(move |cids: &[Link]| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            let (far, near) = (Catalog::open_repo(&from).expect("there"), Catalog::open_repo(&to).expect("here"));
+            for cid in cids {
+                if let Some(block) = far.get_block(cid).expect("get") {
+                    near.put_block(&block, CidVersion::V1).expect("put");
+                }
+            }
+            true
+        });
+        let opened = here.clone();
+        let soup = Soup::new(Box::new(move || Catalog::open_repo(&opened)), Some(fetcher)).writable(here.join("work"));
+
+        // Written to over what's only there, and committed
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let (_, fh) = soup.create(dir, OsStr::new("mine")).expect("create");
+        soup.write(fh, 0, b"mine").expect("write");
+        soup.release(fh);
+        soup.commit();
+        let catalog = Catalog::open_repo(&here).expect("catalog");
+        let (_, value, at) = catalog.anchor_heads(&anchor).expect("heads").pop().expect("head");
+        assert_ne!(value, base, "committed");
+        assert_eq!(names(&soup, &format!("cid/{value}")), ["mine", "sub"]);
+
+        // Forked by a set whose value's only there: merged all the same
+        let set = crate::claim::Set::new([anchor.clone()], theirs, at + 1).expect("set").after(Some(vec![start]));
+        catalog.put_claim(&crate::claim::Claim::Set(set)).expect("put");
+        drop(catalog);
+        assert_eq!(names(&soup, &format!("anchors/{anchor}")), ["mine", "sub", "theirs"]);
+        assert!(asked.load(Ordering::Relaxed) > 0);
     }
 
     #[test]

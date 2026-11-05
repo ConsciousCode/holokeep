@@ -30,11 +30,30 @@ pub trait Fetch {
 }
 
 impl Fetch for Catalog {
+    /// A block here, or, if the catalog fetches through a node, fetched.
     fn fetch(&self, cid: &Link) -> io::Result<Vec<u8>> {
+        let missing = || io::Error::new(io::ErrorKind::NotFound, format!("block {cid} not found"));
         match self.get_block(cid) {
             Ok(Some(block)) => Ok(block.into_data().into_vec()),
-            Ok(None) => Err(io::Error::new(io::ErrorKind::NotFound, format!("block {cid} not found"))),
+            Ok(None) if self.fetch_missing(std::slice::from_ref(cid)) => match self.get_block(cid) {
+                Ok(Some(block)) => Ok(block.into_data().into_vec()),
+                Ok(None) => Err(missing()),
+                Err(e) => Err(io::Error::other(e)),
+            },
+            Ok(None) => Err(missing()),
             Err(e) => Err(io::Error::other(e)),
+        }
+    }
+
+    fn prefetch(&self, cids: &[Link]) {
+        use crate::cid::CidRef as _;
+        use crate::store::BlockIndex as _;
+        let missing: Vec<Link> = cids.iter()
+            .filter(|cid| cid.hashcode() != crate::block::IDENTITY && !self.has(cid.multihash()).unwrap_or(true))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            self.fetch_missing(&missing);
         }
     }
 }
