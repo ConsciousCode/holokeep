@@ -216,6 +216,12 @@ const SCHEMA: &str =
              claim INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
              n INTEGER NOT NULL
          );
+         -- How many failures it takes to lose what a keep keeps, if it
+         -- says, rather than leaving it to the mesh.
+         CREATE TABLE IF NOT EXISTS keep_copies (
+             claim INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
+             copies INTEGER NOT NULL
+         );
          -- What's particular to each type; a tomb has nothing but targets.
          CREATE TABLE IF NOT EXISTS group_claims (
              id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
@@ -629,6 +635,14 @@ impl ClaimStore {
         Ok(n.and_then(|n| u64::try_from(n).ok()).unwrap_or_default())
     }
 
+    fn keep_copies(&self, id: Id) -> Result<Option<u64>> {
+        let copies: Option<i64> = self.db.conn()
+            .prepare_cached("SELECT copies FROM keep_copies WHERE claim = ?1")?
+            .query_row([id], |row| row.get(0))
+            .optional()?;
+        Ok(copies.and_then(|copies| u64::try_from(copies).ok()))
+    }
+
     /// Whether a tomb retracts a claim, by its CID.
     pub fn retracted(&self, claim: &Link) -> Result<bool> {
         self.tombstoned(claim.multihash())
@@ -646,7 +660,7 @@ impl ClaimStore {
         match kind {
             "group" => self.group(id).map(Claim::Group),
             "keep" => Keep::bounded(self.targets(id)?, self.beyond(id)?)
-                .map(|keep| Claim::Keep(keep.again(self.keep_n(id).unwrap_or_default())))
+                .map(|keep| Claim::Keep(keep.again(self.keep_n(id).unwrap_or_default()).with_copies(self.keep_copies(id).unwrap_or_default())))
                 .ok_or_else(|| Error::Invalid { store: NAME, reason: "a keep with no targets".into() }),
             "set" => self.set(id).map(Claim::Set),
             "tomb" => self.tomb(id).map(Claim::Tomb),
@@ -769,18 +783,19 @@ impl ClaimStore {
             },
             Claim::Sign(_) => None,
             Claim::Keep(_) | Claim::Tomb(_) | Claim::Device(_) => {
-                let n = match claim {
-                    Claim::Keep(keep) => keep.n(),
-                    _ => 0,
+                let (n, copies) = match claim {
+                    Claim::Keep(keep) => (keep.n(), keep.copies().unwrap_or_default()),
+                    _ => (0, 0),
                 };
                 let kind = claim.kind();
                 self.db.conn()
                     .prepare_cached(
                         "SELECT c.id FROM claims c JOIN claim_targets t ON t.claim = c.id
                          WHERE c.claim IS NULL AND c.kind = ?3 AND t.target = ?1 AND t.prefix = ?2
-                             AND coalesce((SELECT n FROM keep_n k WHERE k.claim = c.id), 0) = ?4",
+                             AND coalesce((SELECT n FROM keep_n k WHERE k.claim = c.id), 0) = ?4
+                             AND coalesce((SELECT copies FROM keep_copies k WHERE k.claim = c.id), 0) = ?5",
                     )?
-                    .query_row(params![target, prefix, kind, i64::try_from(n).unwrap_or(i64::MAX)], |r| r.get(0))
+                    .query_row(params![target, prefix, kind, i64::try_from(n).unwrap_or(i64::MAX), i64::try_from(copies).unwrap_or(i64::MAX)], |r| r.get(0))
                     .optional()?
             },
         })
@@ -855,6 +870,12 @@ impl ClaimStore {
         {
             conn.prepare_cached("INSERT INTO keep_n (claim, n) VALUES (?1, ?2)")?
                 .execute(params![row, i64::try_from(keep.n()).unwrap_or(i64::MAX)])?;
+        }
+        if let Claim::Keep(keep) = claim
+            && let Some(copies) = keep.copies()
+        {
+            conn.prepare_cached("INSERT INTO keep_copies (claim, copies) VALUES (?1, ?2)")?
+                .execute(params![row, i64::try_from(copies).unwrap_or(i64::MAX)])?;
         }
         if let Claim::Keep(keep) = claim {
             let mut stmt = conn.prepare_cached("INSERT OR IGNORE INTO keep_beyond (claim, target, prefix) VALUES (?1, ?2, ?3)")?;

@@ -1520,6 +1520,35 @@ mod tests {
     }
 
     #[test]
+    fn rules_say_how_many_copies_of_what_can_be_made_again() {
+        use crate::store::BlockIndex as _;
+        let scratch = Scratch::new("mount-copies");
+        let (soup, anchor, repo) = writable(&scratch);
+        Catalog::open_repo(&repo).expect("catalog").keep(&anchor).expect("keep");
+        let top = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let write = |parent: u64, name: &str, data: &[u8]| {
+            let (_, fh) = soup.create(parent, OsStr::new(name)).expect("create");
+            soup.write(fh, 0, data).expect("write");
+            soup.release(fh);
+        };
+        write(top, ".souprules", b"__pycache__/ copies=1\n");
+        let cache = soup.mkdir(top, OsStr::new("__pycache__")).expect("mkdir").ino.0;
+        assert_eq!(soup.resolve_kept(top, OsStr::new("__pycache__")).expect("kept").kind, FileType::Symlink, "an anchor of its own");
+        write(cache, "mod.pyc", b"compiled");
+        write(top, "mod.py", b"source");
+        soup.commit();
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let wanted = |data: &[u8]| {
+            let block: Block = Block::hash(crate::cid::Cidv1Spec::default(), data.into());
+            let key = block.cid().multihash();
+            assert!(catalog.has(key).expect("has"));
+            catalog.copies_wanted(key, 2).expect("copies")
+        };
+        assert_eq!(wanted(b"compiled"), Some(1), "made again easily");
+        assert_eq!(wanted(b"source"), Some(2), "as the mesh runs");
+    }
+
+    #[test]
     fn rules_say_how_often_an_anchor_is_committed() {
         let scratch = Scratch::new("mount-pace");
         let (soup, _, repo) = writable(&scratch);

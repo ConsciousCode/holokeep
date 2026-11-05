@@ -143,11 +143,13 @@ struct Candidate {
     granted: BTreeMap<PeerId, Vec<Replica>>,
     /// A member lets go of it first.
     refused: bool,
+    /// How many failures it should take to lose it, as its nearest keeps
+    /// say, or as the trim runs with.
+    copies: usize,
 }
 
 /// Letting go of what's spare of some blocks.
 pub struct Trim {
-    copies: usize,
     candidates: BTreeMap<Vec<u8>, Candidate>,
     awaiting: HashSet<OutboundRequestId>,
     report: Report,
@@ -159,7 +161,7 @@ impl Trim {
     /// Returns the trim and the intents to send every peer.
     pub fn start(catalog: &Catalog, sightings: &Sightings, peers: &[PeerId], copies: usize, keys: impl IntoIterator<Item = Multihash>) -> Result<(Self, Vec<Intent>)> {
         let own = catalog.own_labels();
-        let mut trim = Self { copies, candidates: BTreeMap::new(), awaiting: HashSet::new(), report: Report::default() };
+        let mut trim = Self { candidates: BTreeMap::new(), awaiting: HashSet::new(), report: Report::default() };
         for key in keys {
             let bytes = key.to_bytes();
             // Spare to this mesh is only spare here if no other account has
@@ -173,10 +175,11 @@ impl Trim {
             }
             let staying: Vec<Replica> = catalog.replicas(key.as_ref())?.into_iter().filter(|replica| !own.contains(&replica.label)).collect();
             let sighted: Vec<Replica> = sightings.of(key.as_ref())?.into_iter().filter(|(peer, _)| peers.contains(peer)).map(|(_, replica)| replica).collect();
+            let copies = catalog.copies_wanted(key.as_ref(), copies)?.unwrap_or(copies);
             if tolerance(&distinct(staying.iter().chain(&sighted)), copies) < copies {
                 continue;
             }
-            trim.candidates.insert(bytes, Candidate { staying, ..Candidate::default() });
+            trim.candidates.insert(bytes, Candidate { staying, copies, ..Candidate::default() });
         }
         trim.report.considered = trim.candidates.len();
         let keys: Vec<ByteBuf> = trim.candidates.keys().cloned().map(ByteBuf::from).collect();
@@ -234,7 +237,7 @@ impl Trim {
         self.candidates
             .iter()
             .filter(|(_, candidate)| !candidate.refused)
-            .filter(|(_, candidate)| tolerance(&distinct(candidate.staying.iter().chain(candidate.granted.values().flatten())), self.copies) >= self.copies)
+            .filter(|(_, candidate)| tolerance(&distinct(candidate.staying.iter().chain(candidate.granted.values().flatten())), candidate.copies) >= candidate.copies)
             .filter_map(|(key, _)| <Multihash>::decode(key).ok())
             .collect()
     }

@@ -65,6 +65,10 @@ pub struct Keep {
     /// them again once a keep's been tombed takes a new claim, since a
     /// tomb is forever.
     n: u64,
+    /// How many failures it takes to lose what's kept, at least, for what
+    /// this keep is the nearest of along a path: left out for whatever the
+    /// mesh runs with.
+    copies: Option<u64>,
 }
 
 /// "The targets, anchors, are `value` as of `at`", in seconds since the
@@ -150,7 +154,7 @@ impl Keep {
     /// A keep of the targets short of a frontier, if there are any.
     pub fn bounded(target: impl IntoIterator<Item = Link>, beyond: impl IntoIterator<Item = Link>) -> Option<Self> {
         let target = set(target);
-        (!target.is_empty()).then_some(Self { target, beyond: set(beyond), n: 0 })
+        (!target.is_empty()).then_some(Self { target, beyond: set(beyond), n: 0, copies: None })
     }
 
     /// The same keep, but the `n`th time.
@@ -161,6 +165,16 @@ impl Keep {
     }
 
     pub const fn n(&self) -> u64 { self.n }
+
+    /// The same keep, asking for `copies` failures to lose what it keeps,
+    /// or whatever the mesh runs with; at least 1.
+    #[must_use]
+    pub fn with_copies(mut self, copies: Option<u64>) -> Self {
+        self.copies = copies.filter(|&copies| copies > 0);
+        self
+    }
+
+    pub const fn copies(&self) -> Option<u64> { self.copies }
 
     pub fn target(&self) -> &[Link] { &self.target }
 
@@ -292,6 +306,9 @@ impl Claim {
                 if keep.n > 0 {
                     map.insert("n".to_owned(), Ipld::Integer(keep.n.into()));
                 }
+                if let Some(copies) = keep.copies {
+                    map.insert("copies".to_owned(), Ipld::Integer(copies.into()));
+                }
                 ("keep", map)
             },
             Self::Set(set) => ("set", BTreeMap::from([
@@ -367,7 +384,12 @@ impl Claim {
                     Some(_) => return None,
                     None => 0,
                 };
-                Self::Keep(Keep::bounded(target.clone(), beyond)?.again(n))
+                let copies = match map.remove("copies") {
+                    Some(Ipld::Integer(copies)) => Some(u64::try_from(copies).ok().filter(|&copies| copies > 0)?),
+                    Some(_) => return None,
+                    None => None,
+                };
+                Self::Keep(Keep::bounded(target.clone(), beyond)?.again(n).with_copies(copies))
             },
             "set" => {
                 let (Ipld::Link(value), Ipld::Integer(at)) = (map.remove("value")?, map.remove("at")?) else {
@@ -617,5 +639,13 @@ mod tests {
         assert!(again.dissolves());
         assert_eq!(dissolved(&again.cid()), Some(again));
         assert_eq!(Claim::Keep(Keep::new([cid(b"a")]).expect("keep").again(0)).cid(), first.cid(), "0 is left out");
+
+        // How many copies, left out for the mesh's own
+        let two = Claim::Keep(Keep::new([cid(b"a")]).expect("keep").with_copies(Some(2)));
+        assert_ne!(two.cid(), first.cid());
+        assert_eq!(Claim::parse(two.block().data()), Some(two.clone()), "round trips");
+        assert_eq!(Claim::Keep(Keep::new([cid(b"a")]).expect("keep").with_copies(None)).cid(), first.cid());
+        assert_eq!(Claim::Keep(Keep::new([cid(b"a")]).expect("keep").with_copies(Some(0))).cid(), first.cid(), "0 isn't a count yet");
+        assert!(two.dissolves(), "small still");
     }
 }

@@ -439,6 +439,9 @@ struct Holding {
     holders: BTreeMap<PeerId, Vec<Replica>>,
     passed: BTreeSet<PeerId>,
     pushing: bool,
+    /// How many failures it should take to lose it, as its nearest keeps
+    /// say, or as the audit runs with.
+    copies: usize,
 }
 
 /// Pushes to send: to whom, what, and the blocks' multihashes.
@@ -447,7 +450,6 @@ pub type Pushes = Vec<(PeerId, Push, Vec<Vec<u8>>)>;
 /// Auditing what this node holds, and raising what's short.
 pub struct Audit {
     me: PeerId,
-    copies: usize,
     blocks: BTreeMap<Vec<u8>, Holding>,
     offers: BTreeMap<PeerId, Offer>,
     /// Adverts sent: to whom, and naming what.
@@ -476,7 +478,6 @@ impl Audit {
         sightings.expire()?;
         let mut audit = Self {
             me,
-            copies,
             blocks: BTreeMap::new(),
             offers: BTreeMap::new(),
             adverts: HashMap::new(),
@@ -491,7 +492,8 @@ impl Audit {
                 continue;
             }
             let ours = catalog.replicas(key.as_ref())?;
-            let mut holding = Holding::default();
+            let copies = catalog.copies_wanted(key.as_ref(), copies)?.unwrap_or(copies);
+            let mut holding = Holding { copies, ..Holding::default() };
             for (peer, replica) in sightings.of(key.as_ref())? {
                 if peers.contains(&peer) {
                     holding.holders.entry(peer).or_default().push(replica);
@@ -626,7 +628,7 @@ impl Audit {
         let mut settled = Vec::new();
         for (key, holding) in &mut self.blocks {
             let held: Vec<Replica> = holding.holders.values().flatten().cloned().collect();
-            if tolerance(&distinct(&held), self.copies) >= self.copies {
+            if tolerance(&distinct(&held), holding.copies) >= holding.copies {
                 settled.push(key.clone());
                 continue;
             }
@@ -637,7 +639,7 @@ impl Audit {
                 continue;
             }
             let offers = self.offers.iter().filter(|(peer, _)| !holding.holders.contains_key(peer) && !holding.passed.contains(peer));
-            let Some(target) = choose(key, &held, offers, self.copies) else {
+            let Some(target) = choose(key, &held, offers, holding.copies) else {
                 self.report.short = self.report.short.saturating_add(1);
                 settled.push(key.clone());
                 continue;

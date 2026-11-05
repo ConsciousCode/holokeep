@@ -35,12 +35,16 @@ pub struct Settings {
     /// The least time between an anchor's commits, for an anchor mounted
     /// by this name.
     pub pace: Option<Duration>,
+    /// How many failures it should take to lose a directory made by this
+    /// name, which makes it an anchor of its own unless it's `inline`, kept
+    /// so.
+    pub copies: Option<usize>,
 }
 
 impl Settings {
     /// These, with what `over` says over them.
     fn and(self, over: Self) -> Self {
-        Self { detach: over.detach.or(self.detach), pace: over.pace.or(self.pace) }
+        Self { detach: over.detach.or(self.detach), pace: over.pace.or(self.pace), copies: over.copies.or(self.copies) }
     }
 }
 
@@ -114,7 +118,9 @@ impl Rule {
                 None if word == "inline" => rule.settings.detach = Some(false),
                 Some(("pace", pace)) => rule.settings.pace = Some(duration(pace).ok_or_else(|| format!("{pace:?} isn't a time, as 30s, 5m or 1h"))?),
                 Some(("app", app)) if !app.is_empty() => rule.app = Some(app.to_owned()),
-                _ => return Err(format!("{word:?} isn't a setting: detach, inline, pace=<time> or app=<name>")),
+                Some(("copies", "0")) => return Err("copies=0 isn't yet: a cache dropped under pressure would be left half there".to_owned()),
+                Some(("copies", copies)) => rule.settings.copies = Some(copies.parse().ok().filter(|&copies| copies > 0).ok_or_else(|| format!("{copies:?} isn't a number of copies"))?),
+                _ => return Err(format!("{word:?} isn't a setting: detach, inline, pace=<time>, copies=<n> or app=<name>")),
             }
         }
         Ok(rule)
@@ -179,7 +185,7 @@ mod tests {
 
     #[test]
     fn rules_say_what_matching_names_are() {
-        let detach = Settings { detach: Some(true), pace: None };
+        let detach = Settings { detach: Some(true), ..Settings::default() };
         assert_eq!(Rules::defaults().apply(Settings::default(), Path::new("notes/.obsidian"), true, None), detach);
         assert_eq!(Rules::defaults().apply(Settings::default(), Path::new(".obsidian"), false, None), Settings::default(), "a directory's rule");
         assert_eq!(said("*.db pace=30s", "app/state.db", false, None).pace, Some(Duration::from_secs(30)));
@@ -195,14 +201,15 @@ mod tests {
         assert_eq!(said(text, ".git", true, Some("git")).detach, Some(false));
         assert_eq!(said(text, ".git", true, Some("bash")).detach, Some(true));
         assert_eq!(said(text, ".git", true, None).detach, Some(true));
-        assert_eq!(said("x pace=1h\nx detach", "x", true, None), Settings { detach: Some(true), pace: Some(Duration::from_hours(1)) }, "settings say over only what they say");
+        assert_eq!(said("x pace=1h\nx detach", "x", true, None), Settings { detach: Some(true), pace: Some(Duration::from_hours(1)), copies: None }, "settings say over only what they say");
+        assert_eq!(said("__pycache__/ copies=1", "src/__pycache__", true, None).copies, Some(1));
     }
 
     #[test]
     fn what_isnt_a_rule_is_said_by_line() {
-        let (rules, errors) = Rules::parse("ok detach\n\n  # nothing\nbad sideways\nslow pace=soon\n/ detach\nfine pace=0\n");
+        let (rules, errors) = Rules::parse("ok detach\n\n  # nothing\nbad sideways\nslow pace=soon\n/ detach\nfine pace=0\ncache copies=0\nmany copies=lots\n");
         assert_eq!(rules.0.len(), 2);
-        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert_eq!(errors.len(), 5, "{errors:?}");
         assert!(errors.first().is_some_and(|e| e.starts_with("line 4:")), "{errors:?}");
     }
 }

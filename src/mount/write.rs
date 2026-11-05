@@ -689,13 +689,15 @@ impl Soup {
     /// where the rules say to detach it, a new anchor, mounted there.
     pub fn mkdir_by(&self, parent: u64, name: &OsStr, app: Option<&str>) -> Result<FileAttr, Errno> {
         if self.inode(parent)? == Inode::Root {
-            return self.anchor_at(parent, name);
+            return self.anchor_at(parent, name, None);
         }
         let (anchor, rel) = self.overlay_of(parent)?;
         let catalog = self.catalog()?;
-        if self.settings_for(&catalog, parent, name.as_bytes(), true, app)?.detach == Some(true) {
+        let settings = self.settings_for(&catalog, parent, name.as_bytes(), true, app)?;
+        // How many copies is said of an anchor's keep, so takes one
+        if settings.detach == Some(true) || (settings.copies.is_some() && settings.detach.is_none()) {
             drop(catalog);
-            return self.anchor_at(parent, name);
+            return self.anchor_at(parent, name, settings.copies);
         }
         self.prepare(&catalog, &anchor)?;
         fs::create_dir_all(self.work_path(&anchor, &rel.join(name)).ok_or(Errno::EROFS)?).map_err(|e| io_errno(&e))?;
@@ -704,8 +706,9 @@ impl Soup {
         self.resolve(parent, name)
     }
 
-    /// A new anchor, an empty directory, mounted at a name in a directory.
-    fn anchor_at(&self, parent: u64, name: &OsStr) -> Result<FileAttr, Errno> {
+    /// A new anchor, an empty directory, mounted at a name in a directory:
+    /// kept, asking for `copies` failures to lose what's in it, if it says.
+    fn anchor_at(&self, parent: u64, name: &OsStr, copies: Option<usize>) -> Result<FileAttr, Errno> {
         use crate::cid::CidVersion;
         let (at, rel) = self.overlay_of(parent)?;
         if parent == super::ROOT && super::TOP.iter().any(|(top, _)| OsStr::new(top) == name) {
@@ -722,6 +725,9 @@ impl Soup {
         catalog.put_block(&empty, CidVersion::V1).map_err(store_errno)?;
         let anchor = catalog.new_anchor().map_err(store_errno)?;
         catalog.set_anchor(&anchor, &empty.cid().clone().into()).map_err(store_errno)?;
+        if let Some(copies) = copies {
+            catalog.keep_copies(&anchor, copies).map_err(store_errno)?;
+        }
         drop(catalog);
         self.symlink(parent, name, &Path::new("/anchors").join(anchor.to_string()))?;
         // The link, mounting the anchor

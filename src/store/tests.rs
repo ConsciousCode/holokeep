@@ -1856,6 +1856,41 @@ fn what_the_root_names_is_kept_through_mount_points() {
 }
 
 #[test]
+fn the_nearest_keep_says_how_many_copies_and_the_most_of_any_path() {
+    use crate::model::Ipld;
+    let scratch = Scratch::new("copies");
+    let repo = Catalog::open_repo(scratch.path()).expect("open");
+    let doc = |links: Vec<Link>| ipld_block(DAG_CBOR_CODEC, &Ipld::List(links.into_iter().map(Ipld::Link).collect()));
+    let leaf = raw(b"leaf");
+    let sub = doc(vec![link(&leaf)]);
+    let top = doc(vec![link(&sub)]);
+    for block in [&leaf, &sub, &top] {
+        repo.put_block(block, CidVersion::V1).expect("put");
+    }
+    let wanted = |block: &Block| repo.copies_wanted(block.cid().multihash(), 2).expect("copies");
+    assert_eq!(wanted(&leaf), None, "nothing keeps it");
+
+    // Kept through an anchor: what the mesh runs with
+    let anchor = repo.new_anchor().expect("anchor");
+    repo.set_anchor(&anchor, &link(&top)).expect("set");
+    repo.keep(&anchor).expect("keep");
+    assert_eq!(wanted(&leaf), Some(2));
+
+    // A nearer keep says otherwise for what's under it
+    repo.keep_copies(&link(&sub), 1).expect("keep");
+    assert_eq!(wanted(&leaf), Some(1));
+    assert_eq!(wanted(&sub), Some(1));
+    assert_eq!(wanted(&top), Some(2), "not above it");
+
+    // What's under two keeps is as safe as the more careful
+    let precious = doc(vec![link(&leaf), link(&leaf)]);
+    repo.put_block(&precious, CidVersion::V1).expect("put");
+    repo.keep_copies(&link(&precious), 3).expect("keep");
+    assert_eq!(wanted(&leaf), Some(3));
+    assert_eq!(wanted(&sub), Some(1));
+}
+
+#[test]
 fn claims_count_only_when_an_authorized_key_signs_them() {
     let root = crate::keys::Key::generate().expect("key");
     let (router, _) = signed_router(&root);
@@ -2210,6 +2245,9 @@ fn repos_earlier_builds_made_still_open() {
         assert_eq!(repo.root_anchor().expect("root").as_ref(), Some(&expect["root"]), "{name}: the same root, from the same key");
         assert_eq!(repo.anchor_value(&expect["root"]).expect("value").as_ref(), Some(&expect["top"]), "{name}");
         assert!(!repo.backrefs(expect["anchor"].multihash()).expect("backrefs").is_empty(), "{name}: the root's mount point links to the anchor it mounts");
+        if let Some(copied) = expect.get("copied") {
+            assert_eq!(repo.copies_wanted(copied.multihash(), 2).expect("copies"), Some(1), "{name}: as its nearest keep says");
+        }
 
         // And it takes more as ever
         let added = AnyCid::V1(Importer::default().add_path(&fixture.join("expect.txt"), &mut repo, &mut |_, _| {}).expect("add").expect("root").cid);

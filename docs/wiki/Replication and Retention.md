@@ -22,8 +22,16 @@ one disk, or in one house, count as one.
 ## Durability
 
 Each node audits what it holds and advertises (see [[Mesh#Protocols|protocols]]) the blocks whose tolerance
-is below the target (`hk node run --copies`, default 2), with the
-replicas it knows of. Every member answers with what it holds of those
+is below their target, with the replicas it knows of.
+
+A block's **target** is what its keeps say. Walking up from it, by links
+and from anchors' values to the anchors, each path stops at the first
+block or anchor a [[Claims|keep]] targets; that keep's `copies`, or else the
+mesh's (`hk node run --copies`, default 2), is the path's target, and
+the block's is the most of any path. So a nearer keep says over a
+farther one for what's under it (`hk keep add --copies 1` on what's
+made again easily), and a block shared with something more precious is
+as safe as that. What no keep reaches has the mesh's. Every member answers with what it holds of those
 (correcting the advertiser's belief, both ways) and an offer: its
 volume's risks and free space.
 
@@ -56,7 +64,7 @@ back. Intervals are jittered by a fifth.
 ## Trimming surplus
 
 When free space falls below `--low-water` (2G), a node lets go of copies
-the mesh can spare until it's above `--high-water` (4G). Only leaves in
+the mesh can spare, by each block's target until it's above `--high-water` (4G). Only leaves in
 its own stores go, never structure, never ranges of files imported in
 place. Before letting go it asks every member what it holds *now*
 (`trim`). A member about to let go of the same block refuses unless the

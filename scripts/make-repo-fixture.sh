@@ -23,6 +23,8 @@ tree=$(h add -q "$tmp/tree")
 hello=$(h add -q -n "$tmp/tree/hello.txt")
 big=$(h add -q -n "$tmp/tree/sub/big.txt")
 h tag add fixture "$hello" >/dev/null
+# Wanted once, by a keep nearer it than the tree's
+h keep add --copies 1 "$big" >/dev/null
 anchor=$(h anchor new)
 h anchor set "$anchor" "$tree" >/dev/null
 # The root names the anchor, as hk mount would
@@ -42,6 +44,7 @@ big $big
 anchor $anchor
 root $root
 top $top
+copied $big
 EXPECT
 echo "made $out"
 du -sh "$out"

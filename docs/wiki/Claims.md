@@ -14,7 +14,7 @@ is not a claim; it's stored as ordinary data.
 | Type | Fields (besides `claim`, `target`) | Meaning |
 |---|---|---|
 | `group` | `into: Link` | The targets belong to `into`. With a raw identity CID for `into`, a simple tag named by its bytes. |
-| `keep` | `beyond: [Link]` (omitted if empty), `n: int` (omitted if 0) | Keep the targets and what they link to, stopping at `beyond`. `n` is which time they're kept, since a tomb is forever. |
+| `keep` | `beyond: [Link]` (omitted if empty), `n: int` (omitted if 0), `copies: int` (omitted for the mesh's own) | Keep the targets and what they link to, stopping at `beyond`. `n` is which time they're kept, since a tomb is forever. `copies`, at least 1, is how many failures it should take to lose what this is the nearest keep of (see [[Replication and Retention#Durability]]). |
 | `set` | `value: Link`, `at: int` | The targets (anchors) are `value` as of `at`, seconds since the epoch. |
 | `tomb` | none | Retract the target claims. |
 | `sign` | `by: Link`, `at: int`, `prev: Link` (omitted for the first), `sig: bytes` | `by` vouches for the target claims. See [[Keys and Users]]. |
@@ -26,7 +26,11 @@ Examples, in dag-json for readability:
 {"claim": "group", "into": {"/": "bafkqablnovzwsyy"}, "target": [{"/": "bafkrei…"}]}   (tagged "music")
 {"claim": "set", "at": 1793750400, "target": [{"/": "bafyqag…"}], "value": {"/": "bafybei…"}}
 {"claim": "keep", "target": [{"/": "bafybei…"}]}
+{"claim": "keep", "copies": 1, "target": [{"/": "bafyqag…"}]}   (made again easily: one copy)
 ```
+
+A node of an older build doesn't know `copies`, so it takes such a keep
+for ordinary data, not a keep.
 
 Not yet implemented, but planned: `same` (targets are the same bytes
 under different hashes), `attr` (attributes, with `prev` history),

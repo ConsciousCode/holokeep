@@ -32,6 +32,7 @@ One rule to a line: a pattern, then settings, separated by whitespace.
 cache/         detach app=obsidian
 notes/.git/    inline
 *.db           pace=5m
+__pycache__/   copies=1
 ```
 
 - A pattern with no slash but at its end matches a **name**, anywhere
@@ -47,6 +48,7 @@ notes/.git/    inline
 |---|---|
 | `detach` | A directory made by this name is a new anchor, an empty directory, mounted where it's made. |
 | `inline` | A directory made by this name is an ordinary directory of the anchor it's in. |
+| `copies=<n>` | A directory made by this name is an anchor of its own (unless the rules say `inline`), kept by a keep asking for `n` failures to lose what's in it, at least 1 (see [[Replication and Retention#Durability]]). |
 | `pace=<time>` | An anchor mounted by this name is committed at most this often, as well as by its own pace (see [[Mount#Committing]]). Times are `30s`, `5m`, `1h` or `0`. |
 | `app=<name>` | The rule applies only to what the application by this name makes: the process making the request, by `/proc/<pid>/comm`. |
 
@@ -69,10 +71,11 @@ notes/.git/    inline
 - `pace` applies whenever the mount point is looked up, so it follows
   edits to the rules. An anchor reached only through `anchors/` has no
   floor.
+- `copies` applies when the directory is made, as its anchor's keep;
+  changing the rule later doesn't change keeps already made.
 
-Not yet implemented: detaching files, so far only directories; and a
-setting for a thing's **value**, how many copies the mesh keeps of it
-(fewer for what can be made again, as `__pycache__/`), which needs keeps
-that say so.
+Not yet implemented: detaching files, so far only directories; and
+`copies=0`, a cache the mesh may drop entirely under pressure, which
+needs whole anchors dropped at once so nothing's left half there.
 
 Source: `src/mount/rules.rs`, `src/mount.rs` (`settings_for`, `rules_at`), `src/mount/write.rs` (`mkdir_by`, `anchor_at`).

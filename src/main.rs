@@ -295,6 +295,11 @@ enum KeepCommand {
         /// keep's frontier, for DAGs too large to hold
         #[arg(long)]
         shallow: bool,
+        /// How many failures it should take to lose what this is the
+        /// nearest keep of, rather than the copies the mesh runs with: 1
+        /// for what's easily made again, more for what matters most
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        copies: Option<u64>,
     },
     /// Stop keeping blocks, printing the tombs which retract their keeps
     Rm {
@@ -613,7 +618,13 @@ fn tag_words(command: TagCommand) -> Vec<String> {
 fn keep_words(command: KeepCommand) -> Vec<String> {
     let cids = |cids: Vec<Link>| cids.into_iter().map(|cid| cid.to_string());
     match command {
-        KeepCommand::Add { cids: list, shallow } => ["keep", "add"].into_iter().chain(shallow.then_some("--shallow")).map(str::to_owned).chain(cids(list)).collect(),
+        KeepCommand::Add { cids: list, shallow, copies } => ["keep", "add"]
+            .into_iter()
+            .chain(shallow.then_some("--shallow"))
+            .map(str::to_owned)
+            .chain(copies.map(|copies| format!("--copies={copies}")))
+            .chain(cids(list))
+            .collect(),
         KeepCommand::Rm { cids: list } => ["keep".to_owned(), "rm".to_owned()].into_iter().chain(cids(list)).collect(),
         KeepCommand::Ls => vec!["keep".to_owned(), "ls".to_owned()],
     }
@@ -1379,11 +1390,11 @@ fn anchor(dir: Option<&PathBuf>, mut repo: Catalog, command: AnchorCommand) -> a
 fn keep(dir: Option<&PathBuf>, mut repo: Catalog, command: KeepCommand) -> anyhow::Result<()> {
     let mut out = io::BufWriter::new(io::stdout().lock());
     match command {
-        KeepCommand::Add { cids, shallow } => {
+        KeepCommand::Add { cids, shallow, copies } => {
             let frontiers = hold_all(dir, &repo, &cids, shallow)?;
             repo.batch(|repo| {
                 for (cid, beyond) in cids.iter().zip(&frontiers) {
-                    writeln!(out, "{}", repo.keep_short_of(cid, beyond)?)?;
+                    writeln!(out, "{}", repo.keep_as(cid, beyond, copies)?)?;
                 }
                 anyhow::Ok(())
             })?;

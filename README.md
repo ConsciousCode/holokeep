@@ -366,7 +366,8 @@ Checklist:
   - [x] Every committed version kept whole: a work file's blocks moved out before it's changed, so history costs only what changed
   - [x] Keeping what the root names: the root anchor kept, and mount points links to what they mount, for keeps and collection alike
   - [x] Rules (`.souprules`, gitignore-like, per directory and at the top of the root): detaching application state (`.obsidian/`, `.git/`) into anchors of its own as it's made, a least pace, by name, path or application
-  - [ ] Rules for value: fewer copies of what can be made again (`__pycache__/`), by keeps that say how many
+  - [x] Rules for value: how many copies, by keeps that say (`hk keep add --copies`, `copies=` in rules), the nearest keep on each path deciding and the most of any path winning, for audits and trims alike
+  - [ ] `copies=0`: caches the mesh may drop whole under pressure
   - [ ] Detaching files, not only directories
   - [ ] Importing `.git` as `git-raw` blocks, packs split into objects
   - [ ] Live anchors, which are whatever their backing is now, and anchors served by a peer, as 9P mounts

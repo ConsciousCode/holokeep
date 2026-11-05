@@ -2086,11 +2086,25 @@ impl Catalog {
         self.keep_short_of(target, &[])
     }
 
+    /// Keep a block and what it links to, asking for `copies` failures to
+    /// lose what this is the nearest keep of, rather than what the mesh
+    /// runs with. Returns the keep's CID.
+    pub fn keep_copies(&self, target: &Link, copies: usize) -> Result<Link> {
+        self.keep_as(target, &[], Some(u64::try_from(copies).unwrap_or(u64::MAX)))
+    }
+
     /// Keep a block and what it links to, short of a frontier: links the
     /// keep's reach stops at. Returns the keep's CID.
     pub fn keep_short_of(&self, target: &Link, beyond: &[Link]) -> Result<Link> {
+        self.keep_as(target, beyond, None)
+    }
+
+    /// Keep a block and what it links to, short of a frontier, asking for
+    /// `copies` failures to lose what this is the nearest keep of, if it
+    /// says. Returns the keep's CID.
+    pub fn keep_as(&self, target: &Link, beyond: &[Link], copies: Option<u64>) -> Result<Link> {
         let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
-        let keep = crate::claim::Keep::bounded([target.clone()], beyond.iter().cloned()).ok_or(Error::NoClaims)?;
+        let keep = crate::claim::Keep::bounded([target.clone()], beyond.iter().cloned()).ok_or(Error::NoClaims)?.with_copies(copies);
         // A tomb is forever, so keeping again once a keep's been tombed takes
         // the next time that hasn't been
         let mut n = 0u64;
@@ -2116,6 +2130,35 @@ impl Catalog {
     /// block: whether its mesh keeps it, as far as this node can say.
     pub fn kept_for_acting(&self, key: Key<'_>) -> Result<bool> {
         self.kept_under_by(key, claims::LIVE, "anchor_values")
+    }
+
+    /// How many failures it should take to lose a block, for the acting
+    /// account's user: along each path up from it, by links and from
+    /// anchors' values, the nearest keep says, as its `copies` or else
+    /// `default`; of every path, the most. None if no keep reaches it.
+    pub fn copies_wanted(&self, key: Key<'_>, default: usize) -> Result<Option<usize>> {
+        if self.claims.is_none() {
+            return Ok(Some(default));
+        }
+        let live = claims::LIVE;
+        let kept = format!(
+            "EXISTS (SELECT 1 FROM claim_targets t JOIN claims c ON c.id = t.claim WHERE t.target = up.id AND c.kind = 'keep' AND {live})"
+        );
+        let most: Option<i64> = self.db.conn()
+            .prepare_cached(&format!(
+                "WITH RECURSIVE up (id) AS (
+                     SELECT id FROM multihashes WHERE multihash = ?1
+                     UNION SELECT l.source FROM links l JOIN up ON l.target = up.id WHERE NOT {kept}
+                     UNION SELECT a.anchor FROM anchor_values a JOIN up ON a.value = up.id WHERE NOT {kept}
+                 )
+                 SELECT max(coalesce(k.copies, ?2)) FROM up
+                 JOIN claim_targets t ON t.target = up.id
+                 JOIN claims c ON c.id = t.claim
+                 LEFT JOIN keep_copies k ON k.claim = c.id
+                 WHERE c.kind = 'keep' AND {live}"
+            ))?
+            .query_row(params![key.to_bytes(), i64::try_from(default).unwrap_or(i64::MAX)], |row| row.get(0))?;
+        Ok(most.map(|most| usize::try_from(most).unwrap_or(default)))
     }
 
     fn kept_under_by(&self, key: Key<'_>, live: &str, anchors: &str) -> Result<bool> {

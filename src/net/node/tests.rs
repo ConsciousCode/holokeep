@@ -924,3 +924,18 @@ async fn what_a_document_links_to_by_anchor_goes_after_it() {
     assert!(!has(&a, &doc));
     assert!(!has(&a, &linked), "in the same cascade");
 }
+
+#[tokio::test]
+async fn what_a_keep_asks_one_copy_of_isnt_copied() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    let [root, branch, leaf, deep] = &blocks[..] else {
+        panic!("{blocks:?}");
+    };
+    a.catalog().keep(&link(root)).expect("keep");
+    // What's made again easily: the branch and what's under it
+    a.catalog().keep_copies(&link(branch), 1).expect("keep");
+    let id = a.audit(2).expect("audit");
+    assert_eq!(audited(&mut [&mut a, &mut b], &[(0, id)]).await, [report(2, 2, 0)]);
+    assert!(has(&b, root) && has(&b, leaf), "kept as the mesh runs");
+    assert!(!has(&b, branch) && !has(&b, deep), "one copy, here");
+}
