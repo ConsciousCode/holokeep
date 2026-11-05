@@ -371,7 +371,8 @@ Checklist:
   - [x] Rules for value: how many copies, by keeps that say (`hk keep add --copies`, `copies=` in rules), the nearest keep on each path deciding and the most of any path winning, for audits and trims alike
   - [ ] `copies=0`: caches the mesh may drop whole under pressure
   - [ ] Detaching files, not only directories
-  - [ ] Importing `.git` as `git-raw` blocks, packs split into objects
+  - [x] Git objects as `git-raw` blocks, named by git's SHA-1, linking as go-ipld-git reads them; importing a repository's loose objects and packs, deltas applied, keeping what its refs name (`hk git import`)
+  - [ ] `.git` through the mount as `git-raw`, and exporting objects back into a repository
   - [ ] Live anchors, which are whatever their backing is now, and anchors served by a peer, as 9P mounts
 - [ ] P2P private mesh
   - [x] Joining: swarm key, members, tickets, mDNS, identify (`hk node id/invite/join/run/peers`)
@@ -504,6 +505,7 @@ cargo test                          # unit tests, codec fixtures, quick fuzzing
 PROPTEST_CASES=1000000 cargo test --release differential   # long fuzzing
 scripts/kubo-compare.sh             # every CID vs Kubo, then store and get back; needs `ipfs`
 LARGE=1 scripts/kubo-compare.sh     # adds >1 GiB files
+scripts/git-compare.sh              # git objects vs git and Kubo, loose and packed; needs `ipfs`, `gpg`
 tests/mesh/run.sh                   # a mesh of real nodes, daemons and mounts, in containers
 ```
 

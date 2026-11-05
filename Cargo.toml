@@ -53,6 +53,7 @@ rpassword = "7"
 zeroize = "1"
 fuser = { version = "0.18", default-features = false, optional = true }
 libc = { version = "0.2.191", optional = true }
+flate2 = "1.1.10"
 
 [lints]
 [lints.clippy]

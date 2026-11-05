@@ -23,6 +23,7 @@ the holokeep repository; this wiki is the reference.
 - [[Protected Meshes]]: vaults, encryption, recovery.
 - [[Mount]]: the FUSE filesystem and writing through it.
 - [[Rules]]: `.souprules`, what's made through the mount becomes.
+- [[Git]]: git objects as `git-raw` blocks, and importing repositories.
 - [[Style Guide]]: how these pages are written.
 
 ## Vocabulary
@@ -50,6 +51,7 @@ the holokeep repository; this wiki is the reference.
 | tomb | A claim retracting other claims. |
 | mount point | A symlink to an anchor, which the mount shows as the anchor. |
 | rules file | A `.souprules` file, saying what's made below it becomes. |
+| git-raw | The codec of git objects as blocks, named by git's SHA-1. |
 
 ## Invariants
 

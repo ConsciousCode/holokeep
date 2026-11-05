@@ -104,6 +104,9 @@ enum Command {
     /// Work with whole DAGs
     #[command(subcommand)]
     Dag(DagCommand),
+    /// Work with git repositories' objects, as `git-raw` blocks
+    #[command(subcommand)]
+    Git(GitCommand),
     /// Work with the repo itself
     #[command(subcommand)]
     Repo(RepoCommand),
@@ -418,6 +421,21 @@ enum DagCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum GitCommand {
+    /// Import every object of a git repository, loose or packed, as a
+    /// `git-raw` block named by its git SHA-1, keeping what its refs name.
+    /// Prints each ref's CID and name
+    Import {
+        /// The repository: a working tree, its `.git`, or a bare one
+        #[arg(default_value = ".", value_name = "REPOSITORY")]
+        git: PathBuf,
+        /// Don't keep what the refs name
+        #[arg(long)]
+        no_keep: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum RepoCommand {
     /// How many blocks each volume holds, in each form
     Stat,
@@ -699,6 +717,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         },
         Command::Refs { cid, back } => refs(&open_repo(args.repo)?, &cid, back),
         Command::Dag(command) => dag(args.repo, command),
+        Command::Git(GitCommand::Import { git, no_keep }) => git_import(args.repo, &git, no_keep),
         Command::Tag(command) => tag_here_or_there(args.repo, command),
         Command::Keep(command) => keep_here_or_there(args.repo, command),
         Command::Whoami => whoami(args.repo),
@@ -1263,6 +1282,39 @@ fn refs(repo: &Catalog, cid: &Link, back: bool) -> anyhow::Result<()> {
 }
 
 /// Import, export or fetch whole DAGs.
+fn git_import(repo: Option<PathBuf>, git: &Path, no_keep: bool) -> anyhow::Result<()> {
+    use std::collections::{BTreeMap, HashSet};
+    let refs = holokeep::git::refs(git)?;
+    open_repo(repo)?.batch(|repo| {
+        let mut imported: HashSet<Vec<u8>> = HashSet::new();
+        let mut linked: BTreeMap<Vec<u8>, Link> = BTreeMap::new();
+        let have = |link: &Link| repo.get_block(link).ok().flatten();
+        let count = holokeep::git::objects(git, &have, &mut |block| {
+            linked.extend(holokeep::git::links(block.data())?.into_iter().map(|link| (link.to_bytes(), link)));
+            repo.put_block(&block, holokeep::cid::CidVersion::V1).map_err(|e| io::Error::other(e.to_string()))?;
+            imported.insert(Link::from(block.cid().clone()).to_bytes());
+            Ok(())
+        })?;
+        // What's linked to but isn't anywhere here, as a submodule's
+        // commits: where the keeps' reach stops
+        let mut beyond = Vec::new();
+        for (bytes, link) in &linked {
+            if !imported.contains(bytes) && repo.get_block(link)?.is_none() {
+                beyond.push(link.clone());
+            }
+        }
+        let mut kept: HashSet<Vec<u8>> = HashSet::new();
+        for (name, link) in &refs {
+            if !no_keep && kept.insert(link.to_bytes()) {
+                repo.keep_short_of(link, &beyond)?;
+            }
+            out!("{link} {name}");
+        }
+        eprintln!("imported {count} objects{}", if beyond.is_empty() { String::new() } else { format!(", {} linked to from elsewhere", beyond.len()) });
+        anyhow::Ok(())
+    })
+}
+
 fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {
     match command {
         #[cfg(feature = "net")]

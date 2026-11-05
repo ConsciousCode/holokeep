@@ -21,6 +21,7 @@ pub mod dag;
 pub mod hamt;
 pub mod import;
 pub mod links;
+pub mod git;
 pub mod export;
 #[cfg(feature = "fuse")]
 pub mod mount;
