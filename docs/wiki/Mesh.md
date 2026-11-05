@@ -30,6 +30,10 @@ one is let in by all.
 2. `hk node invite <id>` on a member prints a ticket.
 3. `hk node join <ticket>` on the new machine.
 
+A daemon running alone when its repo's first invite makes a mesh joins
+that mesh in place, without a restart, and the invite then reads where
+it listens, so the ticket says where to find it.
+
 A **ticket** is dag-cbor, multibase base32-lower encoded:
 
 | Key | Value |
@@ -52,6 +56,14 @@ still watching files imported in place and collecting.
 key, members and daemon (`--mesh <name>`, files in `meshes/<name>/`),
 acting for one account each. A daemon hears of, holds and serves only
 its account's view.
+
+## Connections
+
+Members are dialled on start and once a minute after, and a member is
+dialled again 2 s after its connection drops. Every connection is pinged
+every 10 s, and one whose ping fails is closed, so a peer that slept or
+changed networks isn't left as connected over a dead link: it's
+redialled instead.
 
 ## Protocols
 
