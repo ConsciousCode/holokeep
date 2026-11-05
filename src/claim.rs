@@ -72,17 +72,22 @@ pub struct Keep {
 }
 
 /// "The targets, anchors, are `value` as of `at`", in seconds since the
-/// epoch.
+/// epoch, in place of the sets `prev`.
 ///
-/// An anchor is whatever its latest set says that counts, by `at`
-/// and then CID bytes, so it's mutable while every claim stays put: what
-/// it was is the history.
+/// An anchor is whatever its heads say, the sets that count which no
+/// other set replaces, so it's mutable while every claim stays put: what
+/// it was is the history. A set with `prev` replaces those sets alone, an
+/// empty `prev` none; one without, as older builds made, replaces every
+/// set before it by `at` and then the value's multihash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Set {
     /// Sorted by CID bytes and distinct.
     target: Vec<Link>,
     value: Link,
     at: u64,
+    /// The sets this one replaces, sorted by CID bytes and distinct; none
+    /// for one made by an older build, which replaces every set before it.
+    prev: Option<Vec<Link>>,
 }
 
 /// "`by` vouches for the targets, claims, as of `at`": `sig` is the key's
@@ -186,8 +191,19 @@ impl Set {
     /// A set of the anchors, if there are any.
     pub fn new(target: impl IntoIterator<Item = Link>, value: Link, at: u64) -> Option<Self> {
         let target = set(target);
-        (!target.is_empty()).then_some(Self { target, value, at })
+        (!target.is_empty()).then_some(Self { target, value, at, prev: None })
     }
+
+    /// The same set, replacing the sets `prev`, empty for none, or, if
+    /// none, every set before it, as an older build's.
+    #[must_use]
+    pub fn after(mut self, prev: Option<Vec<Link>>) -> Self {
+        self.prev = prev.map(set);
+        self
+    }
+
+    /// The sets this replaces, if it says.
+    pub fn prev(&self) -> Option<&[Link]> { self.prev.as_deref() }
 
     pub fn target(&self) -> &[Link] { &self.target }
 
@@ -311,10 +327,16 @@ impl Claim {
                 }
                 ("keep", map)
             },
-            Self::Set(set) => ("set", BTreeMap::from([
-                ("value".to_owned(), Ipld::Link(set.value.clone())),
-                ("at".to_owned(), Ipld::Integer(set.at.into())),
-            ])),
+            Self::Set(set) => {
+                let mut map = BTreeMap::from([
+                    ("value".to_owned(), Ipld::Link(set.value.clone())),
+                    ("at".to_owned(), Ipld::Integer(set.at.into())),
+                ]);
+                if let Some(prev) = &set.prev {
+                    map.insert("prev".to_owned(), links(prev));
+                }
+                ("set", map)
+            },
             Self::Tomb(_) => ("tomb", BTreeMap::new()),
             Self::Sign(sign) => return Ipld::Map(sign.fields()),
             Self::Device(_) => ("device", BTreeMap::new()),
@@ -395,7 +417,12 @@ impl Claim {
                 let (Ipld::Link(value), Ipld::Integer(at)) = (map.remove("value")?, map.remove("at")?) else {
                     return None;
                 };
-                Self::Set(Set::new(target.clone(), value, u64::try_from(at).ok()?)?)
+                let prev = match map.remove("prev") {
+                    Some(Ipld::List(prev)) => Some(link_list(prev)?),
+                    Some(_) => return None,
+                    None => None,
+                };
+                Self::Set(Set::new(target.clone(), value, u64::try_from(at).ok()?)?.after(prev))
             },
             "tomb" => Self::Tomb(Tomb::new(target.clone())?),
             "sign" => {
@@ -647,5 +674,23 @@ mod tests {
         assert_eq!(Claim::Keep(Keep::new([cid(b"a")]).expect("keep").with_copies(None)).cid(), first.cid());
         assert_eq!(Claim::Keep(Keep::new([cid(b"a")]).expect("keep").with_copies(Some(0))).cid(), first.cid(), "0 isn't a count yet");
         assert!(two.dissolves(), "small still");
+    }
+
+    #[test]
+    fn a_set_says_which_sets_it_replaces_or_that_its_an_older_builds() {
+        let anchor = anchor().expect("anchor");
+        let old = Set::new([anchor.clone()], cid(b"v"), 1).expect("set");
+        let none = old.clone().after(Some(Vec::new()));
+        let after = old.clone().after(Some(vec![cid(b"b"), cid(b"a"), cid(b"a")]));
+        let cids: Vec<_> = [&old, &none, &after].iter().map(|set| Claim::Set((*set).clone()).cid()).collect();
+        assert!(cids[0] != cids[1] && cids[1] != cids[2] && cids[0] != cids[2], "no prev, an empty one, and some, are three claims");
+        for set in [old, none, after] {
+            let claim = Claim::Set(set.clone());
+            assert_eq!(Claim::parse(claim.block().data()), Some(claim), "round trips");
+        }
+        let set = Set::new([anchor], cid(b"v"), 1).expect("set").after(Some(vec![cid(b"b"), cid(b"a"), cid(b"b")]));
+        let prev = set.prev().expect("prev");
+        assert_eq!(prev.len(), 2, "distinct");
+        assert!(prev.windows(2).all(|pair| pair.first().map(Link::to_bytes) < pair.last().map(Link::to_bytes)), "sorted by CID bytes");
     }
 }

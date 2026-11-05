@@ -118,7 +118,8 @@ A file is never committed halfway through being written: if the anchor
 is written to while it's being imported, nothing is set, and it's
 committed once it's whole again.
 
-Concurrent edits of one anchor from two nodes aren't merged yet: the
-later set wins.
+Concurrent edits of one anchor from two nodes fork it; the mount shows
+the heads merged (see [[Anchors and Names#Forks and merges]]), and its
+next commit names every head, settling the merge.
 
 Source: `src/mount.rs`, `src/mount/write.rs`, `src/store/overlay.rs`, `src/store.rs` (`preserve_in_place`).

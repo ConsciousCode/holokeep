@@ -671,7 +671,7 @@ impl Soup {
 
     /// What an anchor is now, if it's anything.
     fn anchor_root(catalog: &Catalog, anchor: &Link) -> Result<Option<Link>, Errno> {
-        catalog.claims().map(|claims| claims.value_of(anchor.multihash())).transpose().map_err(store_errno).map(Option::flatten)
+        catalog.anchor_value(anchor).map_err(store_errno)
     }
 
     /// What's at a path of an anchor: what's in its work directory, else
@@ -1576,6 +1576,44 @@ mod tests {
         assert_eq!(value(&repo, &made), one, "not a minute since");
         commit(63);
         assert_ne!(value(&repo, &made), one);
+    }
+
+    #[test]
+    fn a_forked_anchor_shows_merged_and_writing_settles_it() {
+        let scratch = Scratch::new("mount-fork");
+        let (soup, anchor, repo) = writable(&scratch);
+        // Two devices' changes, each replacing what it was
+        let mut catalog = Catalog::open_repo(&repo).expect("catalog");
+        let (start, _, at) = catalog.anchor_heads(&anchor).expect("heads").pop().expect("head");
+        let base = catalog.anchor_value(&anchor).expect("value").expect("value");
+        let mut heads = Vec::new();
+        for (name, data, later) in [("one", b"from one".as_slice(), 1), ("two", b"from two".as_slice(), 2)] {
+            let t = scratch.path().join(name);
+            crate::export::get(&catalog, &base, &t).expect("get");
+            std::fs::write(t.join(name), data).expect("write");
+            let importer = Importer { hidden: true, ..Importer::default() };
+            let value = AnyCid::V1(importer.add_path(&t, &mut catalog, &mut |_, _| {}).expect("import").expect("root").cid);
+            let set = crate::claim::Set::new([anchor.clone()], value, at + later).expect("set").after(Some(vec![start.clone()]));
+            heads.push(catalog.put_claim(&crate::claim::Claim::Set(set)).expect("put"));
+        }
+        drop(catalog);
+        assert_eq!(names(&soup, &format!("anchors/{anchor}")), ["a", "big", "dir", "one", "two"], "both devices' files");
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/one")), b"from one");
+
+        // Written to, it's set in place of both
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let (_, fh) = soup.create(dir, OsStr::new("three")).expect("create");
+        soup.write(fh, 0, b"after").expect("write");
+        soup.release(fh);
+        soup.commit();
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let now = catalog.anchor_heads(&anchor).expect("heads");
+        assert_eq!(now.len(), 1, "settled");
+        assert_eq!(names(&soup, &format!("cid/{}", now[0].1)), ["a", "big", "dir", "one", "three", "two"]);
+        let mut prev = heads;
+        prev.sort_by_key(Link::to_bytes);
+        let set = catalog.sets_of(&anchor).expect("sets").pop().expect("set");
+        assert_eq!(set.3.as_deref(), Some(prev.as_slice()), "naming both heads");
     }
 
     #[test]

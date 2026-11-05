@@ -35,6 +35,7 @@ use crate::multihash::Multihash;
 
 mod claims;
 mod ipld;
+mod merge;
 mod offset;
 pub mod overlay;
 mod raw;
@@ -371,7 +372,13 @@ pub struct Catalog {
     unsigned: std::cell::RefCell<Vec<Link>>,
     /// How deep in batches this is.
     batching: usize,
+    /// Forked anchors' merges, by their heads.
+    merges: std::cell::RefCell<std::collections::HashMap<Vec<u8>, Link>>,
 }
+
+/// A set of an anchor in its history: the set, what it says the anchor
+/// is, as of when, and the sets it replaces, if it says.
+pub type SetOf = (Link, Link, u64, Option<Vec<Link>>);
 
 /// Where a block is: an attached volume, by index, and the form it's in.
 type Placement = (usize, String);
@@ -634,6 +641,21 @@ impl Catalog {
     pub fn set_user(&self, root: &Link) -> Result<()> {
         self.claims.as_ref().ok_or(Error::NoClaims)?.set_user(self.uid, root)?;
         self.refresh_acting()
+    }
+
+    /// Make `root` the user of the account this acts for, joining its
+    /// mesh, with what the repo named before beside what the user names: a
+    /// head of the user's root anchor of its own, merged with the rest.
+    pub fn join_user(&self, root: &Link) -> Result<()> {
+        let before = self.root_anchor()?;
+        let named = before.as_ref().map(|anchor| self.anchor_value(anchor)).transpose()?.flatten();
+        self.set_user(root)?;
+        if let (Some(value), Some(anchor)) = (named, self.root_anchor()?)
+            && Some(&anchor) != before.as_ref()
+        {
+            self.set_anchor_beside(&anchor, &value)?;
+        }
+        Ok(())
     }
 
     /// The root anchor of who this acts for, the top of what they've
@@ -951,7 +973,7 @@ impl Catalog {
         if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
             return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
         }
-        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0 };
+        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, merges: std::cell::RefCell::default() };
         for volume in volumes {
             catalog.attach(volume)?;
         }
@@ -2360,18 +2382,57 @@ impl Catalog {
         Ok(crate::claim::anchor()?)
     }
 
-    /// Say an anchor is `value` now, returning the set's CID.
+    /// Say an anchor is `value` now, in place of every head it has,
+    /// which merges a fork: returning the set's CID.
     pub fn set_anchor(&self, anchor: &Link, value: &Link) -> Result<Link> {
+        let heads = self.claims.as_ref().ok_or(Error::NoClaims)?.heads(anchor.multihash())?;
+        self.put_set(anchor, value, heads.into_iter().map(|(set, _, _)| set).collect())
+    }
+
+    /// Say an anchor is `value` too, beside whatever it is, replacing
+    /// nothing: a fork, merged with what it is. What a repo named before
+    /// joining a mesh joins what the mesh names so.
+    pub fn set_anchor_beside(&self, anchor: &Link, value: &Link) -> Result<Link> {
+        self.put_set(anchor, value, Vec::new())
+    }
+
+    fn put_set(&self, anchor: &Link, value: &Link, prev: Vec<Link>) -> Result<Link> {
         // After the latest, so it's what the anchor is even within a second
         let latest = self.anchor_history(anchor)?.last().map_or(0, |&(at, _)| at.saturating_add(1));
         let at = now().max(latest);
-        let claim = Claim::Set(crate::claim::Set::new([anchor.clone()], value.clone(), at).ok_or(Error::NoClaims)?);
-        self.put_claim(&claim)
+        let set = crate::claim::Set::new([anchor.clone()], value.clone(), at).ok_or(Error::NoClaims)?.after(Some(prev));
+        self.put_claim(&Claim::Set(set))
     }
 
-    /// What an anchor is now, if any set says.
+    /// What an anchor is now, if any set says: its head, or its heads,
+    /// merged, where it's forked.
     pub fn anchor_value(&self, anchor: &Link) -> Result<Option<Link>> {
-        self.claims.as_ref().ok_or(Error::NoClaims)?.value_of(anchor.multihash())
+        let heads = self.claims.as_ref().ok_or(Error::NoClaims)?.heads(anchor.multihash())?;
+        match heads.as_slice() {
+            [] => Ok(None),
+            [(_, value, _)] => Ok(Some(value.clone())),
+            _ => {
+                let key: Vec<u8> = heads.iter().flat_map(|(set, _, _)| set.to_bytes()).collect();
+                if let Some(merged) = self.merges.borrow().get(&key) {
+                    return Ok(Some(merged.clone()));
+                }
+                let merged = self.merge_heads(anchor, &heads)?;
+                self.merges.borrow_mut().insert(key, merged.clone());
+                Ok(Some(merged))
+            },
+        }
+    }
+
+    /// Every set of an anchor that counts, as (set, value, at, prev), by
+    /// `at`: its history, as a graph.
+    pub fn sets_of(&self, anchor: &Link) -> Result<Vec<SetOf>> {
+        self.claims.as_ref().ok_or(Error::NoClaims)?.sets(anchor.multihash())
+    }
+
+    /// An anchor's heads, as (set, value, at), by `at`: more than one where
+    /// it's forked.
+    pub fn anchor_heads(&self, anchor: &Link) -> Result<Vec<(Link, Link, u64)>> {
+        self.claims.as_ref().ok_or(Error::NoClaims)?.heads(anchor.multihash())
     }
 
     /// Every set of an anchor that counts, as (at, value), oldest first.

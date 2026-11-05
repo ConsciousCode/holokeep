@@ -826,7 +826,8 @@ fn join_user(dir: &Path, uid: u32, user: &Link, blocks: &[Vec<u8>]) -> anyhow::R
             );
             repo.put_block(&block, CidVersion::V1)?;
         }
-        repo.set_user(user)?;
+        // What this repo named joins what the user names
+        repo.join_user(user)?;
         anyhow::ensure!(repo.claims().is_some_and(|claims| claims.authorized(&me).unwrap_or(false)), "the ticket doesn't certify this node");
         Ok(())
     })?;
@@ -1378,6 +1379,13 @@ fn anchor(dir: Option<&PathBuf>, mut repo: Catalog, command: AnchorCommand) -> a
             match repo.anchor_value(&anchor)? {
                 Some(value) => out!("{value}"),
                 None => out!("unset"),
+            }
+            let heads = repo.anchor_heads(&anchor)?;
+            if heads.len() > 1 {
+                eprintln!("forked: that's {} heads merged, till it's set again:", heads.len());
+                for (set, value, at) in heads {
+                    eprintln!("  {at}\t{value}\tby {set}");
+                }
             }
             for (at, value) in repo.anchor_history(&anchor)? {
                 out!("{at}\t{value}");

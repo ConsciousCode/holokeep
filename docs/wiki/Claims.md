@@ -15,7 +15,7 @@ is not a claim; it's stored as ordinary data.
 |---|---|---|
 | `group` | `into: Link` | The targets belong to `into`. With a raw identity CID for `into`, a simple tag named by its bytes. |
 | `keep` | `beyond: [Link]` (omitted if empty), `n: int` (omitted if 0), `copies: int` (omitted for the mesh's own) | Keep the targets and what they link to, stopping at `beyond`. `n` is which time they're kept, since a tomb is forever. `copies`, at least 1, is how many failures it should take to lose what this is the nearest keep of (see [[Replication and Retention#Durability]]). |
-| `set` | `value: Link`, `at: int` | The targets (anchors) are `value` as of `at`, seconds since the epoch. |
+| `set` | `value: Link`, `at: int`, `prev: [Link]` (omitted by older builds) | The targets (anchors) are `value` as of `at`, seconds since the epoch, in place of the sets `prev` (an empty list for none). See [[Anchors and Names#Forks and merges]]. |
 | `tomb` | none | Retract the target claims. |
 | `sign` | `by: Link`, `at: int`, `prev: Link` (omitted for the first), `sig: bytes` | `by` vouches for the target claims. See [[Keys and Users]]. |
 | `device` | none | The target keys act for whoever signs this: a certificate when a user's root key signs it. |
@@ -60,8 +60,10 @@ contains the whole claim, is 109. Tags dissolve with names up to about
   unions. Retracting one relationship from a batch is a tomb for the
   batch plus single claims for the rest.
 - **Tags union.** Claims with the same `into` combine their targets.
-- **Sets order by `at`, then CID bytes.** An anchor is whatever its
-  latest counting set says. Every set stays, so the history is free.
+- **Sets replace what they name.** An anchor is what its heads say, the
+  counting sets no other replaces, merged if there's more than one (see
+  [[Anchors and Names#Forks and merges]]). Every set stays, so the
+  history is free.
 - **A tomb deletes the dissolved claims it targets at once** and keeps
   them from being put again. A precipitated claim it targets stays a
   block until collected, but stops counting.

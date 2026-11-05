@@ -358,9 +358,11 @@ Checklist:
   - [x] Writable anchors: files written copied to a work directory, renames and removals by marks, the overlay imported once it settles (Kubo-identical CIDs) and the anchor set once per save (`hk mount`, or `--read-only`)
   - [x] Copying what's written to on demand: a file opened to write is filled from what the anchor had a chunk at a time, what's read and written first and the rest in the background; `hk anchor set --lazy` points an anchor at a DAG without fetching it
   - [ ] Moving a file's stored copy to the work directory rather than copying it, when the mesh holds enough other copies
-  - [ ] Merging concurrent edits of an anchor from its history, path by path, keeping conflicting versions side by side
+  - [x] Merging concurrent edits of an anchor: sets name the sets they replace (`prev`), and a fork's heads merge three ways against their common ancestor, name by name, conflicts kept side by side, till the next set settles it
+  - [ ] Conflict claims, so conflicts are found without merging
+  - [ ] Times (mtime) per path, outside the DAG, for tools like make
   - [x] Names for anchors: the account's root anchor at the top, a directory made there a new anchor it names by symlink, late bound and per account (`hk anchor root`)
-  - [ ] Merging a joining repo's root names into the user's
+  - [x] Merging a joining repo's root names into the user's, as a head of its own
   - [x] Mount points: a symlink to an anchor shown as the anchor, a directory of its own wherever it's reached, unless that would loop; directories reached twice are two inodes
   - [x] Committing what's open once it's synced, never a file caught halfway through being written, at a pace that backs off from at once to every 10 min as an anchor's written to often
   - [x] Every committed version kept whole: a work file's blocks moved out before it's changed, so history costs only what changed

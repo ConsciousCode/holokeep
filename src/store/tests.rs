@@ -2256,3 +2256,159 @@ fn repos_earlier_builds_made_still_open() {
     }
     assert!(seen > 0, "no fixtures in {}", fixtures.display());
 }
+
+/// A tree of files, imported, as an anchor might be.
+fn tree(repo: &mut Catalog, scratch: &Scratch, files: &[(&str, &str)]) -> Link {
+    let dir = scratch.path().join(format!("tree-{}", files.iter().map(|(path, data)| format!("{path}={data}")).collect::<Vec<_>>().join(",").replace('/', "_")));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    for (path, data) in files {
+        let path = dir.join(path);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, data).expect("write");
+    }
+    AnyCid::V1(Importer::default().add_path(&dir, repo, &mut |_, _| {}).expect("import").expect("root").cid)
+}
+
+/// What's in a tree, as (path, contents), in order.
+fn files_of(repo: &Catalog, scratch: &Scratch, root: &Link) -> Vec<(String, String)> {
+    let out = scratch.path().join(format!("out-{root}"));
+    crate::export::get(repo, root, &out).expect("get");
+    let mut found = Vec::new();
+    let mut dirs = vec![out.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                found.push((path.strip_prefix(&out).expect("under").display().to_string(), std::fs::read_to_string(&path).expect("read")));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// A set of an anchor made elsewhere, replacing `prev`, as of `at`.
+fn set_after(repo: &Catalog, anchor: &Link, value: &Link, at: u64, prev: Vec<Link>) -> Link {
+    let set = crate::claim::Set::new([anchor.clone()], value.clone(), at).expect("set").after(Some(prev));
+    repo.put_claim(&Claim::Set(set)).expect("put")
+}
+
+#[test]
+fn a_forked_anchor_is_its_heads_merged_till_its_set_again() {
+    let scratch = Scratch::new("fork");
+    let mut repo = Catalog::open_repo(&scratch.path().join("repo")).expect("open");
+    let files = |list: &[(&str, &str)]| list.iter().map(|(path, data)| ((*path).to_owned(), (*data).to_owned())).collect::<Vec<_>>();
+    let anchor = repo.new_anchor().expect("anchor");
+    let base = tree(&mut repo, &scratch, &[("a", "1"), ("b", "1"), ("gone", "1"), ("d/x", "1")]);
+    let start = set_after(&repo, &anchor, &base, 100, Vec::new());
+
+    // Two devices change it without seeing each other
+    let one = tree(&mut repo, &scratch, &[("a", "2"), ("b", "1"), ("c", "new"), ("d/x", "1"), ("d/y", "1")]);
+    let two = tree(&mut repo, &scratch, &[("a", "1"), ("b", "2"), ("gone", "changed"), ("d/x", "1"), ("d/z", "1")]);
+    let first = set_after(&repo, &anchor, &one, 101, vec![start.clone()]);
+    let second = set_after(&repo, &anchor, &two, 102, vec![start]);
+    assert_eq!(repo.anchor_heads(&anchor).expect("heads").len(), 2, "forked");
+    let merged = repo.anchor_value(&anchor).expect("value").expect("merged");
+    assert_eq!(files_of(&repo, &scratch, &merged), files(&[
+        ("a", "2"), ("b", "2"), ("c", "new"), ("d/x", "1"), ("d/y", "1"), ("d/z", "1"),
+        ("gone", "changed"), // one removed it: a change wins over a removal
+    ]), "each side's changes, directories merged within");
+
+    // Changed both ways: the latest by its name, the other beside it,
+    // tagged by its set
+    let three = tree(&mut repo, &scratch, &[("a", "3"), ("b", "3"), ("gone", "1"), ("d/x", "1")]);
+    set_after(&repo, &anchor, &three, 103, vec![first]);
+    let merged = repo.anchor_value(&anchor).expect("value").expect("merged");
+    let second = second.to_string();
+    let tag = second.get(second.len() - 6..).expect("tag");
+    assert_eq!(files_of(&repo, &scratch, &merged), files(&[
+        ("a", "3"), // unchanged on the other side: no conflict
+        ("b", "3"),
+        (&format!("b (conflict {tag})"), "2"),
+        ("d/x", "1"), ("d/z", "1"), ("gone", "changed"),
+    ]));
+
+    // Set again, by anyone, it's whatever that says
+    repo.set_anchor(&anchor, &merged).expect("set");
+    assert_eq!(repo.anchor_heads(&anchor).expect("heads").len(), 1, "merged");
+    assert_eq!(repo.anchor_value(&anchor).expect("value"), Some(merged));
+}
+
+#[test]
+fn heads_beside_each_other_and_older_builds_sets() {
+    let scratch = Scratch::new("heads");
+    let mut repo = Catalog::open_repo(&scratch.path().join("repo")).expect("open");
+    let old = |repo: &Catalog, anchor: &Link, value: &Link, at: u64| {
+        repo.put_claim(&Claim::Set(crate::claim::Set::new([anchor.clone()], value.clone(), at).expect("set"))).expect("put")
+    };
+
+    // An older build's sets are a line, by `at`
+    let anchor = repo.new_anchor().expect("anchor");
+    let (earlier, later) = (tree(&mut repo, &scratch, &[("x", "1")]), tree(&mut repo, &scratch, &[("y", "1")]));
+    old(&repo, &anchor, &later, 200);
+    old(&repo, &anchor, &earlier, 100);
+    assert_eq!(repo.anchor_heads(&anchor).expect("heads").len(), 1);
+    assert_eq!(repo.anchor_value(&anchor).expect("value"), Some(later));
+    // ...which a set after it replaces, as it names the head
+    repo.set_anchor(&anchor, &earlier).expect("set");
+    assert_eq!(repo.anchor_value(&anchor).expect("value"), Some(earlier.clone()));
+
+    // What a joining repo named, beside what the mesh names: no common
+    // ancestor, so every name is a change, and the same name both ways a
+    // conflict
+    let root = repo.new_anchor().expect("anchor");
+    let mesh = tree(&mut repo, &scratch, &[("wiki", "theirs"), ("photos", "1")]);
+    let mine = tree(&mut repo, &scratch, &[("wiki", "mine"), ("notes", "1")]);
+    repo.set_anchor(&root, &mesh).expect("set");
+    let beside = repo.set_anchor_beside(&root, &mine).expect("set");
+    assert_eq!(repo.anchor_heads(&root).expect("heads").len(), 2);
+    let merged = repo.anchor_value(&root).expect("value").expect("merged");
+    let got = files_of(&repo, &scratch, &merged);
+    let (latest, other) = if repo.anchor_heads(&root).expect("heads").last().map(|(set, _, _)| set) == Some(&beside) { ("mine", "theirs") } else { ("theirs", "mine") };
+    assert_eq!(got.len(), 4, "{got:?}");
+    assert!(got.contains(&("notes".to_owned(), "1".to_owned())) && got.contains(&("photos".to_owned(), "1".to_owned())));
+    assert!(got.contains(&("wiki".to_owned(), latest.to_owned())), "{got:?}");
+    assert!(got.iter().any(|(path, data)| path.starts_with("wiki (conflict ") && data == other), "{got:?}");
+
+    // An older build's set after a fork replaces it all, as it would have
+    old(&repo, &root, &earlier, u64::MAX >> 2);
+    assert_eq!(repo.anchor_value(&root).expect("value"), Some(earlier));
+
+    // A file anchor forked: the latest change
+    let file = repo.new_anchor().expect("anchor");
+    let (first, second, third) = (raw(b"a"), raw(b"b"), raw(b"c"));
+    for block in [&first, &second, &third] {
+        repo.put_block(block, CidVersion::V1).expect("put");
+    }
+    let start = set_after(&repo, &file, &link(&first), 300, Vec::new());
+    set_after(&repo, &file, &link(&third), 302, vec![start.clone()]);
+    set_after(&repo, &file, &link(&second), 301, vec![start]);
+    assert_eq!(repo.anchor_value(&file).expect("value"), Some(link(&third)));
+}
+
+#[test]
+fn what_a_joining_repo_named_joins_what_its_user_names() {
+    let scratch = Scratch::new("join-root");
+    let mut repo = Catalog::open_repo(&scratch.path().join("repo")).expect("open");
+    let device = repo.signer().expect("signer").id();
+    let mine = tree(&mut repo, &scratch, &[("wiki", "mine")]);
+    let theirs = tree(&mut repo, &scratch, &[("photos", "theirs")]);
+    let before = repo.root_anchor().expect("root").expect("root");
+    repo.set_anchor(&before, &mine).expect("set");
+
+    // The user's root names photos already, as its other devices said
+    let user = crate::keys::Key::generate().expect("key");
+    let root = crate::claim::root_anchor(&user.id()).expect("root");
+    repo.join_user(&user.id()).expect("join");
+    repo.certify(&user, &device).expect("certify");
+    repo.set_anchor_beside(&root, &theirs).expect("set");
+    assert_eq!(repo.root_anchor().expect("root"), Some(root.clone()));
+    let merged = repo.anchor_value(&root).expect("value").expect("merged");
+    assert_eq!(
+        files_of(&repo, &scratch, &merged),
+        [("photos".to_owned(), "theirs".to_owned()), ("wiki".to_owned(), "mine".to_owned())],
+        "both, neither replacing the other"
+    );
+}

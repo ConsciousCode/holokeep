@@ -8,10 +8,10 @@ permanode or a git ref. It's a dag-cbor identity CID of
 ```
 
 so it's named without being stored anywhere, and anyone can tell it's
-an anchor from the CID alone. Its value is whatever its latest counting
-`set` claim says (by `at`, then CID bytes); every earlier set is its
-history. `hk anchor new`, `hk anchor set <anchor> <cid>`,
-`hk anchor show <anchor>`.
+an anchor from the CID alone. Its value is what its **heads** say (see
+[[#Forks and merges]]): usually one, the latest counting `set` claim;
+every earlier set is its history. `hk anchor new`,
+`hk anchor set <anchor> <cid>`, `hk anchor show <anchor>`.
 
 A `keep` of an anchor keeps its current value; what a set replaces is
 collected after the grace period unless something else keeps it.
@@ -91,9 +91,45 @@ as given.
 
 Making a mesh (`found_user`) sets the new user's root anchor to whatever
 the repo's device root was, so nothing named is lost. A repo *joining* a
-mesh doesn't, since it may not have the mesh's root yet, and setting it
-would overwrite the other devices' names. What it named before stays
-reachable at its old root anchor under `anchors/`. Merging the two is
-future work, alongside merging concurrent edits.
+mesh (`join_user`) sets the user's root anchor to what it named before
+**beside** what it is, with an empty `prev`: a head of its own, which
+the other devices' heads merge with, name by name, neither replacing the
+other. What it named stays reachable at its old root anchor under
+`anchors/` too.
 
-Source: `src/claim.rs` (`anchor`, `root_anchor`), `src/store.rs` (`root_anchor`, `found_user`), `src/mount.rs`.
+## Forks and merges
+
+A `set` names the sets it replaces as its `prev` (see [[Claims]]); an
+empty `prev` replaces none, and a set without one, as older builds
+made, replaces every set before it by `at` and then the value's
+multihash. An anchor's **heads** are its counting sets no other counting
+set replaces. Every set made here names every head it knows as `prev`.
+
+Two devices setting an anchor without seeing each other's set **fork**
+it: two heads. Every node computes the same **merge** of the heads from
+the same claims, so nothing has to agree on it, and that's what the
+anchor is, in the mount and to `hk get`, till it's set again: the next
+set, by anyone, names every head, and so says what it is. `hk anchor
+show` lists the heads of a forked anchor.
+
+Directories merge three ways, name by name, against the value of the
+heads' latest common ancestor (by `prev`, an older build's set coming
+after every set before it):
+
+- what changed on one side only is taken, whether changed, added or
+  removed;
+- what changed the same on every side that changed it is no conflict;
+- a directory changed on more than one side is merged in turn;
+- anything else changed differently is a **conflict**: the latest
+  head's version keeps the name, and each other's is kept beside it as
+  `name (conflict <tag>)`, before the extension (`page (conflict
+  ab3c2d).md`), the tag being the last six characters of its set's CID;
+- a change wins over a removal.
+
+Without a common ancestor, or once its value's been collected, every
+name a head has is a change. Anything that isn't every head a directory
+is the latest head's value. Merged directories are built as the
+importer builds them; each head's value stays referenced while it's a
+head.
+
+Source: `src/claim.rs` (`anchor`, `root_anchor`, `Set`), `src/store.rs` (`root_anchor`, `found_user`, `join_user`, `anchor_value`), `src/store/merge.rs`, `src/store/claims.rs` (`anchor_values`), `src/mount.rs`.

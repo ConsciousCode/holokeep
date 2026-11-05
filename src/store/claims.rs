@@ -164,22 +164,29 @@ fn views() -> String {
     )
 }
 
-/// A view of what each anchor is now: its latest set that counts, by
-/// `at` and then the value's multihash.
+/// A view of what each anchor is now: its heads, the sets that count which
+/// no other that counts replaces, by naming it in its `prev` or, for an
+/// older build's set, saying none, by coming after it, by `at` and then the
+/// value's multihash. More than one row for an anchor is a fork.
 fn anchor_values(name: &str, live: &str) -> String {
     let live2 = live.replace("c.id", "c2.id");
     format!(
-        "CREATE VIEW {name} (anchor, value, prefix, claim) AS
-             SELECT t.target, s.value, s.value_prefix, c.id FROM set_claims s
+        "CREATE VIEW {name} (anchor, value, prefix, claim, at) AS
+             SELECT t.target, s.value, s.value_prefix, c.id, s.at FROM set_claims s
              JOIN claims c ON c.id = s.id
              JOIN claim_targets t ON t.claim = c.id
              JOIN multihashes v ON v.id = s.value
              WHERE {live} AND NOT EXISTS (
+                 SELECT 1 FROM set_prev p
+                 JOIN claims c2 ON c2.id = p.claim
+                 JOIN claim_targets t2 ON t2.claim = c2.id
+                 WHERE p.prev = (SELECT key FROM claim_keys WHERE claim = c.id) AND t2.target = t.target AND {live2}
+             ) AND NOT EXISTS (
                  SELECT 1 FROM set_claims s2
                  JOIN claims c2 ON c2.id = s2.id
                  JOIN claim_targets t2 ON t2.claim = c2.id
                  JOIN multihashes v2 ON v2.id = s2.value
-                 WHERE t2.target = t.target AND {live2}
+                 WHERE t2.target = t.target AND s2.after = 0 AND {live2}
                      AND (s2.at > s.at OR (s2.at = s.at AND v2.multihash > v.multihash))
              );"
     )
@@ -211,6 +218,15 @@ const SCHEMA: &str =
              at INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS set_claims_value ON set_claims (value);
+         -- The sets a set replaces, by their multihashes, as its `prev`
+         -- says; a set saying none has none here, and `after` set.
+         CREATE TABLE IF NOT EXISTS set_prev (
+             claim INTEGER NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
+             prev INTEGER NOT NULL REFERENCES multihashes (id),
+             prefix BLOB NOT NULL,
+             PRIMARY KEY (claim, prev, prefix)
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS set_prev_prev ON set_prev (prev);
          -- Which time a keep keeps its targets, if not the first.
          CREATE TABLE IF NOT EXISTS keep_n (
              claim INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
@@ -294,6 +310,12 @@ fn split(link: &Link) -> Result<(Vec<u8>, Multihash)> {
     Ok((prefix.to_vec(), super::decode_key(NAME, &multihash.to_bytes())?))
 }
 
+/// A claim's CID, by its multihash: a CIDv1 of dag-cbor, as every claim
+/// is, its multihash an identity one if it's dissolved.
+fn claim_link(multihash: &[u8]) -> Result<Link> {
+    link(&[0x01, 0x71], multihash)
+}
+
 /// Rows of (prefix, multihash) as links.
 fn links(rows: impl Iterator<Item = rusqlite::Result<(Vec<u8>, Vec<u8>)>>) -> Result<Vec<Link>> {
     rows.map(|row| {
@@ -333,6 +355,11 @@ impl ClaimStore {
                 "INSERT INTO accounts (uid, user) VALUES (?1, ?2) ON CONFLICT (uid) DO UPDATE SET user = excluded.user",
                 params![rustix::process::getuid().as_raw(), user],
             )?;
+        }
+        if !db.conn().prepare("SELECT 1 FROM pragma_table_info('set_claims') WHERE name = 'after'")?.exists([])? {
+            // Whether a set says which it replaces, as `prev`, or is an
+            // older build's, replacing every set before it
+            db.conn().execute_batch("ALTER TABLE set_claims ADD COLUMN after INTEGER NOT NULL DEFAULT 0")?;
         }
         db.conn().execute_batch(&views())?;
         let chained = db.conn().prepare("SELECT 1 FROM pragma_table_info('sign_claims') WHERE name = 'prev'")?.exists([])?;
@@ -673,20 +700,77 @@ impl ClaimStore {
     }
 
     fn set(&self, id: Id) -> Result<Set> {
-        let (prefix, value, at): (Vec<u8>, Vec<u8>, i64) = self.db.conn()
-            .prepare_cached("SELECT s.value_prefix, v.multihash, s.at FROM set_claims s JOIN multihashes v ON v.id = s.value WHERE s.id = ?1")?
-            .query_row([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let (prefix, value, at, after): (Vec<u8>, Vec<u8>, i64, bool) = self.db.conn()
+            .prepare_cached("SELECT s.value_prefix, v.multihash, s.at, s.after FROM set_claims s JOIN multihashes v ON v.id = s.value WHERE s.id = ?1")?
+            .query_row([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+        let prev = if after { Some(self.set_prev(id)?) } else { None };
         Set::new(self.targets(id)?, link(&prefix, &value)?, u64::try_from(at).unwrap_or_default())
+            .map(|set| set.after(prev))
             .ok_or_else(|| Error::Invalid { store: NAME, reason: "a set with no targets".into() })
     }
 
-    /// What an anchor is now, if any set says.
+    fn set_prev(&self, id: Id) -> Result<Vec<Link>> {
+        let mut stmt = self.db.conn().prepare_cached(
+            "SELECT p.prefix, m.multihash FROM set_prev p JOIN multihashes m ON m.id = p.prev WHERE p.claim = ?1",
+        )?;
+        links(stmt.query_map([id], pair)?)
+    }
+
+    /// An anchor's heads: the sets that count which no other replaces, as
+    /// (set, value, at), by `at` and then the value's multihash. More than
+    /// one is a fork, to be merged.
+    pub fn heads(&self, anchor: Key<'_>) -> Result<Vec<(Link, Link, u64)>> {
+        let mut stmt = self.db.conn().prepare_cached(
+            "SELECT k.multihash, a.prefix, v.multihash, a.at FROM multihashes m
+             JOIN anchor_values a ON a.anchor = m.id
+             JOIN multihashes v ON v.id = a.value
+             JOIN claim_keys ck ON ck.claim = a.claim
+             JOIN multihashes k ON k.id = ck.key
+             WHERE m.multihash = ?1
+             ORDER BY a.at, v.multihash",
+        )?;
+        let rows = stmt.query_map([anchor.to_bytes()], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?)))?;
+        rows.map(|row| {
+            let (key, prefix, value, at) = row?;
+            Ok((claim_link(&key)?, link(&prefix, &value)?, u64::try_from(at).unwrap_or_default()))
+        })
+        .collect()
+    }
+
+    /// Every set of an anchor that counts, as (set, value, at, prev), by
+    /// `at` and then the value's multihash: its history, as a graph.
+    pub fn sets(&self, anchor: Key<'_>) -> Result<Vec<super::SetOf>> {
+        let ids: Vec<(Id, Vec<u8>)> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT c.id, k.multihash FROM multihashes m
+                 JOIN claim_targets t ON t.target = m.id
+                 JOIN claims c ON c.id = t.claim
+                 JOIN set_claims s ON s.id = c.id
+                 JOIN multihashes v ON v.id = s.value
+                 JOIN claim_keys ck ON ck.claim = c.id
+                 JOIN multihashes k ON k.id = ck.key
+                 WHERE m.multihash = ?1 AND {LIVE}
+                 ORDER BY s.at, v.multihash"
+            ))?
+            .query_map([anchor.to_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        ids.into_iter()
+            .map(|(id, key)| {
+                let set = self.set(id)?;
+                Ok((claim_link(&key)?, set.value().clone(), set.at(), set.prev().map(<[Link]>::to_vec)))
+            })
+            .collect()
+    }
+
+    /// What an anchor is now, if any set says: its latest head. Where it's
+    /// forked, the catalog merges its heads.
     pub fn value_of(&self, anchor: Key<'_>) -> Result<Option<Link>> {
         let row: Option<(Vec<u8>, Vec<u8>)> = self.db.conn()
             .prepare_cached(
                 "SELECT a.prefix, v.multihash FROM multihashes m
                  JOIN anchor_values a ON a.anchor = m.id JOIN multihashes v ON v.id = a.value
-                 WHERE m.multihash = ?1",
+                 WHERE m.multihash = ?1
+                 ORDER BY a.at DESC, v.multihash DESC LIMIT 1",
             )?
             .query_row([anchor.to_bytes()], pair)
             .optional()?;
@@ -702,11 +786,16 @@ impl ClaimStore {
              ORDER BY m.multihash",
         )?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, Vec<u8>>(3)?)))?;
-        rows.map(|row| {
+        let mut anchors: Vec<(Link, Link)> = Vec::new();
+        for row in rows {
             let (anchor_prefix, anchor, prefix, value) = row?;
-            Ok((link(&anchor_prefix, &anchor)?, link(&prefix, &value)?))
-        })
-        .collect()
+            let anchor = link(&anchor_prefix, &anchor)?;
+            // A forked anchor once, by one of its heads
+            if anchors.last().is_none_or(|(last, _)| *last != anchor) {
+                anchors.push((anchor, link(&prefix, &value)?));
+            }
+        }
+        Ok(anchors)
     }
 
     /// Every set of an anchor that counts, as (at, value), oldest first.
@@ -773,13 +862,25 @@ impl ClaimStore {
                 let Some(value) = self.db.lookup(value.as_ref())? else {
                     return Ok(None);
                 };
-                self.db.conn()
+                let ids: Vec<Id> = self.db.conn()
                     .prepare_cached(
                         "SELECT c.id FROM claims c JOIN set_claims s ON s.id = c.id JOIN claim_targets t ON t.claim = c.id
-                         WHERE c.claim IS NULL AND s.value = ?1 AND s.value_prefix = ?2 AND s.at = ?3 AND t.target = ?4 AND t.prefix = ?5",
+                         WHERE c.claim IS NULL AND s.value = ?1 AND s.value_prefix = ?2 AND s.at = ?3 AND t.target = ?4 AND t.prefix = ?5
+                             AND s.after = ?6",
                     )?
-                    .query_row(params![value, value_prefix, i64::try_from(set.at()).unwrap_or(i64::MAX), target, prefix], |r| r.get(0))
-                    .optional()?
+                    .query_map(params![value, value_prefix, i64::try_from(set.at()).unwrap_or(i64::MAX), target, prefix, set.prev().is_some()], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                // The same sets replaced, too
+                let mut same = None;
+                for id in ids {
+                    let mut prev = self.set_prev(id)?;
+                    prev.sort_by_key(Link::to_bytes);
+                    if prev.as_slice() == set.prev().unwrap_or_default() {
+                        same = Some(id);
+                        break;
+                    }
+                }
+                same
             },
             Claim::Sign(_) => None,
             Claim::Keep(_) | Claim::Tomb(_) | Claim::Device(_) => {
@@ -852,8 +953,13 @@ impl ClaimStore {
         }
         if let Claim::Set(set) = claim {
             let (value_prefix, value) = split(set.value())?;
-            conn.prepare_cached("INSERT INTO set_claims (id, value, value_prefix, at) VALUES (?1, ?2, ?3, ?4)")?
-                .execute(params![row, self.db.intern(value.as_ref())?, value_prefix, i64::try_from(set.at()).unwrap_or(i64::MAX)])?;
+            conn.prepare_cached("INSERT INTO set_claims (id, value, value_prefix, at, after) VALUES (?1, ?2, ?3, ?4, ?5)")?
+                .execute(params![row, self.db.intern(value.as_ref())?, value_prefix, i64::try_from(set.at()).unwrap_or(i64::MAX), set.prev().is_some()])?;
+            let mut stmt = conn.prepare_cached("INSERT OR IGNORE INTO set_prev (claim, prev, prefix) VALUES (?1, ?2, ?3)")?;
+            for prev in set.prev().unwrap_or_default() {
+                let (prefix, multihash) = split(prev)?;
+                stmt.execute(params![row, self.db.intern(multihash.as_ref())?, prefix])?;
+            }
         }
         if let Claim::Group(group) = claim {
             let (into_prefix, into) = split(group.group())?;
