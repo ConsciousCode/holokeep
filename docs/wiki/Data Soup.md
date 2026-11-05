@@ -39,7 +39,8 @@ the holokeep repository; this wiki is the reference.
 | root anchor | An account's top-level anchor, the top of `hk mount`. |
 | repo | Everything one node keeps: its catalog database and volumes (`~/.holokeep`). |
 | volume | A place bytes are kept: a SQLite file, a flatfs directory, a drive. |
-| form | How a volume breaks a block down: rows, JSONB, raw bytes, file ranges. |
+| form | How a volume breaks a block down: rows, JSONB, raw bytes, file ranges, deltas. |
+| delta | A block kept as copies from another block's bytes and bytes of its own. |
 | catalog | A node's index over its volumes. |
 | node | One machine running holokeep, named by its ed25519 key (= libp2p peer ID). |
 | device | A node's key, certified by a user. |
