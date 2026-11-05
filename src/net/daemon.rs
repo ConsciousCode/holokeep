@@ -42,6 +42,10 @@ pub const LISTEN: &str = "/ip4/0.0.0.0/tcp/4011";
 /// How often to dial members which aren't connected.
 const REDIAL: Duration = Duration::from_mins(1);
 
+/// How soon members are dialled again once one's disconnected, rather
+/// than at the next round: it may only have moved networks.
+const REDIAL_SOON: Duration = Duration::from_secs(2);
+
 /// How often to notice members of structure which arrived, such as from
 /// commands run since.
 const ANNOUNCE: Duration = Duration::from_secs(10);
@@ -380,16 +384,9 @@ fn start(node: &mut Node, place: &Place, listen: Multiaddr, alone: bool) -> Resu
     Ok(())
 }
 
-/// Run the node until interrupted, auditing as a trickle that it would
-/// take `copies` failures to lose each block it holds.
-///
-/// Free space is kept between watermarks, `(low, high)`: below the low,
-/// the node lets go of copies the mesh can spare until it's above the
-/// high. If `collecting`, garbage is collected too, a sample at a time.
-pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (u64, u64), collecting: bool, shared: bool) -> Result<()> {
-    let (mut node, alone) = open_node(place)?;
-    node.set_watermarks(low, high);
-    start(&mut node, place, listen, alone)?;
+/// The socket the node's controlled through, which the host's other users
+/// may reach too if `shared`.
+fn control_socket(place: &Place, shared: bool) -> Result<UnixListener> {
     let path = socket(place);
     // A socket nothing answers on is left from a daemon that died
     if path.exists() {
@@ -403,6 +400,32 @@ pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
     }
+    Ok(control)
+}
+
+/// A node alone, its swarm's key no member's, made a member of a mesh:
+/// started again, as that mesh's node, if it's in one now.
+fn join_mesh(place: &Place, listen: &Multiaddr, (low, high): (u64, u64)) -> Result<Option<Node>> {
+    let (mut joined, alone) = open_node(place)?;
+    if alone {
+        return Ok(None);
+    }
+    joined.set_watermarks(low, high);
+    start(&mut joined, place, listen.clone(), false)?;
+    Ok(Some(joined))
+}
+
+/// Run the node until interrupted, auditing as a trickle that it would
+/// take `copies` failures to lose each block it holds.
+///
+/// Free space is kept between watermarks, `(low, high)`: below the low,
+/// the node lets go of copies the mesh can spare until it's above the
+/// high. If `collecting`, garbage is collected too, a sample at a time.
+pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (u64, u64), collecting: bool, shared: bool) -> Result<()> {
+    let (mut node, mut alone) = open_node(place)?;
+    node.set_watermarks(low, high);
+    start(&mut node, place, listen.clone(), alone)?;
+    let control = control_socket(place, shared)?;
     let mut redial = tokio::time::interval(REDIAL);
     let later = |delay| tokio::time::Instant::now().checked_add(delay).unwrap_or_else(tokio::time::Instant::now);
     let mut trickle = later(SETTLE);
@@ -419,6 +442,9 @@ pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (
         tokio::select! {
             event = node.next() => match event {
                 Ok(event) => {
+                    if let Event::Disconnected(_) = &event {
+                        redial.reset_after(REDIAL_SOON);
+                    }
                     // Still pressed, and a trim helped: again, at once
                     if let Event::Trimmed { report, .. } = &event
                         && report.dropped > 0
@@ -433,10 +459,15 @@ pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (
                 let Ok((stream, _)) = accepted else {
                     continue;
                 };
-                match answer(&mut node, place, stream, copies, collecting, alone).await {
+                let mut join = false;
+                match answer(&mut node, place, stream, copies, collecting, alone, &mut join).await {
                     Ok(Some((waiter, write))) => waiting.wait(waiter, write),
                     Ok(None) => {},
                     Err(e) => eprintln!("control: {e}"),
+                }
+                if join && let Some(joined) = join_mesh(place, &listen, (low, high))? {
+                    node = joined;
+                    alone = false;
                 }
             },
             _ = redial.tick() => node.dial_members()?,
@@ -482,7 +513,7 @@ pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (
             _ = tokio::signal::ctrl_c() => break Ok(()),
         }
     };
-    std::fs::remove_file(&path)?;
+    std::fs::remove_file(socket(place))?;
     result
 }
 
@@ -640,7 +671,7 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
 
 /// Answer one command on the control socket, or say which fetch it waits
 /// on, to be answered when that finishes.
-async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, copies: usize, collecting: bool, alone: bool) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
+async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, copies: usize, collecting: bool, alone: bool, join: &mut bool) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
     let uid = stream.peer_cred()?.uid();
     let me = rustix::process::getuid().as_raw();
     let (read, mut write) = stream.into_split();
@@ -676,10 +707,11 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
             }
         },
         "reload" => {
-            // Alone, it has a swarm key no member has, so it's restarted
-            // to join a mesh
+            // Alone, it has a swarm key no member has, so once it's in a
+            // mesh, it starts again as that mesh's node
             if alone {
-                let _ = writeln!(out, "alone");
+                *join = mesh::swarm_key(&place.dir())?.is_some();
+                let _ = writeln!(out, "{}", if *join { "joined" } else { "alone" });
             } else {
                 node.reload()?;
                 node.dial_members()?;

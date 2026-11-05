@@ -504,7 +504,10 @@ cargo test                          # unit tests, codec fixtures, quick fuzzing
 PROPTEST_CASES=1000000 cargo test --release differential   # long fuzzing
 scripts/kubo-compare.sh             # every CID vs Kubo, then store and get back; needs `ipfs`
 LARGE=1 scripts/kubo-compare.sh     # adds >1 GiB files
+tests/mesh/run.sh                   # a mesh of real nodes, daemons and mounts, in containers
 ```
+
+The mesh tests run each node in a rootless [Podman](https://podman.io) container on a network of its own, with the `hk` just built bind-mounted in: joining, writing on one node and reading on another, a node joining late, and a node cut off from the network, so both sides change the wiki, then put back, so they merge. Nothing runs as root on the host. Podman needs subordinate IDs for your account, once: `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER && podman system migrate`. `KEEP=1` leaves the containers to look at; `tests/mesh/run.sh write_read late_joiner` runs scenarios by name, in order.
 
 Repos made by earlier builds must keep opening. Each store creates its tables if they're missing and adds the columns it needs, so opening upgrades a repo in place; `tests/fixtures/repos/` holds a repo made by each schema since there were real ones, and a test opens every one and checks it has all it had. Whenever the schema changes, add one with `scripts/make-repo-fixture.sh <date>` and keep the old.
 

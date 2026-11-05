@@ -1,0 +1,7 @@
+# A machine for one hk node of a test mesh: just what FUSE mounts need.
+# hk itself is bind-mounted in from the build, so changing it needs no
+# rebuild of this.
+FROM docker.io/library/ubuntu:24.04
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends fuse3 \
+    && rm -rf /var/lib/apt/lists/*

@@ -54,6 +54,12 @@ const MEMBERS: StreamProtocol = StreamProtocol::new("/holokeep/members/1.0.0");
 /// and stays connected.
 const IDLE: Duration = Duration::from_hours(1);
 
+/// How often a connection's pinged, and how long an answer's waited for:
+/// a connection whose ping fails is closed, as one to a peer that slept
+/// or moved networks is dead long before TCP says so, and the peer's
+/// dialled again wherever it is now.
+const PING: Duration = Duration::from_secs(10);
+
 /// The members one node knows of, as it tells another.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Roster {
@@ -194,7 +200,7 @@ impl Node {
         let behaviour = Behaviour {
             allowed: allow_block_list::Behaviour::default(),
             identify: identify::Behaviour::new(identify::Config::new(IDENTIFY.into(), key.public())),
-            ping: ping::Behaviour::default(),
+            ping: ping::Behaviour::new(ping::Config::new().with_interval(PING).with_timeout(PING)),
             mdns: mdns.into(),
             kad,
             members: request_response::cbor::Behaviour::new([(MEMBERS, ProtocolSupport::Full)], request_response::Config::default()),
@@ -964,6 +970,10 @@ impl Node {
                     self.members.add_addr(&peer_id, &addr)?;
                     self.swarm.behaviour_mut().kad.add_address(&peer_id, addr);
                 }
+                None
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { connection, result: Err(_), .. })) => {
+                self.swarm.close_connection(connection);
                 None
             },
             SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(found))) => {
