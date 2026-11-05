@@ -1289,9 +1289,14 @@ fn git_import(repo: Option<PathBuf>, git: &Path, no_keep: bool) -> anyhow::Resul
         let mut imported: HashSet<Vec<u8>> = HashSet::new();
         let mut linked: BTreeMap<Vec<u8>, Link> = BTreeMap::new();
         let have = |link: &Link| repo.get_block(link).ok().flatten();
-        let count = holokeep::git::objects(git, &have, &mut |block| {
+        let count = holokeep::git::objects(git, &have, &mut |object| {
+            let block = &object.block;
             linked.extend(holokeep::git::links(block.data())?.into_iter().map(|link| (link.to_bytes(), link)));
-            repo.put_block(&block, holokeep::cid::CidVersion::V1).map_err(|e| io::Error::other(e.to_string()))?;
+            // A pack's delta kept as a delta, where its base is
+            let provenance = object.delta.as_ref().map_or(holokeep::dag::Provenance::Unknown, |(base, delta)| {
+                holokeep::dag::Provenance::Delta { base: base.multihash(), delta }
+            });
+            repo.put_block_from(block, holokeep::cid::CidVersion::V1, provenance).map_err(|e| io::Error::other(e.to_string()))?;
             imported.insert(Link::from(block.cid().clone()).to_bytes());
             Ok(())
         })?;

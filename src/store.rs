@@ -34,6 +34,7 @@ use crate::model::Link;
 use crate::multihash::Multihash;
 
 mod claims;
+mod delta;
 mod ipld;
 mod merge;
 mod offset;
@@ -44,6 +45,7 @@ mod unixfs;
 mod volume;
 
 pub use claims::{Account, ClaimStore, Signed};
+pub use delta::DeltaStore;
 pub use ipld::IpldStore;
 pub use offset::{ExternalFile, OffsetStore};
 use offset::{Fingerprint, Location, Whole};
@@ -876,7 +878,8 @@ impl Catalog {
 
     /// The standard stores: in the catalog's database, ranges of files
     /// when that's where blocks came from, UnixFS nodes as rows, claims as
-    /// rows, dag-cbor and dag-json as JSONB; large blocks in the shards if
+    /// rows, dag-cbor and dag-json as JSONB, git objects and deltas
+    /// compressed; large blocks in the shards if
     /// there are any; and everything else as raw bytes in the database.
     pub fn with_shards(db: Db, shards: Option<ShardStore>) -> Result<Self> {
         let shards = shards.map(Rc::new);
@@ -887,6 +890,7 @@ impl Catalog {
             Box::new(UnixfsStore::open(db.clone())?),
             Box::new(Rc::clone(&claims)),
             Box::new(IpldStore::open(db.clone())?),
+            Box::new(DeltaStore::open(db.clone())?),
             Box::new(RawStore::open(db.clone())?),
         ];
         let raw = stores.len().saturating_sub(1);

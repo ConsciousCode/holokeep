@@ -35,6 +35,13 @@ fn invalid(what: impl Into<String>) -> Error {
     Error::Invalid(what.into())
 }
 
+/// An object as read from a repository: its block, and if it was a delta
+/// in a pack, the block it was on and the delta between their blocks.
+pub struct Object {
+    pub block: Block,
+    pub delta: Option<(Link, Vec<u8>)>,
+}
+
 /// The kinds of git object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -191,7 +198,7 @@ pub fn objects_dir(repo: &Path) -> Result<std::path::PathBuf> {
 pub fn objects(
     repo: &Path,
     have: &dyn Fn(&Link) -> Option<Block>,
-    each: &mut dyn FnMut(Block) -> Result<()>,
+    each: &mut dyn FnMut(Object) -> Result<()>,
 ) -> Result<usize> {
     let objects = objects_dir(repo)?;
     let mut count = 0_usize;
@@ -215,7 +222,7 @@ pub fn objects(
             if Link::from(block.cid().clone()) != named {
                 return Err(invalid(format!("{} holds {}", file.path().display(), block.cid())));
             }
-            each(block)?;
+            each(Object { block, delta: None })?;
             count = count.saturating_add(1);
         }
     }

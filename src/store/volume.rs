@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use rusqlite::OptionalExtension;
 
-use super::{ClaimStore, Db, IpldStore, RawStore, Result, ShardStore, Store, UnixfsStore};
+use super::{ClaimStore, Db, DeltaStore, IpldStore, RawStore, Result, ShardStore, Store, UnixfsStore};
 
 /// A volume's identity.
 pub type Label = [u8; 16];
@@ -73,6 +73,7 @@ impl Volume {
             Box::new(UnixfsStore::open(db.clone())?),
             Box::new(ClaimStore::open(db.clone())?),
             Box::new(IpldStore::open(db.clone())?),
+            Box::new(DeltaStore::open(db.clone())?),
             Box::new(RawStore::open(db.clone())?),
         ];
         Ok(Some(Self::sqlite(name, db, stores)?.at(path)))

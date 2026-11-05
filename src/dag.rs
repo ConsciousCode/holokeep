@@ -47,6 +47,9 @@ pub enum Provenance<'a> {
     Unknown,
     /// The block's bytes are exactly the bytes of this file at `offset`.
     FileRange { path: &'a std::path::Path, offset: u64 },
+    /// The block's bytes are this delta applied to the bytes of the block
+    /// with this multihash (see `crate::delta`).
+    Delta { base: crate::multihash::Multihash<&'a [u8]>, delta: &'a [u8] },
 }
 
 /// Discard blocks, for when only the CIDs matter (`ipfs add --only-hash`).

@@ -50,13 +50,15 @@ What's linked to but in no object here, as a submodule's commits, is
 each keep's `beyond` (see [[Claims#Encoding]]), so the keep doesn't wait on
 it.
 
-Objects are stored whole, as git's bytes, not as deltas: a packed
-repository takes far more room in the soup than in its pack (ripgrep's
-6.1 MiB pack is 130 MiB of objects).
+An object that's a delta in a pack is kept as that delta, in the
+[[Storage#Deltas|delta store]], so a packed repository takes about as
+much room in the soup as its pack: ripgrep's 6.1 MiB pack, 118 MiB of
+objects, is 5.8 MiB of rows. Its blocks are still whole objects to
+anything reading them, and are sent whole between nodes.
 
 Not yet: `.git` through [[Mount|hk mount]] as `git-raw` (objects written
 there are stored as files, as anything else is); exporting objects back
 into a repository; and the `same` claim tying a blob to the UnixFS file
 of the same bytes.
 
-Source: `src/git.rs`, `src/git/pack.rs`, `src/main.rs` (`git_import`), `scripts/git-compare.sh`.
+Source: `src/git.rs`, `src/git/pack.rs`, `src/main.rs` (`git_import`), `src/store/delta.rs`, `scripts/git-compare.sh`.

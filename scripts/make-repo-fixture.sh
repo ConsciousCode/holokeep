@@ -34,6 +34,17 @@ top=$(h add -q "$tmp/top")
 root=$(h anchor root | head -1)
 h anchor set "$root" "$top" >/dev/null
 
+# A git repository, packed, so some of its objects are kept as deltas
+git init -q "$tmp/git"
+for i in 1 2 3; do
+    seq 1 $((i * 200)) > "$tmp/git/numbers.txt"
+    git -C "$tmp/git" add numbers.txt
+    GIT_AUTHOR_NAME=f GIT_AUTHOR_EMAIL=f@f GIT_COMMITTER_NAME=f GIT_COMMITTER_EMAIL=f@f \
+        git -C "$tmp/git" commit -qm "$i"
+done
+git -C "$tmp/git" repack -adfq
+git=$(h git import "$tmp/git" 2>/dev/null | awk '$2 == "HEAD" { print $1 }')
+
 mkdir -p "$out"
 cp -a "$repo/." "$out/"
 rm -f "$out"/*.sock
@@ -45,6 +56,7 @@ anchor $anchor
 root $root
 top $top
 copied $big
+git $git
 EXPECT
 echo "made $out"
 du -sh "$out"

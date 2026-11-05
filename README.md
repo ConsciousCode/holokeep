@@ -341,6 +341,8 @@ Checklist:
   - [x] Copying to a volume regardless of disk, eg to carry blocks between machines (`hk volume copy`)
   - [x] Claims on other volumes, dissolved ones stamped by row, following what they're about
   - [ ] Repacking blocks which belong together, eg a UnixFS file's leaves, into a whole file
+  - [x] Deltas: blocks kept as git-format deltas on others the store keeps, given with the put (git packs' deltas, as they come), compressed, chains at most 50 deep, made whole before their bases go
+  - [ ] Finding deltas ourselves, for what's written through the mount and git objects that arrive whole
 - [x] Tagging
   - [x] Tags as `Group` claims, kept as rows (`hk tag add/ls/find`)
   - [x] Untagging, by tombstoning the claims (`hk tag rm`)
@@ -505,7 +507,7 @@ cargo test                          # unit tests, codec fixtures, quick fuzzing
 PROPTEST_CASES=1000000 cargo test --release differential   # long fuzzing
 scripts/kubo-compare.sh             # every CID vs Kubo, then store and get back; needs `ipfs`
 LARGE=1 scripts/kubo-compare.sh     # adds >1 GiB files
-scripts/git-compare.sh              # git objects vs git and Kubo, loose and packed; needs `ipfs`, `gpg`
+scripts/git-compare.sh              # git objects vs git and Kubo, loose and packed; needs `ipfs`, `gpg`, `sqlite3`
 tests/mesh/run.sh                   # a mesh of real nodes, daemons and mounts, in containers
 ```
 

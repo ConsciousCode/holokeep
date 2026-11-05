@@ -1350,6 +1350,104 @@ fn ipld_backrefs() {
 }
 
 
+//------------//
+//-[ Deltas ]-//
+//------------//
+
+/// A git blob of `text`, and a delta making it from `base`, as copying
+/// all of `base` then adding the rest.
+fn grown(base: &Block, text: &[u8]) -> (Block, Vec<u8>) {
+    let block = crate::git::block(crate::git::Kind::Blob, text);
+    let (_, base_text) = crate::git::parse(base.data()).expect("base");
+    let header = block.data().len().saturating_sub(text.len());
+    let base_header = base.data().len().saturating_sub(base_text.len());
+    let mut delta = crate::delta::Writer::new(base.data().len(), block.data().len());
+    delta.insert(block.data().get(..header).expect("header"));
+    delta.copy(base_header, base_text.len()).expect("copy");
+    delta.insert(text.get(base_text.len()..).expect("grown"));
+    (block, delta.finish())
+}
+
+fn text(n: usize) -> Vec<u8> {
+    (0..n).flat_map(|i| format!("line {i}\n").into_bytes()).collect()
+}
+
+fn on<'a>(base: &'a Block, delta: &'a [u8]) -> Provenance<'a> {
+    Provenance::Delta { base: base.cid().multihash(), delta }
+}
+
+#[test]
+fn git_objects_and_deltas_on_them_are_kept_compactly() {
+    let router = router();
+    let first = crate::git::block(crate::git::Kind::Blob, &text(1000));
+    router.put_block(&first, CidVersion::V1).expect("put");
+    let (second, delta) = grown(&first, &text(1010));
+    router.put_block_from(&second, CidVersion::V1, on(&first, &delta)).expect("put");
+    assert_eq!(forms(&router), [("delta".to_owned(), 2)]);
+    let delta_store = DeltaStore::open(router.db().clone()).expect("store");
+    assert_eq!(delta_store.counts().expect("counts"), (1, 1), "one delta on one whole");
+    let second_link: Link = second.cid().clone().into();
+    assert_eq!(router.get_block(&second_link).expect("get"), Some(second));
+
+    // A delta that doesn't make the block is no delta, and isn't kept
+    let (third, _) = grown(&first, &text(1020));
+    router.put_block_from(&third, CidVersion::V1, on(&first, &delta)).expect("put");
+    assert_eq!(delta_store.counts().expect("counts"), (1, 2));
+    assert_eq!(router.get_block(&third.cid().clone().into()).expect("get"), Some(third));
+
+    // Anything with a delta on what's here, any codec; without one, or on
+    // what isn't here, elsewhere
+    let other = raw(crate::git::block(crate::git::Kind::Blob, &text(1010)).data());
+    let not_here = crate::git::block(crate::git::Kind::Blob, b"elsewhere");
+    router.put_block_from(&other, CidVersion::V1, on(&first, &delta)).expect("put");
+    router.put_block_from(&raw(b"plain"), CidVersion::V1, Provenance::Delta { base: not_here.cid().multihash(), delta: &delta }).expect("put");
+    assert_eq!(forms(&router), [("delta".to_owned(), 4), ("raw".to_owned(), 1)]);
+    assert_eq!(router.get_block(&other.cid().clone().into()).expect("get"), Some(other));
+}
+
+#[test]
+fn a_whole_block_offered_as_a_delta_becomes_one_unless_that_loops() {
+    let store = DeltaStore::open(Db::memory().expect("db")).expect("store");
+    let first = crate::git::block(crate::git::Kind::Blob, &text(1000));
+    let (second, delta) = grown(&first, &text(1010));
+    store.put(&second).expect("put");
+    store.put(&first).expect("put");
+    assert_eq!(store.counts().expect("counts"), (0, 2));
+    store.put_from(&second, Provenance::Delta { base: first.cid().multihash(), delta: &delta }).expect("put");
+    assert_eq!(store.counts().expect("counts"), (1, 1));
+    // The first on the second would loop, so it stays whole
+    let back = crate::delta::Writer::new(second.data().len(), first.data().len());
+    let mut back = back;
+    back.copy(0, first.data().len()).expect("copy");
+    store.put_from(&first, Provenance::Delta { base: second.cid().multihash(), delta: &back.finish() }).expect("put");
+    assert_eq!(store.counts().expect("counts"), (1, 1));
+    assert_eq!(store.get(first.cid().multihash()).expect("get").as_deref(), Some(first.data()));
+    assert_eq!(store.get(second.cid().multihash()).expect("get").as_deref(), Some(second.data()));
+}
+
+#[test]
+fn chains_of_deltas_stop_at_their_depth_and_outlive_their_bases() {
+    let store = DeltaStore::open(Db::memory().expect("db")).expect("store");
+    let mut chain = vec![crate::git::block(crate::git::Kind::Blob, &text(100))];
+    store.put(&chain[0]).expect("put");
+    for n in 1..=60 {
+        let base = chain.last().expect("base").clone();
+        let (next, delta) = grown(&base, &text(100 + n));
+        store.put_from(&next, Provenance::Delta { base: base.cid().multihash(), delta: &delta }).expect("put");
+        chain.push(next);
+    }
+    let (deltas, whole) = store.counts().expect("counts");
+    assert_eq!((deltas, whole), (59, 2), "the 51st starts a chain of its own");
+    let freed = store.remove(chain[0].cid().multihash()).expect("remove");
+    assert!(freed.is_some());
+    assert_eq!(store.counts().expect("counts"), (58, 2), "what was on it made whole");
+    assert!(!store.has(chain[0].cid().multihash()).expect("has"));
+    for block in chain.iter().skip(1) {
+        assert_eq!(store.get(block.cid().multihash()).expect("get").as_deref(), Some(block.data()));
+    }
+}
+
+
 //-------------//
 //-[ Volumes ]-//
 //-------------//
@@ -2247,6 +2345,18 @@ fn repos_earlier_builds_made_still_open() {
         assert!(!repo.backrefs(expect["anchor"].multihash()).expect("backrefs").is_empty(), "{name}: the root's mount point links to the anchor it mounts");
         if let Some(copied) = expect.get("copied") {
             assert_eq!(repo.copies_wanted(copied.multihash(), 2).expect("copies"), Some(1), "{name}: as its nearest keep says");
+        }
+        if let Some(git) = expect.get("git") {
+            // A commit, its tree and its parents' trees and blobs, some as deltas
+            let mut stack = vec![git.clone()];
+            let mut seen_objects = 0;
+            while let Some(link) = stack.pop() {
+                let block = repo.get_block(&link).expect("get").unwrap_or_else(|| panic!("{name}: git object {link}"));
+                stack.extend(crate::git::links(block.data()).expect("links"));
+                seen_objects += 1;
+            }
+            assert_eq!(seen_objects, 9, "{name}: three commits, trees and blobs");
+            assert!(repo.claims().expect("claims").kept(git.multihash()).expect("kept"), "{name}: what the refs name");
         }
 
         // And it takes more as ever

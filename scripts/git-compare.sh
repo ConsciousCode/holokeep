@@ -105,6 +105,10 @@ make_repo "$work/offsets"
 git -C "$work/offsets" repack -adfq
 [ -z "$(find "$work/offsets/.git/objects" -path '*/objects/??/*')" ] || { echo "offsets: still loose objects"; exit 1; }
 check_repo "$work/offsets" "packed, deltas on offsets"
+# Kept as the pack's deltas, not whole
+stored=$(sqlite3 "$HOLOKEEP_REPO/blocks.db" "SELECT count(base) FROM delta_blocks")
+[ "$stored" -gt 0 ] || { echo "offsets: no objects kept as deltas"; exit 1; }
+echo "kept as deltas: $stored"
 
 make_repo "$work/names"
 git -C "$work/names" -c repack.useDeltaBaseOffset=false repack -adfq

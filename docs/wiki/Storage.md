@@ -42,15 +42,44 @@ keeps it:
    (`WHERE data ->> '$.name' = …`).
 4. **Offsets** (`offset_ranges`): raw leaves as (blob, offset, length)
    ranges of a whole file, kept in the shards or found in place.
-5. **Shards** (flatfs): anything over 64 KiB, and whole files. Named by
+5. **Deltas** (`delta_blocks`): [[Git|git objects]], and any block put
+   with a delta on a block this store already keeps. See below.
+6. **Shards** (flatfs): anything over 64 KiB, and whole files. Named by
    multihash in base32 upper with no multibase prefix, sharded
    `next-to-last/2`, as Kubo's flatfs.
-6. **Raw** (`raw_blocks`): anything else, as bytes.
+7. **Raw** (`raw_blocks`): anything else, as bytes.
 
 **Specialized stores must manifest exact bytes.** A store that keeps rows
 must regenerate each block byte for byte, so it admits only [[Blocks and CIDs#Codecs|canonical]]
 blocks; anything valid but non-canonical falls through to raw. Every
 block is verified against its CID on the way out.
+
+## Deltas
+
+The delta store keeps a block either whole or as a **delta** on another
+block it keeps, its **base**: copies from the base's bytes and bytes of
+its own, in git's delta format (see `src/delta.rs`), over the whole
+blocks' bytes. Each row is zlib-compressed when that makes it smaller.
+
+| Column | Meaning |
+|---|---|
+| `block` | The block, by interned multihash. |
+| `base` | The block it's a delta on, or NULL if it's whole. |
+| `depth` | How many deltas reading it applies, at most. |
+| `zlib` | Whether `data` is compressed. |
+| `data` | The block's bytes, or the delta, as kept. |
+
+- A delta comes with a put, never found by searching: a store is told
+  where a block's bytes came from (its provenance), and a delta on a
+  base is one such. [[Git#Importing|Importing git]] gives each object a
+  pack had as a delta that delta, made one between whole blocks.
+- A delta is kept only if its base is in the store, applying it makes
+  the block, the chain stays at most 50 deep, and it doesn't loop back
+  on itself. Otherwise the block is kept whole if it's a git object, and
+  goes on to the next store if not.
+- A block kept whole is made a delta when it's put again with one,
+  unless whole is smaller.
+- A base let go of first makes each block that's a delta on it whole.
 
 ## Backreferences
 

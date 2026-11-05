@@ -10,7 +10,7 @@ use sha1::Digest as _;
 use crate::block::Block;
 use crate::model::Link;
 
-use super::{Error, Kind, Result, block, cid_of, invalid, parse, sha1_of};
+use super::{Error, Kind, Object, Result, block, cid_of, invalid, parse};
 
 /// The most of a pack's resolved objects kept to resolve deltas on, before
 /// they're let go of and resolved again as needed.
@@ -37,6 +37,8 @@ struct Pack<'a> {
     bytes: &'a [u8],
     by_offset: HashMap<usize, Entry>,
     by_name: HashMap<[u8; 20], usize>,
+    /// The CIDs of the entries resolved, by offset.
+    cids: HashMap<usize, Link>,
     cache: HashMap<usize, (Kind, Rc<Vec<u8>>)>,
     cached: usize,
     have: &'a dyn Fn(&Link) -> Option<Block>,
@@ -45,13 +47,13 @@ struct Pack<'a> {
 /// Every object in a pack, given to `each` in the pack's order, but for
 /// deltas on objects later in it, which come once their bases have.
 /// Returns how many there were.
-pub fn objects(bytes: &[u8], have: &dyn Fn(&Link) -> Option<Block>, each: &mut dyn FnMut(Block) -> Result<()>) -> Result<usize> {
+pub fn objects(bytes: &[u8], have: &dyn Fn(&Link) -> Option<Block>, each: &mut dyn FnMut(Object) -> Result<()>) -> Result<usize> {
     let entries = entries(bytes)?;
-    let mut pack = Pack { bytes, by_offset: entries.iter().map(|entry| (entry.offset, *entry)).collect(), by_name: HashMap::new(), cache: HashMap::new(), cached: 0, have };
+    let mut pack = Pack { bytes, by_offset: entries.iter().map(|entry| (entry.offset, *entry)).collect(), by_name: HashMap::new(), cids: HashMap::new(), cache: HashMap::new(), cached: 0, have };
     let mut waiting = Vec::new();
     for entry in &entries {
         match pack.resolve(entry.offset) {
-            Ok(block) => each(block)?,
+            Ok(object) => each(object)?,
             Err(Wait) => waiting.push(entry.offset),
         }
     }
@@ -61,7 +63,7 @@ pub fn objects(bytes: &[u8], have: &dyn Fn(&Link) -> Option<Block>, each: &mut d
         let mut still = Vec::new();
         for offset in waiting {
             match pack.resolve(offset) {
-                Ok(block) => each(block)?,
+                Ok(object) => each(object)?,
                 Err(Wait) => still.push(offset),
             }
         }
@@ -77,13 +79,53 @@ pub fn objects(bytes: &[u8], have: &dyn Fn(&Link) -> Option<Block>, each: &mut d
 struct Wait;
 
 impl Pack<'_> {
-    fn resolve(&mut self, offset: usize) -> std::result::Result<Block, Wait> {
+    /// An entry as an object, and if it's a delta, that delta made one
+    /// between whole blocks.
+    fn resolve(&mut self, offset: usize) -> std::result::Result<Object, Wait> {
+        let entry = *self.by_offset.get(&offset).ok_or(Wait)?;
         let (kind, content) = self.content(offset)?;
         let block = block(kind, &content);
-        if let Some(sha1) = sha1_of(&block.cid().clone().into()) {
+        let link: Link = block.cid().clone().into();
+        if let Some(sha1) = super::sha1_of(&link) {
             self.by_name.insert(sha1, offset);
         }
-        Ok(block)
+        self.cids.insert(offset, link);
+        let delta = match entry.base {
+            Base::Whole(_) => None,
+            Base::At(at) => self.base_link(at).map(|base| (base, Lookup::At(at))),
+            Base::Named(name) => Some((cid_of(&name), self.by_name.get(&name).map_or_else(|| Lookup::Have(name), |&at| Lookup::At(at)))),
+        };
+        let delta = match delta {
+            None => None,
+            Some((base, lookup)) => {
+                let base_content = match lookup {
+                    Lookup::At(at) => self.content(at)?.1,
+                    Lookup::Have(name) => self.had(&name)?.1,
+                };
+                let raw = inflate(self.bytes.get(entry.data..).unwrap_or_default()).map_err(|_| Wait)?.0;
+                let skip = format!("{} {}\0", kind.name(), base_content.len()).len();
+                let header = format!("{} {}\0", kind.name(), content.len());
+                crate::delta::behind_headers(&raw, skip, header.as_bytes()).ok().map(|delta| (base, delta))
+            },
+        };
+        Ok(Object { block, delta })
+    }
+
+    fn base_link(&mut self, at: usize) -> Option<Link> {
+        if let Some(link) = self.cids.get(&at) {
+            return Some(link.clone());
+        }
+        let (kind, content) = self.content(at).ok()?;
+        let link: Link = block(kind, &content).cid().clone().into();
+        self.cids.insert(at, link.clone());
+        Some(link)
+    }
+
+    /// An object outside the pack, as a thin pack's delta is on.
+    fn had(&self, name: &[u8; 20]) -> std::result::Result<(Kind, Rc<Vec<u8>>), Wait> {
+        let block = (self.have)(&cid_of(name)).ok_or(Wait)?;
+        let (kind, content) = parse(block.data()).map_err(|_| Wait)?;
+        Ok((kind, Rc::new(content.to_vec())))
     }
 
     /// An entry's kind and content, resolved.
@@ -97,18 +139,16 @@ impl Pack<'_> {
             Base::Whole(kind) => (kind, data),
             Base::At(base) => {
                 let (kind, base) = self.content(base)?;
-                (kind, apply(&base, &data).map_err(|_| Wait)?)
+                (kind, crate::delta::apply(&base, &data).map_err(|_| Wait)?)
             },
             Base::Named(name) => {
                 let (kind, base) = if let Some(&at) = self.by_name.get(&name) {
                     self.content(at)?
                 }
                 else {
-                    let block = (self.have)(&cid_of(&name)).ok_or(Wait)?;
-                    let (kind, content) = parse(block.data()).map_err(|_| Wait)?;
-                    (kind, Rc::new(content.to_vec()))
+                    self.had(&name)?
                 };
-                (kind, apply(&base, &data).map_err(|_| Wait)?)
+                (kind, crate::delta::apply(&base, &data).map_err(|_| Wait)?)
             },
         };
         let content = Rc::new(content);
@@ -120,6 +160,12 @@ impl Pack<'_> {
         self.cache.insert(offset, (kind, content.clone()));
         Ok((kind, content))
     }
+}
+
+/// Where a delta's base is.
+enum Lookup {
+    At(usize),
+    Have([u8; 20]),
 }
 
 /// A zlib stream's inflated bytes, and how many bytes of it there were.
@@ -185,81 +231,8 @@ fn entries(bytes: &[u8]) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// A delta applied to its base.
-fn apply(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
-    let mut at = 0_usize;
-    let mut size = || -> Result<usize> {
-        let mut value = 0_usize;
-        let mut shift = 0_u32;
-        loop {
-            let c = *delta.get(at).ok_or_else(|| invalid("a delta cut short"))?;
-            at = at.saturating_add(1);
-            value |= usize::from(c & 0x7f).checked_shl(shift).ok_or_else(|| invalid("a delta's size too big"))?;
-            shift = shift.saturating_add(7);
-            if c & 0x80 == 0 {
-                return Ok(value);
-            }
-        }
-    };
-    let source = size()?;
-    let target = size()?;
-    if source != base.len() {
-        return Err(invalid("a delta on another base"));
-    }
-    let mut out = Vec::with_capacity(target.min(1 << 30));
-    while let Some(&op) = delta.get(at) {
-        at = at.saturating_add(1);
-        if op & 0x80 != 0 {
-            let mut field = |bits: u8, from: u32| -> Result<usize> {
-                let mut value = 0_usize;
-                for bit in 0..bits {
-                    if op & (1 << (from.saturating_add(u32::from(bit)))) != 0 {
-                        let c = *delta.get(at).ok_or_else(|| invalid("a delta cut short"))?;
-                        at = at.saturating_add(1);
-                        value |= usize::from(c) << (8 * u32::from(bit));
-                    }
-                }
-                Ok(value)
-            };
-            let offset = field(4, 0)?;
-            let len = match field(3, 4)? {
-                0 => 0x10000,
-                len => len,
-            };
-            let end = offset.checked_add(len).ok_or_else(|| invalid("a delta copying too much"))?;
-            out.extend_from_slice(base.get(offset..end).ok_or_else(|| invalid("a delta copying past its base"))?);
-        }
-        else if op != 0 {
-            let end = at.saturating_add(usize::from(op));
-            out.extend_from_slice(delta.get(at..end).ok_or_else(|| invalid("a delta cut short"))?);
-            at = end;
-        }
-        else {
-            return Err(invalid("a delta's reserved op"));
-        }
-    }
-    if out.len() != target {
-        return Err(invalid("a delta making the wrong size"));
-    }
-    Ok(out)
-}
-
 impl From<Wait> for Error {
     fn from(_: Wait) -> Self {
         invalid("a delta whose base can't be had")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_delta_copies_and_inserts() {
-        // Source 5, target 8: copy 5 from 0, insert "abc"
-        let delta = [5, 8, 0x80 | 0x01 | 0x10, 0, 5, 3, b'a', b'b', b'c'];
-        assert_eq!(apply(b"hello", &delta).expect("apply"), b"helloabc");
-        assert!(apply(b"hell", &delta).is_err(), "another base");
-        assert!(apply(b"hello", &[5, 8, 0]).is_err(), "the reserved op");
     }
 }
