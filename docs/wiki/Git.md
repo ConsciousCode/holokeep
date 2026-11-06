@@ -51,9 +51,11 @@ each keep's `beyond` (see [[Claims#Encoding]]), so the keep doesn't wait on
 it.
 
 An object that's a delta in a pack is kept as that delta, in the
-[[Storage#Deltas|delta store]], so a packed repository takes about as
-much room in the soup as its pack: ripgrep's 6.1 MiB pack, 118 MiB of
-objects, is 5.8 MiB of rows. Its blocks are still whole objects to
+[[Storage#Deltas|delta store]], so its objects take about as much room
+as in the pack: ripgrep's 5.8 MiB pack, 130 MiB of objects, is 5.8 MiB
+of rows, within 0.5% of it. On disk it's 11.6 MB against git's 6.5 MB
+(pack, index and reverse index), mostly for the index of links between
+blocks, which git doesn't keep, and SQLite's page slack. Its blocks are still whole objects to
 anything reading them, and are sent whole between nodes.
 
 Not yet: `.git` through [[Mount|hk mount]] as `git-raw` (objects written
