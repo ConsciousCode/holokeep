@@ -12,7 +12,7 @@ use holokeep::dag::{BalancedLayout, BlockSink, NullSink};
 use holokeep::import::Importer;
 use holokeep::model::Link;
 use holokeep::cid::{BaseCid, CidRef};
-use holokeep::store::{Copying, InPlace, RefIndex, Catalog};
+use holokeep::store::{Compact, Copying, InPlace, Outcome, RefIndex, Catalog};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -437,10 +437,22 @@ enum GitCommand {
 
 #[derive(Subcommand, Debug)]
 enum RepoCommand {
-    /// How many blocks each volume holds, in each form
+    /// How many blocks each volume holds, in each form, and each database's
+    /// bytes on disk and free pages
     Stat,
     /// Rebuild the block index from the stores
     Reindex,
+    /// Give each database's free pages back to the filesystem. Prints each
+    /// one's volume, bytes before, bytes after, and what became of it
+    Compact {
+        /// Only say what would be done: bytes after are the most it'd have
+        #[arg(long)]
+        dry_run: bool,
+        /// Compact even a database big enough that writers might give up
+        /// waiting for it; for when nothing else is writing to it
+        #[arg(long)]
+        long: bool,
+    },
 }
 
 /// Print a line to stdout, like `println!`, except that a reader which has
@@ -731,11 +743,17 @@ fn run(args: Args) -> anyhow::Result<()> {
             Ok(io::stdout().lock().write_all(block.data())?)
         },
         Command::Repo(RepoCommand::Stat) => {
-            for (volume, form, blocks) in open_repo(args.repo)?.stats()? {
+            let repo = open_repo(args.repo)?;
+            for (volume, form, blocks) in repo.stats()? {
                 out!("{volume}\t{form}\t{blocks}");
+            }
+            for space in repo.space()? {
+                out!("{}\tbytes\t{}", space.volume, space.bytes);
+                out!("{}\tfree-bytes\t{}", space.volume, space.free);
             }
             Ok(())
         },
+        Command::Repo(RepoCommand::Compact { dry_run, long }) => compact(&open_repo(args.repo)?, Compact { dry_run, long }),
         Command::Repo(RepoCommand::Reindex) => {
             let blocks = open_repo(args.repo)?.reindex()?;
             out!("indexed {blocks} blocks");
@@ -1282,6 +1300,29 @@ fn refs(repo: &Catalog, cid: &Link, back: bool) -> anyhow::Result<()> {
 }
 
 /// Import, export or fetch whole DAGs.
+fn compact(repo: &Catalog, compact: Compact) -> anyhow::Result<()> {
+    let mut refused = Vec::new();
+    repo.compact(compact, &mut |done| {
+        let outcome = match done.outcome {
+            Outcome::AlreadyCompact => "already compact".to_owned(),
+            Outcome::WouldCompact => "would compact".to_owned(),
+            Outcome::Compacted { took, wal_left: false } => format!("compacted in {:.2}s", took.as_secs_f64()),
+            Outcome::Compacted { took, wal_left: true } => format!("compacted in {:.2}s, its WAL not emptied since a reader's still on it; compact again, or it goes once nothing has it open", took.as_secs_f64()),
+            Outcome::TooLong => "refused: big enough that writers might give up waiting for it".to_owned(),
+            Outcome::NoRoom { needed, available } => format!("refused: needs {needed} bytes for its WAL, {available} left"),
+        };
+        out!("{}\t{}\t{}\t{outcome}", done.volume, done.before, done.after);
+        if done.outcome.refused() {
+            refused.push((done.volume.clone(), done.outcome));
+        }
+    })?;
+    match refused.iter().find(|(_, outcome)| *outcome == Outcome::TooLong) {
+        Some(_) => anyhow::bail!("not all compacted: stop any mount or node using this repo, then use --long"),
+        None if !refused.is_empty() => anyhow::bail!("not all compacted: too little disk left"),
+        None => Ok(()),
+    }
+}
+
 fn git_import(repo: Option<PathBuf>, git: &Path, no_keep: bool) -> anyhow::Result<()> {
     use std::collections::{BTreeMap, HashSet};
     let refs = holokeep::git::refs(git)?;

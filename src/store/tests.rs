@@ -1575,6 +1575,86 @@ fn git_objects_that_come_whole_become_deltas_on_their_next_versions() {
     assert!(!is_delta(&same));
 }
 
+/// A transaction that reads, then writes, while another process has the
+/// write lock for a moment: if it held a read first, `SQLite` wouldn't wait,
+/// and it'd fail at once however long writers are told to wait.
+#[test]
+fn transactions_wait_for_a_writer_rather_than_failing_at_once() {
+    let scratch = Scratch::new("write-lock");
+    let path = scratch.path().join("db");
+    let db = Db::open(&path).expect("open");
+    db.conn().execute_batch("CREATE TABLE t (n INTEGER)").expect("table");
+    let hold = |ms: u64| {
+        let other = rusqlite::Connection::open(&path).expect("open");
+        other.execute_batch("BEGIN IMMEDIATE").expect("lock");
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            other.execute_batch("COMMIT").expect("unlock");
+        })
+    };
+    let read_then_write = |db: &Db| -> Result<()> {
+        let n: i64 = db.conn().query_row("SELECT count(*) FROM t", [], |row| row.get(0))?;
+        db.conn().execute("INSERT INTO t VALUES (?1)", [n])?;
+        Ok(())
+    };
+    let holder = hold(300);
+    db.atomically(|| read_then_write(&db)).expect("atomically");
+    holder.join().expect("holder");
+
+    let mut router = Catalog::open_repo(&scratch.path().join("repo")).expect("repo");
+    let holder = {
+        let other = rusqlite::Connection::open(scratch.path().join("repo").join("blocks.db")).expect("open");
+        other.execute_batch("BEGIN IMMEDIATE").expect("lock");
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            other.execute_batch("COMMIT").expect("unlock");
+        })
+    };
+    router.batch(|router| router.put_block(&raw(b"in a batch"), CidVersion::V1).map(|_| ())).expect("batch");
+    holder.join().expect("holder");
+
+    // What only reads doesn't wait for a writer at all, while what turns
+    // out to need to write does
+    let other = rusqlite::Connection::open(&path).expect("open");
+    other.execute_batch("BEGIN IMMEDIATE").expect("lock");
+    let quick = std::time::Instant::now();
+    db.reading_first(|| Ok(db.conn().query_row("SELECT count(*) FROM t", [], |row| row.get::<_, i64>(0))?)).expect("read");
+    assert!(quick.elapsed() < std::time::Duration::from_secs(5), "{:?}", quick.elapsed());
+    assert!(db.conn().is_autocommit());
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        other.execute_batch("COMMIT").expect("unlock");
+    });
+    db.reading_first(|| read_then_write(&db)).expect("write");
+    holder.join().expect("holder");
+    assert!(db.conn().is_autocommit());
+    let failed: Result<()> = db.reading_first(|| Err(Error::Volume("nothing to undo".to_owned())));
+    assert!(failed.is_err());
+    assert!(db.conn().is_autocommit());
+
+    // Nested, and rolled back only as far as it should be
+    let count = || db.conn().query_row("SELECT count(*) FROM t", [], |row| row.get::<_, i64>(0)).expect("count");
+    let before = count();
+    let outer = db.atomically(|| {
+        read_then_write(&db)?;
+        let inner: Result<()> = db.atomically(|| {
+            read_then_write(&db)?;
+            Err(Error::Volume("inner".to_owned()))
+        });
+        assert!(inner.is_err());
+        Ok::<_, Error>(())
+    });
+    outer.expect("outer");
+    assert_eq!(count(), before + 1, "the inner one undone");
+    let failed: Result<()> = db.atomically(|| {
+        read_then_write(&db)?;
+        Err(Error::Volume("outer".to_owned()))
+    });
+    assert!(failed.is_err());
+    assert_eq!(count(), before + 1, "the outer one undone");
+    assert!(db.conn().is_autocommit(), "nothing left open");
+}
+
 //-------------//
 //-[ Volumes ]-//
 //-------------//

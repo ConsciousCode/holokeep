@@ -94,6 +94,41 @@ blocks' bytes. Each row is zlib-compressed when that makes it smaller.
 - A base let go of first makes each block that's a delta on it whole,
   and what's on those shallower.
 
+## Compacting
+
+A database keeps the pages it frees to use again, as an allocator does,
+so its file doesn't shrink. That's usually right: what's freed is likely
+needed again. It's worth giving back after something that won't be
+repeated, such as importing a repository of loose objects, which writes
+them whole and then rewrites them as deltas. So it's only done when
+asked:
+
+```
+hk repo stat               # each database's bytes and free-bytes
+hk repo compact --dry-run  # volume, bytes before, the most after, outcome
+hk repo compact            # volume, bytes before, bytes after, outcome
+```
+
+It's safe to run beside a mount and a daemon, and does nothing to a
+database with no free pages. `VACUUM` rewrites the database through its
+WAL: readers carry on, and writers wait. They only wait 10 seconds,
+though, so a database with over 256 MiB of pages in use is refused
+without `--long`, which says nothing else is writing to it. One whose
+filesystem has too little room for the WAL is always refused. A refusal
+exits non-zero, after compacting the databases it can. A reader still in
+a transaction can keep the WAL from being emptied, which the outcome
+says: it goes on the next compact, or once nothing has the database open.
+
+## Transactions
+
+Every database is in WAL mode, so readers don't wait for a writer. But
+`SQLite` doesn't wait, however long it's told to, for a transaction that's
+already read and now wants to write beside a writer: it fails at once.
+So `Db::atomically` takes the write lock before starting, and waits for
+it. What usually only reads, like catching up, uses `Db::reading_first`,
+which starts without it, so isn't held up; if it needs to write beside a
+writer, it's undone and run again, waiting.
+
 ## Backreferences
 
 Every block's links are indexed, by multihash, so "what links to this?"

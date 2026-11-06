@@ -34,6 +34,7 @@ use crate::model::Link;
 use crate::multihash::Multihash;
 
 mod claims;
+mod compact;
 mod delta;
 mod git;
 mod ipld;
@@ -53,6 +54,7 @@ use offset::{Fingerprint, Location, Whole};
 pub use raw::RawStore;
 pub use shards::ShardStore;
 pub use unixfs::UnixfsStore;
+pub use compact::{Compact, Compaction, Outcome, Space};
 pub use git::GitDeltas;
 pub use volume::{Volume, tolerance};
 
@@ -251,10 +253,55 @@ impl Db {
         &self.0
     }
 
-    /// Run `f` atomically. Savepoints nest, so this works inside an
-    /// enclosing transaction too.
+    /// Start a transaction, waiting for the write lock. Writing in one
+    /// that's read first wouldn't wait: `SQLite` can't let a reader's view
+    /// go, so a writer at that moment, however brief, would fail it at once.
+    fn begin(&self) -> Result<()> {
+        Ok(self.conn().execute_batch("BEGIN IMMEDIATE")?)
+    }
+
+    /// Run `f` atomically, for what usually only reads, so a writer doesn't
+    /// hold it up. Should it need to write beside a writer, which it can't
+    /// wait for having read, it's undone and run again, waiting: so `f`
+    /// must change nothing but the database.
+    pub fn reading_first<T>(&self, f: impl Fn() -> Result<T>) -> Result<T> {
+        let conn = self.conn();
+        if !conn.is_autocommit() {
+            return self.atomically(&f);
+        }
+        conn.execute_batch("BEGIN")?;
+        match f().and_then(|value| Ok(conn.execute_batch("COMMIT").map(|()| value)?)) {
+            Ok(value) => Ok(value),
+            Err(e) => {
+                if !conn.is_autocommit() {
+                    conn.execute_batch("ROLLBACK")?;
+                }
+                match &e {
+                    Error::Db(rusqlite::Error::SqliteFailure(failure, _)) if failure.code == rusqlite::ErrorCode::DatabaseBusy => self.atomically(&f),
+                    _ => Err(e),
+                }
+            },
+        }
+    }
+
+    /// Run `f` atomically, for what will write, having waited for the
+    /// write lock. Savepoints nest, so this works inside an enclosing
+    /// transaction too.
     pub fn atomically<T, E: From<Error>>(&self, f: impl FnOnce() -> std::result::Result<T, E>) -> std::result::Result<T, E> {
         let conn = self.conn();
+        if conn.is_autocommit() {
+            self.begin()?;
+            return match f() {
+                Ok(value) => {
+                    conn.execute_batch("COMMIT").map_err(Error::from)?;
+                    Ok(value)
+                },
+                Err(e) => {
+                    conn.execute_batch("ROLLBACK").map_err(Error::from)?;
+                    Err(e)
+                },
+            };
+        }
         conn.execute_batch("SAVEPOINT atomically").map_err(Error::from)?;
         match f() {
             Ok(value) => {
@@ -1304,7 +1351,7 @@ impl Catalog {
     /// writing to a shared one. Returns how many placements were added
     /// and removed.
     pub fn catch_up(&self) -> Result<(usize, usize)> {
-        self.db.atomically(|| {
+        self.db.reading_first(|| {
             let (mut added, mut removed) = (0usize, 0usize);
             for (v, volume) in self.volumes.iter().enumerate() {
                 if let Some(db) = self.foreign_db(v) {
@@ -1808,7 +1855,7 @@ impl Catalog {
         let Some(offsets) = &self.offsets else {
             return Ok(Vec::new());
         };
-        self.db.atomically(|| {
+        self.db.reading_first(|| {
             let mut lost = Vec::new();
             for file in files.iter().filter(|file| file.changed()) {
                 for key in offsets.forget_external(file)? {
@@ -2126,7 +2173,7 @@ impl Catalog {
         let mut dbs: Vec<Db> = (0..self.volumes.len()).filter_map(|v| self.foreign_db(v).cloned()).collect();
         dbs.push(self.db.clone());
         for db in &dbs {
-            db.conn().execute_batch("BEGIN").map_err(Error::from)?;
+            db.begin()?;
         }
         self.batching = self.batching.saturating_add(1);
         let mut result = f(self);
