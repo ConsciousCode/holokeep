@@ -89,6 +89,12 @@ Writing to an anchor turns it into an **overlay mount**:
   **moved out**, to be blocks of their own. So every value the anchor has
   had stays whole, while what it is now is stored once, in the work
   directory: history costs only what changed.
+- What's moved out goes to the [[Storage#Deltas|delta store]], whole,
+  and the version of the same path before it, part by part at the same
+  offsets, is made a **delta** on it, as git keeps history: the newest
+  version written over is whole, each older one only what it differs
+  by. The anchor's history says which version came before; the deltas
+  are found by the committer's thread, not the one writing.
 - An anchor can be a single file. Editors save by writing a file beside
   it and renaming that over it, so `anchors/` accepts loose files, which
   become the anchor when renamed over it.

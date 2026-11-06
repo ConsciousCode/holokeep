@@ -2,11 +2,15 @@
 //! whole, compressed either way when that's smaller.
 //!
 //! A block is kept as a delta only when it comes with one
-//! (`Provenance::Delta`), on a base this store keeps, and the delta's
-//! checked to make it. Git objects come whole too, as a pack's bases do,
-//! and are kept whole. A chain of deltas is at most `MAX_DEPTH` long, so a
-//! read applies at most that many. A base let go of first makes each block
-//! on it whole, so nothing's left on what isn't here.
+//! (`Provenance::Delta`), on a base this store keeps, shorter than the
+//! block, and checked to make it. Git objects come whole too, as a pack's
+//! bases do, and versions of files written over (`Provenance::Superseded`),
+//! for the versions before them to be deltas on; both are kept whole till
+//! a delta comes for them. A chain of deltas is at most `MAX_DEPTH` long,
+//! so a read applies at most that many: a block made a delta deepens what's
+//! on it, and is left whole if that would go too deep. A base let go of
+//! first makes each block on it whole, so nothing's left on what isn't
+//! here.
 
 use std::io::{Read as _, Write as _};
 
@@ -125,6 +129,29 @@ impl DeltaStore {
         Ok(false)
     }
 
+    /// Every block on `id`, however deep, and how deep the deepest is.
+    fn on(&self, id: Id) -> Result<(Vec<Id>, i64)> {
+        let mut stmt = self.db.conn().prepare_cached(
+            "WITH RECURSIVE on_it (block) AS (
+                 SELECT block FROM delta_blocks WHERE base = ?1
+                 UNION SELECT d.block FROM delta_blocks d JOIN on_it ON d.base = on_it.block
+             )
+             SELECT d.block, d.depth FROM on_it JOIN delta_blocks d ON d.block = on_it.block",
+        )?;
+        let rows: Vec<(Id, i64)> = stmt.query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let deepest = rows.iter().map(|&(_, depth)| depth).max().unwrap_or_default();
+        Ok((rows.into_iter().map(|(block, _)| block).collect(), deepest))
+    }
+
+    /// Move blocks deeper, or shallower.
+    fn deepen(&self, blocks: &[Id], by: i64) -> Result<()> {
+        let mut stmt = self.db.conn().prepare_cached("UPDATE delta_blocks SET depth = depth + ?2 WHERE block = ?1")?;
+        for &block in blocks {
+            stmt.execute(params![block, by])?;
+        }
+        Ok(())
+    }
+
     fn write(&self, id: Id, base: Option<(Id, i64)>, bytes: &[u8]) -> Result<()> {
         let (zlib, data) = pack(bytes);
         self.db.conn()
@@ -137,7 +164,8 @@ impl DeltaStore {
     }
 
     /// Keep a block as a delta on `base`, if that's here, shallow enough,
-    /// makes the block, and doesn't loop. Returns whether it did.
+    /// shorter than the block, makes it, and doesn't loop. Returns whether
+    /// it's here.
     fn put_delta(&self, block: &Block, base: Key<'_>, delta: &[u8]) -> Result<bool> {
         let Some(base_id) = self.db.lookup(base)? else {
             return Ok(false);
@@ -145,7 +173,7 @@ impl DeltaStore {
         let Some(base_row) = self.row(base_id)? else {
             return Ok(false);
         };
-        if base_row.depth >= MAX_DEPTH {
+        if base_row.depth >= MAX_DEPTH || delta.len() >= block.data().len() {
             return Ok(false);
         }
         let id = self.db.intern(block.cid().multihash())?;
@@ -160,14 +188,22 @@ impl DeltaStore {
             return Ok(false);
         }
         // A delta, whether or not the block was here whole, unless being
-        // whole is smaller
-        let (_, packed) = pack(delta);
-        if let Some(row) = existing
-            && row.data.len() <= packed.len()
-        {
-            return Ok(true);
+        // whole is smaller, or what's on it would go too deep
+        let depth = base_row.depth.saturating_add(1);
+        let mut deeper = Vec::new();
+        if let Some(row) = existing {
+            let (_, packed) = pack(delta);
+            if row.data.len() <= packed.len() {
+                return Ok(true);
+            }
+            let deepest;
+            (deeper, deepest) = self.on(id)?;
+            if deepest.saturating_add(depth) > MAX_DEPTH {
+                return Ok(true);
+            }
         }
         self.write(id, Some((base_id, base_row.depth)), delta)?;
+        self.deepen(&deeper, depth)?;
         Ok(true)
     }
 
@@ -178,6 +214,20 @@ impl DeltaStore {
             [],
             |row| Ok((row.get::<_, i64>(0)?.try_into().unwrap_or_default(), row.get::<_, i64>(1)?.try_into().unwrap_or_default())),
         )?)
+    }
+}
+
+impl DeltaStore {
+    /// A block kept whole if it's here or `admit`ted.
+    fn put_whole(&self, block: &Block, admit: bool) -> Result<Put> {
+        let id = match self.db.lookup(block.cid().multihash())? {
+            Some(id) if self.row(id)?.is_some() => return Ok(Put::Stored),
+            _ if !admit => return Ok(Put::Declined),
+            Some(id) => id,
+            None => self.db.intern(block.cid().multihash())?,
+        };
+        self.write(id, None, block.data())?;
+        Ok(Put::Stored)
     }
 }
 
@@ -198,9 +248,10 @@ impl Store for DeltaStore {
             .collect::<rusqlite::Result<_>>()?;
         let mut added = 0_u64;
         for child in on {
-            let before = self.row(child)?.map_or(0, |row| row.data.len());
+            let (before, depth) = self.row(child)?.map_or((0, 0), |row| (row.data.len(), row.depth));
             let bytes = self.bytes(child)?.ok_or_else(|| Error::Volume("a delta that won't read".to_owned()))?;
             self.write(child, None, &bytes)?;
+            self.deepen(&self.on(child)?.0, depth.saturating_neg())?;
             let after = self.row(child)?.map_or(0, |row| row.data.len());
             added = added.saturating_add(u64::try_from(after.saturating_sub(before)).unwrap_or_default());
         }
@@ -233,22 +284,14 @@ impl BlockSource for DeltaStore {
 impl BlockStore for DeltaStore {
     /// Git objects, whole; nothing else without a delta.
     fn put(&self, block: &Block) -> Result<Put> {
-        if block.cid().codec() != GIT_RAW_CODEC {
-            return Ok(Put::Declined);
-        }
-        let id = self.db.intern(block.cid().multihash())?;
-        if self.row(id)?.is_none() {
-            self.write(id, None, block.data())?;
-        }
-        Ok(Put::Stored)
+        self.put_whole(block, block.cid().codec() == GIT_RAW_CODEC)
     }
 
     fn put_from(&self, block: &Block, provenance: Provenance<'_>) -> Result<Put> {
-        if let Provenance::Delta { base, delta } = provenance
-            && self.put_delta(block, base, delta)?
-        {
-            return Ok(Put::Stored);
+        match provenance {
+            Provenance::Delta { base, delta } if self.put_delta(block, base, delta)? => Ok(Put::Stored),
+            Provenance::Superseded => self.put_whole(block, true),
+            _ => self.put(block),
         }
-        self.put(block)
     }
 }

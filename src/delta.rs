@@ -6,6 +6,10 @@
 //! the `o` bits saying which of 4 offset bytes follow and the `s` bits
 //! which of 3 size bytes (a size of 0 meaning 0x10000); `0nnnnnnn`, n > 0,
 //! inserts the next n bytes.
+//!
+//! `encode` finds a delta between two blocks, as git's does: the base's
+//! 16-byte windows indexed by a hash, the target's windows hashed as they
+//! roll past, and each match extended both ways.
 
 #[derive(Debug, thiserror::Error)]
 #[error("a bad delta: {0}")]
@@ -193,6 +197,143 @@ impl Writer {
     }
 }
 
+/// The bytes a match is found by: a window of the base, at every multiple
+/// of this, or of the target, at every offset.
+const WINDOW: usize = 16;
+
+/// The most places in the base a window of the target is looked for at.
+const MOST_CANDIDATES: usize = 64;
+
+/// A match shorter than this is looked past, for one that goes further.
+const LAZY: usize = 128;
+
+/// What a window's hash is rolled by.
+const MULTIPLIER: u64 = 0x0100_0000_01b3;
+
+fn window_hash(window: &[u8]) -> u64 {
+    window.iter().fold(0_u64, |hash, &byte| hash.wrapping_mul(MULTIPLIER).wrapping_add(u64::from(byte)))
+}
+
+/// The base's windows, by hash: chains of positions, from a head per
+/// bucket.
+struct Index {
+    heads: Vec<u32>,
+    next: Vec<u32>,
+    at: Vec<u32>,
+    shift: u32,
+}
+
+const NONE: u32 = u32::MAX;
+
+impl Index {
+    fn new(base: &[u8]) -> Self {
+        // Offsets past 4 GiB can't be copied from
+        let reach = base.len().min(usize::try_from(u32::MAX).unwrap_or(usize::MAX));
+        let count = reach / WINDOW;
+        let bits = usize::BITS.saturating_sub(count.max(1).leading_zeros()).max(4);
+        let mut index = Self { heads: vec![NONE; 1 << bits], next: Vec::with_capacity(count), at: Vec::with_capacity(count), shift: 64_u32.saturating_sub(bits) };
+        // Last first, so a chain gives the earliest first
+        for n in (0..count).rev() {
+            let at = n.saturating_mul(WINDOW);
+            let Some(window) = base.get(at..at.saturating_add(WINDOW)) else {
+                continue;
+            };
+            let bucket = index.bucket(window_hash(window));
+            let entry = u32::try_from(index.at.len()).unwrap_or(NONE);
+            if let Some(head) = index.heads.get_mut(bucket) {
+                index.next.push(std::mem::replace(head, entry));
+                index.at.push(u32::try_from(at).unwrap_or(NONE));
+            }
+        }
+        index
+    }
+
+    fn bucket(&self, hash: u64) -> usize {
+        usize::try_from(hash.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> self.shift).unwrap_or_default()
+    }
+
+    /// Where in the base a window with this hash may be.
+    fn candidates(&self, hash: u64) -> impl Iterator<Item = usize> + '_ {
+        let mut entry = self.heads.get(self.bucket(hash)).copied().unwrap_or(NONE);
+        std::iter::from_fn(move || {
+            let i = usize::try_from(entry).ok().filter(|_| entry != NONE)?;
+            entry = self.next.get(i).copied().unwrap_or(NONE);
+            self.at.get(i).and_then(|&at| usize::try_from(at).ok())
+        })
+        .take(MOST_CANDIDATES)
+    }
+}
+
+/// A delta from `base` to `target`: as short as matches of whole windows
+/// make it, not necessarily the shortest.
+pub fn encode(base: &[u8], target: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Writer::new(base.len(), target.len());
+    let index = Index::new(base);
+    // What a window's first byte adds to its hash
+    let top = (1..WINDOW).fold(1_u64, |power, _| power.wrapping_mul(MULTIPLIER));
+    let mut literal = 0_usize;
+    let mut at = 0_usize;
+    let mut rolled: Option<u64> = None;
+    // The longest match through a window of the target, back as far as
+    // what's not yet in the delta: where it starts in the base, in the
+    // target, and how long it is
+    let found = |at: usize, hash: u64, literal: usize| -> Option<(usize, usize, usize)> {
+        let window = target.get(at..at.saturating_add(WINDOW))?;
+        let mut best: Option<(usize, usize, usize)> = None;
+        for from in index.candidates(hash) {
+            if base.get(from..from.saturating_add(WINDOW)) != Some(window) {
+                continue;
+            }
+            let ahead = common(base.get(from..).unwrap_or_default().iter(), target.get(at..).unwrap_or_default().iter());
+            let behind = common(base.get(..from).unwrap_or_default().iter().rev(), target.get(literal..at).unwrap_or_default().iter().rev());
+            let len = ahead.saturating_add(behind);
+            if best.is_none_or(|(_, _, most)| len > most) {
+                best = Some((from.saturating_sub(behind), at.saturating_sub(behind), len));
+            }
+        }
+        best
+    };
+    let end = |(_, start, len): (usize, usize, usize)| start.saturating_add(len);
+    while let Some(window) = target.get(at..at.saturating_add(WINDOW)) {
+        let hash = rolled.unwrap_or_else(|| window_hash(window));
+        if let Some(mut best) = found(at, hash, literal) {
+            // A short match may be one of many alike, as in repetitive
+            // text, while the one that goes on starts a little later
+            if best.2 < LAZY {
+                for later in at.saturating_add(1)..=at.saturating_add(WINDOW) {
+                    let Some(window) = target.get(later..later.saturating_add(WINDOW)) else {
+                        break;
+                    };
+                    if let Some(other) = found(later, window_hash(window), literal)
+                        && end(other) > end(best)
+                    {
+                        best = other;
+                    }
+                }
+            }
+            let (from, start, len) = best;
+            out.insert(target.get(literal..start).unwrap_or_default());
+            out.copy(from, len)?;
+            at = start.saturating_add(len);
+            literal = at;
+            rolled = None;
+            continue;
+        }
+        rolled = match (window.first(), target.get(at.saturating_add(WINDOW))) {
+            (Some(&gone), Some(&next)) => Some(hash.wrapping_sub(u64::from(gone).wrapping_mul(top)).wrapping_mul(MULTIPLIER).wrapping_add(u64::from(next))),
+            _ => None,
+        };
+        at = at.saturating_add(1);
+    }
+    out.insert(target.get(literal..).unwrap_or_default());
+    Ok(out.finish())
+}
+
+/// How many items two sequences start with alike.
+fn common<'a>(a: impl Iterator<Item = &'a u8>, b: impl Iterator<Item = &'a u8>) -> usize {
+    a.zip(b).take_while(|(a, b)| a == b).count()
+}
+
 /// A delta between contents made a delta between blocks whose bytes are
 /// those contents after headers: the base's `skip` bytes long, and the
 /// target's `header`.
@@ -241,5 +382,47 @@ mod tests {
         let delta = [5, 8, 0x80 | 0x10, 5, 3, b'a', b'b', b'c'];
         let moved = behind_headers(&delta, 7, b"blob 8\0").expect("moved");
         assert_eq!(apply(b"blob 5\0hello", &moved).expect("apply"), b"blob 8\0helloabc");
+    }
+    #[test]
+    fn an_encoded_delta_makes_its_target_and_is_small() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let base: Vec<u8> = (0..300_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        // An insertion, a deletion, a change, and a move
+        let mut target = base.get(..1000).expect("range").to_vec();
+        target.extend_from_slice(b"something new in the middle");
+        target.extend_from_slice(base.get(1000..50_000).expect("range"));
+        target.extend_from_slice(base.get(60_000..200_000).expect("range"));
+        target.push(7);
+        target.extend_from_slice(base.get(200_001..250_000).expect("range"));
+        target.extend_from_slice(base.get(..5000).expect("range"));
+        let delta = encode(&base, &target).expect("encode");
+        assert_eq!(apply(&base, &delta).expect("apply"), target);
+        assert!(delta.len() < 100, "{} bytes", delta.len());
+        for (base, target) in [(&b""[..], &b"new"[..]), (b"old", b""), (b"short", b"shorter"), (b"", b"")] {
+            assert_eq!(apply(base, &encode(base, target).expect("encode")).expect("apply"), target);
+        }
+        let unrelated: Vec<u8> = (0..10_000_u32).map(|i| u8::try_from(i % 7).unwrap_or_default()).collect();
+        assert_eq!(apply(&base, &encode(&base, &unrelated).expect("encode")).expect("apply"), unrelated);
+    }
+
+    #[test]
+    fn text_edited_is_a_short_delta() {
+        let base = (0..2000).fold(String::new(), |mut text, i| {
+            text.push_str("line ");
+            text.push_str(&i.to_string());
+            text.push_str(": the quick brown fox\n");
+            text
+        });
+        let target = base.replace("line 1000:", "line one thousand:").replace("line 5:", "");
+        let delta = encode(base.as_bytes(), target.as_bytes()).expect("encode");
+        assert_eq!(apply(base.as_bytes(), &delta).expect("apply"), target.as_bytes());
+        assert!(delta.len() < 60, "{} bytes", delta.len());
     }
 }

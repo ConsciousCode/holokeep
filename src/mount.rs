@@ -1380,6 +1380,38 @@ mod tests {
     }
 
     #[test]
+    fn versions_written_over_are_kept_as_deltas() {
+        let scratch = Scratch::new("mount-deltas");
+        let (soup, anchor, repo) = writable(&scratch);
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let version = |n: usize| -> Vec<u8> { (0..3000).flat_map(|i| format!("line {i}{}\n", if i == n * 100 { " edited" } else { "" }).into_bytes()).collect() };
+        let (_, fh) = soup.create(dir, OsStr::new("doc")).expect("create");
+        soup.write(fh, 0, &version(0)).expect("write");
+        soup.release(fh);
+        soup.commit();
+        for n in 1..4 {
+            let fh = soup.open(ino(&soup, &format!("anchors/{anchor}/doc")).expect("doc").ino.0, true, true).expect("open");
+            soup.write(fh, 0, &version(n)).expect("write");
+            soup.release(fh);
+            soup.commit();
+        }
+        // The first two on the one after each, the third whole, and the
+        // fourth what's in the work directory
+        let db = rusqlite::Connection::open(repo.join("blocks.db")).expect("db");
+        let (deltas, whole, kept): (i64, i64, i64) = db.query_row("SELECT count(base), count(*) - count(base), sum(length(data)) FROM delta_blocks", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).expect("rows");
+        assert_eq!((deltas, whole), (2, 1));
+        assert!(kept < i64::try_from(version(0).len()).expect("len"), "{kept} bytes kept");
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let history = catalog.anchor_history(&anchor).expect("history");
+        assert_eq!(history.len(), 5, "set, then four commits");
+        for (n, (_, value)) in history.iter().skip(1).enumerate() {
+            let out = scratch.path().join(format!("out-{n}"));
+            crate::export::get(&catalog, value, &out).unwrap_or_else(|e| panic!("{value} isn't whole: {e}"));
+            assert_eq!(std::fs::read(out.join("doc")).expect("doc"), version(n), "version {n}");
+        }
+    }
+
+    #[test]
     fn every_version_committed_stays_whole() {
         let scratch = Scratch::new("mount-history");
         let (soup, anchor, repo) = writable(&scratch);

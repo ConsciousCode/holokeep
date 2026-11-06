@@ -1762,7 +1762,7 @@ impl Catalog {
                     let mut moved = 0u64;
                     for (block, elsewhere) in offsets.ranges_of(blob.as_ref())? {
                         if !elsewhere && !going.contains_key(&block.to_bytes()) {
-                            moved = moved.saturating_add(self.move_out(block.as_ref())?);
+                            moved = moved.saturating_add(self.move_out(block.as_ref(), Provenance::Unknown)?);
                         }
                     }
                     freed = freed.saturating_add(offsets.unkeep(blob.as_ref())?.saturating_sub(moved));
@@ -1839,7 +1839,7 @@ impl Catalog {
                 if !file.changed() {
                     for (block, elsewhere) in offsets.ranges_of(file.blob.as_ref())? {
                         if !elsewhere && self.placements(block.as_ref())?.iter().any(|(_, form)| form == "offset") {
-                            self.move_out(block.as_ref())?;
+                            self.move_out(block.as_ref(), Provenance::Superseded)?;
                             moved = moved.saturating_add(1);
                         }
                     }
@@ -1858,8 +1858,8 @@ impl Catalog {
     }
 
     /// Move a block out of the kept file it's a range of, to be a block of
-    /// its own, returning its size.
-    fn move_out(&self, key: Key<'_>) -> Result<u64> {
+    /// its own, placed as its provenance says, returning its size.
+    fn move_out(&self, key: Key<'_>, provenance: Provenance<'_>) -> Result<u64> {
         let (Some(block), Some(id)) = (self.readable(key)?, self.db.lookup(key)?) else {
             return Err(Error::Volume(format!("{key:?} can't be read out of its kept file")));
         };
@@ -1867,9 +1867,31 @@ impl Catalog {
             let &volume = self.ids.get(volume).ok_or_else(|| Error::UnknownStore("offset".into()))?;
             self.db.conn().prepare_cached("DELETE FROM blocks WHERE block = ?1 AND volume = ?2")?.execute([id, volume])?;
         }
-        let placed = self.place(&block, Provenance::Unknown)?;
+        let placed = self.place(&block, provenance)?;
         self.record(id, &placed)?;
         Ok(crate::dag::len64(block.data()))
+    }
+
+    /// Keep `older` as a delta on `newer`, if both are kept in one volume's
+    /// delta store and the delta's shorter: a version of part of a file on
+    /// the version written over it, so the newest is whole.
+    pub fn revise(&self, older: &Link, newer: &Link) -> Result<()> {
+        if older.multihash() == newer.multihash() {
+            return Ok(());
+        }
+        let in_deltas = |cid: &Link| -> Result<Vec<usize>> {
+            Ok(self.placements(cid.multihash())?.into_iter().filter(|(_, form)| form == "delta").map(|(volume, _)| volume).collect())
+        };
+        let newer_in = in_deltas(newer)?;
+        let Some(volume) = in_deltas(older)?.into_iter().find(|volume| newer_in.contains(volume)) else {
+            return Ok(());
+        };
+        let (Some(old), Some(new)) = (self.get_block(older)?, self.get_block(newer)?) else {
+            return Ok(());
+        };
+        let delta = crate::delta::encode(new.data(), old.data()).map_err(|e| Error::Volume(e.to_string()))?;
+        let store = self.named(&(volume, "delta".to_owned()))?;
+        self.db.atomically(|| store.put_from(&old, Provenance::Delta { base: newer.multihash(), delta: &delta }).map(|_| ()))
     }
 
     /// Whether a block is here: as `has`, but a dissolved claim's identity

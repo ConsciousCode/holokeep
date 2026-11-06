@@ -257,6 +257,44 @@ fn part_size(src: &impl Fetch, cid: &Link, depth: usize) -> io::Result<u64> {
     }
 }
 
+/// A file's leaves, the blocks of its bytes, in order, each with where
+/// in the file it starts. Raw leaves sized by their parents aren't
+/// fetched.
+pub fn leaves(src: &impl Fetch, cid: &Link) -> io::Result<Vec<(u64, Link)>> {
+    let mut out = Vec::new();
+    leaves_of(src, cid, 0, None, &mut out, 0)?;
+    Ok(out)
+}
+
+/// A part of a file's leaves, from `offset`, and its size.
+fn leaves_of(src: &impl Fetch, cid: &Link, offset: u64, size: Option<u64>, out: &mut Vec<(u64, Link)>, depth: usize) -> io::Result<u64> {
+    if let (RAW_CODEC, Some(size)) = (cid.codec(), size) {
+        out.push((offset, cid.clone()));
+        return Ok(size);
+    }
+    match load(src, cid)? {
+        Node::Raw(bytes) => {
+            out.push((offset, cid.clone()));
+            Ok(len(&bytes))
+        },
+        Node::Pb { data, links, .. } if matches!(data.data_type, DataType::File | DataType::Raw) => {
+            if links.is_empty() {
+                out.push((offset, cid.clone()));
+                return file_size(src, &data, &links, depth);
+            }
+            let depth = deeper(depth)?;
+            let sized = data.blocksizes.len() == links.len();
+            let mut at = len(data.data.as_deref().unwrap_or_default());
+            for (i, (child, _)) in links.iter().enumerate() {
+                let size = data.blocksizes.get(i).copied().filter(|_| sized);
+                at = at.saturating_add(leaves_of(src, child, offset.saturating_add(at), size, out, depth)?);
+            }
+            Ok(at)
+        },
+        Node::Pb { .. } => Err(invalid(format!("{cid}: not a file"))),
+    }
+}
+
 /// Up to `size` bytes of a file from `offset`, fetching only the parts
 /// of it they're in. Fewer at the end of the file.
 pub fn read_at(src: &impl Fetch, cid: &Link, offset: u64, size: usize) -> io::Result<Vec<u8>> {

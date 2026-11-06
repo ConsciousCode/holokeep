@@ -50,6 +50,9 @@ pub enum Provenance<'a> {
     /// The block's bytes are this delta applied to the bytes of the block
     /// with this multihash (see `crate::delta`).
     Delta { base: crate::multihash::Multihash<&'a [u8]>, delta: &'a [u8] },
+    /// The block's a version of part of a file, written over: kept whole,
+    /// so the version before it can be kept as a delta on it.
+    Superseded,
 }
 
 /// Discard blocks, for when only the CIDs matter (`ipfs add --only-hash`).

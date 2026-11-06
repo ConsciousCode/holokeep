@@ -289,12 +289,31 @@ pub struct Committer {
     /// imported in place since last committed, so needn't be kept before
     /// they're changed.
     fresh: Mutex<std::collections::HashSet<PathBuf>>,
+    /// Parts of files written over, each to be kept as a delta on the
+    /// part written over it: (older, newer).
+    revisions: Mutex<Vec<(Link, Link)>>,
     stop: AtomicBool,
 }
 
 impl Committer {
     pub fn new(open: Arc<dyn Fn() -> crate::store::Result<Catalog> + Send + Sync>, filler: Arc<Filler>) -> Self {
-        Self { open, filler, written: Mutex::new(HashMap::new()), fresh: Mutex::new(std::collections::HashSet::new()), stop: AtomicBool::new(false) }
+        Self { open, filler, written: Mutex::new(HashMap::new()), fresh: Mutex::new(std::collections::HashSet::new()), revisions: Mutex::new(Vec::new()), stop: AtomicBool::new(false) }
+    }
+
+    fn revisions(&self) -> std::sync::MutexGuard<'_, Vec<(Link, Link)>> {
+        self.revisions.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keep each older part of a file as a delta on the newer one written
+    /// over it, where they're kept so it can be. Best done off the thread
+    /// writing, since it reads and encodes each.
+    fn revise(&self, catalog: &Catalog) {
+        let revisions = std::mem::take(&mut *self.revisions());
+        for (older, newer) in revisions {
+            if let Err(e) = catalog.revise(&older, &newer) {
+                eprintln!("{older} is kept whole, not as a delta on {newer}: {e}");
+            }
+        }
     }
 
     fn fresh(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<PathBuf>> {
@@ -369,6 +388,7 @@ impl Committer {
 
     /// Commit what's due as of `now`.
     pub(super) fn commit_as_of(&self, catalog: &mut Catalog, all: bool, now: Instant) {
+        self.revise(catalog);
         for (anchor, changes) in self.due(all, now) {
             let mount = catalog.mounts().ok().and_then(|mounts| mounts.into_iter().find(|mount| mount.anchor == anchor && mount.overlay));
             let Some(mount) = mount else {
@@ -435,7 +455,7 @@ impl Committer {
             let mut catalog = None;
             while !self.stop.load(Ordering::Relaxed) {
                 std::thread::sleep(super::write::TICK);
-                if !self.written().values().any(|it| it.dirty.is_some()) && self.filler.partials().is_empty() {
+                if !self.written().values().any(|it| it.dirty.is_some()) && self.filler.partials().is_empty() && self.revisions().is_empty() {
                     continue;
                 }
                 if catalog.is_none() {
@@ -457,6 +477,46 @@ impl Committer {
             Err(e) => eprintln!("what was written isn't committed yet, and will be when next mounted: {e}"),
         }
     }
+}
+
+/// Blocks here, and only here.
+struct Here<'a>(&'a Catalog);
+
+impl export::Fetch for Here<'_> {
+    fn fetch(&self, cid: &Link) -> io::Result<Vec<u8>> {
+        match self.0.get_block(cid) {
+            Ok(Some(block)) => Ok(block.into_data().into_vec()),
+            Ok(None) => Err(io::Error::new(io::ErrorKind::NotFound, format!("block {cid} isn't here"))),
+            Err(e) => Err(io::Error::other(e)),
+        }
+    }
+}
+
+/// How far back an anchor's history is looked through for the version
+/// of a file before the one committed.
+const HISTORY: usize = 64;
+
+/// The parts of the file committed at a path of an anchor, about to be
+/// written over, each with the part at the same offset of the version
+/// of it before: (that older part, the newer). Only what's here is
+/// looked at, and nothing if the path's not a file.
+fn written_over(catalog: &Catalog, anchor: &Link, rel: &Path) -> Vec<(Link, Link)> {
+    let here = Here(catalog);
+    let marks = crate::store::overlay::Marks::new();
+    let at = |value: &Link| crate::store::overlay::resolve(&here, Some(value.clone()), rel, &marks).ok().flatten().map(|(cid, _)| cid);
+    let Some(newer) = catalog.anchor_value(anchor).ok().flatten().as_ref().and_then(at) else {
+        return Vec::new();
+    };
+    let history = catalog.anchor_history(anchor).unwrap_or_default();
+    let older = history.iter().rev().take(HISTORY).map(|(_, value)| at(value)).find(|cid| cid.as_ref() != Some(&newer));
+    let Some(Some(older)) = older else {
+        return Vec::new();
+    };
+    let (Ok(newer), Ok(older)) = (export::leaves(&here, &newer), export::leaves(&here, &older)) else {
+        return Vec::new();
+    };
+    let older: HashMap<u64, Link> = older.into_iter().collect();
+    newer.into_iter().filter_map(|(offset, newer)| older.get(&offset).filter(|older| **older != newer).map(|older| (older.clone(), newer))).collect()
 }
 
 /// Import an overlay and set its anchor, unless `still()` says it was
@@ -511,6 +571,7 @@ impl Soup {
             return Ok(());
         }
         catalog.preserve_in_place(&path).map_err(store_errno)?;
+        self.committer.revisions().extend(written_over(catalog, anchor, rel));
         self.committer.fresh().insert(path);
         Ok(())
     }

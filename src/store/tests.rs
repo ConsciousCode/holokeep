@@ -1448,6 +1448,66 @@ fn chains_of_deltas_stop_at_their_depth_and_outlive_their_bases() {
 }
 
 
+/// Whether every delta row says how deep it is truly.
+fn depths_true(db: &Db) -> bool {
+    db.conn()
+        .query_row(
+            "WITH RECURSIVE chain (block, depth) AS (
+                 SELECT block, 0 FROM delta_blocks WHERE base IS NULL
+                 UNION ALL SELECT d.block, chain.depth + 1 FROM delta_blocks d JOIN chain ON d.base = chain.block
+             )
+             SELECT count(*) FROM delta_blocks d JOIN chain c ON c.block = d.block WHERE c.depth != d.depth",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("depths")
+        == 0
+}
+
+#[test]
+fn versions_written_over_are_deltas_on_the_versions_after_them() {
+    let router = router();
+    let versions: Vec<Block> = (0..60).map(|n| raw(&text(2000 + n * 3))).collect();
+    // Not without being written over
+    router.put_block(&versions[0], CidVersion::V1).expect("put");
+    assert_eq!(router.store_of(versions[0].cid().multihash()).expect("store").as_deref(), Some("raw"));
+    let router = self::router();
+    for (n, version) in versions.iter().enumerate() {
+        assert_eq!(router.put_block_from(version, CidVersion::V1, Provenance::Superseded).expect("put"), "delta");
+        if let Some(older) = n.checked_sub(1).and_then(|n| versions.get(n)) {
+            router.revise(&older.cid().clone().into(), &version.cid().clone().into()).expect("revise");
+        }
+        assert!(depths_true(&router.db), "after {n}");
+    }
+    let rows = |sql: &str| router.db.conn().query_row(sql, [], |row| row.get::<_, i64>(0)).expect("rows");
+    // The oldest fifty on the next, then the one too deep for that, whole,
+    // and those after on the next, but the newest
+    assert_eq!(rows("SELECT count(*) FROM delta_blocks WHERE base IS NULL"), 2);
+    assert_eq!(rows("SELECT max(depth) FROM delta_blocks"), 50);
+    assert!(rows("SELECT sum(length(data)) FROM delta_blocks") < 3 * i64::try_from(versions[59].data().len()).expect("len"));
+    for version in &versions {
+        assert_eq!(router.get_block(&version.cid().clone().into()).expect("get").as_ref().map(Block::data), Some(version.data()));
+    }
+
+    // A base let go of makes what's on it whole, and shallower what's on that
+    let store = DeltaStore::open(router.db.clone()).expect("store");
+    store.remove(versions[50].cid().multihash()).expect("remove");
+    assert!(depths_true(&router.db));
+    assert_eq!(rows("SELECT max(depth) FROM delta_blocks"), 49);
+    assert_eq!(store.get(versions[0].cid().multihash()).expect("get").as_deref(), Some(versions[0].data()));
+}
+
+#[test]
+fn a_delta_no_shorter_than_its_block_is_not_kept() {
+    let store = DeltaStore::open(Db::memory().expect("db")).expect("store");
+    let base = raw(b"a base");
+    store.put_from(&base, Provenance::Superseded).expect("put");
+    let target = raw(b"tiny");
+    let delta = crate::delta::encode(base.data(), target.data()).expect("encode");
+    assert_eq!(store.put_from(&target, on(&base, &delta)).expect("put"), Put::Declined);
+    assert_eq!(store.counts().expect("counts"), (0, 1));
+}
+
 //-------------//
 //-[ Volumes ]-//
 //-------------//
