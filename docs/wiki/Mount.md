@@ -101,6 +101,33 @@ Writing to an anchor turns it into an **overlay mount**:
 - Unmounting commits what's left; mounting again commits what an
   interrupted mount didn't.
 
+## Threads
+
+The filesystem takes eight requests at once, so one that's fetching a
+block or waiting for the database doesn't hold up the rest. Anything that
+changes something still happens one at a time, and only what reads goes
+on beside it. So:
+
+- A file open to read stays what it was when it's replaced, whether or
+  not anything of it had reached the work directory.
+- A file saved by renaming over it is always there, and always one whole
+  version: rename replaces what's there, never removing it first, and the
+  inode that was there is told from the one that's there now, so nothing
+  read through the old one goes in the page cache among what it held.
+- A file opened to write is known to be partial before it's made, so it's
+  never read full of holes.
+- A commit takes the same lock from seeing nothing's changed until what
+  it's committed is known to be in place, without waiting for it, as a
+  change could be waiting for the commit's own transaction. If something's
+  underway, the commit gives way and tries again. Otherwise that change
+  could replace what was being committed with no copy kept.
+
+The kernel takes a directory's lock for a create or rename, so while one
+of those waits for the database, new lookups in that directory wait too.
+Files already open, and other directories, don't.
+
+`scripts/mount-stress.sh` checks all this through a real mount.
+
 ## Committing
 
 An anchor written to is committed when what's written is **whole**,

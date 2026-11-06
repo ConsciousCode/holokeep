@@ -33,7 +33,13 @@ impl Fetch for Catalog {
     /// A block here, or, if the catalog fetches through a node, fetched.
     fn fetch(&self, cid: &Link) -> io::Result<Vec<u8>> {
         let missing = || io::Error::new(io::ErrorKind::NotFound, format!("block {cid} not found"));
-        match self.get_block(cid) {
+        // A block in a file of a mount's being moved out as that's written
+        // over: where it was looked up, it's gone, and looking again finds it
+        let got = match self.get_block(cid) {
+            Err(crate::store::Error::Corrupt(_) | crate::store::Error::Stale(_) | crate::store::Error::Missing(_)) => self.get_block(cid),
+            got => got,
+        };
+        match got {
             Ok(Some(block)) => Ok(block.into_data().into_vec()),
             Ok(None) if self.fetch_missing(std::slice::from_ref(cid)) => match self.get_block(cid) {
                 Ok(Some(block)) => Ok(block.into_data().into_vec()),

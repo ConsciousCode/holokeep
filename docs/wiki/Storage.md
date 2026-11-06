@@ -137,7 +137,7 @@ suits it, and what can't wait doesn't stop anything else:
 |---|---|---|
 | Opening a repo | Not at all, if nothing's changed | It writes only what has. Catching up waits a quarter of a second, then leaves it for next time, so reading is never held up. |
 | Most commands | 10 s | Fails with `database is locked`. |
-| [[Mount|hk mount]] | 2 minutes | What it was asked fails with `EIO`, since an application can't try again later. It does one thing at a time, so while one write waits, so do reads through the mount. |
+| [[Mount|hk mount]] | 2 minutes | What it was asked fails with `EIO`, since an application can't try again later. Reads go on meanwhile, and other changes wait (see [[Mount#Threads]]). |
 | The mount's committer | 10 s | Tries again next tick. |
 | [[Mesh|The daemon]] | 1 s | Tries again on its next tick, so it's never stuck long enough for members to take it for gone. A fetch is asked for again every 10 s, and an audit finishes, with what it learned left unnoted. What members sent that couldn't be taken, they send again. |
 | What's asked of the daemon | 10 s | The asker hears why. |

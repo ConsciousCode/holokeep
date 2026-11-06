@@ -19,7 +19,7 @@ use crate::model::Link;
 use crate::store::overlay::{CHUNK, Partial};
 use crate::store::{Catalog, Mount};
 
-use super::{At, Inode, Soup, errno, store_errno, to_anchor};
+use super::{At, Inode, Inodes, Soup, errno, store_errno, to_anchor};
 
 /// An empty UnixFS directory, as dag-pb.
 const EMPTY_DIR: &[u8] = &[0x0a, 0x02, 0x08, 0x01];
@@ -43,7 +43,7 @@ const FILLS: usize = 8;
 /// A file open: in an anchor's work directory, and whether it's open to
 /// write.
 pub struct Handle {
-    file: File,
+    file: Arc<File>,
     /// The anchor it's of, or none for a loose file.
     anchor: Option<Link>,
     /// Its path within the anchor.
@@ -72,7 +72,17 @@ impl Handle {
 /// write needn't be copied before it can be.
 pub struct Filler {
     work: Option<PathBuf>,
-    partials: Mutex<HashMap<(Vec<u8>, PathBuf), Partial>>,
+    /// Each file's locked by itself while it's filled, which may mean
+    /// fetching it, or waiting for the database, so that isn't what anything
+    /// else waits for.
+    partials: Mutex<Partials>,
+}
+
+/// Partial files, by the anchor they're of and their paths.
+type Partials = HashMap<(Vec<u8>, PathBuf), Arc<Mutex<Partial>>>;
+
+fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Filler {
@@ -82,23 +92,42 @@ impl Filler {
         Self { work, partials: Mutex::new(HashMap::new()) }
     }
 
-    fn partials(&self) -> std::sync::MutexGuard<'_, HashMap<(Vec<u8>, PathBuf), Partial>> {
-        self.partials.lock().unwrap_or_else(PoisonError::into_inner)
+    fn partials(&self) -> std::sync::MutexGuard<'_, Partials> {
+        locked(&self.partials)
     }
 
-    /// Take up where a mount before left off.
-    fn load(&self, catalog: &Catalog) {
-        let mut partials = self.partials();
+    /// Take up where a mount before left off. A file that was never made
+    /// was never written to, so there's nothing to fill.
+    pub(super) fn load(&self, catalog: &Catalog) {
         for partial in catalog.partials().unwrap_or_default() {
-            partials.insert((partial.anchor.to_bytes(), partial.path.clone()), partial);
+            let made = self.work.as_ref().is_none_or(|work| fs::symlink_metadata(super::work_path(work, &partial.anchor, &partial.path)).is_ok());
+            if !made {
+                if let Err(e) = catalog.remove_partial(&partial.anchor, &partial.path) {
+                    eprintln!("{} of {} was never made, but is still said to be: {e}", partial.path.display(), partial.anchor);
+                }
+                continue;
+            }
+            self.partials().insert((partial.anchor.to_bytes(), partial.path.clone()), Arc::new(Mutex::new(partial)));
         }
     }
 
-    /// A file to fill as it's read and written.
-    fn add(&self, catalog: &Catalog, partial: Partial) -> io::Result<()> {
-        catalog.set_partial(&partial).map_err(io::Error::other)?;
-        self.partials().insert((partial.anchor.to_bytes(), partial.path.clone()), partial);
-        Ok(())
+    /// A file to fill as it's read and written, which `make` makes. It's
+    /// known to be partial before it's there: read in between, what the
+    /// anchor had's read, and read after, it's filled first, not read full
+    /// of holes.
+    fn add(&self, catalog: &Catalog, partial: Partial, make: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let key = (partial.anchor.to_bytes(), partial.path.clone());
+        let (anchor, path) = (partial.anchor.clone(), partial.path.clone());
+        let shared = Arc::new(Mutex::new(partial));
+        let held = locked(&shared);
+        self.partials().insert(key.clone(), Arc::clone(&shared));
+        let done = catalog.set_partial(&held).map_err(io::Error::other).and_then(|()| make());
+        if done.is_err() {
+            self.partials().remove(&key);
+            let _ = catalog.remove_partial(&anchor, &path);
+        }
+        drop(held);
+        done
     }
 
     /// Fill the chunks a range of a file is in, if it's partial, so it can
@@ -106,20 +135,27 @@ impl Filler {
     /// only marked filled.
     pub fn fill(&self, catalog: &Catalog, anchor: &Link, rel: &Path, offset: u64, size: usize, writing: Option<(u64, u64)>) -> io::Result<()> {
         let key = (anchor.to_bytes(), rel.to_path_buf());
-        let mut partials = self.partials();
-        let Some(partial) = partials.get_mut(&key) else {
+        loop {
+            let Some(shared) = self.partials().get(&key).cloned() else {
+                return Ok(());
+            };
+            let mut partial = locked(&shared);
+            // While waiting for it, it may have gone, or been replaced by
+            // what was moved there
+            if !self.partials().get(&key).is_some_and(|now| Arc::ptr_eq(now, &shared)) {
+                continue;
+            }
+            let chunks: Vec<u64> = partial.unfilled(offset, u64::try_from(size).unwrap_or(u64::MAX)).collect();
+            for chunk in chunks {
+                self.fill_chunk(catalog, &mut partial, chunk, writing)?;
+            }
+            if partial.next_unfilled().is_none() {
+                catalog.remove_partial(anchor, rel).map_err(io::Error::other)?;
+                self.partials().remove(&key);
+            }
+            drop(partial);
             return Ok(());
-        };
-        let chunks: Vec<u64> = partial.unfilled(offset, u64::try_from(size).unwrap_or(u64::MAX)).collect();
-        for chunk in chunks {
-            self.fill_chunk(catalog, partial, chunk, writing)?;
         }
-        if partial.next_unfilled().is_none() {
-            catalog.remove_partial(anchor, rel).map_err(io::Error::other)?;
-            partials.remove(&key);
-        }
-        drop(partials);
-        Ok(())
     }
 
     /// Fill one chunk of a partial file from what it's copied from, then
@@ -137,13 +173,17 @@ impl Filler {
         catalog.set_partial(partial).map_err(io::Error::other)
     }
 
-    /// Fill some of whatever's partial, a chunk at a time. Returns whether
-    /// there was any.
+    /// Fill some of whatever's partial, a chunk at a time, leaving what's
+    /// being filled already. Returns whether there was any.
     fn step(&self, catalog: &Catalog, chunks: usize) -> bool {
         for _ in 0..chunks {
-            let next = self.partials().iter().find_map(|(_, partial)| partial.next_unfilled().map(|chunk| (partial.anchor.clone(), partial.path.clone(), chunk)));
+            let shared: Vec<Arc<Mutex<Partial>>> = self.partials().values().cloned().collect();
+            let next = shared.iter().find_map(|partial| {
+                let partial = partial.try_lock().ok()?;
+                partial.next_unfilled().map(|chunk| (partial.anchor.clone(), partial.path.clone(), chunk))
+            });
             let Some((anchor, rel, chunk)) = next else {
-                return false;
+                return !shared.is_empty();
             };
             let offset = chunk.saturating_mul(CHUNK);
             if let Err(e) = self.fill(catalog, &anchor, &rel, offset, 1, None) {
@@ -156,8 +196,13 @@ impl Filler {
 
     /// Fill everything partial of an anchor, as it's to be committed.
     fn complete(&self, catalog: &Catalog, anchor: &Link) -> io::Result<()> {
-        let files: Vec<(PathBuf, u64)> = self.partials().values().filter(|partial| &partial.anchor == anchor).map(|partial| (partial.path.clone(), partial.len)).collect();
-        for (rel, len) in files {
+        let bytes = anchor.to_bytes();
+        let shared: Vec<Arc<Mutex<Partial>>> = self.partials().iter().filter(|((of, _), _)| *of == bytes).map(|(_, partial)| Arc::clone(partial)).collect();
+        for partial in shared {
+            let (rel, len) = {
+                let partial = locked(&partial);
+                (partial.path.clone(), partial.len)
+            };
             self.fill(catalog, anchor, &rel, 0, usize::try_from(len).unwrap_or(usize::MAX), None)?;
         }
         Ok(())
@@ -168,38 +213,59 @@ impl Filler {
     fn cut(&self, catalog: &Catalog, anchor: &Link, rel: &Path, len: u64) -> io::Result<()> {
         self.fill(catalog, anchor, rel, len, 1, None)?;
         let key = (anchor.to_bytes(), rel.to_path_buf());
-        let mut partials = self.partials();
-        if let Some(partial) = partials.get_mut(&key) {
-            partial.cut(len);
-            if partial.next_unfilled().is_none() {
-                catalog.remove_partial(anchor, rel).map_err(io::Error::other)?;
-                partials.remove(&key);
-            } else {
-                catalog.set_partial(partial).map_err(io::Error::other)?;
-            }
+        let Some(shared) = self.partials().get(&key).cloned() else {
+            return Ok(());
+        };
+        let mut partial = locked(&shared);
+        partial.cut(len);
+        if partial.next_unfilled().is_none() {
+            catalog.remove_partial(anchor, rel).map_err(io::Error::other)?;
+            self.partials().remove(&key);
+        } else {
+            catalog.set_partial(&partial).map_err(io::Error::other)?;
         }
-        drop(partials);
+        drop(partial);
         Ok(())
     }
 
     /// Partial files at a path and under it renamed, or gone.
     fn moved(&self, catalog: &Catalog, anchor: &Link, from: &Path, to: Option<&Path>) -> io::Result<()> {
-        let mut partials = self.partials();
-        let keys: Vec<_> = partials.keys().filter(|(at, rel)| *at == anchor.to_bytes() && rel.starts_with(from)).cloned().collect();
-        for key in keys {
-            let Some(mut partial) = partials.remove(&key) else {
-                continue;
-            };
+        self.moving(catalog, anchor, from, to, || Ok(()))
+    }
+
+    /// As `moved`, with what `swap` does as the files move, what's going and
+    /// coming held till it has, so nothing's filled from the wrong place. What
+    /// was at `to` is forgotten, and with it nothing to fill.
+    fn moving(&self, catalog: &Catalog, anchor: &Link, from: &Path, to: Option<&Path>, swap: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+        let bytes = anchor.to_bytes();
+        let shared = {
+            let partials = self.partials();
+            let mut shared: Vec<_> = partials.iter()
+                .filter(|((at, rel), _)| *at == bytes && (rel.starts_with(from) || to.is_some_and(|to| rel.starts_with(to))))
+                .map(|(key, partial)| (key.clone(), Arc::clone(partial)))
+                .collect();
+            drop(partials);
+            shared.sort_by(|(a, _), (b, _)| a.cmp(b));
+            shared
+        };
+        let mut held: Vec<_> = shared.iter().map(|(key, partial)| (key, partial, locked(partial))).collect();
+        for (key, _, partial) in &held {
+            self.partials().remove(*key);
             catalog.remove_partial(anchor, &partial.path).map_err(io::Error::other)?;
-            if let Some(to) = to {
-                let rest = partial.path.strip_prefix(from).map(Path::to_path_buf).unwrap_or_default();
+        }
+        if let Some(to) = to {
+            for (_, shared, partial) in &mut held {
+                let Ok(rest) = partial.path.strip_prefix(from).map(Path::to_path_buf) else {
+                    continue;
+                };
                 partial.path = if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) };
-                catalog.set_partial(&partial).map_err(io::Error::other)?;
-                partials.insert((anchor.to_bytes(), partial.path.clone()), partial);
+                catalog.set_partial(partial).map_err(io::Error::other)?;
+                self.partials().insert((bytes.clone(), partial.path.clone()), Arc::clone(shared));
             }
         }
-        drop(partials);
-        Ok(())
+        let swapped = swap();
+        drop(held);
+        swapped
     }
 }
 
@@ -292,12 +358,21 @@ pub struct Committer {
     /// Parts of files written over, each to be kept as a delta on the
     /// part written over it: (older, newer).
     revisions: Mutex<Vec<(Link, Link)>>,
+    /// Held by whatever changes anything, so changes happen one at a time,
+    /// and so a commit can tell one isn't underway: nothing changes between
+    /// its seeing nothing has, and what it's committed being known to have
+    /// been imported in place. What only reads goes on beside it.
+    writing: Mutex<()>,
     stop: AtomicBool,
 }
 
 impl Committer {
     pub fn new(open: Arc<dyn Fn() -> crate::store::Result<Catalog> + Send + Sync>, filler: Arc<Filler>) -> Self {
-        Self { open, filler, written: Mutex::new(HashMap::new()), fresh: Mutex::new(std::collections::HashSet::new()), revisions: Mutex::new(Vec::new()), stop: AtomicBool::new(false) }
+        Self { open, filler, written: Mutex::new(HashMap::new()), fresh: Mutex::new(std::collections::HashSet::new()), revisions: Mutex::new(Vec::new()), writing: Mutex::new(()), stop: AtomicBool::new(false) }
+    }
+
+    pub(super) fn writing(&self) -> std::sync::MutexGuard<'_, ()> {
+        locked(&self.writing)
     }
 
     fn revisions(&self) -> std::sync::MutexGuard<'_, Vec<(Link, Link)>> {
@@ -400,8 +475,25 @@ impl Committer {
                 self.touched(&anchor);
                 continue;
             }
-            let imported = import(catalog, &mount, &|| self.changes(&anchor) == changes);
+            // From seeing nothing's changed until what's committed is known
+            // to be in place, nothing's to change, or it'd be written over
+            // with no copy kept. A change waiting for this commit's database
+            // transaction would never finish, so it's this that gives way.
+            let holding = std::cell::RefCell::new(None);
+            let still = || {
+                if holding.borrow().is_none() {
+                    match self.writing.try_lock() {
+                        Ok(guard) => *holding.borrow_mut() = Some(guard),
+                        Err(std::sync::TryLockError::Poisoned(poisoned)) => *holding.borrow_mut() = Some(poisoned.into_inner()),
+                        Err(std::sync::TryLockError::WouldBlock) => return false,
+                    }
+                }
+                self.changes(&anchor) == changes
+            };
+            let imported = import(catalog, &mount, &still);
             self.imported(&mount.path);
+            let gave_way = holding.borrow().is_none();
+            drop(holding);
             match imported {
                 Ok(Some(value)) => {
                     let pace = self.of(&anchor, |it| {
@@ -417,8 +509,12 @@ impl Committer {
                     }
                 },
                 // Written to meanwhile, and so dirty again: it's committed
-                // once that's whole
-                Ok(None) => {},
+                // once that's whole. What was underway may change nothing.
+                Ok(None) => {
+                    if gave_way {
+                        self.touched(&anchor);
+                    }
+                },
                 Err(e) => {
                     eprintln!("{anchor} couldn't be committed, so it stays as it was for now: {e}");
                     self.touched(&anchor);
@@ -626,9 +722,11 @@ impl Soup {
         Self::parents(&path)?;
         // As big as it is, its chunks copied as they're read and written,
         // and the rest in the background
-        File::create_new(&path).and_then(|file| file.set_len(size)).map_err(|e| io_errno(&e))?;
+        let make = || File::create_new(&path).and_then(|file| file.set_len(size));
         if size > 0 {
-            self.filler.add(catalog, Partial::new(anchor.clone(), rel.to_path_buf(), cid, size)).map_err(|e| io_errno(&e))?;
+            self.filler.add(catalog, Partial::new(anchor.clone(), rel.to_path_buf(), cid, size), make).map_err(|e| io_errno(&e))?;
+        } else {
+            make().map_err(|e| io_errno(&e))?;
         }
         Ok(path)
     }
@@ -639,8 +737,31 @@ impl Soup {
         if unsynced && let Some(anchor) = &anchor {
             self.committer.unsynced(anchor, true);
         }
-        self.handles().insert(fh, Handle { file, anchor, rel, writable, unsynced });
+        self.handles().insert(fh, Handle { file: Arc::new(file), anchor, rel, writable, unsynced });
         fh
+    }
+
+    /// What's needed of an open file to use it, so the handles aren't locked
+    /// meanwhile: waiting for the database, say, nothing else need wait.
+    fn handle_of(&self, fh: u64) -> Option<(Arc<File>, Option<Link>, PathBuf, bool)> {
+        self.handles().get(&fh).map(|handle| (Arc::clone(&handle.file), handle.anchor.clone(), handle.rel.clone(), handle.writable))
+    }
+
+    /// Note an open file's been written to.
+    fn note_written(&self, fh: u64) {
+        let unsynced = self.handles().get_mut(&fh).and_then(|handle| handle.written().cloned());
+        if let Some(anchor) = unsynced {
+            self.committer.unsynced(&anchor, true);
+        }
+    }
+
+    fn pins(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Link>> {
+        locked(&self.pinned)
+    }
+
+    /// Whether a handle's of a file open to write.
+    pub(super) fn is_writable(&self, fh: u64) -> bool {
+        self.handles().get(&fh).is_some_and(|handle| handle.writable)
     }
 
     /// Open a file, to write if `write`: what's written goes to a copy of
@@ -659,6 +780,13 @@ impl Soup {
             {
                 return Ok(self.handle(file, Some(anchor), rel, false, false));
             }
+            if let Inode::Path(anchor, rel, _) = self.inode(ino)?
+                && let Some((cid, _)) = Self::base_at(&*self.catalog()?, &anchor, &rel)?
+            {
+                let fh = self.next_handle.fetch_add(1, Ordering::Relaxed);
+                self.pins().insert(fh, cid);
+                return Ok(fh);
+            }
             return Ok(0);
         }
         let (anchor, rel) = self.overlay_of(ino)?;
@@ -673,33 +801,28 @@ impl Soup {
 
     /// Read from an open file, if it's one with a handle.
     pub fn read_handle(&self, fh: u64, offset: u64, size: usize) -> Option<Result<Vec<u8>, Errno>> {
-        let handles = self.handles();
-        let handle = handles.get(&fh)?;
-        let filled = handle.anchor.as_ref().map_or(Ok(()), |anchor| {
-            self.catalog().and_then(|catalog| self.filler.fill(&catalog, anchor, &handle.rel, offset, size, None).map_err(|e| errno(&e)))
+        let pinned = self.pins().get(&fh).cloned();
+        if let Some(cid) = pinned {
+            return Some(self.catalog().and_then(|catalog| export::read_at(&*catalog, &cid, offset, size).map_err(|e| errno(&e))));
+        }
+        let (file, anchor, rel, _) = self.handle_of(fh)?;
+        let filled = anchor.as_ref().map_or(Ok(()), |anchor| {
+            self.catalog().and_then(|catalog| self.filler.fill(&catalog, anchor, &rel, offset, size, None).map_err(|e| errno(&e)))
         });
-        let read = filled.and_then(|()| super::read_file(&handle.file, offset, size));
-        drop(handles);
-        Some(read)
+        Some(filled.and_then(|()| super::read_file(&file, offset, size)))
     }
 
     /// Write to an open file.
     pub fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<usize, Errno> {
-        let mut handles = self.handles();
-        let handle = handles.get_mut(&fh).filter(|handle| handle.writable).ok_or(Errno::EBADF)?;
-        if let Some(anchor) = &handle.anchor {
+        let (file, anchor, rel, _) = self.handle_of(fh).filter(|(.., writable)| *writable).ok_or(Errno::EBADF)?;
+        if let Some(anchor) = &anchor {
             let catalog = self.catalog()?;
-            self.keep_committed(&catalog, anchor, &handle.rel)?;
+            self.keep_committed(&catalog, anchor, &rel)?;
             let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
-            self.filler.fill(&catalog, anchor, &handle.rel, offset, data.len(), Some((offset, len))).map_err(|e| errno(&e))?;
+            self.filler.fill(&catalog, anchor, &rel, offset, data.len(), Some((offset, len))).map_err(|e| errno(&e))?;
         }
-        if let Some(anchor) = handle.written() {
-            self.committer.unsynced(anchor, true);
-        }
-        let written = handle.file.write_all_at(data, offset);
-        let anchor = handle.anchor.clone();
-        drop(handles);
-        written.map_err(|e| io_errno(&e))?;
+        self.note_written(fh);
+        file.write_all_at(data, offset).map_err(|e| io_errno(&e))?;
         if let Some(anchor) = anchor {
             self.committer.touched(&anchor);
         }
@@ -709,21 +832,21 @@ impl Soup {
     /// Sync an open file, its data alone if `data_only`: what's written
     /// to it is whole, so its anchor can be committed though it's open.
     pub fn fsync(&self, fh: u64, data_only: bool) -> Result<(), Errno> {
-        let mut handles = self.handles();
-        let Some(handle) = handles.get_mut(&fh) else {
+        let Some((file, ..)) = self.handle_of(fh) else {
             // Read straight from the soup: nothing to sync
             return Ok(());
         };
-        if data_only { handle.file.sync_data() } else { handle.file.sync_all() }.map_err(|e| io_errno(&e))?;
-        if let Some(anchor) = handle.settled() {
-            self.committer.unsynced(anchor, false);
+        if data_only { file.sync_data() } else { file.sync_all() }.map_err(|e| io_errno(&e))?;
+        let settled = self.handles().get_mut(&fh).and_then(|handle| handle.settled().cloned());
+        if let Some(anchor) = settled {
+            self.committer.unsynced(&anchor, false);
         }
-        drop(handles);
         Ok(())
     }
 
     /// Close a file.
     pub fn release(&self, fh: u64) {
+        self.pins().remove(&fh);
         if let Some(mut handle) = self.handles().remove(&fh)
             && handle.writable
         {
@@ -933,31 +1056,51 @@ impl Soup {
         self.keep_committed(&catalog, &anchor, &to)?;
         let base = Self::base_at(&catalog, &anchor, &from)?;
         let (work_from, work_to) = (self.work_path(&anchor, &from).ok_or(Errno::EROFS)?, self.work_path(&anchor, &to).ok_or(Errno::EROFS)?);
-        // What's replaced goes first
-        self.filler.moved(&catalog, &anchor, &to, None).map_err(|e| io_errno(&e))?;
-        match fs::symlink_metadata(&work_to) {
-            Ok(meta) if meta.is_dir() => fs::remove_dir(&work_to).map_err(|e| io_errno(&e))?,
-            Ok(_) => fs::remove_file(&work_to).map_err(|e| io_errno(&e))?,
-            Err(_) => {},
-        }
-        catalog.clear_overlay_marks(&anchor, &to).map_err(store_errno)?;
-        if fs::symlink_metadata(&work_from).is_ok() {
-            Self::parents(&work_to)?;
-            fs::rename(&work_from, &work_to).map_err(|e| io_errno(&e))?;
-            self.filler.moved(&catalog, &anchor, &from, Some(&to)).map_err(|e| io_errno(&e))?;
-        }
-        catalog.move_overlay_marks(&anchor, &from, &to).map_err(store_errno)?;
         // It's exactly what was there: what the anchor had, or nothing
         let mark = base.map(|(cid, size)| (cid, size.unwrap_or_default()));
-        catalog.set_overlay_mark(&anchor, &to, &mark).map_err(store_errno)?;
-        if Self::base_at(&catalog, &anchor, &from)?.is_some() {
-            catalog.set_overlay_mark(&anchor, &from, &None).map_err(store_errno)?;
+        let marks = || -> Result<(), Errno> {
+            catalog.clear_overlay_marks(&anchor, &to).map_err(store_errno)?;
+            catalog.move_overlay_marks(&anchor, &from, &to).map_err(store_errno)?;
+            catalog.set_overlay_mark(&anchor, &to, &mark).map_err(store_errno)?;
+            if Self::base_at(&catalog, &anchor, &from)?.is_some() {
+                catalog.set_overlay_mark(&anchor, &from, &None).map_err(store_errno)?;
+            }
+            Ok(())
+        };
+        // Whatever's reading must find one or the other at `to`, so what's
+        // there is replaced, never removed first. The inodes go with it, so
+        // nothing's taken for what it replaced.
+        let moved_inodes = |inodes: &mut Inodes| {
+            inodes.renamed(&anchor, &from, &to);
+            inodes.via_moved(&(parent, name.as_bytes().to_vec()), &(new_parent, new_name.as_bytes().to_vec()));
+        };
+        if fs::symlink_metadata(&work_from).is_ok() {
+            Self::parents(&work_to)?;
+            self.filler.moving(&catalog, &anchor, &from, Some(&to), || {
+                let mut inodes = self.inodes();
+                fs::rename(&work_from, &work_to)?;
+                moved_inodes(&mut inodes);
+                drop(inodes);
+                Ok(())
+            }).map_err(|e| io_errno(&e))?;
+            marks()?;
+        } else {
+            // Only what the anchor had moves: nothing in the work directory
+            // replaces what's there, so it's the marks that say what is
+            marks()?;
+            self.filler.moving(&catalog, &anchor, &to, None, || {
+                let mut inodes = self.inodes();
+                match fs::symlink_metadata(&work_to) {
+                    Ok(meta) if meta.is_dir() => fs::remove_dir(&work_to)?,
+                    Ok(_) => fs::remove_file(&work_to)?,
+                    Err(_) => {},
+                }
+                moved_inodes(&mut inodes);
+                drop(inodes);
+                Ok(())
+            }).map_err(|e| io_errno(&e))?;
         }
         drop(catalog);
-        let mut inodes = self.inodes();
-        inodes.renamed(&anchor, &from, &to);
-        inodes.via_moved(&(parent, name.as_bytes().to_vec()), &(new_parent, new_name.as_bytes().to_vec()));
-        drop(inodes);
         self.committer.touched(&anchor);
         Ok(())
     }
@@ -1011,23 +1154,20 @@ impl Soup {
     /// Change a file's size: copying it to the work directory, if it isn't
     /// there yet.
     pub fn truncate(&self, ino: u64, fh: Option<u64>, size: u64) -> Result<(), Errno> {
-        if let Some(fh) = fh {
-            let mut handles = self.handles();
-            if let Some(handle) = handles.get_mut(&fh).filter(|handle| handle.writable) {
-                if let Some(anchor) = &handle.anchor {
-                    let catalog = self.catalog()?;
-                    self.keep_committed(&catalog, anchor, &handle.rel)?;
-                    self.filler.cut(&catalog, anchor, &handle.rel, size).map_err(|e| io_errno(&e))?;
-                }
-                if let Some(anchor) = handle.written() {
-                    self.committer.unsynced(anchor, true);
-                }
-                handle.file.set_len(size).map_err(|e| io_errno(&e))?;
-                if let Some(anchor) = &handle.anchor {
-                    self.committer.touched(anchor);
-                }
-                return Ok(());
+        if let Some((file, anchor, rel, _)) = fh.and_then(|fh| self.handle_of(fh)).filter(|(.., writable)| *writable) {
+            if let Some(anchor) = &anchor {
+                let catalog = self.catalog()?;
+                self.keep_committed(&catalog, anchor, &rel)?;
+                self.filler.cut(&catalog, anchor, &rel, size).map_err(|e| io_errno(&e))?;
             }
+            if let Some(fh) = fh {
+                self.note_written(fh);
+            }
+            file.set_len(size).map_err(|e| io_errno(&e))?;
+            if let Some(anchor) = &anchor {
+                self.committer.touched(anchor);
+            }
+            return Ok(());
         }
         if let Inode::Loose(name) = self.inode(ino)? {
             let path = self.loose_path(&name).ok_or(Errno::EROFS)?;

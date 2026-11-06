@@ -512,6 +512,7 @@ PROPTEST_CASES=1000000 cargo test --release differential   # long fuzzing
 scripts/kubo-compare.sh             # every CID vs Kubo, then store and get back; needs `ipfs`
 LARGE=1 scripts/kubo-compare.sh     # adds >1 GiB files
 scripts/git-compare.sh              # git objects vs git and Kubo, loose and packed; needs `ipfs`, `gpg`, `sqlite3`
+scripts/mount-stress.sh [seconds]   # writers and readers at once through a real mount, beside compacts and a held lock
 tests/mesh/run.sh                   # a mesh of real nodes, daemons and mounts, in containers
 ```
 

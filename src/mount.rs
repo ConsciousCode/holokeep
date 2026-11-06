@@ -65,10 +65,15 @@ const TTL: Duration = Duration::from_secs(1);
 pub type Opener = Box<dyn Fn() -> crate::store::Result<Catalog> + Send + Sync>;
 
 /// How long the filesystem waits for another writer, as a big import, before
-/// failing what it's been asked to do. It's asked one thing at a time, so
-/// all of it waits meanwhile; that's better than saves failing, but it's why
-/// this isn't for ever, as what's writing may be reading from it.
+/// failing what it's been asked to do. Other changes wait meanwhile, though
+/// not what reads; that's better than saves failing, but it's why this isn't
+/// for ever.
 const WRITER_WAIT: Duration = Duration::from_mins(2);
+
+/// How many requests the filesystem takes at once. One that's fetching a
+/// block, or waiting for the database, holds up only what can't go on without
+/// it, unless there are this many.
+const THREADS: usize = 8;
 
 thread_local! {
     /// Each soup's catalog, as opened on this thread.
@@ -130,6 +135,15 @@ impl Inodes {
         self.all.get(usize::try_from(ino.checked_sub(1)?).ok()?).cloned()
     }
 
+    /// Whether an inode is still what's at its path, rather than what was
+    /// replaced there, which the kernel may yet ask after.
+    fn is_current(&self, ino: u64) -> bool {
+        match self.get(ino) {
+            Some(inode @ (Inode::Path(..) | Inode::Node(..) | Inode::Tag(_) | Inode::Loose(_))) => self.by_key.get(&Self::key(&inode)) == Some(&ino),
+            _ => true,
+        }
+    }
+
     /// A path of an anchor renamed: the inodes of it and what's under it
     /// are where they moved to, as the kernel takes them to be.
     fn renamed(&mut self, anchor: &Link, from: &Path, to: &Path) {
@@ -141,6 +155,10 @@ impl Inodes {
                 continue;
             };
             if at != anchor {
+                continue;
+            }
+            // One that's been replaced isn't what's there, wherever that goes
+            if self.by_key.get(&Self::key(inode)) != Some(&u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1)) {
                 continue;
             }
             let moved = Inode::Path(at.clone(), if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) }, via.clone());
@@ -229,6 +247,11 @@ pub struct Soup {
     work: Option<PathBuf>,
     /// Files open, by handle: those written to, or in a work directory.
     handles: Mutex<HashMap<u64, Handle>>,
+    /// What files opened to read before there was anything in their
+    /// anchors' work directories are of: what they'll read, whatever's
+    /// written there after, as a file replaced stays as it was to whoever
+    /// has it open.
+    pinned: Mutex<HashMap<u64, Link>>,
     committer: Arc<Committer>,
     fetcher: Option<Arc<Fetcher>>,
     /// Files of overlays being copied as they're read and written.
@@ -350,6 +373,7 @@ impl Soup {
             sizes: Mutex::new(HashMap::new()),
             listings: Mutex::new(HashMap::new()),
             rules: Mutex::new(HashMap::new()),
+            pinned: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             uid: rustix::process::getuid().as_raw(),
             gid: rustix::process::getgid().as_raw(),
@@ -411,6 +435,11 @@ impl Soup {
     }
 
     /// The catalog, as opened on this thread.
+    /// Wait to be the one changing anything: see `Committer::writing`.
+    fn writing(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.committer.writing()
+    }
+
     fn catalog(&self) -> Result<std::rc::Rc<Catalog>, Errno> {
         if let Some(catalog) = CATALOGS.with_borrow(|catalogs| catalogs.get(&self.id).cloned()) {
             return Ok(catalog);
@@ -980,7 +1009,12 @@ impl Filesystem for Soup {
         }
     }
 
-    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> io::Result<()> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
+        // Looked up at once, as one lookup may be fetching. Changes aren't,
+        // so what the kernel makes of this is only what `writing` says too
+        if let Err(unsupported) = config.add_capabilities(fuser::InitFlags::FUSE_PARALLEL_DIROPS) {
+            eprintln!("the kernel lacks {unsupported:?}: looking up one at a time in each directory");
+        }
         self.start();
         Ok(())
     }
@@ -991,7 +1025,11 @@ impl Filesystem for Soup {
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let write = flags.0 & libc::O_ACCMODE != libc::O_RDONLY;
+        let _writing = write.then(|| self.writing());
         match self.open(ino.0, write, write && flags.0 & libc::O_TRUNC != 0) {
+            // Opened through what's been replaced, it reads what replaced it,
+            // which mustn't go in that's cache among what it was
+            Ok(fh) if !self.inodes().is_current(ino.0) => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
             Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
             Err(e) => reply.error(e),
         }
@@ -1006,6 +1044,7 @@ impl Filesystem for Soup {
     }
 
     fn write(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64, data: &[u8], _write_flags: WriteFlags, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyWrite) {
+        let _writing = self.writing();
         match self.write(fh.0, offset, data) {
             Ok(n) => reply.written(u32::try_from(n).unwrap_or(u32::MAX)),
             Err(e) => reply.error(e),
@@ -1013,6 +1052,7 @@ impl Filesystem for Soup {
     }
 
     fn release(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, _lock: Option<LockOwner>, _flush: bool, reply: ReplyEmpty) {
+        let _writing = self.is_writable(fh.0).then(|| self.writing());
         self.release(fh.0);
         reply.ok();
     }
@@ -1022,6 +1062,7 @@ impl Filesystem for Soup {
     }
 
     fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
+        let _writing = self.writing();
         match self.fsync(fh.0, datasync) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -1029,6 +1070,7 @@ impl Filesystem for Soup {
     }
 
     fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
+        let _writing = self.writing();
         match self.create(parent.0, name) {
             Ok((attr, fh)) => reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty()),
             Err(e) => reply.error(e),
@@ -1036,6 +1078,7 @@ impl Filesystem for Soup {
     }
 
     fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+        let _writing = self.writing();
         match self.mkdir_by(parent.0, name, rules::app_of(req.pid()).as_deref()) {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
             Err(e) => reply.error(e),
@@ -1043,6 +1086,7 @@ impl Filesystem for Soup {
     }
 
     fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
+        let _writing = self.writing();
         match self.symlink(parent.0, link_name, target) {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
             Err(e) => reply.error(e),
@@ -1050,6 +1094,7 @@ impl Filesystem for Soup {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let _writing = self.writing();
         match self.unlink(parent.0, name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -1057,6 +1102,7 @@ impl Filesystem for Soup {
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let _writing = self.writing();
         match self.rmdir(parent.0, name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -1068,6 +1114,7 @@ impl Filesystem for Soup {
             reply.error(Errno::EINVAL);
             return;
         }
+        let _writing = self.writing();
         match self.rename(parent.0, name, newparent.0, newname, flags.contains(RenameFlags::RENAME_NOREPLACE)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -1095,12 +1142,14 @@ impl Filesystem for Soup {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let writing = size.map(|_| self.writing());
         if let Some(size) = size
             && let Err(e) = self.truncate(ino.0, fh.map(|fh| fh.0), size)
         {
             reply.error(e);
             return;
         }
+        drop(writing);
         match self.attr(ino.0) {
             Ok(attr) => reply.attr(&TTL, &attr),
             Err(e) => reply.error(e),
@@ -1146,6 +1195,7 @@ pub fn mount(soup: Soup, dir: &Path) -> io::Result<()> {
     let soup = soup.at_dir(dir.canonicalize()?);
     let mut config = fuser::Config::default();
     config.mount_options = vec![MountOption::FSName("holokeep".into()), MountOption::Subtype("hk".into())];
+    config.n_threads = Some(THREADS);
     if soup.work.is_none() {
         config.mount_options.push(MountOption::RO);
     }
@@ -1386,6 +1436,171 @@ mod tests {
         soup.commit();
         assert_eq!(read(&soup, &format!("anchors/{anchor}/db")), b"one two three");
         assert_ne!(value(&repo, &anchor), two);
+    }
+
+    /// A write waiting for the database holds up nothing that only reads:
+    /// not open files, not paths, not even the file it's writing to.
+    #[test]
+    fn reads_go_on_while_a_write_waits() {
+        let scratch = Scratch::new("mount-reads-beside");
+        let (soup, anchor, repo) = writable(&scratch);
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        for (name, data) in [("waits", b"before".as_slice()), ("other", b"other".as_slice())] {
+            let (_, fh) = soup.create(dir, OsStr::new(name)).expect("create");
+            soup.write(fh, 0, data).expect("write");
+            soup.release(fh);
+        }
+        soup.commit();
+        let waits = ino(&soup, &format!("anchors/{anchor}/waits")).expect("waits").ino.0;
+        let other = ino(&soup, &format!("anchors/{anchor}/other")).expect("other").ino.0;
+        let writing = soup.open(waits, true, false).expect("open");
+        let reading = soup.open(other, false, false).expect("open");
+        let soup = std::sync::Arc::new(soup);
+
+        let lock = rusqlite::Connection::open(repo.join("blocks.db")).expect("db");
+        lock.execute_batch("BEGIN IMMEDIATE").expect("lock");
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (soup, finished) = (std::sync::Arc::clone(&soup), std::sync::Arc::clone(&finished));
+            std::thread::spawn(move || {
+                // On its own thread, as each of the filesystem's has its own
+                let written = soup.write(writing, 0, b"AFTER!");
+                finished.store(true, Ordering::SeqCst);
+                written
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!finished.load(Ordering::SeqCst), "it's meant to be waiting");
+        let quick = std::time::Instant::now();
+        assert_eq!(soup.read_handle(reading, 0, 100).expect("handle").expect("read"), b"other");
+        assert_eq!(soup.read(other, 0, 100).expect("read"), b"other");
+        assert_eq!(soup.read(waits, 0, 100).expect("read"), b"before", "what's being written, as it was");
+        assert!(names(&soup, &format!("anchors/{anchor}")).contains(&"waits".to_owned()));
+        assert!(quick.elapsed() < std::time::Duration::from_secs(2), "{:?}", quick.elapsed());
+        assert!(!finished.load(Ordering::SeqCst), "it's still meant to be waiting");
+
+        lock.execute_batch("COMMIT").expect("unlock");
+        assert_eq!(writer.join().expect("writer"), Ok(6));
+        assert_eq!(soup.read(waits, 0, 100).expect("read"), b"AFTER!");
+        soup.release(writing);
+        soup.release(reading);
+    }
+
+    /// A file opened to write is made as big as it is, full of holes, to be
+    /// filled as it's used. Noting that means waiting for the database, so
+    /// held up there, it's read as what the anchor had, not as holes.
+    #[test]
+    fn a_file_being_opened_to_write_is_not_read_as_holes() {
+        let scratch = Scratch::new("mount-holes");
+        let (soup, anchor, repo) = writable(&scratch);
+        let big = ino(&soup, &format!("anchors/{anchor}/big")).expect("big").ino.0;
+        // The first opened to write makes the anchor's overlay, which waits
+        // too: it's noting the file that's to be waited for
+        let first = ino(&soup, &format!("anchors/{anchor}/a")).expect("a").ino.0;
+        soup.release(soup.open(first, true, false).expect("open"));
+        let soup = std::sync::Arc::new(soup);
+        let lock = rusqlite::Connection::open(repo.join("blocks.db")).expect("db");
+        lock.execute_batch("BEGIN IMMEDIATE").expect("lock");
+        let opening = {
+            let soup = std::sync::Arc::clone(&soup);
+            std::thread::spawn(move || soup.open(big, true, false))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!opening.is_finished(), "it's meant to be waiting");
+        assert_eq!(soup.read(big, 2_000_000, 4), Ok(vec![3; 4]));
+
+        lock.execute_batch("COMMIT").expect("unlock");
+        let fh = opening.join().expect("opening").expect("open");
+        assert_eq!(soup.read_handle(fh, 2_000_000, 4).expect("handle"), Ok(vec![3; 4]));
+        assert_eq!(soup.read(big, 2_000_000, 4), Ok(vec![3; 4]));
+        soup.release(fh);
+    }
+
+    /// A file known to be partial that was never made, as when a mount ended
+    /// between the two, is forgotten; one that was made is filled still.
+    #[test]
+    fn a_partial_file_never_made_is_forgotten() {
+        let scratch = Scratch::new("mount-partial-gone");
+        let (soup, anchor, repo) = writable(&scratch);
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let work = repo.join("work");
+        let base = catalog.anchor_value(&anchor).expect("value").expect("set");
+        for name in ["made", "never"] {
+            catalog.set_partial(&overlay::Partial::new(anchor.clone(), PathBuf::from(name), base.clone(), 10)).expect("partial");
+        }
+        let made = work_path(&work, &anchor, Path::new("made"));
+        std::fs::create_dir_all(made.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&made, b"").expect("made");
+        let filler = write::Filler::new(Some(work));
+        filler.load(&catalog);
+        let left: Vec<PathBuf> = catalog.partials().expect("partials").into_iter().map(|partial| partial.path).collect();
+        assert_eq!(left, [PathBuf::from("made")]);
+        drop(soup);
+    }
+
+    /// A commit doesn't go ahead with a change underway, which might replace
+    /// what it's committing with no copy kept. It's not lost, only later.
+    #[test]
+    fn a_commit_gives_way_to_a_change_underway() {
+        let scratch = Scratch::new("mount-commit-gives-way");
+        let (soup, anchor, repo) = writable(&scratch);
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let (_, fh) = soup.create(dir, OsStr::new("new")).expect("create");
+        soup.write(fh, 0, b"written").expect("write");
+        soup.release(fh);
+        let before = value(&repo, &anchor);
+        let later = |secs| std::time::Instant::now().checked_add(std::time::Duration::from_secs(secs)).expect("later");
+        let commit = |secs| soup.committer.commit_as_of(&mut Catalog::open_repo(&repo).expect("catalog"), false, later(secs));
+
+        let underway = soup.writing();
+        commit(10);
+        assert_eq!(value(&repo, &anchor), before, "it gave way");
+        drop(underway);
+        commit(20);
+        assert_ne!(value(&repo, &anchor), before, "and went ahead after, though nothing else was written");
+        let read = ino(&soup, &format!("anchors/{anchor}/new")).expect("new").ino.0;
+        assert_eq!(soup.read(read, 0, 100).expect("read"), b"written");
+    }
+
+    /// A file opened to read goes on reading what it was, whatever's saved
+    /// over it, before and after anything of it's in the work directory.
+    #[test]
+    fn whats_open_to_read_stays_as_it_was_when_replaced() {
+        let scratch = Scratch::new("mount-pinned");
+        let (soup, anchor, _repo) = writable(&scratch);
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let a = ino(&soup, &format!("anchors/{anchor}/a")).expect("a").ino.0;
+        let save = |text: &[u8]| {
+            let (_, fh) = soup.create(dir, OsStr::new(".a.tmp")).expect("create");
+            soup.write(fh, 0, text).expect("write");
+            soup.release(fh);
+            soup.rename(dir, OsStr::new(".a.tmp"), dir, OsStr::new("a"), false).expect("rename");
+        };
+
+        // Only what the anchor had, so far
+        let reading = soup.open(a, false, false).expect("open");
+        assert_ne!(reading, 0);
+        save(b"second");
+        assert_eq!(soup.read_handle(reading, 0, 100).expect("handle"), Ok(b"first".to_vec()));
+        soup.release(reading);
+        assert_eq!(soup.read_handle(reading, 0, 100), None, "and it's let go of");
+
+        // In the work directory now
+        let current = ino(&soup, &format!("anchors/{anchor}/a")).expect("a").ino.0;
+        let reading = soup.open(current, false, false).expect("open");
+        save(b"third");
+        assert_eq!(soup.read_handle(reading, 0, 100).expect("handle"), Ok(b"second".to_vec()));
+        soup.release(reading);
+
+        // What was replaced isn't what's there, which is told from it, and
+        // nothing's taken for it when what it's at moves on
+        let newest = ino(&soup, &format!("anchors/{anchor}/a")).expect("a").ino.0;
+        assert_ne!(current, newest);
+        assert!(!soup.inodes().is_current(current));
+        assert!(soup.inodes().is_current(newest));
+        soup.rename(dir, OsStr::new("a"), dir, OsStr::new("moved"), false).expect("rename");
+        assert_eq!(ino(&soup, &format!("anchors/{anchor}/moved")).expect("moved").ino.0, newest);
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/moved")), b"third");
     }
 
     #[test]
