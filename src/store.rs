@@ -111,6 +111,19 @@ pub enum Error {
     Invalid { store: &'static str, reason: String },
 }
 
+impl Error {
+    /// Whether it failed only since something else was writing: it's worth
+    /// trying again later.
+    pub const fn is_busy(&self) -> bool {
+        matches!(self, Self::Db(e) if is_busy(e))
+    }
+}
+
+/// Whether a database failed only since something else was writing.
+pub const fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(failure, _) if matches!(failure.code, rusqlite::ErrorCode::DatabaseBusy))
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// What blocks are keyed by: their multihash.
@@ -215,6 +228,14 @@ pub trait Store: BlockIndex + BlockSource + BlockStore {
 //-[ Database ]-//
 //--------------//
 
+/// How long a write waits for another writer, by default, before failing
+/// as busy.
+pub const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long catching up as a catalog's opened waits for another writer,
+/// before leaving it for next time.
+const CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// A shared `SQLite` connection, so stores in the same file can share a
 /// transaction.
 #[derive(Clone)]
@@ -245,7 +266,7 @@ impl Db {
                  multihash BLOB UNIQUE NOT NULL
              );",
         )?;
-        conn.busy_timeout(std::time::Duration::from_secs(10))?;
+        conn.busy_timeout(WRITER_WAIT)?;
         Ok(Self(Rc::new(conn)))
     }
 
@@ -276,10 +297,7 @@ impl Db {
                 if !conn.is_autocommit() {
                     conn.execute_batch("ROLLBACK")?;
                 }
-                match &e {
-                    Error::Db(rusqlite::Error::SqliteFailure(failure, _)) if failure.code == rusqlite::ErrorCode::DatabaseBusy => self.atomically(&f),
-                    _ => Err(e),
-                }
+                if e.is_busy() { self.atomically(&f) } else { Err(e) }
             },
         }
     }
@@ -607,7 +625,7 @@ impl Catalog {
         let mut catalog = Self::with_shards(db, Some(shards))?;
         catalog.locate(0, &path)?;
         catalog.attach_known()?;
-        catalog.catch_up()?;
+        catalog.catch_up_if_free()?;
         catalog.sign_as(dir)?;
         Ok(catalog)
     }
@@ -1130,17 +1148,28 @@ impl Catalog {
     /// Record a volume as attached, as of where it's mounted now.
     fn attach(&mut self, volume: Volume) -> Result<usize> {
         let path = volume.path().map(path_bytes);
-        let id: Id = self.db.conn()
-            .prepare_cached(
-                "INSERT INTO volumes (label, name, kind, path) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (label) DO UPDATE SET
-                     name = excluded.name, kind = excluded.kind, path = coalesce(excluded.path, path)
-                 RETURNING id",
-            )?
-            .query_row(params![volume.label().as_slice(), volume.name, volume.kind(), path], |row| row.get(0))?;
+        // Only what's changed is written: opening a repo as it was leaves
+        // it to whoever's writing, and doesn't wait for them
+        let known: Option<(Id, String, String, Option<Vec<u8>>)> = self.db.conn()
+            .prepare_cached("SELECT id, name, kind, path FROM volumes WHERE label = ?1")?
+            .query_row([volume.label().as_slice()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .optional()?;
+        let id: Id = match known {
+            Some((id, name, kind, was)) if name == volume.name && kind == volume.kind() && (path.is_none() || path == was.as_deref()) => id,
+            _ => self.db.conn()
+                .prepare_cached(
+                    "INSERT INTO volumes (label, name, kind, path) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (label) DO UPDATE SET
+                         name = excluded.name, kind = excluded.kind, path = coalesce(excluded.path, path)
+                     RETURNING id",
+                )?
+                .query_row(params![volume.label().as_slice(), volume.name, volume.kind(), path], |row| row.get(0))?,
+        };
         self.found_risks(id, &volume)?;
         for store in volume.stores() {
-            self.db.conn().execute("INSERT OR IGNORE INTO forms (name) VALUES (?1)", [store.name()])?;
+            if !self.db.conn().prepare_cached("SELECT 1 FROM forms WHERE name = ?1")?.exists([store.name()])? {
+                self.db.conn().execute("INSERT OR IGNORE INTO forms (name) VALUES (?1)", [store.name()])?;
+            }
         }
         self.ids.push(id);
         self.volumes.push(volume);
@@ -1154,9 +1183,12 @@ impl Catalog {
         };
         let taken = std::mem::replace(v, Volume::new("", [0; 16], Vec::new()));
         *v = taken.at(path);
-        self.db.conn()
-            .prepare_cached("UPDATE volumes SET path = ?1 WHERE id = ?2")?
-            .execute(params![path_bytes(path), id])?;
+        let was: Option<Vec<u8>> = self.db.conn().prepare_cached("SELECT path FROM volumes WHERE id = ?1")?.query_row([id], |row| row.get(0))?;
+        if was.as_deref() != Some(path_bytes(path)) {
+            self.db.conn()
+                .prepare_cached("UPDATE volumes SET path = ?1 WHERE id = ?2")?
+                .execute(params![path_bytes(path), id])?;
+        }
         let Some(v) = self.volumes.get(volume) else {
             return Ok(());
         };
@@ -1170,6 +1202,15 @@ impl Catalog {
             return Ok(());
         }
         let conn = self.db.conn();
+        let known: Vec<(String, bool)> = conn
+            .prepare_cached("SELECT risk, found FROM risks WHERE volume = ?1")?
+            .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let found_still = known.iter().all(|(risk, found)| !found || volume.risks().contains(risk));
+        let all_known = volume.risks().iter().all(|risk| known.iter().any(|(known, _)| known == risk));
+        if found_still && all_known {
+            return Ok(());
+        }
         conn.prepare_cached("DELETE FROM risks WHERE volume = ?1 AND found")?.execute([id])?;
         let mut insert = conn.prepare_cached("INSERT OR IGNORE INTO risks (volume, risk, found) VALUES (?1, ?2, 1)")?;
         for risk in volume.risks() {
@@ -1305,6 +1346,32 @@ impl Catalog {
             }
         }
         Ok(shared)
+    }
+
+    /// Catch up, as a catalog's opened, unless it would mean waiting for
+    /// a writer: what's missed is caught up with next time, and a writer
+    /// that's long at it, keeping shards busy as it adds to them, mustn't
+    /// keep anything from being read.
+    fn catch_up_if_free(&self) -> Result<()> {
+        self.db.conn().busy_timeout(CATCH_UP_WAIT)?;
+        let caught_up = self.catch_up();
+        self.db.conn().busy_timeout(WRITER_WAIT)?;
+        match caught_up {
+            Err(e) if e.is_busy() => Ok(()),
+            other => other.map(drop),
+        }
+    }
+
+    /// How long this catalog waits for other writers, from now on. What
+    /// can't try again later would rather wait for longer.
+    pub fn wait_for_writers(&self, wait: std::time::Duration) -> Result<()> {
+        self.db.conn().busy_timeout(wait)?;
+        for volume in 0..self.volumes.len() {
+            if let Some(db) = self.foreign_db(volume) {
+                db.conn().busy_timeout(wait)?;
+            }
+        }
+        Ok(())
     }
 
     /// Whether a volume is a database other than the catalog's own, which

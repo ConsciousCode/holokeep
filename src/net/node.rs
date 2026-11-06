@@ -40,7 +40,7 @@ use super::collect::{self, Condemn, Condemned, Verdict};
 use super::durability::{self, Advert, Audit, Haves, Kept, Push, Report, Sightings, Trickle};
 use crate::multihash::Multihash;
 use crate::store::BlockIndex;
-use super::mesh::{Error, Members, Result};
+use super::mesh::{Error, Members, Result, unless_busy};
 use super::structure::{self, Cursors, Notice, Wants};
 use super::trim::{self, Ack, Dropped, Grant, Intent, Trim, Watermarks};
 use crate::model::Link;
@@ -734,7 +734,7 @@ impl Node {
             },
             request_response::Event::Message { message: request_response::Message::Response { request_id, response }, .. } => {
                 if let Some(audit) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
-                    audit.haves(&self.sightings, request_id, response)?;
+                    unless_busy(audit.haves(&self.sightings, request_id, response), "noting what a member has")?;
                 }
             },
             request_response::Event::OutboundFailure { request_id, .. } => {
@@ -760,7 +760,7 @@ impl Node {
                 // was there to want them for
                 let kept = response.keys();
                 if let Some(audit) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
-                    audit.kept(&self.sightings, request_id, response)?;
+                    unless_busy(audit.kept(&self.sightings, request_id, response), "noting what a member kept")?;
                 } else {
                     response.sight(&self.catalog, &self.sightings, &peer)?;
                 }
@@ -906,10 +906,31 @@ impl Node {
             let Some(event) = self.swarm.next().await else {
                 return Err(Error::Invalid("the swarm stopped".into()));
             };
-            if let Some(event) = self.handle(event)? {
-                return Ok(event);
+            match self.handle(event) {
+                Ok(Some(event)) => return Ok(event),
+                Ok(None) => {},
+                // What it was for is asked again, by this node on its next
+                // `redrive`, or by whoever asked it
+                Err(e) if e.is_busy() => unless_busy(Err(e), "what a member sent or said")?,
+                Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Go on with every fetch, audit and trim that's no longer waiting on
+    /// anyone, as may be if what would have gone on with it failed. Doing
+    /// so again is harmless.
+    pub fn redrive(&mut self) -> Result<()> {
+        let fetches: Vec<FetchId> = self.fetches.keys().copied().collect();
+        for id in fetches {
+            self.drive(id)?;
+        }
+        self.drive_audits()?;
+        let trims: Vec<TrimId> = self.trims.keys().copied().collect();
+        for id in trims {
+            self.drive_trim(id)?;
+        }
+        Ok(())
     }
 
     /// A member's newly connected: tell it of the members, notice it of
@@ -917,7 +938,8 @@ impl Node {
     fn on_connected(&mut self, peer: PeerId) -> Result<()> {
         let roster = self.roster()?;
         self.swarm.behaviour_mut().members.send_request(&peer, roster);
-        self.announce_to(peer)?;
+        // Told again on the next announce
+        unless_busy(self.announce_to(peer), "telling a new member what's here")?;
         self.sightings.connected(peer);
         self.trickle.alarm();
         Ok(())
@@ -951,7 +973,7 @@ impl Node {
             SwarmEvent::NewListenAddr { address, .. } => Some(Event::Listening(address)),
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                 if endpoint.is_dialer() {
-                    self.members.add_addr(&peer_id, endpoint.get_remote_address())?;
+                    unless_busy(self.members.add_addr(&peer_id, endpoint.get_remote_address()), "noting a member's address")?;
                 }
                 if num_established.get() > 1 {
                     return Ok(None);
@@ -1004,10 +1026,14 @@ impl Node {
                 },
                 request_response::Message::Response { request_id, response } => {
                     if let Some(id) = self.fetch_of(request_id) {
-                        if let Some(fetch) = self.fetches.get_mut(&id) {
-                            fetch.received(&self.catalog, &self.sightings, &peer, request_id, response)?;
+                        let received = self.fetches.get_mut(&id).map_or(Ok(()), |fetch| fetch.received(&self.catalog, &self.sightings, &peer, request_id, response));
+                        // What couldn't be kept is wanted still, and asked for
+                        // again on the next `redrive`, not at once, which
+                        // would only send it all over again meanwhile
+                        if !received.as_ref().is_err_and(Error::is_busy) {
+                            self.drive(id)?;
                         }
-                        self.drive(id)?;
+                        received?;
                     }
                     None
                 },

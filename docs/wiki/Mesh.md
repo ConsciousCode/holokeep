@@ -65,6 +65,10 @@ every 10 s, and one whose ping fails is closed, so a peer that slept or
 changed networks isn't left as connected over a dead link: it's
 redialled instead.
 
+A daemon never stops for another program writing to its database, such
+as a big `hk add`: it waits a second, so its connections stay up, and
+tries again on a later tick (see [[Storage#Transactions]]).
+
 ## Protocols
 
 All of these are libp2p request-response with the **CBOR codec** (serde):

@@ -1655,6 +1655,68 @@ fn transactions_wait_for_a_writer_rather_than_failing_at_once() {
     assert!(db.conn().is_autocommit(), "nothing left open");
 }
 
+/// Opening a repo that's already as it should be writes nothing, so what
+/// only reads isn't held up by a writer, however long it takes.
+#[test]
+fn opening_a_repo_beside_a_writer_does_not_wait() {
+    let scratch = Scratch::new("open-beside");
+    let repo = scratch.path().join("repo");
+    let mut catalog = Catalog::open_repo(&repo).expect("open");
+    catalog.add_sqlite_volume("other", &scratch.path().join("other.db")).expect("volume");
+    let block = raw(b"read beside a writer");
+    catalog.put_block(&block, CidVersion::V1).expect("put");
+    // In a shard so new it's not to be trusted, so catching up would write
+    let big = raw(&vec![7_u8; 100_000]);
+    assert_eq!(catalog.put_block(&big, CidVersion::V1).expect("put"), "flatfs");
+    drop(catalog);
+    Catalog::open_repo(&repo).expect("settle");
+
+    let other = rusqlite::Connection::open(repo.join("blocks.db")).expect("db");
+    other.execute_batch("BEGIN IMMEDIATE").expect("lock");
+    let start = std::time::Instant::now();
+    let catalog = Catalog::open_repo(&repo).expect("open beside a writer");
+    for block in [&block, &big] {
+        assert_eq!(catalog.get_block(&block.cid().clone().into()).expect("get").as_ref().map(Block::data), Some(block.data()));
+    }
+    assert!(start.elapsed() < std::time::Duration::from_secs(5), "{:?}", start.elapsed());
+    other.execute_batch("COMMIT").expect("unlock");
+    assert!(catalog.db.conn().is_autocommit(), "left nothing open");
+    drop(catalog);
+    Catalog::open_repo(&repo).expect("and once it's free");
+}
+
+/// Opening writes nothing that's as it should be, but still puts right
+/// what isn't.
+#[test]
+fn opening_a_repo_puts_right_what_has_changed() {
+    let scratch = Scratch::new("open-right");
+    let repo = scratch.path().join("repo");
+    drop(Catalog::open_repo(&repo).expect("open"));
+    let db = rusqlite::Connection::open(repo.join("blocks.db")).expect("db");
+    let version = |db: &rusqlite::Connection| db.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0)).expect("version");
+    let before = version(&db);
+    drop(Catalog::open_repo(&repo).expect("open"));
+    assert_eq!(version(&db), before, "the schema's left alone");
+
+    let keys = |db: &rusqlite::Connection| db.query_row("SELECT count(*) FROM authorized", [], |row| row.get::<_, i64>(0)).expect("keys");
+    let authorized = keys(&db);
+    assert!(authorized > 0);
+    db.execute_batch(
+        "DELETE FROM authorized;
+         DROP VIEW tags;
+         DROP VIEW anchor_values;
+         DROP VIEW anchor_values_any;
+         CREATE VIEW anchor_values_any (anchor, value, prefix, claim, at) AS SELECT 1, 2, 3, 4, 5;",
+    ).expect("change");
+    let catalog = Catalog::open_repo(&repo).expect("open");
+    assert_eq!(keys(&db), authorized, "what's authorized worked out again");
+    let view = |name: &str| db.query_row("SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?1", [name], |row| row.get::<_, String>(0)).expect("view");
+    assert!(view("tags").contains("CREATE VIEW tags"));
+    assert!(view("anchor_values").contains("CREATE VIEW anchor_values"));
+    assert!(view("anchor_values_any").len() > 100, "what's out of date made again");
+    assert!(catalog.new_anchor().is_ok());
+}
+
 //-------------//
 //-[ Volumes ]-//
 //-------------//

@@ -54,6 +54,30 @@ pub enum Error {
     Invalid(String),
 }
 
+impl Error {
+    /// Whether it failed only since something else was writing to the
+    /// database: what failed can be tried again later.
+    pub const fn is_busy(&self) -> bool {
+        match self {
+            Self::Store(e) => e.is_busy(),
+            Self::Db(e) => crate::store::is_busy(e),
+            Self::Io(_) | Self::Invalid(_) => false,
+        }
+    }
+}
+
+/// What's tried again later anyway, unless it failed for good: a node goes
+/// on while something else is writing, such as a big import.
+pub fn unless_busy(done: Result<()>, what: &str) -> Result<()> {
+    match done {
+        Err(e) if e.is_busy() => {
+            eprintln!("{what} waits, the database being busy");
+            Ok(())
+        },
+        done => done,
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Write a secret, readable only by its owner.

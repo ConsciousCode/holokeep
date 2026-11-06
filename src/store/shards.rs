@@ -121,9 +121,17 @@ impl ShardStore {
 
     fn with_label(db: Db, dir: &Path, label: Label) -> Result<Self> {
         super::offset::schema(&db)?;
-        let id = db.conn()
-            .prepare_cached("INSERT INTO shard_dirs (label) VALUES (?1) ON CONFLICT (label) DO UPDATE SET label = label RETURNING id")?
-            .query_row([label.as_slice()], |row| row.get(0))?;
+        // Only if it's new: opening a repo as it was doesn't wait for a writer
+        let known: Option<Id> = db.conn()
+            .prepare_cached("SELECT id FROM shard_dirs WHERE label = ?1")?
+            .query_row([label.as_slice()], |row| row.get(0))
+            .optional()?;
+        let id: Id = match known {
+            Some(id) => id,
+            None => db.conn()
+                .prepare_cached("INSERT INTO shard_dirs (label) VALUES (?1) ON CONFLICT (label) DO UPDATE SET label = label RETURNING id")?
+                .query_row([label.as_slice()], |row| row.get(0))?,
+        };
         Ok(Self { dir: fs::canonicalize(dir)?, label, id, db, threshold: Some(THRESHOLD) })
     }
 

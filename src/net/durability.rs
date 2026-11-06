@@ -542,6 +542,9 @@ impl Audit {
         if let Some(offer) = haves.offer {
             self.offers.insert(peer, offer);
         }
+        // What's seen is finished with whether or not it can be noted now:
+        // sightings are made again, and an audit must go on to its end
+        let mut noting = Ok(());
         let mut held: BTreeMap<Vec<u8>, Vec<Replica>> = haves.held.into_iter().map(|(key, replicas)| (key.into_vec(), replicas)).collect();
         for key in asked {
             let Ok(multihash) = decode(&key) else {
@@ -552,15 +555,19 @@ impl Audit {
             };
             if let Some(replicas) = held.remove(&key) {
                 for replica in &replicas {
-                    sightings.see(multihash.as_ref(), &peer, replica)?;
+                    if noting.is_ok() {
+                        noting = sightings.see(multihash.as_ref(), &peer, replica);
+                    }
                 }
                 holding.holders.insert(peer, replicas);
             } else {
-                sightings.unsee(multihash.as_ref(), &peer)?;
+                if noting.is_ok() {
+                    noting = sightings.unsee(multihash.as_ref(), &peer);
+                }
                 holding.holders.remove(&peer);
             }
         }
-        Ok(())
+        noting
     }
 
     /// A member which didn't answer an advert: it offers nothing.
@@ -574,6 +581,8 @@ impl Audit {
         let Some((peer, keys)) = self.pushes.remove(&request) else {
             return Ok(());
         };
+        // As in `haves`
+        let mut noting = Ok(());
         let mut kept: BTreeMap<Vec<u8>, Vec<Replica>> = kept.kept.into_iter().map(|(key, replicas)| (key.into_vec(), replicas)).collect();
         for key in keys {
             let Some(holding) = self.blocks.get_mut(&key) else {
@@ -584,7 +593,9 @@ impl Audit {
                 Some(replicas) => {
                     if let Ok(multihash) = decode(&key) {
                         for replica in &replicas {
-                            sightings.see(multihash.as_ref(), &peer, replica)?;
+                            if noting.is_ok() {
+                                noting = sightings.see(multihash.as_ref(), &peer, replica);
+                            }
                         }
                     }
                     holding.holders.insert(peer, replicas);
@@ -595,7 +606,7 @@ impl Audit {
                 },
             }
         }
-        Ok(())
+        noting
     }
 
     /// A push which got no answer: pass its target over.

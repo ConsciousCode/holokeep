@@ -85,17 +85,31 @@ pub(super) const LIVE_OTHERS: &str = live!("u.key IS NOT (SELECT id FROM multiha
 
 /// The keys each user has authorized: itself, and devices it has
 /// certified and not revoked.
-const AUTHORIZE: &str = "
-    DELETE FROM authorized;
-    INSERT OR IGNORE INTO authorized (user, key) SELECT key, key FROM users;
-    INSERT OR IGNORE INTO authorized (user, key)
+const AUTHORIZED: &str = "
+    SELECT key AS user, key FROM users
+    UNION
         SELECT rs.by, t.target FROM claims d JOIN claim_targets t ON t.claim = d.id JOIN claim_keys dk ON dk.claim = d.id
         JOIN claim_targets rt ON rt.target = dk.key JOIN sign_claims rs ON rs.id = rt.claim
         WHERE d.kind = 'device' AND rs.by IN (SELECT key FROM users) AND NOT EXISTS (
             SELECT 1 FROM claim_targets tt JOIN claims tb ON tb.id = tt.claim JOIN claim_keys tbk ON tbk.claim = tb.id
             JOIN claim_targets rt2 ON rt2.target = tbk.key JOIN sign_claims rs2 ON rs2.id = rt2.claim
             WHERE tt.target = dk.key AND tb.kind = 'tomb' AND rs2.by = rs.by
-        );";
+        )";
+
+/// The views below, each `CREATE VIEW` as it's kept, if they're as they are
+/// now: they're only made again if not, since that's a write, and makes
+/// every connection prepare what it had again.
+fn views_current(db: &Db, views: &str) -> Result<bool> {
+    for name in ["tags", "anchor_values", "anchor_values_any"] {
+        let start = format!("CREATE VIEW {name} ");
+        let wanted = views.find(&start).and_then(|at| views.get(at..)).and_then(|rest| rest.split(';').next());
+        let kept: Option<String> = db.conn().query_row("SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?1", [name], |row| row.get(0)).optional()?;
+        if wanted.is_none() || kept.as_deref() != wanted {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 
 /// Who signed what, and who may: see the module's documentation.
 const AUTH_TABLES: &str = "
@@ -361,7 +375,10 @@ impl ClaimStore {
             // older build's, replacing every set before it
             db.conn().execute_batch("ALTER TABLE set_claims ADD COLUMN after INTEGER NOT NULL DEFAULT 0")?;
         }
-        db.conn().execute_batch(&views())?;
+        let views = views();
+        if !views_current(&db, &views)? {
+            db.conn().execute_batch(&views)?;
+        }
         let chained = db.conn().prepare("SELECT 1 FROM pragma_table_info('sign_claims') WHERE name = 'prev'")?.exists([])?;
         if !chained {
             db.conn().execute_batch("ALTER TABLE sign_claims ADD COLUMN prev INTEGER REFERENCES multihashes (id)")?;
@@ -370,7 +387,9 @@ impl ClaimStore {
         widen_kinds(&db)?;
         let store = Self { db, acting };
         store.key_claims()?;
-        store.authorize()?;
+        if !store.authorized_current()? {
+            store.authorize()?;
+        }
         Ok(store)
     }
 
@@ -395,8 +414,21 @@ impl ClaimStore {
 
     /// Recompute the keys the user has authorized.
     fn authorize(&self) -> Result<()> {
-        self.db.conn().execute_batch(AUTHORIZE)?;
+        self.db.conn().execute_batch(&format!("DELETE FROM authorized; INSERT OR IGNORE INTO authorized (user, key) {AUTHORIZED};"))?;
         Ok(())
+    }
+
+    /// Whether the keys kept as authorized are those that are.
+    fn authorized_current(&self) -> Result<bool> {
+        let differs: bool = self.db.conn().query_row(
+            &format!(
+                "SELECT EXISTS (SELECT user, key FROM authorized EXCEPT SELECT * FROM ({AUTHORIZED}))
+                     OR EXISTS (SELECT * FROM ({AUTHORIZED}) EXCEPT SELECT user, key FROM authorized)"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(!differs)
     }
 
     /// Act as a user, so what's seen is what counts for it, or with
@@ -436,6 +468,10 @@ impl ClaimStore {
 
     /// The key an account signs with here.
     pub fn set_device(&self, uid: u32, device: &Link) -> Result<()> {
+        // As it's said each time a repo's opened, which needn't write
+        if self.account(uid)?.is_some_and(|account| account.device.as_ref() == Some(device)) {
+            return Ok(());
+        }
         self.set_account(uid, "device", device)
     }
 

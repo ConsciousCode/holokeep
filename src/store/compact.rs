@@ -3,8 +3,9 @@
 //! A database keeps the pages it frees to use again, as an allocator does,
 //! so this is only ever asked for: after an import that won't be repeated,
 //! say. `VACUUM` rewrites a database, passing all of it through the WAL.
-//! Readers carry on meanwhile, but writers wait, and only so long, which
-//! is why one that may take longer isn't started unless it's asked for.
+//! Readers carry on meanwhile, but writers wait, which holds up a mount
+//! entirely once it needs to write, and only so long, which is why one that
+//! may take long isn't started unless it's asked for.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -12,9 +13,8 @@ use std::time::{Duration, Instant};
 use super::{Catalog, Db, Result, free_space};
 
 /// The most of a database rewritten without being asked to take long:
-/// well within what writers wait for (see `Db::init`), at the 50 MiB/s or
-/// so of a slow disk. A daemon or mount that waits longer gives up, and
-/// what it was doing fails.
+/// well within what writers wait for by default (`WRITER_WAIT`), at the
+/// 50 MiB/s or so of a slow disk.
 const LONGEST: u64 = 256 * 1024 * 1024;
 
 /// How a database's bytes are used.

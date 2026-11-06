@@ -64,6 +64,12 @@ const TTL: Duration = Duration::from_secs(1);
 /// catalog stays on the thread it's opened on.
 pub type Opener = Box<dyn Fn() -> crate::store::Result<Catalog> + Send + Sync>;
 
+/// How long the filesystem waits for another writer, as a big import, before
+/// failing what it's been asked to do. It's asked one thing at a time, so
+/// all of it waits meanwhile; that's better than saves failing, but it's why
+/// this isn't for ever, as what's writing may be reading from it.
+const WRITER_WAIT: Duration = Duration::from_mins(2);
+
 thread_local! {
     /// Each soup's catalog, as opened on this thread.
     static CATALOGS: std::cell::RefCell<HashMap<u64, std::rc::Rc<Catalog>>> = std::cell::RefCell::new(HashMap::new());
@@ -410,6 +416,9 @@ impl Soup {
             return Ok(catalog);
         }
         let catalog = std::rc::Rc::new((self.open)().map_err(store_errno)?);
+        // What's asked of a filesystem can't be tried again later: it fails
+        // in whatever's asking
+        catalog.wait_for_writers(WRITER_WAIT).map_err(store_errno)?;
         CATALOGS.with_borrow_mut(|catalogs| catalogs.insert(self.id, std::rc::Rc::clone(&catalog)));
         Ok(catalog)
     }

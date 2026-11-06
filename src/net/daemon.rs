@@ -27,7 +27,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::net::unix::OwnedWriteHalf;
 
-use super::mesh::{self, Error, Members, Place, Result};
+use super::mesh::{self, Error, Members, Place, Result, unless_busy};
 use super::durability::Report;
 use super::node::{AuditId, Event, FetchId, Node, TrimId};
 use crate::cid::CidRef as _;
@@ -48,6 +48,11 @@ const REDIAL_SOON: Duration = Duration::from_secs(2);
 
 /// How often to notice members of structure which arrived, such as from
 /// commands run since.
+/// How long the daemon waits for another writer, as a big import, before
+/// leaving what it was doing to try again: not long, since it's all it can
+/// do meanwhile, and members would take it for gone.
+const WRITER_WAIT: Duration = Duration::from_secs(1);
+
 const ANNOUNCE: Duration = Duration::from_secs(10);
 
 /// How long after starting to begin the trickle, so members have
@@ -360,7 +365,10 @@ fn open_node(place: &Place) -> Result<(Node, bool)> {
         None => return Err(Error::Invalid("this node isn't in that mesh: invite another, or join one".into())),
     };
     let mut catalog = crate::store::Catalog::open_repo(dir)?;
-    let members = members(place)?;
+    catalog.wait_for_writers(WRITER_WAIT)?;
+    let db = Db::open(&dir.join("blocks.db"))?;
+    db.conn().busy_timeout(WRITER_WAIT)?;
+    let members = Members::open(db, &place.mesh)?;
     // A mesh for another of the host's accounts holds and hears of its repo
     if let Some(uid) = members.account()? {
         catalog.act_for(uid, crate::keys::account_key(dir, uid)?)?;
@@ -415,6 +423,61 @@ fn join_mesh(place: &Place, listen: &Multiaddr, (low, high): (u64, u64)) -> Resu
     Ok(Some(joined))
 }
 
+/// Answer whoever's asking on the control socket, who'd rather it waited
+/// for other writers than failed.
+#[allow(clippy::too_many_arguments, reason = "what `answer` takes, and what it's answered into")]
+async fn answer_patiently(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, copies: usize, collecting: bool, alone: bool, join: &mut bool, waiting: &mut Waiting) -> Result<()> {
+    node.catalog().wait_for_writers(crate::store::WRITER_WAIT)?;
+    let answered = answer(node, place, stream, copies, collecting, alone, join).await;
+    node.catalog().wait_for_writers(WRITER_WAIT)?;
+    match answered {
+        Ok(Some((waiter, write))) => waiting.wait(waiter, write),
+        Ok(None) => {},
+        Err(e) => eprintln!("control: {e}"),
+    }
+    Ok(())
+}
+
+/// Git objects come whole from members: once they've stopped coming for a
+/// while, what can be is kept as deltas.
+fn git_deltas(node: &Node) {
+    if !node.catalog().git_arriving() && node.catalog().git_waiting() {
+        match node.catalog().git_deltas() {
+            Ok(done) if done.deltas > 0 => eprintln!("git: {} objects kept as deltas, {} commits waiting on more", done.deltas, done.waiting),
+            Ok(_) => {},
+            Err(e) => eprintln!("git: objects kept whole for now: {e}"),
+        }
+    }
+}
+
+/// Notice a file's changed, or remember to try again if that's busy.
+fn notice_change(node: &mut Node, remounts: &mut Remounts, path: PathBuf, again: &mut Vec<PathBuf>) -> Result<()> {
+    if let Err(e) = on_change(node, remounts, path.clone()) {
+        unless_busy(Err(e), "noticing a change to a file")?;
+        again.push(path);
+    }
+    Ok(())
+}
+
+/// Join the mesh this node's been made a member of, if it can now. Returns
+/// whether that's been dealt with.
+fn join_now(node: &mut Node, alone: &mut bool, place: &Place, listen: &Multiaddr, marks: (u64, u64)) -> Result<bool> {
+    match join_mesh(place, listen, marks) {
+        Ok(joined) => {
+            if let Some(joined) = joined {
+                *node = joined;
+                *alone = false;
+            }
+            Ok(true)
+        },
+        Err(e) if e.is_busy() => {
+            eprintln!("joining waits, the database being busy");
+            Ok(false)
+        },
+        Err(e) => Err(e),
+    }
+}
+
 /// Run the node until interrupted, auditing as a trickle that it would
 /// take `copies` failures to lose each block it holds.
 ///
@@ -438,6 +501,9 @@ pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (
     let mut watch = if place.is_main() { watch_external(&node, notify)? } else { Watch::new(notify) };
     let (done, mut remounted) = tokio::sync::mpsc::unbounded_channel();
     let mut remounts = Remounts { dir: place.repo.clone(), pending: HashSet::new(), done };
+    // What couldn't be done for something else writing, to try again
+    let mut changed_again: Vec<PathBuf> = Vec::new();
+    let mut joining = false;
     let result = loop {
         tokio::select! {
             event = node.next() => match event {
@@ -460,19 +526,23 @@ pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (
                     continue;
                 };
                 let mut join = false;
-                match answer(&mut node, place, stream, copies, collecting, alone, &mut join).await {
-                    Ok(Some((waiter, write))) => waiting.wait(waiter, write),
-                    Ok(None) => {},
-                    Err(e) => eprintln!("control: {e}"),
-                }
-                if join && let Some(joined) = join_mesh(place, &listen, (low, high))? {
-                    node = joined;
-                    alone = false;
+                answer_patiently(&mut node, place, stream, copies, collecting, alone, &mut join, &mut waiting).await?;
+                joining |= join;
+                if joining {
+                    joining = !join_now(&mut node, &mut alone, place, &listen, (low, high))?;
                 }
             },
-            _ = redial.tick() => node.dial_members()?,
+            _ = redial.tick() => unless_busy(node.dial_members(), "dialing members")?,
             _ = announce.tick() => {
-                node.announce()?;
+                // Anything that was busy before, tried again
+                if joining {
+                    joining = !join_now(&mut node, &mut alone, place, &listen, (low, high))?;
+                }
+                for path in std::mem::take(&mut changed_again) {
+                    notice_change(&mut node, &mut remounts, path, &mut changed_again)?;
+                }
+                unless_busy(node.redrive(), "what's underway")?;
+                unless_busy(node.announce(), "announcing")?;
                 // What's been added since is copied without waiting out a
                 // calm interval
                 if node.arrived()? {
@@ -484,19 +554,11 @@ pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (
                         trickle = tokio::time::Instant::now();
                     }
                 }
-                // Git objects come whole from members: once they've stopped
-                // coming for a while, what can be is kept as deltas
-                if !node.catalog().git_arriving() && node.catalog().git_waiting() {
-                    match node.catalog().git_deltas() {
-                        Ok(done) if done.deltas > 0 => eprintln!("git: {} objects kept as deltas, {} commits waiting on more", done.deltas, done.waiting),
-                        Ok(_) => {},
-                        Err(e) => eprintln!("git: objects kept whole for now: {e}"),
-                    }
-                }
+                git_deltas(&node);
             },
             () = tokio::time::sleep_until(trickle) => {
                 if !node.auditing() {
-                    node.trickle(copies)?;
+                    unless_busy(node.trickle(copies).map(drop), "auditing")?;
                 }
                 let paths = node.take_changed();
                 if place.is_main() {
@@ -506,18 +568,19 @@ pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (
             },
             () = tokio::time::sleep_until(pressure) => {
                 if !node.trimming() && node.pressed()? && !node.connected().is_empty() {
-                    node.trim_some(copies, false)?;
+                    unless_busy(node.trim_some(copies, false).map(drop), "trimming")?;
                 }
                 pressure = later(PRESSURE);
             },
             () = tokio::time::sleep_until(collect), if collecting => {
-                let report = node.collect(false)?;
-                if report.collected > 0 {
-                    eprintln!("collected: {} let go of, {} bytes freed", report.collected, report.freed);
+                match node.collect(false) {
+                    Ok(report) if report.collected > 0 => eprintln!("collected: {} let go of, {} bytes freed", report.collected, report.freed),
+                    Ok(_) => {},
+                    Err(e) => unless_busy(Err(e), "collecting")?,
                 }
                 collect = later(COLLECT);
             },
-            Some(path) = changes.recv() => on_change(&mut node, &mut remounts, path)?,
+            Some(path) = changes.recv() => notice_change(&mut node, &mut remounts, path, &mut changed_again)?,
             Some((mount, root)) = remounted.recv() => remounts.finished(&mount, &root),
             _ = tokio::signal::ctrl_c() => break Ok(()),
         }

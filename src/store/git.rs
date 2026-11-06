@@ -67,11 +67,24 @@ impl Catalog {
         let waiting = std::mem::take(&mut self.commits.borrow_mut().waiting);
         let mut done = GitDeltas::default();
         let mut still = BTreeMap::new();
+        let mut failed = None;
         for (key, (commit, tries)) in waiting {
-            let whole = self.commit_deltas(&commit, &mut done.deltas)?;
-            let tries = tries.saturating_add(1);
-            if !whole && tries < TRIES {
+            // What's not been looked at waits on, for the next pass
+            if failed.is_some() {
                 still.insert(key, (commit, tries));
+                continue;
+            }
+            match self.commit_deltas(&commit, &mut done.deltas) {
+                Ok(whole) => {
+                    let tries = tries.saturating_add(1);
+                    if !whole && tries < TRIES {
+                        still.insert(key, (commit, tries));
+                    }
+                },
+                Err(e) => {
+                    still.insert(key, (commit, tries));
+                    failed = Some(e);
+                },
             }
         }
         done.waiting = still.len();
@@ -79,7 +92,8 @@ impl Catalog {
         for (key, waiting) in still {
             commits.waiting.entry(key).or_insert(waiting);
         }
-        Ok(done)
+        drop(commits);
+        failed.map_or(Ok(done), Err)
     }
 
     /// A commit compared with its parents. Returns whether everything it

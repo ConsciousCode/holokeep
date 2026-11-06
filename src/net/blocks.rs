@@ -195,24 +195,33 @@ impl Fetch {
             return Ok(());
         };
         let mut copies = answer.copies.into_iter();
+        let mut failed = None;
         for (cid, data) in answer.found {
             let theirs = copies.next().unwrap_or_default();
             let Ok(link) = Link::decode(&cid) else {
                 continue;
             };
             let key = link.multihash().to_bytes();
-            if asked.remove(&key).is_none() {
+            let Some((_, tried)) = asked.remove(&key) else {
                 continue;
-            }
+            };
             let Ok(block) = Block::verify(link.clone().into(), data.into_vec().into_boxed_slice()) else {
                 // Wrong bytes: ask someone else
                 self.wanted.insert(key, (link, 1));
                 continue;
             };
-            catalog.put_block(&block, link.version())?;
+            // What can't be kept yet is wanted still, as is the rest of the
+            // answer, there being no use in waiting for each in turn
+            if let Err(e) = catalog.put_block(&block, link.version()) {
+                asked.insert(key, (link, tried));
+                failed = Some(e.into());
+                break;
+            }
             if link.hashcode() != IDENTITY {
                 for replica in &theirs {
-                    sightings.see(link.multihash(), peer, replica)?;
+                    if let Err(e) = sightings.see(link.multihash(), peer, replica) {
+                        failed = Some(e);
+                    }
                 }
             }
             self.fetched = self.fetched.saturating_add(1);
@@ -227,7 +236,7 @@ impl Fetch {
         }
         // Left out to keep the answer small: the same member again
         self.wanted.extend(asked);
-        Ok(())
+        failed.map_or(Ok(()), Err)
     }
 
     /// A want which got no answer: ask the next member.

@@ -1,5 +1,5 @@
 use super::*;
-use crate::net::mesh::{self, Ticket};
+use crate::net::mesh::{self, Ticket, unless_busy};
 use crate::store::Db;
 use libp2p::core::transport::MemoryTransport;
 use libp2p::multiaddr::Protocol;
@@ -938,4 +938,104 @@ async fn what_a_keep_asks_one_copy_of_isnt_copied() {
     assert_eq!(audited(&mut [&mut a, &mut b], &[(0, id)]).await, [report(2, 2, 0)]);
     assert!(has(&b, root) && has(&b, leaf), "kept as the mesh runs");
     assert!(!has(&b, branch) && !has(&b, deep), "one copy, here");
+}
+
+/// A node with a catalog in a file, that gives up on other writers quickly,
+/// and a connection to hold its write lock with.
+async fn node_in_file(swarm_key: PreSharedKey, path: &std::path::Path) -> (Node, rusqlite::Connection) {
+    let key = Keypair::generate_ed25519();
+    let members = Members::open(Db::memory().expect("db"), crate::net::mesh::MAIN).expect("members");
+    let transport = transport(MemoryTransport::default(), &key, swarm_key).expect("transport");
+    let catalog = Catalog::standard(Db::open(path).expect("db")).expect("catalog");
+    catalog.wait_for_writers(Duration::from_millis(20)).expect("wait");
+    let mut node = Node::new(transport, &key, catalog, members, false).expect("node");
+    node.listen(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
+    loop {
+        if let Event::Listening(_) = node.next().await.expect("event") {
+            return (node, rusqlite::Connection::open(path).expect("open"));
+        }
+    }
+}
+
+async fn beside_one_in_a_file(path: &std::path::Path) -> (Node, Node, rusqlite::Connection) {
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let mut a = node(swarm_key).await;
+    let (mut b, writer) = node_in_file(swarm_key, path).await;
+    invite(&a, &b, swarm_key);
+    a.reload().expect("reload");
+    b.reload().expect("reload");
+    b.dial_members().expect("dial");
+    assert!(until(&mut [&mut a, &mut b], |n| connected(n[0], n[1])).await);
+    (a, b, writer)
+}
+
+/// A fetch goes on, and finishes, though for a while something else is
+/// writing, so nothing can be kept.
+#[tokio::test]
+async fn a_fetch_outlasts_another_writer() {
+    let scratch = crate::testutil::Scratch::new("busy-fetch");
+    let (mut a, mut b, writer) = Box::pin(beside_one_in_a_file(&scratch.path().join("b.db"))).await;
+    let blocks = [raw(b"kept once the writer's done"), raw(b"and so is this")];
+    let root = cbor(&Ipld::List(blocks.iter().map(|block| Ipld::Link(link(block))).collect()));
+    a.catalog().put_block(&root, CidVersion::V1).expect("put");
+    for block in &blocks {
+        a.catalog().put_block(block, CidVersion::V1).expect("put");
+    }
+    writer.execute_batch("BEGIN IMMEDIATE").expect("lock");
+    let id = b.fetch(link(&root)).expect("fetch");
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        writer.execute_batch("COMMIT").expect("unlock");
+    });
+    let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(10)).expect("deadline");
+    let (fetched, missing) = loop {
+        assert!(tokio::time::Instant::now() < deadline, "the fetch never finished");
+        let event = tokio::time::timeout(Duration::from_millis(50), async {
+            tokio::select! {
+                event = a.next() => event,
+                event = b.next() => event,
+            }
+        });
+        match event.await {
+            Ok(event) => {
+                if let Event::Fetched { id: done, fetched, missing } = event.expect("event")
+                    && done == id
+                {
+                    break (fetched, missing);
+                }
+            },
+            // As the daemon does every so often
+            Err(_) => unless_busy(b.redrive(), "the test").expect("redrive"),
+        }
+    };
+    release.join().expect("release");
+    assert!(missing.is_empty(), "{missing:?}");
+    assert_eq!(fetched, 3);
+    for block in &blocks {
+        assert!(has(&b, block));
+    }
+}
+
+/// An audit finishes, though what it's learned can't be noted for something
+/// else writing: stranded, a node would never audit again.
+#[tokio::test]
+async fn an_audit_finishes_beside_another_writer() {
+    let scratch = crate::testutil::Scratch::new("busy-audit");
+    let (mut a, mut b, writer) = Box::pin(beside_one_in_a_file(&scratch.path().join("b.db"))).await;
+    let blocks = wide();
+    for block in &blocks {
+        b.catalog().put_block(block, CidVersion::V1).expect("put");
+    }
+    let id = b.audit(2).expect("audit");
+    writer.execute_batch("BEGIN IMMEDIATE").expect("lock");
+    let reports = audited(&mut [&mut a, &mut b], &[(1, id)]).await;
+    assert_eq!(reports, [report(17, 17, 0)]);
+    assert!(!b.auditing());
+    for block in &blocks {
+        assert!(has(&a, block));
+    }
+    // Still busy throughout, and fine after
+    writer.execute_batch("COMMIT").expect("unlock");
+    let id = b.audit(2).expect("audit");
+    assert_eq!(audited(&mut [&mut a, &mut b], &[(1, id)]).await.len(), 1);
 }

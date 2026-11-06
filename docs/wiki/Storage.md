@@ -111,8 +111,8 @@ hk repo compact            # volume, bytes before, bytes after, outcome
 
 It's safe to run beside a mount and a daemon, and does nothing to a
 database with no free pages. `VACUUM` rewrites the database through its
-WAL: readers carry on, and writers wait. They only wait 10 seconds,
-though, so a database with over 256 MiB of pages in use is refused
+WAL: readers carry on, and writers wait (see [[#Transactions]]). So that
+isn't for long, a database with over 256 MiB of pages in use is refused
 without `--long`, which says nothing else is writing to it. One whose
 filesystem has too little room for the WAL is always refused. A refusal
 exits non-zero, after compacting the databases it can. A reader still in
@@ -128,6 +128,19 @@ So `Db::atomically` takes the write lock before starting, and waits for
 it. What usually only reads, like catching up, uses `Db::reading_first`,
 which starts without it, so isn't held up; if it needs to write beside a
 writer, it's undone and run again, waiting.
+
+Something else may hold the write lock for a long time: `hk add` and
+`hk git import` hold it for all of a big import. So each waits only as
+suits it, and what can't wait doesn't stop anything else:
+
+| What | Waits | Then |
+|---|---|---|
+| Opening a repo | Not at all, if nothing's changed | It writes only what has. Catching up waits a quarter of a second, then leaves it for next time, so reading is never held up. |
+| Most commands | 10 s | Fails with `database is locked`. |
+| [[Mount|hk mount]] | 2 minutes | What it was asked fails with `EIO`, since an application can't try again later. It does one thing at a time, so while one write waits, so do reads through the mount. |
+| The mount's committer | 10 s | Tries again next tick. |
+| [[Mesh|The daemon]] | 1 s | Tries again on its next tick, so it's never stuck long enough for members to take it for gone. A fetch is asked for again every 10 s, and an audit finishes, with what it learned left unnoted. What members sent that couldn't be taken, they send again. |
+| What's asked of the daemon | 10 s | The asker hears why. |
 
 ## Backreferences
 
