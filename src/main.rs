@@ -1316,6 +1316,12 @@ fn git_import(repo: Option<PathBuf>, git: &Path, no_keep: bool) -> anyhow::Resul
             out!("{link} {name}");
         }
         eprintln!("imported {count} objects{}", if beyond.is_empty() { String::new() } else { format!(", {} linked to from elsewhere", beyond.len()) });
+        // What came whole, as loose objects do, kept as deltas on the
+        // version after it
+        let deltas = repo.git_deltas()?;
+        if deltas.deltas > 0 {
+            eprintln!("{} kept as deltas on the versions after them", deltas.deltas);
+        }
         anyhow::Ok(())
     })
 }

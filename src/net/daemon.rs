@@ -484,6 +484,15 @@ pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (
                         trickle = tokio::time::Instant::now();
                     }
                 }
+                // Git objects come whole from members: once they've stopped
+                // coming for a while, what can be is kept as deltas
+                if !node.catalog().git_arriving() && node.catalog().git_waiting() {
+                    match node.catalog().git_deltas() {
+                        Ok(done) if done.deltas > 0 => eprintln!("git: {} objects kept as deltas, {} commits waiting on more", done.deltas, done.waiting),
+                        Ok(_) => {},
+                        Err(e) => eprintln!("git: objects kept whole for now: {e}"),
+                    }
+                }
             },
             () = tokio::time::sleep_until(trickle) => {
                 if !node.auditing() {

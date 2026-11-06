@@ -1508,6 +1508,73 @@ fn a_delta_no_shorter_than_its_block_is_not_kept() {
     assert_eq!(store.counts().expect("counts"), (0, 1));
 }
 
+/// A git tree of these entries, each (mode, name, object).
+fn git_tree(entries: &[(&str, &str, &Block)]) -> Block {
+    let mut content = Vec::new();
+    for (mode, name, object) in entries {
+        content.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+        content.extend_from_slice(&crate::git::sha1_of(&object.cid().clone().into()).expect("sha1"));
+    }
+    crate::git::block(crate::git::Kind::Tree, &content)
+}
+
+fn git_hex(object: &Block) -> String {
+    crate::git::sha1_of(&object.cid().clone().into()).expect("sha1").iter().fold(String::new(), |mut hex, byte| {
+        hex.push(char::from_digit(u32::from(byte >> 4), 16).expect("digit"));
+        hex.push(char::from_digit(u32::from(byte & 15), 16).expect("digit"));
+        hex
+    })
+}
+
+#[test]
+fn git_objects_that_come_whole_become_deltas_on_their_next_versions() {
+    let router = router();
+    let blob = |text: &[u8]| crate::git::block(crate::git::Kind::Blob, text);
+    let same = blob(b"never changes\n");
+    // Each commit: (commit, [a.txt, sub/b.txt, sub, root])
+    let mut commits: Vec<(Block, Vec<Block>)> = Vec::new();
+    for n in 0..3_usize {
+        let a = blob(&text(300 + n * 10));
+        let b = blob(&text(200 + n));
+        let sub = git_tree(&[("100644", "b.txt", &b)]);
+        let root = git_tree(&[("100644", "a.txt", &a), ("100644", "same.txt", &same), ("40000", "sub", &sub)]);
+        let parent = commits.last().map(|(commit, _)| format!("parent {}\n", git_hex(commit))).unwrap_or_default();
+        let commit = crate::git::block(crate::git::Kind::Commit, format!("tree {}\n{parent}author t <t@t> 0 +0000\n\ncommit {n}\n", git_hex(&root)).as_bytes());
+        commits.push((commit, vec![a, b, sub, root]));
+    }
+    let put = |block: &Block| router.put_block(block, CidVersion::V1).expect("put");
+    put(&same);
+    // Newest first, and the newest a.txt not yet
+    for (n, (commit, objects)) in commits.iter().enumerate().rev() {
+        put(commit);
+        for (i, object) in objects.iter().enumerate() {
+            if (n, i) != (2, 0) {
+                put(object);
+            }
+        }
+    }
+    assert!(router.git_arriving() && !router.git_arriving(), "said once");
+    let first = router.git_deltas().expect("deltas");
+    assert_eq!(first.waiting, 1, "the newest commit waits on its a.txt");
+    put(&commits[2].1[0]);
+    let second = router.git_deltas().expect("deltas");
+    assert_eq!(second.waiting, 0);
+    assert_eq!(first.deltas + second.deltas, 8, "four objects of each of the older two");
+    assert!(!router.git_waiting());
+    let is_delta = |block: &Block| {
+        router.db.conn()
+            .query_row("SELECT base IS NOT NULL FROM delta_blocks d JOIN multihashes m ON m.id = d.block WHERE m.multihash = ?1", [block.cid().multihash().to_bytes()], |row| row.get::<_, bool>(0))
+            .expect("row")
+    };
+    for (n, (_, objects)) in commits.iter().enumerate() {
+        for object in objects {
+            assert_eq!(is_delta(object), n < 2, "commit {n}");
+            assert_eq!(router.get_block(&object.cid().clone().into()).expect("get").as_ref().map(Block::data), Some(object.data()));
+        }
+    }
+    assert!(!is_delta(&same));
+}
+
 //-------------//
 //-[ Volumes ]-//
 //-------------//

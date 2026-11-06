@@ -75,7 +75,9 @@ blocks' bytes. Each row is zlib-compressed when that makes it smaller.
   a base is one such. [[Git#Importing|Importing git]] gives each object
   a pack had as a delta that delta, made one between whole blocks. The
   [[Mount|mount]] gives each part of a file written over the part of the
-  version before it, which is then made a delta on it.
+  version before it, which is then made a delta on it, and git objects
+  that came whole are made deltas on the same path's next version (see
+  [[Git#Storage]]).
 - Deltas are found by `delta::encode`, as git's are: the base's 16-byte
   windows indexed by a rolling hash, each match extended both ways, and
   a short match looked past for one that goes further. On the pairs of

@@ -115,21 +115,69 @@ pub fn parse(data: &[u8]) -> Result<(Kind, &[u8])> {
     Ok((kind, content))
 }
 
+/// An entry of a tree.
+pub struct Entry<'a> {
+    /// Its mode, in octal: `40000` a tree, `160000` a submodule's commit,
+    /// else a blob.
+    pub mode: &'a [u8],
+    pub name: &'a [u8],
+    pub link: Link,
+}
+
+impl Entry<'_> {
+    pub fn is_tree(&self) -> bool {
+        self.mode == b"40000"
+    }
+
+    pub fn is_blob(&self) -> bool {
+        !self.is_tree() && self.mode != b"160000"
+    }
+}
+
+/// A tree's entries, from its content.
+pub fn entries(content: &[u8]) -> Result<Vec<Entry<'_>>> {
+    let mut out = Vec::new();
+    let mut rest = content;
+    while !rest.is_empty() {
+        let nul = rest.iter().position(|&byte| byte == 0).ok_or_else(|| invalid("a tree entry without a name's end"))?;
+        let (head, tail) = rest.split_at(nul);
+        let space = head.iter().position(|&byte| byte == b' ').ok_or_else(|| invalid("a tree entry without a mode"))?;
+        let sha1 = tail.get(1..21).ok_or_else(|| invalid("a tree entry cut short"))?;
+        out.push(Entry {
+            mode: head.get(..space).unwrap_or_default(),
+            name: head.get(space.saturating_add(1)..).unwrap_or_default(),
+            link: cid_of(sha1.try_into().map_err(|_| invalid("a tree entry cut short"))?),
+        });
+        rest = tail.get(21..).unwrap_or_default();
+    }
+    Ok(out)
+}
+
+/// A commit's tree and parents, from its content.
+pub fn commit(content: &[u8]) -> Result<(Link, Vec<Link>)> {
+    let mut tree = None;
+    let mut parents = Vec::new();
+    for line in content.split(|&byte| byte == b'\n') {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(hex) = line.strip_prefix(b"tree ") {
+            tree = Some(cid_of_hex(hex)?);
+        }
+        else if let Some(hex) = line.strip_prefix(b"parent ") {
+            parents.push(cid_of_hex(hex)?);
+        }
+    }
+    Ok((tree.ok_or_else(|| invalid("a commit without a tree"))?, parents))
+}
+
 /// Every link in an object's block, in order.
 pub fn links(data: &[u8]) -> Result<Vec<Link>> {
     let (kind, content) = parse(data)?;
     let mut out = Vec::new();
     match kind {
         Kind::Blob => {},
-        Kind::Tree => {
-            let mut rest = content;
-            while !rest.is_empty() {
-                let nul = rest.iter().position(|&byte| byte == 0).ok_or_else(|| invalid("a tree entry without a name's end"))?;
-                let sha1 = rest.get(nul.saturating_add(1)..nul.saturating_add(21)).ok_or_else(|| invalid("a tree entry cut short"))?;
-                out.push(cid_of(sha1.try_into().map_err(|_| invalid("a tree entry cut short"))?));
-                rest = rest.get(nul.saturating_add(21)..).unwrap_or_default();
-            }
-        },
+        Kind::Tree => out.extend(entries(content)?.into_iter().map(|entry| entry.link)),
         Kind::Commit | Kind::Tag => {
             // Headers up to the first blank line; a continuation line, as
             // of a merge tag, starts with a space

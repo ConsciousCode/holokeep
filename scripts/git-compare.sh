@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Compare `hk git import` against git and Kubo: build a repository with
-# loose objects, packs (deltas on offsets, and on names), annotated tags, a
-# merged tag and a submodule's commit, import it, then check every object
+# loose objects (which become deltas), packs (deltas on offsets, and on
+# names), annotated tags, a merged tag and a submodule's commit, import
+# it, then check every object
 # is held with git's bytes, under the CID Kubo gives those bytes, linking
 # to what Kubo says it links to. Uses throwaway repos only.
 #
@@ -100,6 +101,10 @@ check_repo() {
 
 make_repo "$work/loose"
 check_repo "$work/loose" "loose"
+# Loose objects come whole, and are kept as deltas on their next versions
+stored=$(sqlite3 "$HOLOKEEP_REPO/blocks.db" "SELECT count(base) FROM delta_blocks")
+[ "$stored" -gt 0 ] || { echo "loose: no objects kept as deltas"; exit 1; }
+echo "loose, kept as deltas: $stored"
 
 make_repo "$work/offsets"
 git -C "$work/offsets" repack -adfq

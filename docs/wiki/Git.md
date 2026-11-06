@@ -50,13 +50,29 @@ What's linked to but in no object here, as a submodule's commits, is
 each keep's `beyond` (see [[Claims#Encoding]]), so the keep doesn't wait on
 it.
 
+## Storage
+
 An object that's a delta in a pack is kept as that delta, in the
 [[Storage#Deltas|delta store]], so its objects take about as much room
 as in the pack: ripgrep's 5.8 MiB pack, 130 MiB of objects, is 5.8 MiB
 of rows, within 0.5% of it. On disk it's 11.6 MB against git's 6.5 MB
 (pack, index and reverse index), mostly for the index of links between
-blocks, which git doesn't keep, and SQLite's page slack. Its blocks are still whole objects to
-anything reading them, and are sent whole between nodes.
+blocks, which git doesn't keep, and SQLite's page slack. Its blocks are
+still whole objects to anything reading them, and are sent whole between
+nodes.
+
+Objects that come whole, loose or from another node, are made deltas
+after: each commit new to a catalog has its tree compared with its
+parents', path by path, and what a parent has where the commit has
+something else, trees and blobs, is kept as a delta on what the commit
+has, so the newest version of each path is whole. A commit whose
+parents, or the objects compared, aren't here yet waits, and is looked
+at again once git objects stop coming, eight times at most. `hk git
+import` does this as it finishes, and the [[Mesh|mesh]] daemon on its
+announce tick, when no git objects came in the one before. Ripgrep's
+14,184 objects, imported loose, are 3.9 MB of rows: smaller than git's
+own pack, since a file's last version is a better base than what git's
+window of similar objects finds.
 
 Not yet: `.git` through [[Mount|hk mount]] as `git-raw` (objects written
 there are stored as files, as anything else is); exporting objects back

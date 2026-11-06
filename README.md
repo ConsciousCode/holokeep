@@ -343,7 +343,7 @@ Checklist:
   - [ ] Repacking blocks which belong together, eg a UnixFS file's leaves, into a whole file
   - [x] Deltas: blocks kept as git-format deltas on others the store keeps, given with the put (git packs' deltas, as they come), compressed, chains at most 50 deep, made whole before their bases go
   - [x] Finding deltas ourselves (git's way, rolling-hash windows, 6% smaller than git's on ripgrep): what's written over through the mount kept as deltas on the version after it, newest whole
-  - [ ] Git objects that arrive whole kept as deltas too, on the same path in the parent commit
+  - [x] Git objects that come whole (loose, or from members) kept as deltas on the same path's next version, each new commit compared with its parents
 - [x] Tagging
   - [x] Tags as `Group` claims, kept as rows (`hk tag add/ls/find`)
   - [x] Untagging, by tombstoning the claims (`hk tag rm`)

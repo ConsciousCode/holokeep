@@ -17,7 +17,7 @@ use crate::store::Catalog;
 use crate::unixfs::{DataBuf, DataType};
 
 /// Deeper than any sane DAG, shallow enough not to overflow the stack.
-const MAX_DEPTH: usize = 1024;
+pub const MAX_DEPTH: usize = 1024;
 
 /// Somewhere to get verified blocks from.
 pub trait Fetch {

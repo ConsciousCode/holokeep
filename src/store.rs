@@ -35,6 +35,7 @@ use crate::multihash::Multihash;
 
 mod claims;
 mod delta;
+mod git;
 mod ipld;
 mod merge;
 mod offset;
@@ -52,6 +53,7 @@ use offset::{Fingerprint, Location, Whole};
 pub use raw::RawStore;
 pub use shards::ShardStore;
 pub use unixfs::UnixfsStore;
+pub use git::GitDeltas;
 pub use volume::{Volume, tolerance};
 
 #[derive(Debug, thiserror::Error)]
@@ -190,6 +192,12 @@ pub trait Store: BlockIndex + BlockSource + BlockStore {
     /// that takes.
     fn rescan(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Whether a block's kept as a delta on another.
+    fn is_delta(&self, key: Key<'_>) -> Result<bool> {
+        let _ = key;
+        Ok(false)
     }
 
     /// Let a block go, returning how many bytes that frees, or None if
@@ -382,6 +390,9 @@ pub struct Catalog {
     /// Blocks found missing in a transaction, which can't wait on the node
     /// writing them, to fetch once it's over.
     missed: std::cell::RefCell<Vec<Link>>,
+    /// Git commits new here, to keep what their parents have as deltas on
+    /// what they have; see `git_deltas`.
+    commits: std::cell::RefCell<git::Commits>,
 }
 
 /// Asks a running node to fetch blocks, just them, saying whether it
@@ -987,7 +998,7 @@ impl Catalog {
         if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
             return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
         }
-        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, merges: std::cell::RefCell::default(), fetcher: None, missed: std::cell::RefCell::default() };
+        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, merges: std::cell::RefCell::default(), fetcher: None, missed: std::cell::RefCell::default(), commits: std::cell::RefCell::default() };
         for volume in volumes {
             catalog.attach(volume)?;
         }
@@ -1874,24 +1885,31 @@ impl Catalog {
 
     /// Keep `older` as a delta on `newer`, if both are kept in one volume's
     /// delta store and the delta's shorter: a version of part of a file on
-    /// the version written over it, so the newest is whole.
-    pub fn revise(&self, older: &Link, newer: &Link) -> Result<()> {
+    /// the version written over it, so the newest is whole. Returns
+    /// whether it made it one; one already a delta is left as it is.
+    pub fn revise(&self, older: &Link, newer: &Link) -> Result<bool> {
         if older.multihash() == newer.multihash() {
-            return Ok(());
+            return Ok(false);
         }
         let in_deltas = |cid: &Link| -> Result<Vec<usize>> {
             Ok(self.placements(cid.multihash())?.into_iter().filter(|(_, form)| form == "delta").map(|(volume, _)| volume).collect())
         };
         let newer_in = in_deltas(newer)?;
         let Some(volume) = in_deltas(older)?.into_iter().find(|volume| newer_in.contains(volume)) else {
-            return Ok(());
+            return Ok(false);
         };
+        let store = self.named(&(volume, "delta".to_owned()))?;
+        if store.is_delta(older.multihash())? {
+            return Ok(false);
+        }
         let (Some(old), Some(new)) = (self.get_block(older)?, self.get_block(newer)?) else {
-            return Ok(());
+            return Ok(false);
         };
         let delta = crate::delta::encode(new.data(), old.data()).map_err(|e| Error::Volume(e.to_string()))?;
-        let store = self.named(&(volume, "delta".to_owned()))?;
-        self.db.atomically(|| store.put_from(&old, Provenance::Delta { base: newer.multihash(), delta: &delta }).map(|_| ()))
+        self.db.atomically(|| {
+            store.put_from(&old, Provenance::Delta { base: newer.multihash(), delta: &delta })?;
+            store.is_delta(older.multihash())
+        })
     }
 
     /// Whether a block is here: as `has`, but a dissolved claim's identity
@@ -2600,6 +2618,7 @@ impl Catalog {
             else {
                 let placed = self.place(block, provenance)?;
                 self.record(id, &placed)?;
+                self.commits.borrow_mut().arrived(block);
                 placed
             };
             // Read under each codec it's put with, since that's what says

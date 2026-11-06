@@ -234,6 +234,12 @@ impl DeltaStore {
 impl Store for DeltaStore {
     fn name(&self) -> &'static str { NAME }
 
+    fn is_delta(&self, key: Key<'_>) -> Result<bool> {
+        Ok(self.db.conn()
+            .prepare_cached("SELECT 1 FROM multihashes m JOIN delta_blocks d ON d.block = m.id WHERE m.multihash = ?1 AND d.base IS NOT NULL")?
+            .exists([key.to_bytes()])?)
+    }
+
     fn remove(&self, key: Key<'_>) -> Result<Option<u64>> {
         let Some(id) = self.db.lookup(key)? else {
             return Ok(Some(0));
