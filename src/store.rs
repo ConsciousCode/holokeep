@@ -544,6 +544,17 @@ impl Mount {
     }
 }
 
+/// A claim a device signed, as `Catalog::signed_in` tells it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedClaim {
+    pub cid: Link,
+    /// What it says, unless it isn't here.
+    pub claim: Option<Claim>,
+    /// Whether the device is all that makes it count.
+    pub alone: bool,
+    pub retracted: bool,
+}
+
 /// What `drop_all` let go of.
 #[derive(Debug, Default)]
 pub struct Dropping {
@@ -990,16 +1001,82 @@ impl Catalog {
     /// does, whenever it says it was, and with no cutoff nothing it signed
     /// does. Returns how many were signed again.
     pub fn revoke(&self, root: &crate::keys::Key, device: &Link, cutoff: Option<&Link>) -> Result<usize> {
-        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        self.revoke_trusting(root, device, cutoff.map_or(&[], std::slice::from_ref))
+    }
+
+    /// As `revoke`, with as many signs as a key's chains fork into, trusting
+    /// each and those before it. The user's sealed root and root anchor stay
+    /// kept whatever's trusted, signed here if this was all that kept them:
+    /// there's no good in losing those, and no getting them back.
+    pub fn revoke_trusting(&self, root: &crate::keys::Key, device: &Link, trusted: &[Link]) -> Result<usize> {
         let key = self.signer.as_ref().filter(|key| key.id() != *device).ok_or(Error::NoClaims)?;
-        let orphans = cutoff.map(|cutoff| claims.signed_only_by(device, cutoff)).transpose()?.unwrap_or_default();
+        let orphans = self.trusted_alone(device, trusted)?;
         let certificate = Claim::Device(crate::claim::Device::new([device.clone()]).ok_or(Error::NoClaims)?);
         let tomb = Claim::Tomb(Tomb::new([certificate.cid()]).ok_or(Error::NoClaims)?);
         self.put_block(&tomb.block(), CidVersion::V1)?;
         self.sign_with(root, [tomb.cid()])?;
         let count = orphans.len();
         self.sign_with(key, orphans)?;
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        for (seal, _) in self.seals()? {
+            if !claims.kept(seal.multihash())? {
+                self.keep(&seal)?;
+            }
+        }
+        self.keep_root()?;
         Ok(count)
+    }
+
+    /// What's signed by this key alone in these signs or before them.
+    fn trusted_alone(&self, device: &Link, trusted: &[Link]) -> Result<Vec<Link>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let mut alone = std::collections::BTreeMap::new();
+        for sign in trusted {
+            for claim in claims.signed_only_by(device, sign)? {
+                alone.insert(claim.to_bytes(), claim);
+            }
+        }
+        Ok(alone.into_values().collect())
+    }
+
+    /// The claims which stop counting if a device's revoked trusting these
+    /// signs: signed by it alone, not among what's trusted, nor what keeps the
+    /// sealed root or the root anchor, which are kept regardless.
+    pub fn revocation_costs(&self, device: &Link, trusted: &[Link]) -> Result<Vec<Claim>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let trusted: std::collections::HashSet<Vec<u8>> = self.trusted_alone(device, trusted)?.iter().map(Link::to_bytes).collect();
+        let mut always: std::collections::HashSet<Vec<u8>> = self.seals()?.iter().map(|(cid, _)| cid.multihash().to_bytes()).collect();
+        always.extend(self.root_anchor()?.map(|root| root.multihash().to_bytes()));
+        let mut costs = Vec::new();
+        for cid in claims.signed_alone_by(device)? {
+            if trusted.contains(&cid.to_bytes()) {
+                continue;
+            }
+            if let Some(claim) = self.claim_at(owned(cid.multihash())?.as_ref())?
+                && !(matches!(claim, Claim::Keep(_)) && claim.target().iter().any(|target| always.contains(&target.multihash().to_bytes())))
+            {
+                costs.push(claim);
+            }
+        }
+        Ok(costs)
+    }
+
+    /// What a sign of a device's says: each claim, if it's here, and whether
+    /// no other key that's authorized has signed it, or it's been retracted.
+    pub fn signed_in(&self, device: &Link, sign: &Link) -> Result<Vec<SignedClaim>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let Some(Claim::Sign(sign)) = self.claim_at(owned(sign.multihash())?.as_ref())? else {
+            return Ok(Vec::new());
+        };
+        let alone: std::collections::HashSet<Vec<u8>> = claims.signed_alone_by(device)?.iter().map(Link::to_bytes).collect();
+        sign.signs().iter()
+            .map(|cid| Ok(SignedClaim {
+                cid: cid.clone(),
+                claim: self.claim_at(owned(cid.multihash())?.as_ref())?,
+                alone: alone.contains(&cid.to_bytes()),
+                retracted: claims.retracted(cid)?,
+            }))
+            .collect()
     }
 
     /// Every device a certificate names, and whether it counts now.

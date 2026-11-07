@@ -377,7 +377,14 @@ enum DeviceCommand {
     List,
     /// Print a device's signs, in the order they came: CID, the sign
     /// before it, when it says, and how many claims it signs
-    Log { peer: String },
+    Log {
+        peer: String,
+        /// And under each, a tab in: each claim's CID, its kind, its targets,
+        /// and `alone` if nothing else authorized makes it count, `shared`
+        /// if something does, or `retracted`
+        #[arg(long)]
+        claims: bool,
+    },
     /// Become a device of the user whose root key's here, sealed, with their
     /// passphrase, as brought by `hk dag export --sealed-root`, when there's
     /// no device left to invite this one. What they've said counts here
@@ -385,14 +392,22 @@ enum DeviceCommand {
     Restore,
     /// Revoke a device, with the user's passphrase. What it alone signed
     /// up to `--until` is signed again here, so it still counts; nothing
-    /// else it signed does
+    /// else it signed does, and it says what that is and asks first. What
+    /// keeps the user's sealed root and root anchor is always signed again
     Revoke {
         peer: String,
         /// One of its signs, to trust it and those before it in its chain,
         /// or seconds since the epoch, to trust its signs until then if
-        /// its chain doesn't fork [default: now]
+        /// its chain doesn't fork. A sign for each chain, if it forks
+        /// [default: now]
         #[arg(long)]
-        until: Option<String>,
+        until: Vec<String>,
+        /// Say what would stop counting, and revoke nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Go ahead though claims would stop counting, without asking
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1327,32 +1342,76 @@ fn device(dir: &Path, command: DeviceCommand) -> anyhow::Result<()> {
             let user = repo.batch(|repo| repo.restore_user(passphrase(false)?.as_bytes()).map_err(anyhow::Error::from))?;
             out!("user\t{}", keys::peer_id(&user));
         },
-        DeviceCommand::Log { peer } => {
+        DeviceCommand::Log { peer, claims } => {
             let device = keys::from_peer_id(&peer).context("not an ed25519 peer ID")?;
             for signed in repo.claims().context("this repo keeps no claims")?.signs_by(&device)? {
                 let prev = signed.prev.map_or_else(|| "-".to_owned(), |prev| prev.to_string());
                 out!("{}\t{prev}\t{}\t{}", signed.sign, signed.at, signed.claims);
+                if claims {
+                    for claim in repo.signed_in(&device, &signed.sign)? {
+                        let what = claim.claim.as_ref().map_or_else(|| "not here\t-".to_owned(), describe_claim);
+                        let state = if claim.retracted { "retracted" } else if claim.alone { "alone" } else { "shared" };
+                        out!("\t{}\t{what}\t{state}", claim.cid);
+                    }
+                }
             }
             for fork in repo.forks(&device)? {
                 eprintln!("forks at {}", fork.map_or_else(|| "its start".to_owned(), |fork| fork.to_string()));
             }
         },
-        DeviceCommand::Revoke { peer, until } => {
-            let device = keys::from_peer_id(&peer).context("not an ed25519 peer ID")?;
-            anyhow::ensure!(repo.signer().is_some_and(|key| key.id() != device), "a node can't revoke itself");
-            let cutoff = match until.as_deref().map(str::parse::<u64>) {
-                Some(Ok(at)) => repo.cutoff_at(&device, at)?,
-                Some(Err(_)) => Some(until.as_deref().unwrap_or_default().parse::<Link>().context("--until is neither a CID nor a time")?),
-                None => {
-                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
-                    repo.cutoff_at(&device, now)?
-                },
-            };
-            let root = root_key(&repo, dir)?;
-            let resigned = repo.batch(|repo| repo.revoke(&root, &device, cutoff.as_ref()))?;
-            out!("revoked {peer}; signed {resigned} of its claims again");
-        },
+        DeviceCommand::Revoke { peer, until, dry_run, yes } => revoke_device(dir, &repo, &peer, &until, dry_run, yes)?,
     }
+    Ok(())
+}
+
+/// A claim's kind and targets, tab-separated.
+fn describe_claim(claim: &claim::Claim) -> String {
+    let targets: Vec<String> = claim.target().iter().map(ToString::to_string).collect();
+    format!("{}\t{}", claim.kind(), targets.join(" "))
+}
+
+/// Revoke a device, saying first what'd stop counting.
+fn revoke_device(dir: &Path, repo: &Catalog, peer: &str, until: &[String], dry_run: bool, yes: bool) -> anyhow::Result<()> {
+    use holokeep::keys;
+    let device = keys::from_peer_id(peer).context("not an ed25519 peer ID")?;
+    anyhow::ensure!(repo.signer().is_some_and(|key| key.id() != device), "a node can't revoke itself");
+    let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    let mut trusted = Vec::new();
+    if until.is_empty() {
+        trusted.extend(repo.cutoff_at(&device, now())?);
+    }
+    for until in until {
+        match until.parse::<u64>() {
+            Ok(at) => trusted.extend(repo.cutoff_at(&device, at)?),
+            Err(_) => trusted.push(until.parse::<Link>().context("--until is neither a sign nor a time")?),
+        }
+    }
+    let costs = repo.revocation_costs(&device, &trusted)?;
+    if dry_run {
+        for claim in &costs {
+            out!("{}\t{}", claim.cid(), describe_claim(claim));
+        }
+        eprintln!("{} claims would stop counting", costs.len());
+        return Ok(());
+    }
+    if !costs.is_empty() {
+        eprintln!("{} claims would stop counting, signed by {peer} alone:", costs.len());
+        for claim in &costs {
+            eprintln!("  {}\t{}", claim.cid(), describe_claim(claim));
+        }
+        if !yes {
+            use std::io::IsTerminal as _;
+            anyhow::ensure!(io::stdin().is_terminal(), "not revoking: --yes to go ahead, or --until to trust what signed them");
+            eprint!("revoke it all the same? [y/N] ");
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+            anyhow::ensure!(matches!(answer.trim(), "y" | "Y" | "yes"), "not revoking");
+        }
+    }
+    let root = root_key(repo, dir)?;
+    let mut repo = Catalog::open_repo(dir)?;
+    let resigned = repo.batch(|repo| repo.revoke_trusting(&root, &device, &trusted))?;
+    out!("revoked {peer}; signed {resigned} of its claims again");
     Ok(())
 }
 

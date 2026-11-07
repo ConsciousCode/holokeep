@@ -625,6 +625,26 @@ impl ClaimStore {
         )
     }
 
+    /// The CIDs of what it'd cost to revoke a key, signing nothing again:
+    /// claims, other than signs and certificates, not retracted, which it's
+    /// signed and no other authorized key has.
+    pub fn signed_alone_by(&self, key: &Link) -> Result<Vec<Link>> {
+        self.claims_where(
+            "c.kind NOT IN ('sign', 'device')
+             AND EXISTS (
+                 SELECT 1 FROM claim_targets st JOIN sign_claims sg ON sg.id = st.claim JOIN multihashes b ON b.id = sg.by
+                 WHERE st.target = ck.key AND b.multihash = ?1)
+             AND NOT EXISTS (
+                 SELECT 1 FROM claim_targets st JOIN sign_claims sg ON sg.id = st.claim JOIN multihashes b ON b.id = sg.by
+                 JOIN authorized au ON au.key = sg.by
+                 WHERE st.target = ck.key AND b.multihash != ?1
+                     AND (acting_user() IS NULL OR au.user = (SELECT id FROM multihashes WHERE multihash = acting_user())))
+             AND NOT EXISTS (
+                 SELECT 1 FROM claim_targets x JOIN claims k ON k.id = x.claim WHERE x.target = ck.key AND k.kind = 'tomb')",
+            &[&key.multihash().to_bytes()],
+        )
+    }
+
     /// A key's sign `cutoff` and those before it in its chain, by their
     /// multihashes' ids.
     fn chain(&self, key: &Link, cutoff: &Link) -> Result<Vec<Id>> {

@@ -163,6 +163,34 @@ scenario_lost() {
     [ "$(on one hk cat "$cid")" = "only here" ] || fail "it isn't what it was"
 }
 
+# A device's claims can be seen, and revoking it says what it'd cost first,
+# trusting what's asked to and taking nothing else unasked
+scenario_revoke() {
+    local peer block keep sign
+    machine leaving
+    invite one leaving
+    node_up leaving
+    peer=$(on leaving hk node id)
+    block=$(sh_on one 'echo "only kept by leaving" | hk add -q --no-keep -')
+    wait_for "leaving to be connected" sh_on one "hk node peers | grep '$peer' | grep -q connected"
+    on leaving hk dag fetch "$block" >/dev/null
+    keep=$(on leaving hk keep add "$block")
+    on leaving hk dag export "$block" --claims -o /tmp/kept.car 2>/dev/null
+    podman cp "$run-leaving:/tmp/kept.car" "$run-one:/tmp/kept.car"
+    on one hk dag import /tmp/kept.car >/dev/null 2>&1
+
+    on one hk device log "$peer" --claims | grep "$keep" | grep "keep" | grep "alone" >/dev/null || fail "the log doesn't say what it signed"
+    sign=$(on one hk device log "$peer" | awk -v keep="$keep" 'END { print $1 }')
+    [ "$(on one hk device revoke "$peer" --until 1 --dry-run 2>/dev/null | cut -f1)" = "$keep" ] || fail "the dry run doesn't name it"
+    on one hk node peers | grep "$peer" >/dev/null || fail "a dry run shouldn't have done anything"
+    ! on one hk device revoke "$peer" --until 1 </dev/null >/dev/null 2>&1 || fail "revoked without being told to lose it"
+    on one hk keep ls | grep "$block" >/dev/null || fail "refusing lost it"
+    [ -z "$(on one hk device revoke "$peer" --until "$sign" --dry-run 2>/dev/null)" ] || fail "trusting its sign still costs"
+    on one hk device revoke "$peer" --until "$sign" </dev/null >/dev/null
+    on one hk device list | grep "$peer" | grep "revoked" >/dev/null || fail "it isn't revoked"
+    on one hk keep ls | grep "$block" >/dev/null || fail "what was trusted isn't kept"
+}
+
 # Every device gone, a new machine with a backup and the passphrase is the user
 # again, and has the soup; without the passphrase it's only got ciphertext
 scenario_restore() {
@@ -285,7 +313,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read late_joiner fork_merge lost forget car restore)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read late_joiner fork_merge lost forget car restore revoke)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

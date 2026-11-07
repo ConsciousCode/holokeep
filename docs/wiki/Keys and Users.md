@@ -47,6 +47,14 @@ had signed up to a sign the user names (`hk device log` lists them).
 Nothing made later can be among those, so a thief can't backdate: what
 the device said before it was lost stands, nothing after does.
 
+`hk device log <peer> --claims` lists what each sign says, and whether the
+device is all that makes each claim count. `hk device revoke` lists what'd
+stop counting, trusting what it's told, and asks before going ahead (`--yes`
+when there's no terminal, `--dry-run` to only see). `--until` takes a sign for
+each chain, if the key's forked, as a time can't say which it means. What keeps
+the user's sealed root and root anchor is signed again regardless, as neither
+is any good to lose.
+
 ## The sealed root
 
 The root key is kept on no machine. It's **sealed** with the user's

@@ -357,6 +357,7 @@ Checklist:
   - [x] Dissolved claims, named by identity CIDs
   - [x] History as a reference, let go of explicitly (`hk anchor forget`)
   - [x] Forgetting members gone for good (`hk node forget`)
+  - [x] Seeing what a key signed (`hk device log --claims`), and what revoking it would cost, before it does
   - [x] Reporting what's lost, `Lost` claims: `hk lost scan` finds what was held here, never let go of, that something still refers to, and reports it once every member's said it hasn't got it, as a running node does daily (`hk lost add/rm/ls`, `hk node scan-lost`)
 - [ ] Purging blocks immediately, across stores and permission tiers
 - [ ] Marking suspect blocks: ones whose links say sizes, or other things, that turn out wrong

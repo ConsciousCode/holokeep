@@ -627,6 +627,86 @@ fn whats_authorized_is_kept_up_however_claims_arrive() {
     }
 }
 
+/// A key whose chain forks at its start, as a key copied to a fresh repo's
+/// would, signing what it alone keeps. What's trusted decides what stays, what
+/// doesn't is said beforehand, and the sealed root isn't at stake either way.
+#[test]
+fn revoking_a_forked_key_keeps_what_its_told_and_says_what_it_wont() {
+    let scratch = Scratch::new("revoke-forked");
+    let repo = Catalog::open_repo(&scratch.path().join("repo")).expect("catalog");
+    let root = repo.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let (seal, _) = repo.seals().expect("seals").into_iter().next().expect("a seal");
+    let root_anchor = repo.root_anchor().expect("root").expect("root");
+    let old = crate::keys::Key::generate().expect("key");
+    repo.certify(&root, &old.id()).expect("certify");
+    let (first, second, third) = (raw(b"first"), raw(b"second"), raw(b"third"));
+    let keep_of = |block: &Block| Claim::Keep(crate::claim::Keep::new([block.cid().clone().into()]).expect("keep"));
+    let mut signs = Vec::new();
+    for (n, block) in [&first, &second, &third].into_iter().enumerate() {
+        repo.put_block(block, CidVersion::V1).expect("put");
+        let claim = keep_of(block);
+        repo.put_block(&claim.block(), CidVersion::V1).expect("put");
+        let sign = Claim::Sign(crate::claim::Sign::new(&old, [claim.cid()], None, u64::try_from(n).expect("n")).expect("sign"));
+        repo.put_block(&sign.block(), CidVersion::V1).expect("put");
+        signs.push(sign.cid());
+    }
+    let claims = repo.claims().expect("claims");
+    // The old key's all that keeps the sealed root and root anchor, too
+    for target in [&seal, &root_anchor] {
+        repo.unkeep(target).expect("unkeep");
+        let again = Claim::Keep(crate::claim::Keep::new([target.clone()]).expect("keep").again(1));
+        repo.put_block(&again.block(), CidVersion::V1).expect("put");
+        let sign = Claim::Sign(crate::claim::Sign::new(&old, [again.cid()], None, 9).expect("sign"));
+        repo.put_block(&sign.block(), CidVersion::V1).expect("put");
+        assert!(claims.kept(target.multihash()).expect("kept"));
+    }
+
+    // What it says of itself
+    let said = repo.signed_in(&old.id(), &signs[0]).expect("signed");
+    assert_eq!(said.len(), 1);
+    assert_eq!(said[0].claim, Some(keep_of(&first)));
+    assert!(said[0].alone && !said[0].retracted);
+
+    // Trusting no chain costs all it signed; each trusted, that much less. What
+    // keeps the sealed root and root anchor isn't a cost
+    assert_eq!(repo.revocation_costs(&old.id(), &[]).expect("costs").len(), 3);
+    assert_eq!(repo.revocation_costs(&old.id(), &signs[..1]).expect("costs"), [keep_of(&second), keep_of(&third)]);
+    assert!(repo.revocation_costs(&old.id(), &signs).expect("costs").is_empty());
+    assert!(repo.cutoff_at(&old.id(), 100).is_err(), "a time can't say which chain");
+
+    assert_eq!(repo.revoke_trusting(&root, &old.id(), &signs[..2]).expect("revoke"), 2);
+    assert!(!claims.authorized(&old.id()).expect("authorized"));
+    assert!(claims.kept(first.cid().multihash()).expect("kept") && claims.kept(second.cid().multihash()).expect("kept"));
+    assert!(!claims.kept(third.cid().multihash()).expect("kept"), "as it said");
+    assert!(claims.kept(seal.multihash()).expect("kept"), "kept regardless");
+    assert!(claims.kept(root_anchor.multihash()).expect("kept"), "kept regardless");
+    assert!(repo.root(b"pass").is_ok());
+}
+
+/// A claim another authorized key has signed doesn't depend on this one, and
+/// a retraction's no loss.
+#[test]
+fn what_others_sign_or_was_retracted_is_no_cost_of_revoking() {
+    let scratch = Scratch::new("revoke-shared");
+    let repo = Catalog::open_repo(&scratch.path().join("repo")).expect("catalog");
+    let root = repo.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let old = crate::keys::Key::generate().expect("key");
+    repo.certify(&root, &old.id()).expect("certify");
+    let (shared, retracted) = (raw(b"shared"), raw(b"retracted"));
+    for block in [&shared, &retracted] {
+        repo.put_block(block, CidVersion::V1).expect("put");
+    }
+    let shared_keep = repo.keep(&shared.cid().clone().into()).expect("keep");
+    let retracted_keep = repo.keep(&retracted.cid().clone().into()).expect("keep");
+    let sign = Claim::Sign(crate::claim::Sign::new(&old, [shared_keep, retracted_keep], None, 1).expect("sign"));
+    repo.put_block(&sign.block(), CidVersion::V1).expect("put");
+    repo.unkeep(&retracted.cid().clone().into()).expect("unkeep");
+    assert!(repo.revocation_costs(&old.id(), &[]).expect("costs").is_empty());
+    let said = repo.signed_in(&old.id(), &sign.cid()).expect("signed");
+    assert_eq!(said.iter().filter(|claim| claim.retracted).count(), 1);
+    assert!(said.iter().all(|claim| !claim.alone));
+}
+
 /// A batch that breathes commits as it goes, between files, ending whole.
 #[test]
 fn a_big_import_lets_others_write_as_it_goes() {
