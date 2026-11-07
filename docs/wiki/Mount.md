@@ -116,6 +116,11 @@ on beside it. So:
   read through the old one goes in the page cache among what it held.
 - A file opened to write is known to be partial before it's made, so it's
   never read full of holes.
+- A file open follows its path: renamed, or with a directory over it
+  renamed, it's still what's filled, kept and committed where it now is.
+  Replaced or removed, it's at no path and of no anchor, as any unlinked
+  file, though whoever has it open can still read all of it, copied as
+  it's read, and needn't sync it for the anchor to be committed.
 - A commit takes the same lock from seeing nothing's changed until what
   it's committed is known to be in place, without waiting for it, as a
   change could be waiting for the commit's own transaction. If something's

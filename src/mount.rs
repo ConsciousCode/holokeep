@@ -1562,6 +1562,120 @@ mod tests {
         assert_eq!(soup.read(read, 0, 100).expect("read"), b"written");
     }
 
+    #[test]
+    fn a_partial_file_renamed_while_open_reads_whats_there() {
+        let scratch = Scratch::new("mount-moved-read");
+        let (soup, anchor, _repo) = writable(&scratch);
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let file = ino(&soup, &format!("anchors/{anchor}/big")).expect("big").ino.0;
+        let fh = soup.open(file, true, false).expect("open");
+        soup.rename(dir, OsStr::new("big"), dir, OsStr::new("moved"), false).expect("rename");
+        assert_eq!(soup.read_handle(fh, 1_500_000, 4).expect("handle").expect("read"), [3u8; 4]);
+    }
+
+    #[test]
+    fn a_write_to_a_partial_file_renamed_while_open_is_kept() {
+        let scratch = Scratch::new("mount-moved-write");
+        let (soup, anchor, repo) = writable(&scratch);
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let file = ino(&soup, &format!("anchors/{anchor}/big")).expect("big").ino.0;
+        let fh = soup.open(file, true, false).expect("open");
+        soup.rename(dir, OsStr::new("big"), dir, OsStr::new("moved"), false).expect("rename");
+        soup.write(fh, 10, b"KEPT").expect("write");
+        soup.release(fh);
+        soup.commit();
+        let out = scratch.path().join("out");
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        crate::export::get(&catalog, &value(&repo, &anchor), &out).expect("export");
+        let data = std::fs::read(out.join("moved")).expect("moved");
+        assert_eq!(&data[10..14], b"KEPT");
+    }
+
+    #[test]
+    fn a_file_renamed_while_open_keeps_its_history() {
+        let scratch = Scratch::new("mount-moved-history");
+        let (soup, anchor, repo) = writable(&scratch);
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let (_, fh) = soup.create(dir, OsStr::new("log")).expect("create");
+        soup.write(fh, 0, b"one\n").expect("write");
+        soup.fsync(fh, false).expect("sync");
+        soup.commit();
+        soup.rename(dir, OsStr::new("log"), dir, OsStr::new("log.1"), false).expect("rename");
+        soup.commit();
+        soup.write(fh, 4, b"two\n").expect("write");
+        soup.fsync(fh, false).expect("sync");
+        soup.commit();
+        soup.write(fh, 8, b"three\n").expect("write");
+        soup.fsync(fh, false).expect("sync");
+        soup.commit();
+        soup.release(fh);
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let history = catalog.anchor_history(&anchor).expect("history");
+        assert!(history.len() >= 3, "only {} versions", history.len());
+        for (n, (_, value)) in history.iter().enumerate() {
+            let out = scratch.path().join(format!("out-{n}"));
+            crate::export::get(&catalog, value, &out).unwrap_or_else(|e| panic!("version {n} of {} isn't whole: {e}", history.len()));
+        }
+    }
+
+    /// A partial file open when it's replaced, or removed, is still what it
+    /// was to whoever has it open, all of it, though it's at no path now.
+    #[test]
+    fn a_partial_file_replaced_or_removed_while_open_reads_what_it_was() {
+        let scratch = Scratch::new("mount-orphan");
+        let (soup, anchor, repo) = writable(&scratch);
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let big = |soup: &Soup| ino(soup, &format!("anchors/{anchor}/big")).expect("big").ino.0;
+        let writing = soup.open(big(&soup), true, false).expect("open");
+        let reading = soup.open(big(&soup), false, false).expect("open");
+
+        let (_, fh) = soup.create(dir, OsStr::new(".big.tmp")).expect("create");
+        soup.write(fh, 0, b"new").expect("write");
+        soup.release(fh);
+        soup.rename(dir, OsStr::new(".big.tmp"), dir, OsStr::new("big"), false).expect("rename");
+        assert!(unfilled(&repo).is_empty(), "it's nothing to fill now");
+
+        assert_eq!(soup.read_handle(reading, 1_500_000, 4).expect("handle").expect("read"), [3u8; 4]);
+        // Written beside what's still to be copied, which doesn't then undo it
+        soup.write(writing, 2_500_000, b"mine").expect("write");
+        assert_eq!(soup.read_handle(reading, 2_500_000, 6).expect("handle").expect("read"), [b'm', b'i', b'n', b'e', 3, 3]);
+        soup.release(writing);
+        soup.release(reading);
+        let now = big(&soup);
+        assert_eq!(soup.read(now, 0, 100).expect("read"), b"new", "and what's there is what replaced it");
+
+        // Removed, likewise; writing to it asks nothing of the anchor
+        let reading = soup.open(ino(&soup, &format!("anchors/{anchor}/dir/b")).expect("b").ino.0, true, false).expect("open");
+        soup.unlink(ino(&soup, &format!("anchors/{anchor}/dir")).expect("dir").ino.0, OsStr::new("b")).expect("unlink");
+        assert_eq!(soup.read_handle(reading, 0, 100).expect("handle").expect("read"), b"bee");
+        soup.write(reading, 0, b"BEE").expect("write");
+        soup.commit();
+        let (out, catalog) = (scratch.path().join("out"), Catalog::open_repo(&repo).expect("catalog"));
+        crate::export::get(&catalog, &value(&repo, &anchor), &out).expect("export");
+        assert!(!out.join("dir/b").exists(), "committed without it, though it's open and unsynced");
+        soup.release(reading);
+    }
+
+    /// Whatever's under a directory moved follows it too.
+    #[test]
+    fn a_partial_file_follows_the_directory_it_is_in() {
+        let scratch = Scratch::new("mount-moved-dir");
+        let (soup, anchor, repo) = writable(&scratch);
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let sub = soup.mkdir_by(dir, OsStr::new("sub"), None).expect("mkdir").ino.0;
+        soup.rename(dir, OsStr::new("big"), sub, OsStr::new("big"), false).expect("into it");
+        let fh = soup.open(ino(&soup, &format!("anchors/{anchor}/sub/big")).expect("big").ino.0, true, false).expect("open");
+        soup.rename(dir, OsStr::new("sub"), dir, OsStr::new("moved"), false).expect("rename");
+        assert_eq!(soup.read_handle(fh, 1_500_000, 4).expect("handle").expect("read"), [3u8; 4]);
+        soup.write(fh, 2_500_000, b"KEPT").expect("write");
+        soup.release(fh);
+        soup.commit();
+        let (out, catalog) = (scratch.path().join("out"), Catalog::open_repo(&repo).expect("catalog"));
+        crate::export::get(&catalog, &value(&repo, &anchor), &out).expect("export");
+        let data = std::fs::read(out.join("moved/big")).expect("big");
+        assert_eq!((&data[2_500_000..2_500_004], data[0]), (&b"KEPT"[..], 3));
+    }
+
     /// A file opened to read goes on reading what it was, whatever's saved
     /// over it, before and after anything of it's in the work directory.
     #[test]
