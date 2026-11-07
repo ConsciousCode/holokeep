@@ -165,7 +165,7 @@ fn rejects_what_it_cant_trust() {
 
 fn export_claims(repo: &Catalog, root: &Link, history: bool) -> (Vec<u8>, Exported) {
     let mut car = Vec::new();
-    let exported = export_with_claims(repo, root, history, &mut car).expect("export");
+    let exported = export_with_claims(repo, root, WithClaims { history, sealed_root: false }, &mut car).expect("export");
     (car, exported)
 }
 
@@ -308,7 +308,53 @@ fn anchors_are_followed_to_what_they_are_and_were() {
     assert!(whole.lost_at(&link_of(&gone)).expect("lost").is_some(), "and said to be lost");
     assert!(whole.missing_under(&root).expect("missing").is_empty());
 
-    // What it is now is another matter
+    // What it is now is another matter, unless it's known to be lost, when
+    // there's no having it
     here.lose(now.cid().multihash()).expect("lose");
-    assert!(export_with_claims(&here, &root, true, &mut Vec::new()).is_err());
+    let with = WithClaims { history: true, sealed_root: false };
+    assert!(export_with_claims(&here, &root, with, &mut Vec::new()).is_err());
+    here.report_lost(&link_of(&now)).expect("report").expect("a claim");
+    assert_eq!(export_with_claims(&here, &root, with, &mut Vec::new()).expect("export").unreadable, 2);
+}
+
+/// With the sealed root and its passphrase, a repo with nothing else can be
+/// the user again, everything said counting; without the passphrase, it can't.
+#[test]
+fn a_user_is_restored_from_a_car_and_a_passphrase() {
+    let scratch = Scratch::new("car-restore");
+    let mut here = Catalog::open_repo(&scratch.path().join("here")).expect("catalog");
+    let user = here.found_user(b"correct horse", crate::keys::Cost::NONE).expect("found").id();
+    let root = tree(&mut here);
+    let music = crate::claim::tag("music").expect("tag");
+    here.tag(&root, &music).expect("tag");
+    here.keep(&root).expect("keep");
+    let plain = export_claims(&here, &root, false).0;
+
+    let mut car = Vec::new();
+    let exported = export_with_claims(&here, &root, WithClaims { history: false, sealed_root: true }, &mut car).expect("export");
+    assert_eq!(exported.sealed, 1);
+    assert!(car.len() > plain.len());
+
+    let mut there = Catalog::open_repo(&scratch.path().join("there")).expect("catalog");
+    import_into(&mut there, car);
+    assert!(there.claims().expect("claims").tagged(music.multihash()).expect("tagged").is_empty(), "not yet");
+    assert!(there.restore_user(b"wrong").is_err());
+    assert_ne!(there.user().expect("user"), Some(user.clone()));
+    assert_eq!(there.restore_user(b"correct horse").expect("restore"), user);
+    assert_eq!(there.user().expect("user"), Some(user.clone()));
+    let claims = there.claims().expect("claims");
+    assert_eq!(claims.tagged(music.multihash()).expect("tagged"), std::slice::from_ref(&root));
+    assert!(claims.kept(root.multihash()).expect("kept"));
+    assert_eq!(there.seals().expect("seals").len(), 1, "and it can invite others, having the seal");
+    assert!(there.root(b"correct horse").is_ok());
+
+    // Again's no harm, and it says the same
+    assert_eq!(there.restore_user(b"correct horse").expect("again"), user);
+
+    // A repo with nothing to open
+    let empty = Catalog::open_repo(&scratch.path().join("empty")).expect("catalog");
+    assert!(empty.restore_user(b"correct horse").is_err());
+    // Nor is a seal written for a repo that has none
+    let none = Catalog::open_repo(&scratch.path().join("none")).expect("catalog");
+    assert!(export_with_claims(&none, &root, WithClaims { history: false, sealed_root: true }, &mut Vec::new()).is_err());
 }

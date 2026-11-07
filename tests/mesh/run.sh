@@ -159,8 +159,30 @@ scenario_lost() {
     [ -z "$(on two hk lost ls)" ] || fail "two heard of what it hasn't got"
     sh_on two 'echo "only here" > /tmp/again && hk add -q /tmp/again >/dev/null'
     on one hk dag fetch "$cid" >/dev/null
-    ! on one hk lost ls | grep -q "$cid" || fail "one still says it's lost, having it"
+    ! on one hk lost ls | grep "$cid" >/dev/null || fail "one still says it's lost, having it"
     [ "$(on one hk cat "$cid")" = "only here" ] || fail "it isn't what it was"
+}
+
+# Every device gone, a new machine with a backup and the passphrase is the user
+# again, and has the soup; without the passphrase it's only got ciphertext
+scenario_restore() {
+    local root user
+    root=$(on one hk anchor root | sed -n 1p)
+    user=$(on one hk device list | sed -n 1p | cut -f2)
+    on one hk dag export "$root" --claims --history --sealed-root -o /tmp/backup.car
+    machine phoenix
+    podman cp "$run-one:/tmp/backup.car" "$run-phoenix:/tmp/backup.car"
+    on phoenix hk dag import /tmp/backup.car >/dev/null
+    ! sh_on phoenix 'HK_PASSPHRASE=wrong hk device restore' >/dev/null 2>&1 || fail "restored with the wrong passphrase"
+    [ "$(on phoenix hk device restore | cut -f2)" = "$user" ] || fail "not the same user"
+    [ "$(on phoenix hk anchor root | sed -n 1p)" = "$root" ] || fail "not the same root"
+    on phoenix hk device list | grep "certified	this node" >/dev/null || fail "this node isn't certified"
+    mount_up phoenix
+    # What the merged anchor says: one's own mount shows its own edit over that
+    local page
+    page=$(sh_on two 'cat /soup/wiki/page.md')
+    wait_for "phoenix to read the wiki" holds phoenix /soup/wiki/page.md "$page"
+    same_listing one phoenix /soup/wiki || fail "phoenix doesn't have all the wiki"
 }
 
 # A CAR carries what's said of a DAG to another device of the user, where it
@@ -174,8 +196,8 @@ scenario_car() {
     on one hk dag export "$root" --claims -o /tmp/album.car 2>/dev/null
     podman cp "$run-one:/tmp/album.car" "$run-two:/tmp/album.car"
     on two hk dag import /tmp/album.car >/dev/null 2>&1
-    on two hk tag find album | grep -q "$root" || fail "two doesn't see the tag"
-    on two hk keep ls | grep -q "$root" || fail "two doesn't see the keep"
+    on two hk tag find album | grep "$root" >/dev/null || fail "two doesn't see the tag"
+    on two hk keep ls | grep "$root" >/dev/null || fail "two doesn't see the keep"
     [ "$(sh_on two "hk get $root -o /tmp/got >/dev/null 2>&1; cat /tmp/got/song")" = "a song" ] || fail "two can't read it"
 
     # What a tag retracted stays so, wherever it's imported
@@ -183,7 +205,7 @@ scenario_car() {
     on one hk dag export "$root" --claims -o /tmp/album.car 2>/dev/null
     podman cp "$run-one:/tmp/album.car" "$run-two:/tmp/album.car"
     on two hk dag import /tmp/album.car >/dev/null 2>&1
-    ! on two hk tag find album | grep -q "$root" || fail "two still sees the tag"
+    ! on two hk tag find album | grep "$root" >/dev/null || fail "two still sees the tag"
 
     machine stranger
     podman cp "$run-one:/tmp/album.car" "$run-stranger:/tmp/album.car"
@@ -209,10 +231,10 @@ scenario_forget() {
     reconnect_two
     wait_for "two to hear of the ghost" sh_on two "hk node peers | grep -q $ghost"
     on one hk node forget "$ghost"
-    ! on one hk node peers | grep -q "$ghost" || fail "still a member"
+    ! on one hk node peers | grep "$ghost" >/dev/null || fail "still a member"
     reconnect_two
     sleep 2
-    ! on one hk node peers | grep -q "$ghost" || fail "two brought it back"
+    ! on one hk node peers | grep "$ghost" >/dev/null || fail "two brought it back"
 
     local anchor first second now
     anchor=$(on one hk anchor new)
@@ -263,7 +285,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read late_joiner fork_merge lost forget car)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read late_joiner fork_merge lost forget car restore)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

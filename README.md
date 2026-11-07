@@ -335,6 +335,7 @@ Checklist:
 - [x] Retrieval (`hk cat`, `hk get`)
 - [x] CAR import/export
   - [x] With what's said of a DAG (`hk dag export --claims`), and all that anchors have been (`--history`)
+  - [x] Restoring a user with no device left, from a backup with the sealed root key and the passphrase (`--sealed-root`, `hk device restore`)
 - [x] UnixFSv1 indexing in SQL
 - [x] Backreference indexing
 - [x] Catalog over labelled volumes (the database, the shards)
@@ -476,6 +477,8 @@ $hk keep ls                         # what's kept
 $hk tag rm <name> <cid>...          # untag blocks, with tombs
 $hk dag export <cid> -o <file.car>  # a DAG as a CARv1, like `ipfs dag export`
 $hk dag export <anchor> --claims --history -o <file.car>  # all of it: claims, anchors followed, every version here
+$hk dag export <anchor> --claims --sealed-root -o <file.car>  # and the root key, to restore with its passphrase
+$hk device restore                  # be the user again, from a sealed root key imported here
 $hk dag import <file.car>...        # CARv1 or v2 files, like `ipfs dag import`
 $hk repo stat                       # blocks per volume and form, and each database's bytes and free bytes
 $hk repo compact --dry-run          # what compacting would give back; prints volume, before, after, outcome

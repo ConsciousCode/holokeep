@@ -212,8 +212,20 @@ pub struct Exported {
     pub claims: u64,
     /// Claims about the DAG not asked for.
     pub left_out: u64,
-    /// Blocks of older versions of anchors that aren't here to write.
+    /// Blocks of older versions of anchors, or reported lost, that aren't here
+    /// to write.
     pub unreadable: u64,
+    /// The user's root key, sealed, written after them.
+    pub sealed: u64,
+}
+
+/// What goes in an export besides the DAG and what's said of it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WithClaims {
+    /// All that anchors have been, not only what they are.
+    pub history: bool,
+    /// The user's root key, sealed with their passphrase.
+    pub sealed_root: bool,
 }
 
 /// As `export`, noting what's left out: claims, which plain interchange
@@ -252,7 +264,21 @@ fn keys_of(blocks: &[Link]) -> io::Result<Vec<Multihash>> {
 /// now, or if `history`, to all it's been, what's no longer here of that being
 /// counted and passed over. Otherwise its older sets say what it was, with
 /// nothing there, as with any block that isn't here.
-pub fn export_with_claims(catalog: &crate::store::Catalog, root: &Link, history: bool, out: &mut impl Write) -> io::Result<Exported> {
+///
+/// With `sealed_root`, a repo with no devices left can become the user again
+/// from this and the passphrase. It's refused if there's none to write, as a
+/// backup that can't do what it was asked is worse than an error now.
+pub fn export_with_claims(catalog: &crate::store::Catalog, root: &Link, with: WithClaims, out: &mut impl Write) -> io::Result<Exported> {
+    let WithClaims { history, sealed_root } = with;
+    let seals = if sealed_root {
+        let seals = catalog.seals().map_err(io::Error::other)?;
+        if seals.is_empty() {
+            return Err(io::Error::other("this repo has no sealed root key to write"));
+        }
+        seals
+    } else {
+        Vec::new()
+    };
     write_header(out, std::slice::from_ref(root))?;
     let (mut seen, mut missed) = (HashSet::new(), HashSet::new());
     let mut stack = vec![(root.clone(), true)];
@@ -268,7 +294,9 @@ pub fn export_with_claims(catalog: &crate::store::Catalog, root: &Link, history:
         }
         let data = match catalog.fetch(&cid) {
             Ok(data) => data,
-            Err(e) if !needed && gone(&e) => {
+            // Not needed, or known not to be had, which a backup's no less
+            // worth having for
+            Err(e) if gone(&e) && (!needed || catalog.lost_at(&cid).is_ok_and(|at| at.is_some())) => {
                 missed.insert(bytes);
                 unreadable.push(cid);
                 continue;
@@ -292,7 +320,15 @@ pub fn export_with_claims(catalog: &crate::store::Catalog, root: &Link, history:
         blocks.push(cid);
     }
     // What's not here may have been reported lost, which belongs with it
-    let about: Vec<Link> = blocks.iter().chain(&unreadable).cloned().collect();
+    // A seal goes last, as what it's about is the rest
+    let seal_cids: Vec<Link> = seals.into_iter().map(|(cid, _)| cid).filter(|cid| !seen.contains(&cid.to_bytes())).collect();
+    let mut sealed = 0u64;
+    for cid in &seal_cids {
+        write_section(out, cid, &catalog.fetch(cid)?)?;
+        seen.insert(cid.to_bytes());
+        sealed = sealed.saturating_add(1);
+    }
+    let about: Vec<Link> = blocks.iter().chain(&unreadable).chain(&seal_cids).cloned().collect();
     let claims = catalog.claims_on(&keys_of(&about)?).map_err(io::Error::other)?;
     let mut written = 0u64;
     for (cid, data) in &claims {
@@ -306,6 +342,7 @@ pub fn export_with_claims(catalog: &crate::store::Catalog, root: &Link, history:
         claims: written,
         left_out: 0,
         unreadable: count(unreadable.len()),
+        sealed,
     })
 }
 

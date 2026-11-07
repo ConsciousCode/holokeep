@@ -925,6 +925,44 @@ impl Catalog {
         Ok(found)
     }
 
+    /// Every user's root key sealed here, whoever's user this repo is: as
+    /// when it's been brought in a CAR, for a repo with no devices left.
+    pub fn sealed_roots(&self) -> Result<Vec<crate::keys::Sealed>> {
+        let mut found = Vec::new();
+        for key in self.keys()? {
+            if let Some(cid) = self.cid_of(key.as_ref())?
+                && cid.codec() == crate::cid::DAG_CBOR_CODEC
+                && let Some(block) = self.get_block(&cid)?
+                && let Some(sealed) = crate::keys::Sealed::parse(block.data())
+                && sealed.what().is_none()
+            {
+                found.push(sealed);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Become a device of the user whose root key a passphrase opens, from
+    /// what's here, as with no other device left to invite this one. Its
+    /// other devices are as they were. Returns the user.
+    pub fn restore_user(&self, passphrase: &[u8]) -> Result<Link> {
+        let device = self.signer.as_ref().ok_or_else(|| Error::User("this repo has no key to sign with".into()))?.id();
+        let seals = self.sealed_roots()?;
+        if seals.is_empty() {
+            return Err(Error::User("there's no sealed root key here: import one, from `hk dag export --sealed-root`".into()));
+        }
+        let root = seals.iter()
+            .find_map(|sealed| sealed.open(passphrase))
+            .ok_or_else(|| Error::User("that's not the passphrase of any root key here".into()))?;
+        if self.user()?.is_some_and(|user| user != root.id()) {
+            return Err(Error::User("this repo has another user".into()));
+        }
+        self.certify(&root, &device)?;
+        self.join_user(&root.id())?;
+        self.keep_root()?;
+        Ok(root.id())
+    }
+
     /// The user's root key, unsealed with its passphrase.
     pub fn root(&self, passphrase: &[u8]) -> Result<crate::keys::Key> {
         let seals = self.seals()?;

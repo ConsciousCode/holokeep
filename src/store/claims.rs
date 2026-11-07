@@ -430,10 +430,41 @@ impl ClaimStore {
         Ok(())
     }
 
+    /// Whether a claim coming might change the keys users have authorized:
+    /// see `AUTHORIZED`. That's a certificate, which may be signed already; a
+    /// tomb of one; or a user's signature, of either. A device's signature,
+    /// which most are, says nothing about who's authorized.
+    fn changes_who_is_authorized(&self, claim: &Claim) -> Result<bool> {
+        Ok(match claim {
+            Claim::Device(_) => true,
+            Claim::Sign(sign) => self.db.conn()
+                .prepare_cached("SELECT 1 FROM users u JOIN multihashes m ON m.id = u.key WHERE m.multihash = ?1")?
+                .exists([sign.by().multihash().to_bytes()])?,
+            Claim::Tomb(tomb) => {
+                let mut certificate = self.db.conn().prepare_cached(
+                    "SELECT 1 FROM multihashes m JOIN claim_keys k ON k.key = m.id JOIN claims c ON c.id = k.claim
+                     WHERE m.multihash = ?1 AND c.kind = 'device'",
+                )?;
+                let mut any = false;
+                for target in tomb.target() {
+                    any = any || certificate.exists([target.multihash().to_bytes()])?;
+                }
+                any
+            },
+            _ => false,
+        })
+    }
+
     /// Recompute the keys the user has authorized.
     fn authorize(&self) -> Result<()> {
         self.db.conn().execute_batch(&format!("DELETE FROM authorized; INSERT OR IGNORE INTO authorized (user, key) {AUTHORIZED};"))?;
         Ok(())
+    }
+
+    /// Whether the keys kept as authorized are those that are.
+    #[cfg(test)]
+    pub(crate) fn is_authorized_current(&self) -> Result<bool> {
+        self.authorized_current()
     }
 
     /// Whether the keys kept as authorized are those that are.
@@ -1330,8 +1361,10 @@ impl BlockStore for ClaimStore {
             return Ok(Put::Stored);
         }
         self.db.atomically(|| {
+            // Before it's in: a tomb takes a dissolved certificate with it
+            let authorizing = self.changes_who_is_authorized(&claim)?;
             self.insert(&claim, (!dissolved).then_some(key))?;
-            if matches!(claim, Claim::Sign(_) | Claim::Device(_) | Claim::Tomb(_)) {
+            if authorizing {
                 self.authorize()?;
             }
             Ok(Put::Stored)

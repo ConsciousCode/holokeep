@@ -98,14 +98,22 @@ as the block. They're sorted by CID bytes. Which claims:
 An anchor reached, by a link or a mount point, is followed to what it is now,
 so the DAG under an account's root anchor is its whole soup, and its claims
 include every set: what it was is still said. `--history` follows it to what
-it's been too, passing over and counting what's not here. Claims about what's
-not here go too, such as that it's been [[Claims|reported lost]].
+it's been too, passing over and counting what's not here. What's not here is
+fetched through the running node as it's reached, so what only another member
+holds goes too. What can't be had fails the export, unless it's an older
+version or [[Replication and Retention#Lost blocks|reported lost]], when it's
+counted, with the claims about it.
 
 A plain `hk dag export` says how many claims it left out, on stderr.
 
 `hk dag import` takes claims as it takes any block. Only a claim signed by a
 key the repo's user has authorized counts, so a fresh repo, whose device key
-is its own user, keeps them only as data until it joins that user. There's no
-restoring a user from a CAR: its root key isn't in one.
+is its own user, keeps them only as data until it joins that user.
+
+`--sealed-root` adds the user's root key, as it's [[Keys and Users#The sealed root|sealed]], with what keeps it, and it's an error if there's none. Anyone
+with the file can try passphrases offline, so it's opt-in. `hk device restore`
+then opens it with the passphrase, certifies this device and joins that user,
+with no other device needed. A vault's key isn't included, nor the swarm key:
+inviting from there makes a new mesh, not the old one.
 
 Source: `src/multihash.rs`, `src/cid/`, `src/dagcbor.rs`, `src/dagjson.rs`, `src/pb.rs`, `src/car.rs`.

@@ -97,3 +97,19 @@ identified by `SO_PEERCRED`. The owner and root may ask anything;
 others may fetch, keep and tag as their own account.
 
 Source: `src/keys.rs`, `src/claim.rs` (`Sign`), `src/account.rs`, `src/store/claims.rs`.
+
+## Restoring a user
+
+`hk device restore` makes a repo a device of a user with no other device
+to invite it, from a root key sealed in the repo, as brought by
+`hk dag export --sealed-root`. It tries each user's sealed root here with
+the passphrase, signs a certificate for this device, and joins the user. A
+repo that already has another user refuses. Their other devices stay
+certified, since a lost one can't say it's lost: `hk device revoke` them.
+
+## Recomputing what's authorized
+
+The `authorized` table holds what certificates and their tombs say, and is
+worked out again when a claim that might change it arrives: a certificate,
+a tomb of one, or a signature by a user's root key. A device's signature
+can't change it, so doesn't cost anything.

@@ -628,11 +628,17 @@ async fn a_keep_noticed_with_its_target_goes_with_it() {
 async fn signatures_over_what_a_member_lacks_stay_put() {
     let (mut a, mut b, blocks) = Box::pin(holding()).await;
     one_user(&mut [&mut a, &mut b]);
-    let before = b.catalog().keys().expect("keys").len();
-    a.catalog().keep(&link(&blocks[0])).expect("keep");
+    let keep = a.catalog().keep(&link(&blocks[0])).expect("keep");
+    let device = a.catalog().signer().expect("signer").id();
     a.announce().expect("announce");
-    // b holds none of it, so neither the keep nor what signs it is b's
-    assert!(!within(Duration::from_millis(500), &mut [&mut a, &mut b], |n| n[1].catalog().keys().expect("keys").len() != before).await);
+    // b holds none of it, so neither the keep nor what signs it is b's. What
+    // b does hold, such as the certificates, may yet be signed by others
+    let heard = |n: &[&mut Node]| {
+        let claims = n[1].catalog().claims().expect("claims");
+        n[1].catalog().backrefs(blocks[0].cid().multihash()).is_ok_and(|about| !about.is_empty())
+            || claims.signed_by(&keep, &device).unwrap_or(false)
+    };
+    assert!(!within(Duration::from_millis(500), &mut [&mut a, &mut b], heard).await);
 }
 
 /// Make nodes devices of one user, its root certifying each.

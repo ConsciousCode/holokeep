@@ -579,6 +579,54 @@ fn a_scan_finds_what_went_without_being_let_go() {
     assert!(alone.lost_candidates().expect("scan").is_empty(), "nothing refers to it");
 }
 
+/// However claims arrive, what's authorized is what it'd be worked out afresh,
+/// though it's only worked out when it might have changed: certificates and
+/// revocations, before and after what signs them.
+#[test]
+fn whats_authorized_is_kept_up_however_claims_arrive() {
+    let scratch = Scratch::new("claims-authorized");
+    let here = Catalog::open_repo(&scratch.path().join("here")).expect("catalog");
+    let root = here.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let others: Vec<crate::keys::Key> = (0..3).map(|_| crate::keys::Key::generate().expect("key")).collect();
+    for other in &others {
+        here.certify(&root, &other.id()).expect("certify");
+    }
+    let revoked = crate::claim::Device::new([others[0].id()]).expect("device");
+    let tomb = crate::claim::Claim::Tomb(crate::claim::Tomb::new([crate::claim::Claim::Device(revoked).cid()]).expect("tomb"));
+    here.put_block(&tomb.block(), CidVersion::V1).expect("tomb");
+    here.sign_with(&root, [tomb.cid()]).expect("sign");
+    let claims = here.claims().expect("claims");
+    assert!(!claims.authorized(&others[0].id()).expect("authorized"), "revoked");
+    assert!(claims.authorized(&others[1].id()).expect("authorized"));
+
+    let mut sections: Vec<Block> = Vec::new();
+    for key in here.keys().expect("keys") {
+        let cid = here.cid_of(key.as_ref()).expect("cid").expect("cid");
+        sections.push(here.get_block(&cid).expect("get").expect("block"));
+    }
+    for claim in claims.dissolved().expect("dissolved") {
+        sections.push(claim.block());
+    }
+    // Forwards, backwards, and each from the middle out
+    let orders: Vec<Vec<&Block>> = vec![
+        sections.iter().collect(),
+        sections.iter().rev().collect(),
+        sections.iter().step_by(2).chain(sections.iter().skip(1).step_by(2)).collect(),
+        sections.iter().skip(1).step_by(2).rev().chain(sections.iter().step_by(2)).collect(),
+    ];
+    for (n, order) in orders.into_iter().enumerate() {
+        let there = Catalog::open_repo(&scratch.path().join(format!("there-{n}"))).expect("catalog");
+        there.set_user(&root.id()).expect("user");
+        for block in order {
+            there.put_block(block, CidVersion::V1).expect("put");
+            assert!(there.claims().expect("claims").is_authorized_current().expect("current"), "order {n}");
+        }
+        let claims = there.claims().expect("claims");
+        assert!(!claims.authorized(&others[0].id()).expect("authorized"), "order {n}");
+        assert!(claims.authorized(&others[2].id()).expect("authorized"), "order {n}");
+    }
+}
+
 /// A batch that breathes commits as it goes, between files, ending whole.
 #[test]
 fn a_big_import_lets_others_write_as_it_goes() {

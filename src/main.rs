@@ -378,6 +378,11 @@ enum DeviceCommand {
     /// Print a device's signs, in the order they came: CID, the sign
     /// before it, when it says, and how many claims it signs
     Log { peer: String },
+    /// Become a device of the user whose root key's here, sealed, with their
+    /// passphrase, as brought by `hk dag export --sealed-root`, when there's
+    /// no device left to invite this one. What they've said counts here
+    /// then. Their other devices stay certified until they're revoked
+    Restore,
     /// Revoke a device, with the user's passphrase. What it alone signed
     /// up to `--until` is signed again here, so it still counts; nothing
     /// else it signed does
@@ -473,6 +478,12 @@ enum DagCommand {
         /// what they are now
         #[arg(long, requires = "claims")]
         history: bool,
+        /// With the user's root key, sealed with their passphrase, so a repo
+        /// with no devices left can become the user again (`hk device
+        /// restore`). Whoever has this file can try passphrases offline, as
+        /// long as they like, so its passphrase is all that protects the user
+        #[arg(long, requires = "claims")]
+        sealed_root: bool,
         /// Where to write it [default: stdout]
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -579,6 +590,18 @@ fn fetch_first(repo: Option<&PathBuf>, cid: &Link) -> anyhow::Result<()> {
     let _ = (repo, cid);
     Ok(())
 }
+
+/// Have a repo fetch blocks it wants through its running node, if there is one.
+#[cfg(feature = "net")]
+fn fetch_through_node(repo: &mut Catalog, dir: &Path) {
+    use holokeep::net::{daemon, mesh::Place};
+    let place = Place::main(dir);
+    repo.fetch_through(std::sync::Arc::new(move |cids: &[Link]| daemon::fetch_blocks(&place, cids).is_ok_and(|fetched| fetched.is_some())));
+}
+
+#[cfg(not(feature = "net"))]
+#[allow(clippy::missing_const_for_fn)]
+fn fetch_through_node(_: &mut Catalog, _: &Path) {}
 
 /// Refuse a block another of the host's accounts has here, but this one
 /// doesn't: it's as good as not here.
@@ -1300,6 +1323,10 @@ fn device(dir: &Path, command: DeviceCommand) -> anyhow::Result<()> {
                 out!("{}\t{}{forked}{this}", keys::peer_id(&device), if ok { "certified" } else { "revoked" });
             }
         },
+        DeviceCommand::Restore => {
+            let user = repo.batch(|repo| repo.restore_user(passphrase(false)?.as_bytes()).map_err(anyhow::Error::from))?;
+            out!("user\t{}", keys::peer_id(&user));
+        },
         DeviceCommand::Log { peer } => {
             let device = keys::from_peer_id(&peer).context("not an ed25519 peer ID")?;
             for signed in repo.claims().context("this repo keeps no claims")?.signs_by(&device)? {
@@ -1477,11 +1504,17 @@ fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {
                 Ok(())
             })
         },
-        DagCommand::Export { cid, claims, history, output } => {
+        DagCommand::Export { cid, claims, history, sealed_root, output } => {
             fetch_first(repo.as_ref(), &cid)?;
-            let repo = open_repo(repo)?;
+            let dir = repo_dir(repo)?;
+            let mut repo = open_repo(Some(dir.clone()))?;
+            // What it reaches through anchors isn't what fetching the root
+            // fetches, so it's fetched as it's reached
+            if claims {
+                fetch_through_node(&mut repo, &dir);
+            }
             let export = |out: &mut dyn io::Write| -> io::Result<()> {
-                let exported = if claims { car::export_with_claims(&repo, &cid, history, &mut { out }) } else { car::export_noting(&repo, &cid, &mut { out }) }?;
+                let exported = if claims { car::export_with_claims(&repo, &cid, car::WithClaims { history, sealed_root }, &mut { out }) } else { car::export_noting(&repo, &cid, &mut { out }) }?;
                 if exported.left_out > 0 {
                     eprintln!("left out {} claims about this: --claims to take them", exported.left_out);
                 }
@@ -1489,7 +1522,10 @@ fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {
                     eprintln!("wrote {} blocks and {} claims", exported.blocks, exported.claims);
                 }
                 if exported.unreadable > 0 {
-                    eprintln!("{} blocks of older versions aren't here, so aren't there", exported.unreadable);
+                    eprintln!("{} blocks of older versions, or reported lost, aren't here, so aren't there", exported.unreadable);
+                }
+                if exported.sealed > 0 {
+                    eprintln!("the root key's in there, sealed: keep this file as safe as its passphrase is strong");
                 }
                 Ok(())
             };
