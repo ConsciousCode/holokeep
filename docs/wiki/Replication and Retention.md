@@ -104,7 +104,9 @@ claim each, unless any known member is away, when it only lists them. A
 repo with members needs its node running; one with none needs nothing. A
 reference counts even if it's only a version in an anchor's history.
 
-Scanning isn't automatic yet. `hk lost add` reports by hand, whatever's
+A running node scans likewise 10 minutes after it starts and then daily,
+unless `--no-lost-scan` (`hk node scan-lost` says now), and `hk node
+status` says how many are lost. `hk lost add` reports by hand, whatever's
 known, and `hk lost rm` tombs reports. `hk lost ls` lists what's reported
 and isn't here.
 

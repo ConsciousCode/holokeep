@@ -2740,6 +2740,14 @@ impl Catalog {
         Ok(tombs)
     }
 
+    /// A block's gone, without anyone having let go of it.
+    #[cfg(all(test, feature = "net"))]
+    pub(crate) fn lose(&self, key: Key<'_>) {
+        self.db.conn()
+            .execute("DELETE FROM blocks WHERE block = (SELECT id FROM multihashes WHERE multihash = ?1)", [key.to_bytes()])
+            .expect("gone");
+    }
+
     /// What's gone without anyone meaning it to, by what's known here, not
     /// yet reported lost: blocks once held here, which nothing has let go of,
     /// as collecting forgets they were, that something still refers to. A

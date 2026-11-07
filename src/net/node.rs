@@ -165,6 +165,8 @@ pub struct Node {
     marks: Watermarks,
     /// Blocks members let go of which this node holds, to audit soon.
     suspects: Vec<Multihash>,
+    /// The fetch asking members for what a scan found gone, if it's underway.
+    lost_scan: Option<FetchId>,
     /// How far through lost claims this has looked for what's here.
     lost_cursor: i64,
     /// The trickle's audit under way, and whether more arrived than it
@@ -254,6 +256,7 @@ impl Node {
             next_trim: 0,
             marks: Watermarks::default(),
             suspects: Vec::new(),
+            lost_scan: None,
             lost_cursor: 0,
             trickling: None,
             cursors,
@@ -396,6 +399,48 @@ impl Node {
         // Before it starts, since one with nothing to ask finishes at once
         self.trickling = Some((self.next_audit, more));
         self.audit_of_keys(copies, keys).map(Some)
+    }
+
+    /// Look for what's gone without being let go of, and report what no
+    /// member has, once they've been asked: see `Catalog::lost_candidates`.
+    /// With a member away, it could be with them, so this waits for next time.
+    pub fn scan_lost(&mut self) -> Result<()> {
+        if self.lost_scan.is_some() {
+            return Ok(());
+        }
+        let candidates = self.catalog.lost_candidates()?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let me = self.peer_id();
+        let members: Vec<PeerId> = self.members.list()?.into_keys().filter(|peer| *peer != me).collect();
+        if members.is_empty() {
+            return self.report_lost(&candidates);
+        }
+        let connected = self.connected();
+        let away = members.iter().filter(|peer| !connected.contains(peer)).count();
+        if away > 0 {
+            eprintln!("{} blocks may be lost, or with the {away} members away", candidates.len());
+            return Ok(());
+        }
+        self.lost_scan = Some(self.fetch_blocks(candidates)?);
+        Ok(())
+    }
+
+    fn report_lost(&mut self, blocks: &[Link]) -> Result<()> {
+        let mut reported = 0usize;
+        self.catalog.batch(|catalog| {
+            for cid in blocks {
+                if catalog.report_lost(cid)?.is_some() {
+                    reported = reported.saturating_add(1);
+                }
+            }
+            Ok::<_, crate::store::Error>(())
+        })?;
+        if reported > 0 {
+            eprintln!("reported {reported} blocks lost, which no member has");
+        }
+        Ok(())
     }
 
     /// What's newly reported lost that's here after all, to audit: if it's
@@ -842,6 +887,14 @@ impl Node {
             && let Some(fetch) = self.fetches.remove(&id)
         {
             let (fetched, missing) = fetch.outcome();
+            if self.lost_scan == Some(id) {
+                self.lost_scan = None;
+                // What couldn't be written now, the next scan finds
+                match self.report_lost(&missing) {
+                    Err(e) if e.is_busy() => eprintln!("reporting what's lost: {e}"),
+                    done => done?,
+                }
+            }
             self.ready.push_back(Event::Fetched { id, fetched, missing });
         }
         Ok(())

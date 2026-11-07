@@ -205,6 +205,42 @@ async fn what_one_reports_lost_another_makes_good() {
     assert!(b.catalog().lost_blocks().expect("list").is_empty());
 }
 
+/// A node's scan asks its members first, and only reports with all of them
+/// there to ask.
+#[tokio::test]
+async fn a_scan_reports_only_what_no_member_has() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    let root = blocks.first().expect("root");
+    let (held, gone) = (blocks.get(1).expect("branch"), blocks.get(2).expect("leaf"));
+    // Both blocks were here, linked to by the root, and went
+    b.catalog().put_block(root, CidVersion::V1).expect("put");
+    for block in [held, gone] {
+        b.catalog().put_block(block, CidVersion::V1).expect("put");
+    }
+    let forget = |node: &Node, block: &Block| node.catalog().lose(block.cid().multihash());
+    forget(&b, held);
+    forget(&b, gone);
+    // The other has one of them
+    forget(&a, gone);
+
+    b.scan_lost().expect("scan");
+    let lost_at = |node: &Node, block: &Block| node.catalog().lost_at(&link(block)).expect("lost");
+    assert!(within(Duration::from_secs(10), &mut [&mut a, &mut b], |n| n[1].catalog().lost_at(&link(gone)).is_ok_and(|at| at.is_some())).await, "never reported");
+    assert!(lost_at(&b, gone).is_some());
+    assert_eq!(lost_at(&b, held), None, "fetched instead");
+    assert!(has(&b, held));
+
+    // With a member away, it might be with them, so nothing's even asked
+    let deep = blocks.get(3).expect("deep");
+    b.catalog().put_block(deep, CidVersion::V1).expect("put");
+    forget(&b, deep);
+    forget(&a, deep);
+    b.members().add(&PeerId::random()).expect("add");
+    b.scan_lost().expect("scan");
+    let _ = within(Duration::from_secs(1), &mut [&mut a, &mut b], |_| false).await;
+    assert_eq!(lost_at(&b, deep), None, "not with a member away");
+}
+
 #[tokio::test]
 async fn fetching_blocks_takes_only_them() {
     let (mut a, mut b, blocks) = Box::pin(holding()).await;

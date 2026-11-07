@@ -66,6 +66,11 @@ const PRESSURE: Duration = Duration::from_secs(30);
 /// collecting.
 const COLLECT: Duration = Duration::from_mins(1);
 
+/// How long after starting to look for what's been lost, and how often after
+/// that: it writes claims that go to members, so it's no hurry.
+const LOST_SCAN_FIRST: Duration = Duration::from_mins(10);
+const LOST_SCAN: Duration = Duration::from_hours(24);
+
 /// Watches the directories of files imported in place, sending the path of
 /// whatever changes in them; a file is watched through its directory since
 /// editors often replace rather than write. What a watch misses, the
@@ -484,7 +489,7 @@ fn join_now(node: &mut Node, alone: &mut bool, place: &Place, listen: &Multiaddr
 /// Free space is kept between watermarks, `(low, high)`: below the low,
 /// the node lets go of copies the mesh can spare until it's above the
 /// high. If `collecting`, garbage is collected too, a sample at a time.
-pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (u64, u64), collecting: bool, shared: bool) -> Result<()> {
+pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (u64, u64), collecting: bool, scanning: bool, shared: bool) -> Result<()> {
     let (mut node, mut alone) = open_node(place)?;
     node.set_watermarks(low, high);
     start(&mut node, place, listen.clone(), alone)?;
@@ -495,6 +500,7 @@ pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (
     let mut announce = tokio::time::interval(ANNOUNCE);
     let mut pressure = later(SETTLE);
     let mut collect = later(SETTLE);
+    let mut lost_scan = later(LOST_SCAN_FIRST);
     let mut waiting = Waiting::default();
     let (notify, mut changes) = tokio::sync::mpsc::unbounded_channel();
     // Files imported in place are watched by the main mesh's node alone
@@ -573,12 +579,12 @@ pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (
                 pressure = later(PRESSURE);
             },
             () = tokio::time::sleep_until(collect), if collecting => {
-                match node.collect(false) {
-                    Ok(report) if report.collected > 0 => eprintln!("collected: {} let go of, {} bytes freed", report.collected, report.freed),
-                    Ok(_) => {},
-                    Err(e) => unless_busy(Err(e), "collecting")?,
-                }
+                collect_some(&mut node)?;
                 collect = later(COLLECT);
+            },
+            () = tokio::time::sleep_until(lost_scan), if scanning && place.is_main() => {
+                unless_busy(node.scan_lost(), "looking for what's lost")?;
+                lost_scan = later(LOST_SCAN);
             },
             Some(path) = changes.recv() => notice_change(&mut node, &mut remounts, path, &mut changed_again)?,
             Some((mount, root)) = remounted.recv() => remounts.finished(&mount, &root),
@@ -587,6 +593,16 @@ pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (
     };
     std::fs::remove_file(socket(place))?;
     result
+}
+
+/// Collect a sample of what's here, if it's due.
+fn collect_some(node: &mut Node) -> Result<()> {
+    match node.collect(false) {
+        Ok(report) if report.collected > 0 => eprintln!("collected: {} let go of, {} bytes freed", report.collected, report.freed),
+        Ok(_) => {},
+        Err(e) => unless_busy(Err(e), "collecting")?,
+    }
+    Ok(())
 }
 
 /// Files imported in place: watched from now, and looked at once in the
@@ -730,6 +746,7 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
     let _ = writeln!(out, "account\t{}", node.catalog().uid());
     let keeps = node.catalog().claims().map(crate::store::ClaimStore::keeps).transpose()?.map_or(0, |keeps| keeps.len());
     let _ = writeln!(out, "keeps\t{keeps}");
+    let _ = writeln!(out, "lost\t{}", node.catalog().lost_blocks()?.len());
     match node.catalog().quota_left()? {
         Some((quota, left)) => {
             let _ = writeln!(out, "used\t{} of {} bytes", quota.saturating_sub(left), quota);
@@ -766,13 +783,18 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
     match line.trim() {
         "peers" => {
             let connected = node.connected();
-            for (peer, addrs) in node.members().list()? {
+            // A ticket's list includes whoever it let in
+            for (peer, addrs) in node.members().list()?.into_iter().filter(|(peer, _)| *peer != node.peer_id()) {
                 let state = if connected.contains(&peer) { "connected" } else { "-" };
                 let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
                 let _ = writeln!(out, "{peer}\t{state}\t{}", addrs.join(" "));
             }
         },
         "status" => out.push_str(&status(node, copies, collecting, alone)?),
+        "scan-lost" => {
+            node.scan_lost()?;
+            out.push_str("scanning\n");
+        },
         "listeners" => {
             for addr in node.listeners() {
                 let _ = writeln!(out, "{addr}");

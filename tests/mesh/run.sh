@@ -144,11 +144,22 @@ scenario_lost() {
 
     [ "$(on one hk lost scan)" = "$cid" ] || fail "the scan didn't report $cid"
     [ "$(on one hk lost ls | cut -f1)" = "$cid" ] || fail "it isn't listed"
+    # The daemon's own scan reports what it finds, signed so it counts
+    sh_on one 'echo "only here too" > /tmp/too'
+    local too
+    too=$(sh_on one 'hk add -q --nocopy --no-keep /tmp/too | tail -1')
+    on one hk keep add --copies 1 "$too" >/dev/null
+    sleep 1
+    sh_on one 'echo "changed too" > /tmp/too'
+    wait_for "one to notice it changed too" sh_on one "! hk block get $too"
+    on one hk node scan-lost
+    wait_for "one's node to report it" sh_on one "hk lost ls | grep -q $too"
+
     # Two hasn't got it, so wasn't told. The same bytes made there end it
     [ -z "$(on two hk lost ls)" ] || fail "two heard of what it hasn't got"
     sh_on two 'echo "only here" > /tmp/again && hk add -q /tmp/again >/dev/null'
     on one hk dag fetch "$cid" >/dev/null
-    [ -z "$(on one hk lost ls)" ] || fail "one still says it's lost, having it"
+    ! on one hk lost ls | grep -q "$cid" || fail "one still says it's lost, having it"
     [ "$(on one hk cat "$cid")" = "only here" ] || fail "it isn't what it was"
 }
 

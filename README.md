@@ -352,7 +352,7 @@ Checklist:
   - [x] Untagging, by tombstoning the claims (`hk tag rm`)
   - [x] Keeps, `Keep` claims which say to keep their targets and what they link to: `hk add` keeps what it adds unless `--no-keep` (`hk keep add/rm/ls`)
   - [x] Dissolved claims, named by identity CIDs
-  - [x] Reporting what's lost, `Lost` claims: `hk lost scan` finds what was held here, never let go of, that something still refers to, and reports it once every member's said it hasn't got it (`hk lost add/rm/ls`)
+  - [x] Reporting what's lost, `Lost` claims: `hk lost scan` finds what was held here, never let go of, that something still refers to, and reports it once every member's said it hasn't got it, as a running node does daily (`hk lost add/rm/ls`, `hk node scan-lost`)
 - [ ] Purging blocks immediately, across stores and permission tiers
 - [ ] Marking suspect blocks: ones whose links say sizes, or other things, that turn out wrong
 - [ ] Querying

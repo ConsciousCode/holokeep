@@ -209,6 +209,10 @@ enum NodeCommand {
         /// doesn't keep them
         #[arg(long)]
         no_collect: bool,
+        /// Don't look once a day for what's gone without being let go of,
+        /// reporting what no member has as lost, as `hk lost scan` does
+        #[arg(long)]
+        no_lost_scan: bool,
         /// Let the host's other users connect, to keep and tag things here
         /// as accounts of their own, which this repo signs for with keys of
         /// their own (the repo's directory must let them reach the socket)
@@ -221,6 +225,9 @@ enum NodeCommand {
     /// Have the running node condemn everything here nothing keeps now,
     /// ask members whether they keep it, and let go of what's due
     Collect,
+    /// Have the running node look for what's been lost now, rather than
+    /// when it next would, and report what no member has. See `hk lost ls`
+    ScanLost,
     /// List the mesh's members, and which are connected
     Peers,
     /// How the running node is: connected members, blocks, and the
@@ -1141,11 +1148,11 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
                 }
             }
         },
-        NodeCommand::Run { listen, copies, low_water, high_water, no_collect, shared } => {
+        NodeCommand::Run { listen, copies, low_water, high_water, no_collect, no_lost_scan, shared } => {
             let listen = listen.as_deref().unwrap_or_else(|| if place.is_main() { daemon::LISTEN } else { "/ip4/0.0.0.0/tcp/0" });
             let listen = listen.parse().context("not a multiaddr")?;
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            runtime.block_on(daemon::run(place, listen, copies, (low_water, high_water), !no_collect, shared))?;
+            runtime.block_on(daemon::run(place, listen, copies, (low_water, high_water), !no_collect, !no_lost_scan, shared))?;
         },
         NodeCommand::Collect => {
             let report = daemon::collect(place)?.context("this node isn't running: start `hk node run`")?;
@@ -1153,6 +1160,9 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
                 "condemned {}, pardoned {}, let go of {}, freeing {} bytes",
                 report.condemned, report.pardoned, report.collected, report.freed,
             );
+        },
+        NodeCommand::ScanLost => {
+            daemon::ask(place, "scan-lost")?.context("this node isn't running: start `hk node run`")?;
         },
         NodeCommand::Trim => {
             let report = daemon::trim(place)?.context("this node isn't running: start `hk node run`")?;
