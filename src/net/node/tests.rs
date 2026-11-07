@@ -217,7 +217,7 @@ async fn a_scan_reports_only_what_no_member_has() {
     for block in [held, gone] {
         b.catalog().put_block(block, CidVersion::V1).expect("put");
     }
-    let forget = |node: &Node, block: &Block| node.catalog().lose(block.cid().multihash());
+    let forget = |node: &Node, block: &Block| assert_eq!(node.catalog().lose(block.cid().multihash()).expect("lose"), 1);
     forget(&b, held);
     forget(&b, gone);
     // The other has one of them

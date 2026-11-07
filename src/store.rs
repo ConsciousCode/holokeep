@@ -2742,10 +2742,8 @@ impl Catalog {
 
     /// A block's gone, without anyone having let go of it.
     #[cfg(all(test, feature = "net"))]
-    pub(crate) fn lose(&self, key: Key<'_>) {
-        self.db.conn()
-            .execute("DELETE FROM blocks WHERE block = (SELECT id FROM multihashes WHERE multihash = ?1)", [key.to_bytes()])
-            .expect("gone");
+    pub(crate) fn lose(&self, key: Key<'_>) -> Result<usize> {
+        Ok(self.db.conn().execute("DELETE FROM blocks WHERE block = (SELECT id FROM multihashes WHERE multihash = ?1)", [key.to_bytes()])?)
     }
 
     /// What's gone without anyone meaning it to, by what's known here, not

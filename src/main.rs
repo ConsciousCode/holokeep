@@ -1161,9 +1161,7 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
                 report.condemned, report.pardoned, report.collected, report.freed,
             );
         },
-        NodeCommand::ScanLost => {
-            daemon::ask(place, "scan-lost")?.context("this node isn't running: start `hk node run`")?;
-        },
+        NodeCommand::ScanLost => drop(daemon::ask(place, "scan-lost")?.context("this node isn't running: start `hk node run`")?),
         NodeCommand::Trim => {
             let report = daemon::trim(place)?.context("this node isn't running: start `hk node run`")?;
             out!("let go of {} of {} spare blocks, freeing {} bytes", report.dropped, report.considered, report.freed);
