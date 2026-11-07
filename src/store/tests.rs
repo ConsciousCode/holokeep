@@ -411,6 +411,62 @@ fn splits_cids() {
     }
 }
 
+/// A batch that breathes commits as it goes, between files, ending whole.
+#[test]
+fn a_big_import_lets_others_write_as_it_goes() {
+    let scratch = Scratch::new("breathing");
+    let repo = scratch.path().join("repo");
+    let t = scratch.path().join("t");
+    std::fs::create_dir_all(&t).expect("mkdir");
+    for n in 0..4 {
+        std::fs::write(t.join(format!("small{n}")), format!("small {n}")).expect("write");
+        // Kept whole, so its leaves wait on its being settled
+        std::fs::write(t.join(format!("big{n}")), vec![u8::try_from(n).expect("n"); 2_000_000]).expect("write");
+    }
+    let mut catalog = Catalog::open_repo(&repo).expect("catalog");
+    let other = Catalog::open_repo(&repo).expect("other");
+    let root = catalog.batch_breathing_every(std::time::Duration::ZERO, |catalog| {
+        let importer = Importer::default();
+        let root = importer.add_path(&t, &mut Copying::new(catalog), &mut |_, _| {}).expect("import").expect("root");
+        // Everything before the last file's committed
+        assert!(other.has(raw(b"small 0").cid().multihash()).expect("has"), "seen before it's finished");
+        Ok::<_, Error>(root)
+    }).expect("batch");
+    let out = scratch.path().join("out");
+    crate::export::get(&catalog, &AnyCid::V1(root.cid), &out).expect("whole");
+    assert_eq!(std::fs::read(out.join("big3")).expect("big"), vec![3u8; 2_000_000]);
+}
+
+/// A failed import leaves what it's committed, every block of it readable.
+#[test]
+fn a_big_import_that_fails_leaves_only_what_can_be_read() {
+    let scratch = Scratch::new("breathing-fails");
+    let repo = scratch.path().join("repo");
+    let t = scratch.path().join("t");
+    std::fs::create_dir_all(&t).expect("mkdir");
+    std::fs::write(t.join("big"), vec![7u8; 2_000_000]).expect("write");
+    let mut catalog = Catalog::open_repo(&repo).expect("catalog");
+    let (kept, chunk) = (raw(b"kept"), raw(&vec![7u8; 1 << 18]));
+    let failed: Result<()> = catalog.batch_breathing_every(std::time::Duration::ZERO, |catalog| {
+        BlockSink::put(catalog, kept.clone()).expect("put");
+        let mut sink = Copying::new(catalog);
+        sink.begin_file(&t.join("big")).expect("begin");
+        let mut offset = 0;
+        for _ in 0..7 {
+            sink.put_from(chunk.clone(), Provenance::FileRange { path: &t.join("big"), offset }).expect("put");
+            offset += 1 << 18;
+            // In the middle of a file, it doesn't breathe
+            sink.router.breathe().expect("held");
+        }
+        Err(Error::NoClaims)
+    });
+    assert!(failed.is_err());
+    drop(catalog);
+    let again = Catalog::open_repo(&repo).expect("catalog");
+    assert!(again.has(kept.cid().multihash()).expect("has"), "committed by the breath before it");
+    assert!(!again.has(chunk.cid().multihash()).expect("has"), "said to be here, it couldn't be read");
+}
+
 #[test]
 fn batches_roll_back() {
     let mut router = router();

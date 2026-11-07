@@ -216,6 +216,11 @@ impl OffsetStore {
         Ok(Self { db, shards })
     }
 
+    /// Whether any file's ranges are yet to be settled.
+    pub fn is_pending(&self) -> Result<bool> {
+        Ok(self.db.conn().prepare_cached("SELECT 1 FROM temp.pending_ranges LIMIT 1")?.exists([])?)
+    }
+
     /// The file imported from `path` has multihash `blob` and is `len`
     /// bytes long: its pending ranges are of that blob, which is at
     /// `location`. Returns how many ranges the blob has in all.

@@ -232,6 +232,18 @@ pub trait Store: BlockIndex + BlockSource + BlockStore {
 /// as busy.
 pub const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a big import holds the write lock before letting others have it.
+/// A second, as that's how long the daemon waits, so it gets its turn.
+const BREATHE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a big import leaves the write lock free. A writer waiting for it
+/// looks again every 100 ms at the slowest, as `SQLite` waits.
+const BREATH: std::time::Duration = std::time::Duration::from_millis(110);
+
+/// How long a big import that's taken a breath waits for the write lock back,
+/// as after all that work it's not to fail for another's being big too.
+const BREATHING_WAIT: std::time::Duration = std::time::Duration::from_mins(10);
+
 /// How long catching up as a catalog's opened waits for another writer,
 /// before leaving it for next time.
 const CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
@@ -447,6 +459,9 @@ pub struct Catalog {
     unsigned: std::cell::RefCell<Vec<Link>>,
     /// How deep in batches this is.
     batching: usize,
+    /// In a batch that breathes: how long between breaths, and when it last
+    /// took one.
+    breathing: std::cell::Cell<Option<(std::time::Duration, std::time::Instant)>>,
     /// Forked anchors' merges, by their heads.
     merges: std::cell::RefCell<std::collections::HashMap<Vec<u8>, Link>>,
     /// Asks a running node for blocks that aren't here, if this fetches
@@ -1063,7 +1078,7 @@ impl Catalog {
         if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
             return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
         }
-        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, merges: std::cell::RefCell::default(), fetcher: None, missed: std::cell::RefCell::default(), commits: std::cell::RefCell::default() };
+        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, breathing: std::cell::Cell::new(None), merges: std::cell::RefCell::default(), fetcher: None, missed: std::cell::RefCell::default(), commits: std::cell::RefCell::default() };
         for volume in volumes {
             catalog.attach(volume)?;
         }
@@ -2253,9 +2268,55 @@ impl Catalog {
         }
         let end = if result.is_ok() { "COMMIT" } else { "ROLLBACK" };
         for db in &dbs {
-            db.conn().execute_batch(end).map_err(Error::from)?;
+            // None, if it failed for want of the lock after a breath
+            if !db.conn().is_autocommit() {
+                db.conn().execute_batch(end).map_err(Error::from)?;
+            }
         }
         result
+    }
+
+    /// A batch for a big import, which lets others write as it goes: what
+    /// it's done so far is committed every so often, wherever it says it
+    /// can [`Self::breathe`]. So it may leave some behind if it fails, which
+    /// is only blocks nothing refers to, there for it to skip when tried
+    /// again, and collected if it isn't.
+    pub fn batch_breathing<T, E: From<Error>>(&mut self, f: impl FnOnce(&mut Self) -> std::result::Result<T, E>) -> std::result::Result<T, E> {
+        self.batch_breathing_every(BREATHE_EVERY, f)
+    }
+
+    fn batch_breathing_every<T, E: From<Error>>(&mut self, every: std::time::Duration, f: impl FnOnce(&mut Self) -> std::result::Result<T, E>) -> std::result::Result<T, E> {
+        self.breathing.set(Some((every, std::time::Instant::now())));
+        let result = self.batch(f);
+        self.breathing.set(None);
+        result
+    }
+
+    /// Let others write, if this is a batch that breathes and it's time.
+    /// Only where nothing's half done but what a file's ranges wait on, for
+    /// which it goes on holding its breath: a range's block is placed before
+    /// its range is known, so its file must be settled first. So a big file
+    /// holds the lock for as long as it takes to read.
+    pub fn breathe(&self) -> Result<()> {
+        let Some((every, last)) = self.breathing.get() else {
+            return Ok(());
+        };
+        if self.batching != 1 || last.elapsed() < every || self.offsets.as_ref().is_some_and(|offsets| offsets.is_pending().unwrap_or(true)) {
+            return Ok(());
+        }
+        self.sign_batch()?;
+        let mut dbs: Vec<Db> = (0..self.volumes.len()).filter_map(|v| self.foreign_db(v).cloned()).collect();
+        dbs.push(self.db.clone());
+        for db in &dbs {
+            db.conn().execute_batch("COMMIT")?;
+        }
+        std::thread::sleep(BREATH);
+        self.wait_for_writers(BREATHING_WAIT)?;
+        for db in &dbs {
+            db.begin()?;
+        }
+        self.breathing.set(Some((every, std::time::Instant::now())));
+        Ok(())
     }
 
     /// The claim store, if there is one.
@@ -3052,7 +3113,8 @@ impl BlockStore for Catalog {
 /// they come; see `Copying` and `InPlace` for sinks which keep files whole.
 impl BlockSink for Catalog {
     fn put(&mut self, block: Block) -> io::Result<()> {
-        self.put_block(&block, CidVersion::V1).map(drop).map_err(io::Error::other)
+        self.put_block(&block, CidVersion::V1).map_err(io::Error::other)?;
+        self.breathe().map_err(io::Error::other)
     }
 }
 
@@ -3126,6 +3188,7 @@ impl BlockSink for InPlace<'_> {
     }
 
     fn begin_file(&mut self, path: &Path) -> io::Result<()> {
+        self.router.breathe().map_err(io_error)?;
         let fingerprint = Fingerprint::read(path)
             .ok_or_else(|| io::Error::other(format!("can't fingerprint {}", path.display())))?;
         self.file = Some((fingerprint, Whole::default()));
@@ -3202,6 +3265,7 @@ impl BlockSink for Copying<'_> {
     }
 
     fn begin_file(&mut self, _path: &Path) -> io::Result<()> {
+        self.router.breathe().map_err(io_error)?;
         self.file = Some(Keeping { whole: Whole::default(), held: Vec::new(), temp: None });
         Ok(())
     }

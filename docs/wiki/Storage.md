@@ -129,9 +129,18 @@ it. What usually only reads, like catching up, uses `Db::reading_first`,
 which starts without it, so isn't held up; if it needs to write beside a
 writer, it's undone and run again, waiting.
 
-Something else may hold the write lock for a long time: `hk add` and
-`hk git import` hold it for all of a big import. So each waits only as
-suits it, and what can't wait doesn't stop anything else:
+`hk add` and `hk git import` take a breath: every second, they commit
+what they've done and leave the lock free for a tenth of a second, as
+long enough for whatever's waiting to look again. So if one fails, or is
+interrupted, it leaves blocks behind, there to skip when it's tried again
+and collected if it isn't, with no keep to hold them. They can't breathe
+in the middle of a file kept whole or imported in place, since a leaf is
+placed before its range of the file is known, so one big file holds the
+lock until it's read, about 2 s a gigabyte.
+
+Something may still hold the write lock for a long time: that, a
+[[#Compacting|compact]], or another writer's big transaction. So each
+waits only as suits it, and what can't wait doesn't stop anything else:
 
 | What | Waits | Then |
 |---|---|---|

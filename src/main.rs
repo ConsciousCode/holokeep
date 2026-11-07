@@ -683,7 +683,7 @@ fn run(args: Args) -> anyhow::Result<()> {
             if only_hash {
                 return add(&importer, &path, quiet, &mut NullSink).map(drop);
             }
-            open_repo(args.repo)?.batch(|repo| {
+            open_repo(args.repo)?.batch_breathing(|repo| {
                 // What's imported in place is mounted on an anchor, which is
                 // what's kept, so it's kept through its changes
                 let kept = if nocopy && path != Path::new("-") {
@@ -1326,7 +1326,7 @@ fn compact(repo: &Catalog, compact: Compact) -> anyhow::Result<()> {
 fn git_import(repo: Option<PathBuf>, git: &Path, no_keep: bool) -> anyhow::Result<()> {
     use std::collections::{BTreeMap, HashSet};
     let refs = holokeep::git::refs(git)?;
-    open_repo(repo)?.batch(|repo| {
+    open_repo(repo)?.batch_breathing(|repo| {
         let mut imported: HashSet<Vec<u8>> = HashSet::new();
         let mut linked: BTreeMap<Vec<u8>, Link> = BTreeMap::new();
         let have = |link: &Link| repo.get_block(link).ok().flatten();
@@ -1339,6 +1339,7 @@ fn git_import(repo: Option<PathBuf>, git: &Path, no_keep: bool) -> anyhow::Resul
             });
             repo.put_block_from(block, holokeep::cid::CidVersion::V1, provenance).map_err(|e| io::Error::other(e.to_string()))?;
             imported.insert(Link::from(block.cid().clone()).to_bytes());
+            repo.breathe().map_err(|e| io::Error::other(e.to_string()))?;
             Ok(())
         })?;
         // What's linked to but isn't anywhere here, as a submodule's
