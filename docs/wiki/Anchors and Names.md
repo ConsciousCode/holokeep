@@ -116,7 +116,10 @@ show` lists the heads of a forked anchor.
 
 Directories merge three ways, name by name, against the value of the
 heads' latest common ancestor (by `prev`, an older build's set coming
-after every set before it):
+after every set before it). With more than one, none coming after another,
+as when two devices each go on from the same merge, which no set says, it's
+those merged in turn, by these same rules, so what's measured from is what
+they saw:
 
 - what changed on one side only is taken, whether changed, added or
   removed;

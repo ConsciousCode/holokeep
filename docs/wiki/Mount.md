@@ -160,8 +160,32 @@ A file is never committed halfway through being written: if the anchor
 is written to while it's being imported, nothing is set, and it's
 committed once it's whole again.
 
-Concurrent edits of one anchor from two nodes fork it; the mount shows
-the heads merged (see [[Anchors and Names#Forks and merges]]), and its
-next commit names every head, settling the merge.
+## In step with what's set elsewhere
+
+An anchor's work directory says what the anchor was when it was committed,
+and it would hide whatever's set elsewhere since, or undo it on the next
+commit. So each overlay keeps its **base** in `overlay_bases`: the value its
+work directory and marks were last in step with, and the sets saying so. An
+overlay from before bases is taken to be over the last set this device signed.
+
+When the anchor's value isn't its base, within about a second, and before
+anything's changed in it, so an edit is measured from what the mount showed,
+unless a file of it is open to write or not yet committed:
+
+1. What's in the work directory is imported over the **base**. If that's
+   changed anything, it's set, replacing the base's sets alone. So it forks
+   what's been set since, and [[Anchors and Names#Forks and merges|merging]]
+   settles it, a conflict side by side if the same file changed, with the base
+   as the common ancestor.
+2. The blocks imported in place are moved out, so every version stays whole.
+3. The work directory is renamed aside and removed, and its marks forgotten.
+4. The base is what the anchor is now.
+
+Each step can start over if the mount ends part way. So the mount shows what
+the anchor is, as every other node does. An anchor set by another device while
+a file's open to write shows once it's closed.
+
+A commit does the first of those too, whenever the anchor has moved on from its
+base, so it never replaces what it didn't see.
 
 Source: `src/mount.rs`, `src/mount/write.rs`, `src/store/overlay.rs`, `src/store.rs` (`preserve_in_place`).

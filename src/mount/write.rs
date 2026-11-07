@@ -331,6 +331,23 @@ const PACES: [Duration; 5] = [
     Duration::from_mins(10),
 ];
 
+/// How many ticks apart to look for what's been set elsewhere, when nothing's
+/// been written here: a second or so.
+const RECONCILE: u32 = 4;
+
+/// What a work directory's called once it's being let go of, whatever it was.
+const DROPPED: &str = ".dropped-";
+
+/// Remove what's left of a work directory being let go of, if there's any.
+fn discard(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// How long what's written to an anchor without its ever being quiet waits
 /// at most, at its pace's first step, before it's committed anyway.
 const STALE: Duration = Duration::from_secs(5);
@@ -345,6 +362,9 @@ struct Written {
     /// application syncs what it's written once it's whole, as a database
     /// does after each transaction; a file closed is whole.
     unsynced: usize,
+    /// How many of its files are open to write, whether they've been or not:
+    /// what's in the work directory can't be let go of under them.
+    open: usize,
     /// How many times it's been written to, ever, to tell whether it was
     /// as it was committed.
     changes: u64,
@@ -361,7 +381,7 @@ struct Written {
 
 impl Written {
     const fn new(anchor: Link) -> Self {
-        Self { anchor, dirty: None, unsynced: 0, changes: 0, pace: 0, floor: Duration::ZERO, stale: false, committed: None }
+        Self { anchor, dirty: None, unsynced: 0, open: 0, changes: 0, pace: 0, floor: Duration::ZERO, stale: false, committed: None }
     }
 
     /// Whether what's written is due to be committed, at `now`: written
@@ -480,6 +500,11 @@ impl Committer {
         self.of(anchor, |it| it.unsynced = if unsynced { it.unsynced.saturating_add(1) } else { it.unsynced.saturating_sub(1) });
     }
 
+    /// Note a file of an anchor's been opened to write, or one's closed.
+    fn opened(&self, anchor: &Link, opened: bool) {
+        self.of(anchor, |it| it.open = if opened { it.open.saturating_add(1) } else { it.open.saturating_sub(1) });
+    }
+
     /// The least time between an anchor's commits, as the rules say.
     pub(super) fn floor(&self, anchor: &Link, floor: Duration) {
         self.of(anchor, |it| it.floor = floor);
@@ -572,6 +597,69 @@ impl Committer {
                 },
             }
         }
+        self.reconcile(catalog);
+    }
+
+    /// Bring overlays into step with what's been set elsewhere, as they can
+    /// be: what's in the work directory only says what the anchor was, and it
+    /// can't go on saying so over what the anchor's become. See
+    /// `Self::bring_into_step`.
+    fn reconcile(&self, catalog: &mut Catalog) {
+        for mount in catalog.mounts().unwrap_or_default().into_iter().filter(|mount| mount.overlay) {
+            if let Err(e) = catalog.note_overlay_base(&mount.anchor) {
+                eprintln!("{} has no base noted yet: {e}", mount.anchor);
+            }
+            if !catalog.overlay_behind(&mount.anchor).unwrap_or(false) || self.in_use(&mount.anchor) {
+                continue;
+            }
+            if let Err(e) = self.bring_into_step(catalog, &mount) {
+                eprintln!("{} isn't in step with what it's been set to yet: {e}", mount.anchor);
+            }
+        }
+    }
+
+    /// Whether what's in an anchor's work directory is being written, or has
+    /// been and isn't committed: that goes first.
+    fn in_use(&self, anchor: &Link) -> bool {
+        self.of(anchor, |it| it.dirty.is_some() || it.unsynced > 0 || it.open > 0)
+    }
+
+    /// Commit whatever's in an overlay's work directory that isn't committed,
+    /// as a fork of what's been set elsewhere if it's anything, then let go of
+    /// it all, keeping the blocks it backs, so the mount shows what the anchor
+    /// is. Each step leaves what the next can start over from: its blocks
+    /// moved out, an overlay imports as it did; and with its files gone too,
+    /// it's what it was over, so there's nothing to commit.
+    fn bring_into_step(&self, catalog: &mut Catalog, mount: &Mount) -> crate::store::Result<()> {
+        self.filler.complete(catalog, &mount.anchor)?;
+        let Ok(underway) = self.writing.try_lock() else {
+            return Ok(());
+        };
+        let done = self.let_go(catalog, mount);
+        drop(underway);
+        done
+    }
+
+    /// As `bring_into_step`, for what already holds the lock on changes.
+    fn let_go(&self, catalog: &mut Catalog, mount: &Mount) -> crate::store::Result<()> {
+        let anchor = &mount.anchor;
+        if self.in_use(anchor) {
+            return Ok(());
+        }
+        import(catalog, mount, &|| true)?;
+        catalog.preserve_in_place(&mount.path)?;
+        if let (Some(parent), Some(name)) = (mount.path.parent(), mount.path.file_name())
+            && fs::symlink_metadata(&mount.path).is_ok()
+        {
+            let dropped = parent.join(format!("{DROPPED}{}", name.to_string_lossy()));
+            discard(&dropped)?;
+            fs::rename(&mount.path, &dropped)?;
+            discard(&dropped)?;
+        }
+        self.imported(&mount.path);
+        catalog.overlay_dropped(anchor)?;
+        eprintln!("{anchor} is {} now, as set elsewhere", catalog.anchor_value(anchor)?.map_or_else(|| "nothing".to_owned(), |value| value.to_string()));
+        Ok(())
     }
 
     /// Commit every overlay mount, as after a mount that ended before it
@@ -579,6 +667,14 @@ impl Committer {
     pub fn recover(&self) {
         match (self.open)() {
             Ok(mut catalog) => {
+                // What was being let go of when the mount before ended
+                if let Some(work) = &self.filler.work {
+                    for entry in fs::read_dir(work).into_iter().flatten().flatten() {
+                        if entry.file_name().as_bytes().starts_with(DROPPED.as_bytes()) {
+                            let _ = discard(&entry.path());
+                        }
+                    }
+                }
                 self.filler.load(&catalog);
                 for mount in catalog.mounts().unwrap_or_default().into_iter().filter(|mount| mount.overlay) {
                     if let Err(e) = self.filler.complete(&catalog, &mount.anchor) {
@@ -590,6 +686,7 @@ impl Committer {
                     }
                     self.imported(&mount.path);
                 }
+                self.reconcile(&mut catalog);
             },
             Err(e) => eprintln!("not committing what was written before: {e}"),
         }
@@ -600,9 +697,11 @@ impl Committer {
     pub fn run(self: Arc<Self>) {
         std::thread::spawn(move || {
             let mut catalog = None;
+            let mut reconciled = 0u32;
             while !self.stop.load(Ordering::Relaxed) {
                 std::thread::sleep(super::write::TICK);
-                if !self.written().values().any(|it| it.dirty.is_some()) && self.filler.partials().is_empty() && self.revisions().is_empty() {
+                reconciled = reconciled.wrapping_add(1);
+                if !reconciled.is_multiple_of(RECONCILE) && !self.written().values().any(|it| it.dirty.is_some()) && self.filler.partials().is_empty() && self.revisions().is_empty() {
                     continue;
                 }
                 if catalog.is_none() {
@@ -697,13 +796,35 @@ impl Soup {
         self.handles.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The anchor and path of an inode which can be written to.
+    /// The anchor and path of an inode, to change something there: brought
+    /// into step first, so what's changed is measured from what was seen.
     fn overlay_of(&self, ino: u64) -> Result<(Link, PathBuf), Errno> {
-        match self.inode(ino)? {
-            Inode::Path(anchor, rel, _) if self.work.is_some() => Ok((anchor, rel)),
-            Inode::Root if self.work.is_some() => Ok((Self::root(&*self.catalog()?)?.ok_or(Errno::EROFS)?, PathBuf::new())),
-            _ => Err(Errno::EROFS),
+        let (anchor, rel) = match self.inode(ino)? {
+            Inode::Path(anchor, rel, _) if self.work.is_some() => (anchor, rel),
+            Inode::Root if self.work.is_some() => (Self::root(&*self.catalog()?)?.ok_or(Errno::EROFS)?, PathBuf::new()),
+            _ => return Err(Errno::EROFS),
+        };
+        self.catch_up(&anchor)?;
+        Ok((anchor, rel))
+    }
+
+    /// An overlay about to be changed, if it's behind what's been set
+    /// elsewhere, with nothing of its own to commit: into step now, not when
+    /// next it's looked at, or what's written to what the mount showed would
+    /// seem written to what it was over. The caller holds the lock on changes.
+    fn catch_up(&self, anchor: &Link) -> Result<(), Errno> {
+        let catalog = self.catalog()?;
+        if !catalog.overlay_behind(anchor).map_err(store_errno)? || self.committer.in_use(anchor) {
+            return Ok(());
         }
+        let Some(mount) = catalog.mounts().map_err(store_errno)?.into_iter().find(|mount| mount.overlay && &mount.anchor == anchor) else {
+            return Ok(());
+        };
+        drop(catalog);
+        let mut own = (self.open)().map_err(store_errno)?;
+        own.wait_for_writers(super::WRITER_WAIT).map_err(store_errno)?;
+        self.committer.filler.complete(&own, anchor).map_err(|e| io_errno(&e))?;
+        self.committer.let_go(&mut own, &mount).map_err(store_errno)
     }
 
     /// Before what's at a path of an anchor's work directory, or under it,
@@ -731,9 +852,12 @@ impl Soup {
         match catalog.mounts().map_err(store_errno)?.into_iter().find(|mount| &mount.anchor == anchor) {
             Some(mount) if mount.overlay => {},
             Some(_) => return Err(Errno::EROFS),
-            None => catalog
-                .mount(&Mount { anchor: anchor.clone(), path: dir.clone(), chunk_size: crate::import::CHUNK_SIZE, width: crate::dag::FILE_WIDTH, hidden: true, overlay: true })
-                .map_err(store_errno)?,
+            None => {
+                catalog
+                    .mount(&Mount { anchor: anchor.clone(), path: dir.clone(), chunk_size: crate::import::CHUNK_SIZE, width: crate::dag::FILE_WIDTH, hidden: true, overlay: true })
+                    .map_err(store_errno)?;
+                catalog.overlay_in_step(anchor).map_err(store_errno)?;
+            },
         }
         Ok(dir)
     }
@@ -788,6 +912,9 @@ impl Soup {
         if unsynced && let Some(anchor) = &anchor {
             self.committer.unsynced(anchor, true);
         }
+        if writable && let Some(anchor) = &anchor {
+            self.committer.opened(anchor, true);
+        }
         self.handles().insert(fh, Handle { file: Arc::new(file), anchor, rel, writable, unsynced, orphan: None });
         fh
     }
@@ -820,28 +947,34 @@ impl Soup {
     /// removed. What was at `to`, replaced, is at no path any more: those who
     /// have it open go on with it, as with any unlinked file, but it's not
     /// what's there and it's no part of the anchor.
-    fn retarget(&self, anchor: &Link, from: &Path, to: Option<&Path>, orphans: &[(PathBuf, SharedPartial)]) -> Vec<Link> {
-        let mut settled = Vec::new();
+    fn retarget(&self, anchor: &Link, from: &Path, to: Option<&Path>, orphans: &[(PathBuf, SharedPartial)]) -> (Vec<Link>, Vec<Link>) {
+        let (mut settled, mut closed) = (Vec::new(), Vec::new());
         for handle in self.handles().values_mut().filter(|handle| handle.anchor.as_ref() == Some(anchor)) {
             if let Some((to, rest)) = to.and_then(|to| Some((to, handle.rel.strip_prefix(from).ok()?))) {
                 handle.rel = if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) };
             } else if handle.rel.starts_with(to.unwrap_or(from)) {
                 settled.extend(handle.settled().cloned());
+                if handle.writable {
+                    closed.extend(handle.anchor.clone());
+                }
                 handle.orphan = orphans.iter().find(|(path, _)| *path == handle.rel).map(|(_, partial)| Arc::clone(partial));
                 handle.anchor = None;
             }
         }
-        settled
+        (settled, closed)
     }
 
     /// Partial files and open files moved, or gone, as `Filler::moving` says,
     /// with `swap` moving the file itself.
     fn moving(&self, catalog: &Catalog, anchor: &Link, from: &Path, to: Option<&Path>, swap: impl FnOnce() -> io::Result<()>) -> Result<(), Errno> {
-        let mut settled = Vec::new();
-        let done = self.filler.moving(catalog, anchor, from, to, |orphans| settled = self.retarget(anchor, from, to, orphans), swap);
+        let (mut settled, mut closed) = (Vec::new(), Vec::new());
+        let done = self.filler.moving(catalog, anchor, from, to, |orphans| (settled, closed) = self.retarget(anchor, from, to, orphans), swap);
         // What's gone needn't be synced for its anchor to be committed
         for anchor in settled {
             self.committer.unsynced(&anchor, false);
+        }
+        for anchor in closed {
+            self.committer.opened(&anchor, false);
         }
         done.map_err(|e| io_errno(&e))
     }
@@ -962,6 +1095,7 @@ impl Soup {
             }
             if let Some(anchor) = &handle.anchor {
                 self.committer.touched(anchor);
+                self.committer.opened(anchor, false);
             }
         }
     }

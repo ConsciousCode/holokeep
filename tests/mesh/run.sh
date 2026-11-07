@@ -114,6 +114,26 @@ scenario_write_read() {
     wait_for "one to read two's page" holds one /soup/wiki/two.md "two was here"
 }
 
+# Taking turns at one file, each sees the other's edit, and writing something
+# else after doesn't undo it, nor bring back what the other removed
+scenario_edits() {
+    sh_on one 'echo first > /soup/wiki/turns.md'
+    wait_for "two to read one's edit" holds two /soup/wiki/turns.md first
+    sh_on two 'echo second > /soup/wiki/turns.md'
+    wait_for "one to read two's edit" holds one /soup/wiki/turns.md second
+    sh_on one 'echo other > /soup/wiki/other.md'
+    wait_for "two to read one's other file" holds two /soup/wiki/other.md other
+    holds one /soup/wiki/turns.md second || fail "one undid two's edit"
+    holds two /soup/wiki/turns.md second || fail "two lost its own edit"
+    ! listing one /soup/wiki | grep conflict >/dev/null || fail "a conflict, taking turns"
+    sh_on two 'rm /soup/wiki/turns.md'
+    wait_for "one to see it gone" sh_on one '! test -e /soup/wiki/turns.md'
+    sh_on one 'echo more > /soup/wiki/other.md'
+    wait_for "two to read more" holds two /soup/wiki/other.md more
+    sh_on two '! test -e /soup/wiki/turns.md' || fail "one brought it back"
+    sh_on one '! test -e /soup/wiki/turns.md' || fail "one still shows it"
+}
+
 # A node joining later sees what the root names, and reads it
 scenario_late_joiner() {
     machine three
@@ -206,9 +226,8 @@ scenario_restore() {
     [ "$(on phoenix hk anchor root | sed -n 1p)" = "$root" ] || fail "not the same root"
     on phoenix hk device list | grep "certified	this node" >/dev/null || fail "this node isn't certified"
     mount_up phoenix
-    # What the merged anchor says: one's own mount shows its own edit over that
     local page
-    page=$(sh_on two 'cat /soup/wiki/page.md')
+    page=$(sh_on one 'cat /soup/wiki/page.md')
     wait_for "phoenix to read the wiki" holds phoenix /soup/wiki/page.md "$page"
     same_listing one phoenix /soup/wiki || fail "phoenix doesn't have all the wiki"
 }
@@ -292,6 +311,7 @@ scenario_fork_merge() {
     wait_for "one to see two's change" sh_on one 'test -e /soup/wiki/only-two.md'
     wait_for "two to see one's change" sh_on two 'test -e /soup/wiki/only-one.md'
     wait_for "one and two to agree" same_listing one two /soup/wiki
+    wait_for "one and two to agree what it says" sh_on one "test \"\$(cat /soup/wiki/page.md)\" = \"$(sh_on two 'cat /soup/wiki/page.md')\""
     listing one /soup/wiki | grep -q '^page (conflict ......)\.md$' \
         || fail "no conflict beside page.md: $(listing one /soup/wiki | tr '\n' ' ')"
 }
@@ -313,7 +333,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read late_joiner fork_merge lost forget car restore revoke)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

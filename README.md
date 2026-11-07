@@ -378,6 +378,7 @@ Checklist:
   - [x] Merging a joining repo's root names into the user's, as a head of its own
   - [x] Mount points: a symlink to an anchor shown as the anchor, a directory of its own wherever it's reached, unless that would loop; directories reached twice are two inodes
   - [x] Committing what's open once it's synced, never a file caught halfway through being written, at a pace that backs off from at once to every 10 min as an anchor's written to often
+  - [x] What's set elsewhere shows, and is merged with what's written here, not hidden or undone by it
   - [x] Every committed version kept whole: a work file's blocks moved out before it's changed, so history costs only what changed
   - [x] Keeping what the root names: the root anchor kept, and mount points links to what they mount, for keeps and collection alike
   - [x] Rules (`.souprules`, gitignore-like, per directory and at the top of the root): detaching application state (`.obsidian/`, `.git/`) into anchors of its own as it's made, a least pace, by name, path or application

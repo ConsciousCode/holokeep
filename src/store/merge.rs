@@ -6,7 +6,8 @@
 //! head as its `prev`, and says what it is.
 //!
 //! Directories merge three ways, name by name, against the heads' latest
-//! common ancestor: what changed on one side only is taken; what changed
+//! common ancestor, or if they've more than one, those merged in turn, as when
+//! two devices each go on from one merge: what changed on one side only is taken; what changed
 //! the same on every side that changed it is no conflict; directories
 //! changed on more than one side are merged in turn; and anything else
 //! changed differently is a conflict, kept side by side, the latest head's
@@ -49,9 +50,28 @@ impl Catalog {
     pub(super) fn merge_heads(&self, anchor: &Link, heads: &[(Link, Link, u64)]) -> Result<Link> {
         let claims = self.claims.as_ref().ok_or(super::Error::NoClaims)?;
         let sets = claims.sets(anchor.multihash())?;
-        let base = common_ancestor(&sets, heads.iter().map(|(set, _, _)| set));
+        let index: BTreeMap<Vec<u8>, usize> = sets.iter().enumerate().map(|(i, (set, ..))| (set.to_bytes(), i)).collect();
+        let from: Option<Vec<usize>> = heads.iter().map(|(set, _, _)| index.get(&set.to_bytes()).copied()).collect();
+        let base = from.and_then(|from| self.ancestor(&sets, &index, &from));
         let heads: Vec<Head> = heads.iter().map(|(set, value, _)| Head { value: value.clone(), tag: tag(set) }).collect();
         Ok(self.merge_values(base.as_ref(), &heads)?)
+    }
+
+    /// The value these sets have in common: their latest common set's, or if
+    /// there's more than one, those merged in turn, as that's what's gone on
+    /// from. Worked out the same everywhere, from the same sets.
+    fn ancestor(&self, sets: &[super::SetOf], index: &BTreeMap<Vec<u8>, usize>, from: &[usize]) -> Option<Link> {
+        let latest = latest_common(sets, index, from);
+        match latest.as_slice() {
+            [] => None,
+            [one] => sets.get(*one).map(|(_, value, ..)| value.clone()),
+            many => {
+                let base = self.ancestor(sets, index, many);
+                let heads: Vec<Head> = many.iter().filter_map(|at| sets.get(*at)).map(|(set, value, ..)| Head { value: value.clone(), tag: tag(set) }).collect();
+                // What isn't here to merge, the latest of them says it
+                self.merge_values(base.as_ref(), &heads).ok().or_else(|| heads.last().map(|head| head.value.clone()))
+            },
+        }
     }
 
     /// Heads' values merged, over what they had in common, if that's
@@ -173,38 +193,50 @@ fn conflict_name(name: &[u8], tag: &str) -> Vec<u8> {
     [stem, format!(" (conflict {tag})").as_bytes(), ext].concat()
 }
 
-/// The value of the latest set every head comes after, if any: by `prev`,
-/// or for an older build's set, every set before it.
-fn common_ancestor<'a>(sets: &[super::SetOf], heads: impl Iterator<Item = &'a Link>) -> Option<Link> {
-    let index: BTreeMap<Vec<u8>, usize> = sets.iter().enumerate().map(|(i, (set, ..))| (set.to_bytes(), i)).collect();
-    let mut common: Option<Vec<bool>> = None;
-    for head in heads {
-        let start = *index.get(&head.to_bytes())?;
-        let mut seen = vec![false; sets.len()];
-        let mut stack = vec![start];
-        while let Some(at) = stack.pop() {
-            if seen.get(at).copied().unwrap_or(true) {
-                continue;
-            }
-            if let Some(slot) = seen.get_mut(at) {
-                *slot = true;
-            }
-            match sets.get(at).and_then(|(_, _, _, prev)| prev.as_ref()) {
-                Some(prev) => stack.extend(prev.iter().filter_map(|prev| index.get(&prev.to_bytes()).copied())),
-                // An older build's set comes after every set before it
-                None => {
-                    for earlier in seen.iter_mut().take(at) {
-                        *earlier = true;
-                    }
-                },
-            }
+/// The sets a set comes after, and itself, by position: by `prev`, or for an
+/// older build's set, every set before it.
+fn reach(sets: &[super::SetOf], index: &BTreeMap<Vec<u8>, usize>, start: usize) -> Vec<bool> {
+    let mut seen = vec![false; sets.len()];
+    let mut stack = vec![start];
+    while let Some(at) = stack.pop() {
+        if seen.get(at).copied().unwrap_or(true) {
+            continue;
         }
+        if let Some(slot) = seen.get_mut(at) {
+            *slot = true;
+        }
+        match sets.get(at).and_then(|(_, _, _, prev)| prev.as_ref()) {
+            Some(prev) => stack.extend(prev.iter().filter_map(|prev| index.get(&prev.to_bytes()).copied())),
+            None => {
+                for earlier in seen.iter_mut().take(at) {
+                    *earlier = true;
+                }
+            },
+        }
+    }
+    seen
+}
+
+/// The latest sets every one of these comes after, none of which another of
+/// them comes after, by position: more than one, once two devices have each
+/// gone on from the same merge, which no set says.
+fn latest_common(sets: &[super::SetOf], index: &BTreeMap<Vec<u8>, usize>, from: &[usize]) -> Vec<usize> {
+    let mut common: Option<Vec<bool>> = None;
+    for &at in from {
+        let seen = reach(sets, index, at);
         common = Some(match common {
             None => seen,
             Some(common) => common.iter().zip(&seen).map(|(a, b)| *a && *b).collect(),
         });
     }
-    let common = common?;
-    let latest = common.iter().rposition(|&shared| shared)?;
-    sets.get(latest).map(|(_, value, ..)| value.clone())
+    let shared: Vec<usize> = common.unwrap_or_default().iter().enumerate().filter(|&(_, &shared)| shared).map(|(at, _)| at).collect();
+    let mut covered = vec![false; sets.len()];
+    for &at in &shared {
+        for (earlier, _) in reach(sets, index, at).iter().enumerate().filter(|&(earlier, &seen)| seen && earlier != at) {
+            if let Some(slot) = covered.get_mut(earlier) {
+                *slot = true;
+            }
+        }
+    }
+    shared.into_iter().filter(|&at| !covered.get(at).copied().unwrap_or(false)).collect()
 }

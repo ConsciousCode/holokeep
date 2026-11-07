@@ -22,7 +22,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension as _, params};
 
 use crate::cid::{BaseCid as _, Cid as _, CidRef as _, Cidv1, RAW_CODEC};
 use crate::dag::{DagLink, DirLayoutBuilder as _, DirLayoutStrategy as _};
@@ -246,6 +246,81 @@ impl Catalog {
         Ok(())
     }
 
+    /// What an overlay's work directory and marks were last in step with:
+    /// a value, and the sets replacing it replaces. Till that's been noted,
+    /// which an overlay from before it was won't have, it's what this device
+    /// last said the anchor was, as that's what it committed, or else what the
+    /// anchor is.
+    pub fn overlay_base(&self, anchor: &Link) -> Result<Option<(Link, Vec<Link>)>> {
+        let row: Option<(Vec<u8>, String)> = self.db.conn()
+            .prepare_cached("SELECT value, sets FROM overlay_bases WHERE anchor = ?1")?
+            .query_row([anchor.to_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        if let Some((value, sets)) = row {
+            let invalid = |e: String| Error::Invalid { store: "router", reason: format!("overlay base of {anchor}: {e}") };
+            let value = Link::decode(&value).map_err(|e| invalid(format!("{e:?}")))?;
+            let sets = sets.split_whitespace().map(|set| set.parse::<Link>().map_err(|e| invalid(format!("{e:?}")))).collect::<Result<_>>()?;
+            return Ok(Some((value, sets)));
+        }
+        if let (Some(signer), Some(claims)) = (&self.signer, &self.claims) {
+            for (set, value, _, _) in self.sets_of(anchor)?.into_iter().rev() {
+                if claims.signed_by(&set, &signer.id())? {
+                    return Ok(Some((value, vec![set])));
+                }
+            }
+        }
+        self.anchor_now(anchor)
+    }
+
+    /// Note what an overlay's over, if that's not yet been: it'd only be
+    /// worked out again each time.
+    pub fn note_overlay_base(&self, anchor: &Link) -> Result<()> {
+        let noted = self.db.conn().prepare_cached("SELECT 1 FROM overlay_bases WHERE anchor = ?1")?.exists([anchor.to_bytes()])?;
+        if !noted && let Some((value, sets)) = self.overlay_base(anchor)? {
+            self.set_overlay_base(anchor, &value, &sets)?;
+        }
+        Ok(())
+    }
+
+    /// What an anchor is now, and the sets saying so.
+    fn anchor_now(&self, anchor: &Link) -> Result<Option<(Link, Vec<Link>)>> {
+        let sets = self.anchor_heads(anchor)?.into_iter().map(|(set, ..)| set).collect();
+        Ok(self.anchor_value(anchor)?.map(|value| (value, sets)))
+    }
+
+    fn set_overlay_base(&self, anchor: &Link, value: &Link, sets: &[Link]) -> Result<()> {
+        let sets: Vec<String> = sets.iter().map(ToString::to_string).collect();
+        self.db.conn()
+            .prepare_cached("INSERT OR REPLACE INTO overlay_bases (anchor, value, sets) VALUES (?1, ?2, ?3)")?
+            .execute(params![anchor.to_bytes(), value.to_bytes(), sets.join(" ")])?;
+        Ok(())
+    }
+
+    /// Note an overlay's in step with what its anchor is now, as when it's
+    /// new, with nothing in its work directory.
+    pub fn overlay_in_step(&self, anchor: &Link) -> Result<()> {
+        if let Some((value, sets)) = self.anchor_now(anchor)? {
+            self.set_overlay_base(anchor, &value, &sets)?;
+        }
+        Ok(())
+    }
+
+    /// Whether an anchor's been set to something an overlay isn't in step
+    /// with, from elsewhere.
+    pub fn overlay_behind(&self, anchor: &Link) -> Result<bool> {
+        let now = self.anchor_value(anchor)?;
+        Ok(self.overlay_base(anchor)?.map(|(value, _)| value) != now && now.is_some())
+    }
+
+    /// The last of bringing an overlay into step with what its anchor is, its
+    /// work directory having gone: nothing it says is so any more.
+    pub fn overlay_dropped(&self, anchor: &Link) -> Result<()> {
+        self.db.atomically(|| {
+            self.clear_overlay_marks(anchor, Path::new(""))?;
+            self.overlay_in_step(anchor)
+        })
+    }
+
     /// Import an overlay mount, setting its anchor to what it now is, if
     /// that's anything new, and saying what it is.
     pub fn import_overlay(&mut self, mount: &Mount) -> Result<Link> {
@@ -258,7 +333,11 @@ impl Catalog {
     /// halfway through being written. Otherwise none.
     pub fn import_overlay_if(&mut self, mount: &Mount, still: &dyn Fn() -> bool) -> Result<Option<Link>> {
         let marks = self.overlay_marks(&mount.anchor)?;
-        let root = self.anchor_value(&mount.anchor)?;
+        let now = self.anchor_value(&mount.anchor)?;
+        // It's over what it was last in step with, whatever's been set
+        // elsewhere since: what's changed is measured from there
+        let base = self.overlay_base(&mount.anchor)?;
+        let root = base.as_ref().map(|(value, _)| value.clone());
         let importer = mount.importer();
         let built = self.overlay_node(&importer, mount, Path::new(""), root.clone().map(|cid| (cid, None)), &marks)?;
         let value: Link = match built {
@@ -269,9 +348,21 @@ impl Catalog {
         if !still() {
             return Ok(None);
         }
-        if root.as_ref() != Some(&value) {
-            self.set_anchor(&mount.anchor, &value)?;
+        // Nothing's changed here, or only to what it's since become
+        if root.as_ref() == Some(&value) {
+            return Ok(Some(now.unwrap_or(value)));
         }
+        if now.as_ref() == Some(&value) {
+            self.overlay_in_step(&mount.anchor)?;
+            return Ok(Some(value));
+        }
+        // In place of what it's over: if that's what the anchor is, of that;
+        // if not, a fork of what's been set since, which merging resolves
+        let set = match base {
+            Some((was, sets)) if now.as_ref() != Some(&was) => self.set_anchor_after(&mount.anchor, &value, sets)?,
+            _ => self.set_anchor(&mount.anchor, &value)?,
+        };
+        self.set_overlay_base(&mount.anchor, &value, std::slice::from_ref(&set))?;
         Ok(Some(value))
     }
 

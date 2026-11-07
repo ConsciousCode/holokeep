@@ -1676,6 +1676,255 @@ mod tests {
         assert_eq!((&data[2_500_000..2_500_004], data[0]), (&b"KEPT"[..], 3));
     }
 
+    /// Another device's set of an anchor, in place of what it is now, making
+    /// these changes to it: (name, contents, or none to remove).
+    fn set_elsewhere(scratch: &Scratch, repo: &Path, anchor: &Link, changes: &[(&str, Option<&[u8]>)]) -> Link {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut catalog = Catalog::open_repo(repo).expect("catalog");
+        let (head, _, at) = catalog.anchor_heads(anchor).expect("heads").pop().expect("head");
+        let at = at.saturating_add(100);
+        let base = catalog.anchor_value(anchor).expect("value").expect("value");
+        let t = scratch.path().join(format!("elsewhere-{}", N.fetch_add(1, Ordering::Relaxed)));
+        crate::export::get(&catalog, &base, &t).expect("get");
+        for (name, data) in changes {
+            match data {
+                Some(data) => std::fs::write(t.join(name), data).expect("write"),
+                None => std::fs::remove_file(t.join(name)).expect("remove"),
+            }
+        }
+        let importer = Importer { hidden: true, ..Importer::default() };
+        let value = AnyCid::V1(importer.add_path(&t, &mut catalog, &mut |_, _| {}).expect("import").expect("root").cid);
+        let set = crate::claim::Set::new([anchor.clone()], value, at).expect("set").after(Some(vec![head]));
+        catalog.put_claim(&crate::claim::Claim::Set(set)).expect("put")
+    }
+
+    /// What's been set elsewhere is what's written to, as soon as it shows,
+    /// though nothing's looked since: an edit of what's seen isn't a conflict.
+    #[test]
+    fn an_edit_is_of_what_was_seen_not_what_was_committed_here() {
+        let scratch = Scratch::new("mount-elsewhere-seen");
+        let (soup, anchor, repo) = writable(&scratch);
+        save(&soup, &anchor, "page", b"first");
+        set_elsewhere(&scratch, &repo, &anchor, &[("page", Some(b"second"))]);
+        // No commit's been through to notice
+        let path = format!("anchors/{anchor}/page");
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let (_, fh) = soup.create(dir, OsStr::new("page")).expect("create");
+        soup.write(fh, 0, b"third").expect("write");
+        soup.release(fh);
+        soup.commit();
+        assert_eq!(read(&soup, &path), b"third");
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        assert_eq!(catalog.anchor_heads(&anchor).expect("heads").len(), 1, "not a fork");
+        assert!(!names(&soup, &format!("anchors/{anchor}")).iter().any(|name| name.contains("conflict")));
+    }
+
+    /// Written here but not committed when another device's set arrives, on
+    /// another file: both are kept, as a fork that merges.
+    #[test]
+    fn whats_being_written_merges_with_a_change_from_elsewhere() {
+        let scratch = Scratch::new("mount-elsewhere-dirty");
+        let (soup, anchor, repo) = writable(&scratch);
+        save(&soup, &anchor, "mine", b"before");
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let (_, fh) = soup.create(dir, OsStr::new("new here")).expect("create");
+        soup.write(fh, 0, b"written here").expect("write");
+        soup.release(fh);
+        set_elsewhere(&scratch, &repo, &anchor, &[("theirs", Some(b"written there"))]);
+        soup.commit();
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/new here")), b"written here");
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/theirs")), b"written there");
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/mine")), b"before");
+        // And what's merged is what it is everywhere
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let value = catalog.anchor_value(&anchor).expect("value").expect("value");
+        assert_eq!(read(&soup, &format!("cid/{value}/new here")), b"written here");
+        assert_eq!(read(&soup, &format!("cid/{value}/theirs")), b"written there");
+    }
+
+    /// The same file changed on both sides is a conflict, with neither lost.
+    #[test]
+    fn whats_being_written_conflicts_with_the_same_file_changed_elsewhere() {
+        let scratch = Scratch::new("mount-elsewhere-conflict");
+        let (soup, anchor, repo) = writable(&scratch);
+        save(&soup, &anchor, "page", b"to start");
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let (_, fh) = soup.create(dir, OsStr::new("page")).expect("create");
+        soup.write(fh, 0, b"mine").expect("write");
+        soup.release(fh);
+        set_elsewhere(&scratch, &repo, &anchor, &[("page", Some(b"theirs"))]);
+        soup.commit();
+        let names_now = names(&soup, &format!("anchors/{anchor}"));
+        let conflict = names_now.iter().find(|name| name.contains("conflict")).expect("a conflict").clone();
+        let both = [read(&soup, &format!("anchors/{anchor}/page")), read(&soup, &format!("anchors/{anchor}/{conflict}"))];
+        assert!(both.contains(&b"mine".to_vec()) && both.contains(&b"theirs".to_vec()), "{both:?}");
+    }
+
+    /// A file open to write stays what it is till it's closed, then settles.
+    #[test]
+    fn a_file_open_to_write_isnt_let_go_of_under_it() {
+        let scratch = Scratch::new("mount-elsewhere-open");
+        let (soup, anchor, repo) = writable(&scratch);
+        save(&soup, &anchor, "page", b"to start");
+        let file = ino(&soup, &format!("anchors/{anchor}/page")).expect("page").ino.0;
+        let fh = soup.open(file, true, false).expect("open");
+        set_elsewhere(&scratch, &repo, &anchor, &[("theirs", Some(b"written there"))]);
+        soup.commit();
+        soup.write(fh, 0, b"STILL").expect("write");
+        soup.fsync(fh, false).expect("sync");
+        assert_eq!(soup.read_handle(fh, 0, 100).expect("handle").expect("read"), b"STILLart");
+        soup.release(fh);
+        soup.commit();
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/page")), b"STILLart", "it wasn't lost");
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/theirs")), b"written there");
+    }
+
+    /// Whatever's let go of, every version's still whole, and the work
+    /// directory's gone from what it shadowed.
+    #[test]
+    fn letting_go_of_a_work_directory_keeps_every_version_whole() {
+        let scratch = Scratch::new("mount-elsewhere-history");
+        let (soup, anchor, repo) = writable(&scratch);
+        save(&soup, &anchor, "page", b"first");
+        save(&soup, &anchor, "page", b"second");
+        let work = work_path(&repo.join("work"), &anchor, Path::new("page"));
+        assert!(work.exists());
+        set_elsewhere(&scratch, &repo, &anchor, &[("page", Some(b"third"))]);
+        soup.commit();
+        assert!(!work.exists(), "it's only what the anchor says now");
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let history = catalog.anchor_history(&anchor).expect("history");
+        assert_eq!(history.len(), 4);
+        let mut seen = Vec::new();
+        for (n, (_, value)) in history.iter().enumerate() {
+            let out = scratch.path().join(format!("version-{n}"));
+            crate::export::get(&catalog, value, &out).unwrap_or_else(|e| panic!("version {n}: {e}"));
+            seen.push(std::fs::read(out.join("page")).ok());
+        }
+        assert_eq!(seen, [None, Some(b"first".to_vec()), Some(b"second".to_vec()), Some(b"third".to_vec())]);
+    }
+
+    /// An overlay from before they said what they're over is taken to be over
+    /// what this device last said, which is what it committed.
+    #[test]
+    fn an_overlay_from_before_bases_catches_up() {
+        let scratch = Scratch::new("mount-elsewhere-legacy");
+        let (soup, anchor, repo) = writable(&scratch);
+        save(&soup, &anchor, "page", b"mine");
+        // Another device of the user's sets it, as this hasn't
+        let mut catalog = Catalog::open_repo(&repo).expect("catalog");
+        let root = catalog.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+        let other = crate::keys::Key::generate().expect("key");
+        catalog.certify(&root, &other.id()).expect("certify");
+        let (head, _, at) = catalog.anchor_heads(&anchor).expect("heads").pop().expect("head");
+        let t = scratch.path().join("theirs");
+        crate::export::get(&catalog, &catalog.anchor_value(&anchor).expect("value").expect("value"), &t).expect("get");
+        std::fs::write(t.join("page"), b"theirs").expect("write");
+        let importer = Importer { hidden: true, ..Importer::default() };
+        let value = AnyCid::V1(importer.add_path(&t, &mut catalog, &mut |_, _| {}).expect("import").expect("root").cid);
+        let set = crate::claim::Claim::Set(crate::claim::Set::new([anchor.clone()], value, at + 100).expect("set").after(Some(vec![head])));
+        catalog.put_block(&set.block(), CidVersion::V1).expect("put");
+        let sign = crate::claim::Claim::Sign(crate::claim::Sign::new(&other, [set.cid()], None, at + 100).expect("sign"));
+        catalog.put_block(&sign.block(), CidVersion::V1).expect("put");
+        drop(catalog);
+        rusqlite::Connection::open(repo.join("blocks.db")).expect("db").execute("DELETE FROM overlay_bases", []).expect("forget");
+        // As when it's next mounted
+        drop(soup);
+        let opened = repo.clone();
+        let again = Soup::new(Box::new(move || Catalog::open_repo(&opened)), None).writable(repo.join("work"));
+        again.committer.recover();
+        assert_eq!(read(&again, &format!("anchors/{anchor}/page")), b"theirs");
+    }
+
+    /// An anchor that's a file settles too.
+    #[test]
+    fn a_file_anchor_set_elsewhere_shows() {
+        let scratch = Scratch::new("mount-elsewhere-file");
+        let repo = scratch.path().join("repo");
+        std::fs::write(scratch.path().join("abc.txt"), "before").expect("write");
+        let mut catalog = Catalog::open_repo(&repo).expect("catalog");
+        let first: Link = AnyCid::V1(Importer::default().add_path(&scratch.path().join("abc.txt"), &mut catalog, &mut |_, _| {}).expect("import").expect("root").cid);
+        let anchor = catalog.new_anchor().expect("anchor");
+        catalog.set_anchor(&anchor, &first).expect("set");
+        drop(catalog);
+        let opened = repo.clone();
+        let soup = Soup::new(Box::new(move || Catalog::open_repo(&opened)), None).writable(repo.join("work"));
+        let file = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let fh = soup.open(file, true, true).expect("open");
+        soup.write(fh, 0, b"mine").expect("write");
+        soup.release(fh);
+        soup.commit();
+        std::fs::write(scratch.path().join("abc.txt"), "theirs").expect("write");
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let mut sink = Catalog::open_repo(&repo).expect("catalog");
+        let theirs: Link = AnyCid::V1(Importer::default().add_path(&scratch.path().join("abc.txt"), &mut sink, &mut |_, _| {}).expect("import").expect("root").cid);
+        catalog.set_anchor(&anchor, &theirs).expect("set");
+        soup.commit();
+        assert_eq!(soup.read(file, 0, 100).expect("read"), b"theirs");
+    }
+
+    /// Write a file through the mount and commit it.
+    fn save(soup: &Soup, anchor: &Link, name: &str, data: &[u8]) {
+        let dir = ino(soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let (_, fh) = soup.create(dir, OsStr::new(name)).expect("create");
+        soup.write(fh, 0, data).expect("write");
+        soup.release(fh);
+        soup.commit();
+    }
+
+    /// What another device sets isn't hidden by, or lost to, what this one
+    /// committed before: there's no fork, so nothing to merge.
+    #[test]
+    fn a_change_from_elsewhere_shows_and_isnt_undone() {
+        let scratch = Scratch::new("mount-elsewhere-edit");
+        let (soup, anchor, repo) = writable(&scratch);
+        save(&soup, &anchor, "page", b"mine");
+        save(&soup, &anchor, "gone", b"going");
+        set_elsewhere(&scratch, &repo, &anchor, &[("page", Some(b"theirs")), ("gone", None)]);
+        soup.commit();
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/page")), b"theirs", "what it is");
+        assert!(ino(&soup, &format!("anchors/{anchor}/gone")).is_err(), "and what it isn't");
+
+        save(&soup, &anchor, "other", b"another file");
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/page")), b"theirs", "not undone by writing something else");
+        assert!(ino(&soup, &format!("anchors/{anchor}/gone")).is_err(), "nor brought back");
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let value = catalog.anchor_value(&anchor).expect("value").expect("value");
+        assert_eq!(names(&soup, &format!("cid/{value}")), ["a", "big", "dir", "other", "page"]);
+    }
+
+    /// Forked, the mount shows the merge like everywhere else, and settling
+    /// it loses neither side.
+    #[test]
+    fn a_merge_shows_over_what_was_committed_here() {
+        let scratch = Scratch::new("mount-elsewhere-merge");
+        let (soup, anchor, repo) = writable(&scratch);
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let (start, _, at) = catalog.anchor_heads(&anchor).expect("heads").pop().expect("head");
+        let base = catalog.anchor_value(&anchor).expect("value").expect("value");
+        drop(catalog);
+        save(&soup, &anchor, "page", b"mine");
+        let mut catalog = Catalog::open_repo(&repo).expect("catalog");
+        let t = scratch.path().join("theirs");
+        crate::export::get(&catalog, &base, &t).expect("get");
+        std::fs::write(t.join("page"), b"theirs").expect("write");
+        let importer = Importer { hidden: true, ..Importer::default() };
+        let value = AnyCid::V1(importer.add_path(&t, &mut catalog, &mut |_, _| {}).expect("import").expect("root").cid);
+        let set = crate::claim::Set::new([anchor.clone()], value, at + 100).expect("set").after(Some(vec![start]));
+        catalog.put_claim(&crate::claim::Claim::Set(set)).expect("put");
+        let merged = catalog.anchor_value(&anchor).expect("value").expect("value");
+        drop(catalog);
+        soup.commit();
+        let names_now = names(&soup, &format!("anchors/{anchor}"));
+        assert_eq!(names_now, names(&soup, &format!("cid/{merged}")), "the merge");
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/page")), read(&soup, &format!("cid/{merged}/page")), "and what it says");
+
+        save(&soup, &anchor, "other", b"settled");
+        let conflict = names_now.iter().find(|name| name.contains("conflict")).expect("a conflict").clone();
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/page")), b"theirs");
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/{conflict}")), b"mine");
+    }
+
     /// A file opened to read goes on reading what it was, whatever's saved
     /// over it, before and after anything of it's in the work directory.
     #[test]

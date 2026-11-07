@@ -707,6 +707,43 @@ fn what_others_sign_or_was_retracted_is_no_cost_of_revoking() {
     assert!(said.iter().all(|claim| !claim.alone));
 }
 
+/// Two devices settling a merge the same way and going on from it have no one
+/// set in common that says what they had: that's the merge, worked out again,
+/// or what one left alone looks changed, and undoes what the other did.
+#[test]
+fn going_on_from_a_merge_measures_from_the_merge() {
+    let scratch = Scratch::new("merge-criss-cross");
+    let mut repo = Catalog::open_repo(&scratch.path().join("repo")).expect("catalog");
+    let anchor = repo.new_anchor().expect("anchor");
+    let set = |files: &[(&str, &str)], at: u64, prev: Vec<Link>, repo: &mut Catalog| -> (Link, Link) {
+        let value = tree(repo, &scratch, files);
+        let claim = crate::claim::Set::new([anchor.clone()], value.clone(), at).expect("set").after(Some(prev));
+        (repo.put_claim(&Claim::Set(claim)).expect("put"), value)
+    };
+    let (start, _) = set(&[("turns", "first")], 1, Vec::new(), &mut repo);
+    // One edits it, then the other, not having seen that, adds something: so
+    // the latest they have in common, by itself, is from before the edit
+    let (edited, _) = set(&[("turns", "second")], 2, vec![start.clone()], &mut repo);
+    let (added, _) = set(&[("turns", "first"), ("other", "other")], 3, vec![start], &mut repo);
+    let merge = repo.anchor_value(&anchor).expect("value").expect("merged");
+    assert_eq!(repo.anchor_heads(&anchor).expect("heads").len(), 2);
+    let read = |name: &str, value: &Link, repo: &Catalog| -> Option<Vec<u8>> {
+        let out = scratch.path().join("out");
+        let _ = std::fs::remove_dir_all(&out);
+        crate::export::get(repo, value, &out).expect("get");
+        std::fs::read(out.join(name)).ok()
+    };
+    assert_eq!(read("turns", &merge, &repo), Some(b"second".to_vec()), "what changed on one side");
+
+    // Each goes on from the merge: one removes the file, the other changes
+    // something else
+    let (_, _) = set(&[("other", "other")], 4, vec![edited.clone(), added.clone()], &mut repo);
+    let (_, _) = set(&[("turns", "second"), ("other", "more")], 5, vec![edited, added], &mut repo);
+    let settled = repo.anchor_value(&anchor).expect("value").expect("merged");
+    assert_eq!(read("turns", &settled, &repo), None, "the removal stands: the other side left it as it was");
+    assert_eq!(read("other", &settled, &repo), Some(b"more".to_vec()));
+}
+
 /// A batch that breathes commits as it goes, between files, ending whole.
 #[test]
 fn a_big_import_lets_others_write_as_it_goes() {

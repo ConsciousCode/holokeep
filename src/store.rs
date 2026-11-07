@@ -1156,6 +1156,15 @@ impl Catalog {
                  tsize INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (anchor, path)
              ) WITHOUT ROWID;
+             -- What an overlay's work directory and marks were last in step
+             -- with: a value of its anchor, and the sets that said so, a
+             -- space between their CIDs. What's committed replaces those, so
+             -- what's since been set elsewhere isn't written over.
+             CREATE TABLE IF NOT EXISTS overlay_bases (
+                 anchor BLOB PRIMARY KEY,
+                 value BLOB NOT NULL,
+                 sets TEXT NOT NULL
+             ) WITHOUT ROWID;
              -- Files of overlays being copied from what the anchor had as
              -- they're read and written, rather than all at once: the block
              -- each is from, how much of it's wanted, and which of its
@@ -2802,6 +2811,12 @@ impl Catalog {
     pub fn set_anchor(&self, anchor: &Link, value: &Link) -> Result<Link> {
         let heads = self.claims.as_ref().ok_or(Error::NoClaims)?.heads(anchor.multihash())?;
         self.put_set(anchor, value, heads.into_iter().map(|(set, _, _)| set).collect())
+    }
+
+    /// Say an anchor is `value`, in place of these of its sets alone: a fork
+    /// of any others, merged with them.
+    pub fn set_anchor_after(&self, anchor: &Link, value: &Link, prev: Vec<Link>) -> Result<Link> {
+        self.put_set(anchor, value, prev)
     }
 
     /// Say an anchor is `value` too, beside whatever it is, replacing
