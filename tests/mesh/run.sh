@@ -163,6 +163,45 @@ scenario_lost() {
     [ "$(on one hk cat "$cid")" = "only here" ] || fail "it isn't what it was"
 }
 
+# A member that's gone for good stays gone from here, though others say it's
+# there, and history's kept till it's forgotten, leaving what the anchor is
+scenario_forget() {
+    machine ghost
+    invite one ghost
+    local ghost
+    ghost=$(on one hk node peers | grep -- "	-	" | cut -f1 | head -1)
+    [ -n "$ghost" ] || fail "no member away"
+    # Members tell each other of members as they connect
+    reconnect_two() {
+        cut_off two
+        wait_for "two to be gone" sh_on one "hk node peers | grep -v $ghost | grep -q -- '	-	'"
+        put_back two
+        wait_for "two to be back" sh_on one "! hk node peers | grep -v $ghost | grep -q -- '	-	'"
+    }
+    reconnect_two
+    wait_for "two to hear of the ghost" sh_on two "hk node peers | grep -q $ghost"
+    on one hk node forget "$ghost"
+    ! on one hk node peers | grep -q "$ghost" || fail "still a member"
+    reconnect_two
+    sleep 2
+    ! on one hk node peers | grep -q "$ghost" || fail "two brought it back"
+
+    local anchor first second now
+    anchor=$(on one hk anchor new)
+    first=$(sh_on one 'echo first | hk add -q -')
+    second=$(sh_on one 'echo second | hk add -q -')
+    on one hk anchor set "$anchor" "$first" >/dev/null
+    sleep 2
+    now=$(sh_on one 'date +%s')
+    sleep 2
+    on one hk anchor set "$anchor" "$second" >/dev/null
+    [ "$(on one hk anchor forget "$anchor" --before "$now" --dry-run | cut -f2)" = "$first" ] || fail "it'd forget something else"
+    [ "$(on one hk anchor show "$anchor" | tail -n +2 | wc -l)" = 2 ] || fail "a dry run forgot"
+    on one hk anchor forget "$anchor" --before "$now" >/dev/null
+    [ "$(on one hk anchor show "$anchor" | head -1)" = "$second" ] || fail "forgetting changed what it is"
+    [ "$(on one hk anchor show "$anchor" | tail -n +2 | wc -l)" = 1 ] || fail "it still has its history"
+}
+
 # Cut off, both sides change the same anchor; put back, both merge it the
 # same, conflicts side by side
 scenario_fork_merge() {
@@ -196,7 +235,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read late_joiner fork_merge lost)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read late_joiner fork_merge lost forget)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

@@ -205,6 +205,25 @@ async fn what_one_reports_lost_another_makes_good() {
     assert!(b.catalog().lost_blocks().expect("list").is_empty());
 }
 
+/// A member forgotten stays forgotten, whoever says it's a member, and one
+/// that's there can't be.
+#[tokio::test]
+async fn a_member_forgotten_stays_so_till_its_invited() {
+    let (mut a, b, _) = Box::pin(holding()).await;
+    let ghost = PeerId::random();
+    a.members().add(&ghost).expect("add");
+    b.members().add(&ghost).expect("add");
+    assert!(a.forget_member(&b.peer_id()).is_err(), "it's connected");
+    assert!(a.forget_member(&PeerId::random()).is_err(), "not a member");
+    a.forget_member(&ghost).expect("forget");
+    assert!(!a.members().contains(&ghost).expect("contains"));
+    let theirs = b.members().list().expect("list");
+    assert!(!a.members().merge(&theirs).expect("merge").contains(&ghost));
+    assert!(!a.members().contains(&ghost).expect("contains"), "not taken back");
+    assert!(a.members().add(&ghost).expect("add"), "invited, it's let back in");
+    assert!(a.members().contains(&ghost).expect("contains"));
+}
+
 /// A node's scan asks its members first, and only reports with all of them
 /// there to ask.
 #[tokio::test]
@@ -952,9 +971,15 @@ async fn what_a_kept_root_mounts_stays_till_its_mount_point_goes() {
     condemn(&mut [&mut a, &mut b]).await;
     assert!(has(&a, &inside) && has(&a, &top_block), "kept through the root and its mount point");
 
-    // Once the root names nothing, the mount point goes, and what it mounted after it
+    // The root naming nothing now, it did: that's history
     let empty = raw(b"");
     a.catalog().set_anchor(&root, &link(&empty)).expect("set");
+    condemn(&mut [&mut a, &mut b]).await;
+    assert!(has(&a, &top_block) && has(&a, &inside), "what the root named, and what that mounted");
+
+    // Forgotten, the mount point goes, and what it mounted after it
+    let versions = a.catalog().versions_before(&root, u64::MAX).expect("versions");
+    a.catalog().forget_versions(&root, &versions).expect("forget");
     condemn(&mut [&mut a, &mut b]).await;
     assert!(!has(&a, &top_block), "what the root named");
     assert!(!has(&a, &inside), "and what that mounted, in the same cascade");

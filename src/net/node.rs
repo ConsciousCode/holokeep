@@ -401,6 +401,21 @@ impl Node {
         self.audit_of_keys(copies, keys).map(Some)
     }
 
+    /// No longer take a peer for a member, as one that won't be back: it
+    /// holds up nothing now, and isn't believed to hold anything. One that's
+    /// connected is plainly there.
+    pub fn forget_member(&mut self, peer: &PeerId) -> Result<()> {
+        if self.connected().contains(peer) {
+            return Err(Error::Invalid(format!("{peer} is connected")));
+        }
+        if !self.members.forget(peer)? {
+            return Err(Error::Invalid(format!("{peer} isn't a member")));
+        }
+        self.sightings.forget_peer(peer)?;
+        self.swarm.behaviour_mut().allowed.disallow_peer(*peer);
+        Ok(())
+    }
+
     /// Look for what's gone without being let go of, and report what no
     /// member has, once they've been asked: see `Catalog::lost_candidates`.
     /// With a member away, it could be with them, so this waits for next time.

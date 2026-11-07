@@ -229,6 +229,12 @@ impl Sightings {
         Ok(())
     }
 
+    /// Forget every copy a peer was believed to have: it's no member now.
+    pub fn forget_peer(&self, peer: &PeerId) -> Result<()> {
+        self.db.conn().prepare_cached("DELETE FROM sightings WHERE peer = ?1")?.execute([peer.to_string()])?;
+        Ok(())
+    }
+
     /// Forget a peer's copies of a block: it says it holds none.
     pub fn unsee(&self, key: Key<'_>, peer: &PeerId) -> Result<()> {
         let Some(block) = self.db.lookup(key)? else {

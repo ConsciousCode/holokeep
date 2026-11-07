@@ -196,7 +196,14 @@ pub struct Members {
 impl Members {
     pub fn open(db: Db, mesh: &str) -> Result<Self> {
         db.conn().execute_batch(
-            "-- The peers this node lets into each mesh it's in.
+            "-- Peers no longer members of a mesh, which others may still
+             -- say are.
+             CREATE TABLE IF NOT EXISTS mesh_forgotten (
+                 mesh TEXT NOT NULL,
+                 peer TEXT NOT NULL,
+                 PRIMARY KEY (mesh, peer)
+             ) WITHOUT ROWID;
+             -- The peers this node lets into each mesh it's in.
              CREATE TABLE IF NOT EXISTS mesh_members (
                  mesh TEXT NOT NULL,
                  peer TEXT NOT NULL,
@@ -290,8 +297,10 @@ impl Members {
         Ok(peers.iter().filter_map(|peer| PeerId::from_str(peer).ok()).collect())
     }
 
-    /// Let a peer in. Returns whether it's new.
+    /// Let a peer in, as asked to, whatever's been forgotten. Returns whether
+    /// it's new.
     pub fn add(&self, peer: &PeerId) -> Result<bool> {
+        self.db.conn().prepare_cached("DELETE FROM mesh_forgotten WHERE mesh = ?1 AND peer = ?2")?.execute([&self.mesh, &peer.to_string()])?;
         Ok(self.db.conn()
             .prepare_cached("INSERT OR IGNORE INTO mesh_members (mesh, peer) VALUES (?1, ?2)")?
             .execute([&self.mesh, &peer.to_string()])? > 0)
@@ -333,10 +342,31 @@ impl Members {
         Ok(members)
     }
 
-    /// Take in members another member knows of. Returns those new here.
+    /// No longer let a peer in, or count it as a member, nor take it for one
+    /// when others say it is, until it's invited again. Returns whether it
+    /// was one.
+    pub fn forget(&self, peer: &PeerId) -> Result<bool> {
+        let conn = self.db.conn();
+        conn.prepare_cached("DELETE FROM mesh_member_addrs WHERE mesh = ?1 AND peer = ?2")?.execute([&self.mesh, &peer.to_string()])?;
+        let was = conn.prepare_cached("DELETE FROM mesh_members WHERE mesh = ?1 AND peer = ?2")?.execute([&self.mesh, &peer.to_string()])? > 0;
+        conn.prepare_cached("INSERT OR IGNORE INTO mesh_forgotten (mesh, peer) VALUES (?1, ?2)")?.execute([&self.mesh, &peer.to_string()])?;
+        Ok(was)
+    }
+
+    fn forgotten(&self, peer: &PeerId) -> Result<bool> {
+        Ok(self.db.conn()
+            .prepare_cached("SELECT 1 FROM mesh_forgotten WHERE mesh = ?1 AND peer = ?2")?
+            .exists([&self.mesh, &peer.to_string()])?)
+    }
+
+    /// Take in members another member knows of, but those forgotten here.
+    /// Returns those new here.
     pub fn merge(&self, other: &BTreeMap<PeerId, Vec<Multiaddr>>) -> Result<Vec<PeerId>> {
         let mut new = Vec::new();
         for (peer, addrs) in other {
+            if self.forgotten(peer)? {
+                continue;
+            }
             if self.add(peer)? {
                 new.push(*peer);
             }

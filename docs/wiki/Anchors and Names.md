@@ -13,8 +13,10 @@ an anchor from the CID alone. Its value is what its **heads** say (see
 every earlier set is its history. `hk anchor new`,
 `hk anchor set <anchor> <cid>`, `hk anchor show <anchor>`.
 
-A `keep` of an anchor keeps its current value; what a set replaces is
-collected after the grace period unless something else keeps it.
+A `keep` of an anchor keeps everything it's been, until that's forgotten
+(`hk anchor forget`; see [[Replication and Retention#Garbage collection]]),
+though what it was needn't all be here: only what it is now is fetched
+to keep it.
 
 Anchors carry everything mutable:
 

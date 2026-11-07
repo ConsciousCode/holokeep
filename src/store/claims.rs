@@ -101,7 +101,7 @@ const AUTHORIZED: &str = "
 /// now: they're only made again if not, since that's a write, and makes
 /// every connection prepare what it had again.
 fn views_current(db: &Db, views: &str) -> Result<bool> {
-    for name in ["tags", "anchor_values", "anchor_values_any"] {
+    for name in ["tags", "anchor_values", "anchor_values_any", "anchor_history", "anchor_history_any"] {
         let start = format!("CREATE VIEW {name} ");
         let wanted = views.find(&start).and_then(|at| views.get(at..)).and_then(|rest| rest.split(';').next());
         let kept: Option<String> = db.conn().query_row("SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?1", [name], |row| row.get(0)).optional()?;
@@ -159,6 +159,8 @@ fn views() -> String {
         "DROP VIEW IF EXISTS tags;
          DROP VIEW IF EXISTS anchor_values;
          DROP VIEW IF EXISTS anchor_values_any;
+         DROP VIEW IF EXISTS anchor_history;
+         DROP VIEW IF EXISTS anchor_history_any;
          -- Every block's tags that count for the acting user. A simple
          -- tag's name is its identity digest, after the multihash's code
          -- and length varint (one byte, or two from 128).
@@ -173,7 +175,17 @@ fn views() -> String {
              JOIN multihashes i ON i.id = g.into_
              WHERE {LIVE};
          {acting}
-         {any}",
+         {any}
+         -- Everything an anchor's been: what's referenced, as it's the
+         -- anchor's history, till the sets saying so are tombed.
+         CREATE VIEW anchor_history (anchor, value) AS
+             SELECT t.target, s.value FROM set_claims s
+             JOIN claims c ON c.id = s.id JOIN claim_targets t ON t.claim = c.id
+             WHERE {LIVE};
+         CREATE VIEW anchor_history_any (anchor, value) AS
+             SELECT t.target, s.value FROM set_claims s
+             JOIN claims c ON c.id = s.id JOIN claim_targets t ON t.claim = c.id
+             WHERE {LIVE_ANY};",
         acting = anchor_values("anchor_values", LIVE),
         any = anchor_values("anchor_values_any", LIVE_ANY),
     )

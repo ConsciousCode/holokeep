@@ -1792,7 +1792,8 @@ impl Catalog {
     }
 
     /// Whether anything here references a block: structure linking to it,
-    /// a keep that counts, or a kept anchor being it now. Tags don't keep what they tag, and a tomb's
+    /// a keep that counts, or a kept anchor being it or having been, till
+    /// that's forgotten. Tags don't keep what they tag, and a tomb's
     /// link to what it retracts is the opposite of a reference.
     pub fn referenced(&self, key: Key<'_>) -> Result<bool> {
         let Some(id) = self.db.lookup(key)? else {
@@ -1810,13 +1811,13 @@ impl Catalog {
                 "SELECT 1 FROM claim_targets t JOIN claims c ON c.id = t.claim WHERE t.target = ?1 AND c.kind = 'keep' AND {}",
                 claims::LIVE_ANY,
             ));
-            // What a kept anchor is now; what it was isn't referenced
+            // What a kept anchor is and was: see `Self::forget_versions`
             sources.push(format!(
-                "SELECT 1 FROM anchor_values_any a JOIN claim_targets t ON t.target = a.anchor JOIN claims c ON c.id = t.claim
+                "SELECT 1 FROM anchor_history_any a JOIN claim_targets t ON t.target = a.anchor JOIN claims c ON c.id = t.claim
                  WHERE a.value = ?1 AND c.kind = 'keep' AND {}",
                 claims::LIVE_ANY,
             ));
-            // What a linked anchor is now: a block here linking to the
+            // What a linked anchor is and was: a block here linking to the
             // anchor, as an IPLD link or a mount point, references it.
             // Claims don't: a set links to its own anchor
             for table in ["refs", "unixfs_links", "ipld_links"] {
@@ -1827,7 +1828,7 @@ impl Catalog {
                 };
                 if table == "refs" || conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?.exists([table])? {
                     sources.push(format!(
-                        "SELECT 1 FROM anchor_values_any a JOIN {table} l ON l.{target} = a.anchor
+                        "SELECT 1 FROM anchor_history_any a JOIN {table} l ON l.{target} = a.anchor
                          WHERE a.value = ?1 AND EXISTS (SELECT 1 FROM blocks b WHERE b.block = l.{source})"
                     ));
                 }
@@ -2378,16 +2379,16 @@ impl Catalog {
 
     /// Whether a keep that counts for anyone reaches a block, by its
     /// backrefs: the block, or anything linking to it however indirectly,
-    /// is a keep's target; an anchor links to what it is now. Without
+    /// is a keep's target; an anchor links to what it is and was. Without
     /// claims to keep, everything is kept.
     pub fn kept_under(&self, key: Key<'_>) -> Result<bool> {
-        self.kept_under_by(key, claims::LIVE_ANY, "anchor_values_any")
+        self.kept_under_by(key, claims::LIVE_ANY, "anchor_history_any")
     }
 
     /// Whether a keep that counts for the acting account's user reaches a
     /// block: whether its mesh keeps it, as far as this node can say.
     pub fn kept_for_acting(&self, key: Key<'_>) -> Result<bool> {
-        self.kept_under_by(key, claims::LIVE, "anchor_values")
+        self.kept_under_by(key, claims::LIVE, "anchor_history")
     }
 
     /// How many failures it should take to lose a block, for the acting
@@ -2407,7 +2408,7 @@ impl Catalog {
                 "WITH RECURSIVE up (id) AS (
                      SELECT id FROM multihashes WHERE multihash = ?1
                      UNION SELECT l.source FROM links l JOIN up ON l.target = up.id WHERE NOT {kept}
-                     UNION SELECT a.anchor FROM anchor_values a JOIN up ON a.value = up.id WHERE NOT {kept}
+                     UNION SELECT a.anchor FROM anchor_history a JOIN up ON a.value = up.id WHERE NOT {kept}
                  )
                  SELECT max(coalesce(k.copies, ?2)) FROM up
                  JOIN claim_targets t ON t.target = up.id
@@ -2480,7 +2481,7 @@ impl Catalog {
                  WHERE m.multihash = ?1 AND h.uid != ?2 AND h.since >= ?3",
             )?
             .exists(params![key.to_bytes(), self.uid, held_since()])?;
-        Ok(held || self.kept_under_by(key, claims::LIVE_OTHERS, "anchor_values_any")?)
+        Ok(held || self.kept_under_by(key, claims::LIVE_OTHERS, "anchor_history_any")?)
     }
 
     /// What isn't here of the DAG under a root: each block linked to,
@@ -2789,6 +2790,44 @@ impl Catalog {
     /// Every set of an anchor that counts, as (at, value), oldest first.
     pub fn anchor_history(&self, anchor: &Link) -> Result<Vec<(u64, Link)>> {
         self.claims.as_ref().ok_or(Error::NoClaims)?.history(anchor.multihash())
+    }
+
+    /// The versions of an anchor to forget, to forget what it was before a
+    /// time: its sets from before then, by `at`, but for its heads, which are
+    /// what it is. With them, what they replaced, whenever a clock said that
+    /// was: a set stops replacing what it did once it's tombed, so what's
+    /// left behind would be taken for what the anchor is.
+    pub fn versions_before(&self, anchor: &Link, before: u64) -> Result<Vec<SetOf>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let sets = claims.sets(anchor.multihash())?;
+        let heads: std::collections::HashSet<Vec<u8>> = claims.heads(anchor.multihash())?.iter().map(|(set, ..)| set.to_bytes()).collect();
+        let by_cid: std::collections::HashMap<Vec<u8>, &SetOf> = sets.iter().map(|set| (set.0.to_bytes(), set)).collect();
+        let mut forgetting = std::collections::HashSet::new();
+        let mut pending: Vec<&SetOf> = sets.iter().filter(|set| set.2 < before && !heads.contains(&set.0.to_bytes())).collect();
+        while let Some(set) = pending.pop() {
+            if forgetting.insert(set.0.to_bytes()) {
+                pending.extend(set.3.iter().flatten().filter_map(|prev| by_cid.get(&prev.to_bytes()).copied()));
+            }
+        }
+        Ok(sets.iter().filter(|set| forgetting.contains(&set.0.to_bytes())).cloned().collect())
+    }
+
+    /// Forget versions of an anchor: tomb the sets which say it was them, so
+    /// what only they referenced is condemned, and collected in time. What
+    /// it is now isn't changed, or nothing's done. Returns the tomb.
+    pub fn forget_versions(&self, anchor: &Link, sets: &[SetOf]) -> Result<Option<Link>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let Some(tomb) = Tomb::new(sets.iter().map(|set| set.0.clone())) else {
+            return Ok(None);
+        };
+        self.db.atomically(|| {
+            let was = claims.heads(anchor.multihash())?;
+            let cid = self.put_claim(&Claim::Tomb(tomb))?;
+            if claims.heads(anchor.multihash())? != was {
+                return Err(Error::Invalid { store: "router", reason: format!("forgetting those would change what {anchor} is") });
+            }
+            Ok(Some(cid))
+        })
     }
 
     /// Stop keeping a block, tombing every keep of it. Returns the tombs'

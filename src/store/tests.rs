@@ -411,6 +411,70 @@ fn splits_cids() {
     }
 }
 
+/// What an anchor was stays referenced, and what's under it, till it's
+/// forgotten; and forgetting never changes what it is.
+#[test]
+fn history_is_kept_till_its_forgotten() {
+    let scratch = Scratch::new("history-kept");
+    let catalog = Catalog::open_repo(&scratch.path().join("repo")).expect("catalog");
+    let value = |data: &[u8]| -> (Block, Link) {
+        let block = raw(data);
+        catalog.put_block(&block, CidVersion::V1).expect("put");
+        let cid = block.cid().clone().into();
+        (block, cid)
+    };
+    let anchor = catalog.new_anchor().expect("anchor");
+    catalog.keep(&anchor).expect("keep");
+    let (old, older) = value(b"oldest");
+    let (_, middle) = value(b"middle");
+    let (_, now) = value(b"now");
+    let first = catalog.set_anchor(&anchor, &older).expect("set");
+    let second = catalog.set_anchor(&anchor, &middle).expect("set");
+    let third = catalog.set_anchor(&anchor, &now).expect("set");
+    assert!([&first, &second, &third].iter().all(|set| !set.to_bytes().is_empty()));
+    assert!(catalog.referenced(old.cid().multihash()).expect("referenced"), "what it was");
+    assert!(catalog.kept_under(old.cid().multihash()).expect("kept"));
+
+    let everything = u64::MAX;
+    let versions = catalog.versions_before(&anchor, everything).expect("versions");
+    assert_eq!(versions.len(), 2, "all but what it is");
+    assert_eq!(catalog.versions_before(&anchor, 0).expect("versions"), [], "nothing's before the start of time");
+    catalog.forget_versions(&anchor, &versions).expect("forget").expect("a tomb");
+    assert_eq!(catalog.anchor_value(&anchor).expect("value"), Some(now.clone()), "still what it is");
+    assert_eq!(catalog.anchor_history(&anchor).expect("history").len(), 1);
+    assert!(!catalog.referenced(old.cid().multihash()).expect("referenced"), "free to go");
+    assert!(catalog.referenced(now.multihash()).expect("referenced"));
+    assert_eq!(catalog.versions_before(&anchor, everything).expect("versions"), [], "nothing left to forget");
+    assert_eq!(catalog.forget_versions(&anchor, &[]).expect("forget"), None);
+}
+
+/// Forgetting takes what's replaced too, whatever its clock said, or that
+/// would be what the anchor is now.
+#[test]
+fn forgetting_a_version_takes_what_it_replaced() {
+    let scratch = Scratch::new("history-skewed");
+    let catalog = Catalog::open_repo(&scratch.path().join("repo")).expect("catalog");
+    let anchor = catalog.new_anchor().expect("anchor");
+    let at = |value: &Block, at: u64, prev: Vec<Link>| -> Link {
+        catalog.put_block(value, CidVersion::V1).expect("put");
+        let set = crate::claim::Set::new([anchor.clone()], value.cid().clone().into(), at).expect("set").after(Some(prev));
+        catalog.put_claim(&Claim::Set(set)).expect("put")
+    };
+    // By its clock, the first's after the second, which replaced it
+    let (first, second, third) = (raw(b"first"), raw(b"second"), raw(b"third"));
+    let a = at(&first, 500, Vec::new());
+    let b = at(&second, 100, vec![a]);
+    at(&third, 900, vec![b]);
+    let third_cid: Link = third.cid().clone().into();
+    assert_eq!(catalog.anchor_value(&anchor).expect("value"), Some(third_cid.clone()));
+
+    let versions = catalog.versions_before(&anchor, 200).expect("versions");
+    assert_eq!(versions.len(), 2, "the second, and what it replaced, which it says is later");
+    catalog.forget_versions(&anchor, &versions).expect("forget");
+    assert_eq!(catalog.anchor_value(&anchor).expect("value"), Some(third_cid));
+    assert_eq!(catalog.anchor_heads(&anchor).expect("heads").len(), 1);
+}
+
 /// Lost is only what's said of what isn't here: when it turns up, that's that.
 #[test]
 fn what_turns_up_is_not_lost() {
@@ -925,8 +989,8 @@ fn anchors_are_what_they_were_last_set_to() {
     // Set again within the second, it's still the latest
     let second = router.set_anchor(&anchor, &link(&v2)).expect("set");
     assert_eq!(router.anchor_value(&anchor).expect("value"), Some(link(&v2)));
-    assert!(!router.referenced(v1.cid().multihash()).expect("referenced"), "what it was isn't");
-    assert!(!router.kept_under(leaf1.cid().multihash()).expect("kept"));
+    assert!(router.referenced(v1.cid().multihash()).expect("referenced"), "nor what it was");
+    assert!(router.kept_under(leaf1.cid().multihash()).expect("kept"));
     assert!(router.kept_under(leaf2.cid().multihash()).expect("kept"));
     let history: Vec<Link> = router.anchor_history(&anchor).expect("history").into_iter().map(|(_, value)| value).collect();
     assert_eq!(history, [link(&v1), link(&v2)]);
@@ -1083,7 +1147,7 @@ fn files_imported_in_place_are_mounted_on_anchors() {
     assert_eq!(router.mounts().expect("mounts"), std::slice::from_ref(&mount));
     assert_eq!(router.anchor_value(&mount.anchor).expect("value"), Some(second.clone()));
     assert!(router.referenced(second.multihash()).expect("referenced"));
-    assert!(!router.referenced(first.multihash()).expect("referenced"), "what it was is collectable");
+    assert!(router.referenced(first.multihash()).expect("referenced"), "what it was, till that's forgotten");
     assert_eq!(router.mounts_over(&mount.path).expect("over"), std::slice::from_ref(&mount));
     assert!(router.mounts_over(scratch.path()).expect("over").is_empty(), "a parent isn't under it");
 }

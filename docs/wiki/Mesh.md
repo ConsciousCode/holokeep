@@ -124,3 +124,14 @@ collection (`condemn`) are described in
 [[Replication and Retention]].
 
 Source: `src/net/node.rs`, `src/net/mesh.rs`, `src/net/blocks.rs`, `src/net/structure.rs`, `src/net/daemon.rs`.
+
+## Forgetting members
+
+`hk node forget <peer>` is for a member that's gone for good, as a node's
+old key. A member away holds up [[Replication and Retention#Garbage collection|collection]]
+and [[Replication and Retention#Lost blocks|lost reports]], so this ends
+that: it's no longer let in, and copies it was believed to hold aren't
+counted. Others telling of it aren't heeded, in `mesh_forgotten`, so each
+node has to say so itself. It's refused while the peer's connected.
+Inviting it lets it back in. Its key can still sign, which `hk device
+revoke` stops.

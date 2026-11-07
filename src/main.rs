@@ -228,6 +228,11 @@ enum NodeCommand {
     /// Have the running node look for what's been lost now, rather than
     /// when it next would, and report what no member has. See `hk lost ls`
     ScanLost,
+    /// No longer take a peer for a member, as one that's gone for good: it
+    /// holds up nothing now, and members saying it is one aren't heeded, so
+    /// say so on each node. Inviting it lets it back in. To stop what its key
+    /// signs counting, `hk device revoke` too
+    Forget { peer: libp2p::PeerId },
     /// List the mesh's members, and which are connected
     Peers,
     /// How the running node is: connected members, blocks, and the
@@ -404,6 +409,19 @@ enum AnchorCommand {
     /// Print what an anchor is now, then every value it's had, oldest
     /// first, with when
     Show { anchor: Link },
+    /// Forget what an anchor was before a time, seconds since the epoch as
+    /// `show` prints it, printing what that lets go of. What only those
+    /// versions refer to is then collected in time, deleted files and
+    /// anchors nothing else names among them. History's kept until this says
+    Forget {
+        anchor: Link,
+        /// Forget the versions from before this
+        #[arg(long)]
+        before: u64,
+        /// Say which versions, and forget nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Print this account's root anchor, the top of `hk mount`, and what
     /// it is now
     Root,
@@ -1090,6 +1108,24 @@ fn may_join(dir: &Path, uid: u32, user: &Link) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "net")]
+/// List the members, and which the running node's connected to.
+fn peers(place: &holokeep::net::mesh::Place) -> anyhow::Result<()> {
+    use holokeep::net::daemon;
+    if let Some(lines) = daemon::ask(place, "peers")? {
+        for line in &lines {
+            out!("{line}");
+        }
+    } else {
+        eprintln!("this node isn't running; members it knows of:");
+        for (peer, addrs) in daemon::members(place)?.list()? {
+            let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
+            out!("{peer}\t-\t{}", addrs.join(" "));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "net")]
 fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Result<()> {
     use holokeep::net::{daemon, mesh};
     anyhow::ensure!(mesh::Place::valid(&place.mesh), "a mesh's name is letters, digits, - and _");
@@ -1161,6 +1197,7 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
                 report.condemned, report.pardoned, report.collected, report.freed,
             );
         },
+        NodeCommand::Forget { peer } => daemon::forget(place, &peer)?,
         NodeCommand::ScanLost => drop(daemon::ask(place, "scan-lost")?.context("this node isn't running: start `hk node run`")?),
         NodeCommand::Trim => {
             let report = daemon::trim(place)?.context("this node isn't running: start `hk node run`")?;
@@ -1179,17 +1216,7 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
                 eprintln!("{} blocks are still short, with no connected member to raise them", report.short);
             }
         },
-        NodeCommand::Peers => if let Some(lines) = daemon::ask(place, "peers")? {
-            for line in &lines {
-                out!("{line}");
-            }
-        } else {
-            eprintln!("this node isn't running; members it knows of:");
-            for (peer, addrs) in daemon::members(place)?.list()? {
-                let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
-                out!("{peer}\t-\t{}", addrs.join(" "));
-            }
-        },
+        NodeCommand::Peers => peers(place)?,
     }
     Ok(())
 }
@@ -1520,6 +1547,16 @@ fn anchor(dir: Option<&PathBuf>, mut repo: Catalog, command: AnchorCommand) -> a
             match repo.anchor_value(&root)? {
                 Some(value) => out!("{value}"),
                 None => out!("unset"),
+            }
+        },
+        AnchorCommand::Forget { anchor, before, dry_run } => {
+            anyhow::ensure!(holokeep::claim::is_anchor(&anchor), "{anchor} isn't an anchor");
+            let versions = repo.versions_before(&anchor, before)?;
+            if !dry_run && let Some(tomb) = repo.forget_versions(&anchor, &versions)? {
+                eprintln!("forgotten by {tomb}: what only they refer to goes once it's been condemned a week, with every member's say");
+            }
+            for (_, value, at, _) in versions {
+                out!("{at}\t{value}");
             }
         },
         AnchorCommand::Show { anchor } => {

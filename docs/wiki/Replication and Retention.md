@@ -116,17 +116,27 @@ A block is **condemned** when nothing here references it: no structure
 links to it and no counting [[Claims|keep]] reaches it. Tags don't keep things; a
 tomb's link is the opposite of a reference; claims are never collected.
 
-An anchor's current value is referenced while a keep targets the anchor,
-or while a block here links to the anchor: an IPLD link
+Everything an anchor has been is referenced, each value of a `set` that
+counts, while a keep targets the anchor, or while a block here links to
+the anchor: an IPLD link
 (`{"/": "bafyqag…"}` in dag-cbor, a PBLink) or a **mount point** (see
 [[Anchors and Names#Mount points]]), which is indexed as a link from its
 block to the anchor. Claims don't count, as a `set` links to its own
-anchor. What an anchor was before isn't referenced. A keep reaches
-through any of these links, and when the block linking goes, what the
-anchor is now is condemned in the same cascade. Each account's root anchor is kept by a keep of its
+anchor. A keep reaches through any of these links, and when the block
+linking goes, what the anchor is and was is condemned in the same
+cascade. So nothing's collected for being old: what goes is what's been
+explicitly let go of. Each account's root anchor is kept by a keep of its
 own (see [[Anchors and Names#The root anchor]]), so everything the root
-names, however deep, is kept, and an anchor nothing names any more is
-collected after the grace period, as a deleted file would be.
+names, however deep, is kept, and that includes what it's ever named.
+
+`hk anchor forget <anchor> --before <at>` lets go of the past: it tombs
+the sets from before then, in one tomb, signed, with whatever they
+replaced whatever their clocks say, since a set that's tombed stops
+replacing anything. What the anchor is now never changes: its heads stay,
+and if tombing would change them, nothing's done. `--dry-run` lists them.
+What only those versions referred to is then condemned as above, a deleted
+file or an anchor nothing else names among it, and goes a level at a time.
+The tomb goes to members as any does, and they do likewise with theirs.
 
 The node asks every member whether a keep of theirs reaches what's
 condemned (`condemn`). A member that keeps it pardons it, as does a

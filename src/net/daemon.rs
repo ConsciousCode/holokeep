@@ -322,6 +322,24 @@ pub fn trim(place: &Place) -> Result<Option<super::trim::Report>> {
     Err(Error::Invalid("the node hung up without saying what it trimmed".into()))
 }
 
+/// No longer take a peer for a member of this mesh, through the running
+/// daemon, if there is one, or else here.
+pub fn forget(place: &Place, peer: &libp2p::PeerId) -> Result<()> {
+    let Some(lines) = ask(place, &format!("forget {peer}"))? else {
+        let members = members(place)?;
+        if !members.forget(peer)? {
+            return Err(Error::Invalid(format!("{peer} isn't a member")));
+        }
+        return super::durability::Sightings::open(Db::open(&place.repo.join("blocks.db"))?)?.forget_peer(peer);
+    };
+    match lines.first().map(String::as_str) {
+        Some("forgotten") => Ok(()),
+        Some(line) if line.starts_with("unknown command") => Err(Error::Invalid("the running node is older than this hk: restart `hk node run`".into())),
+        Some(line) => Err(Error::Invalid(line.trim_start_matches("error: ").to_owned())),
+        None => Err(Error::Invalid("the node hung up without saying".into())),
+    }
+}
+
 /// Have the running daemon collect garbage from everything here now: what
 /// it did, or None if it isn't running.
 ///
@@ -809,6 +827,12 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
             } else {
                 node.reload()?;
                 node.dial_members()?;
+            }
+        },
+        command if command.starts_with("forget ") => {
+            match command.trim_start_matches("forget ").trim().parse().map_err(|e| Error::Invalid(format!("not a peer: {e}"))).and_then(|peer| node.forget_member(&peer)) {
+                Ok(()) => out.push_str("forgotten\n"),
+                Err(e) => { let _ = writeln!(out, "error: {e}"); },
             }
         },
         command if command.starts_with("fetch-blocks ") => {
