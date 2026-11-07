@@ -979,6 +979,15 @@ impl ClaimStore {
             .exists([key.to_bytes()])?)
     }
 
+    /// Every tomb here.
+    pub fn tombs(&self) -> Result<Vec<Claim>> {
+        let rows: Vec<Id> = self.db.conn()
+            .prepare_cached("SELECT id FROM claims WHERE kind = 'tomb' ORDER BY id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter().map(|id| self.claim(id, "tomb")).collect()
+    }
+
     /// Every dissolved claim here.
     pub fn dissolved(&self) -> Result<Vec<Claim>> {
         let rows: Vec<(Id, String)> = self.db.conn()

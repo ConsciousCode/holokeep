@@ -459,9 +459,20 @@ enum DagCommand {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
-    /// Write the DAG under a CID to a `CARv1`, like `ipfs dag export`
+    /// Write the DAG under a CID to a `CARv1`, like `ipfs dag export`, which
+    /// claims about it are left out of, unless they're asked for
     Export {
         cid: Link,
+        /// With the claims about it after it, tags, keeps and so on, dissolved
+        /// or not, with their signatures and what makes those count, and
+        /// following anchors to what they are: the rest of what it is here.
+        /// These say what you've kept and tagged, and signed with which keys
+        #[arg(long)]
+        claims: bool,
+        /// With all that anchors have been, as far as it's here, not only
+        /// what they are now
+        #[arg(long, requires = "claims")]
+        history: bool,
         /// Where to write it [default: stdout]
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -1447,7 +1458,7 @@ fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {
             Ok(())
         },
         DagCommand::Import { paths } => {
-            open_repo(repo)?.batch(|repo| {
+            open_repo(repo)?.batch_breathing(|repo| {
                 for path in paths {
                     let reader: Box<dyn io::Read> = if path == Path::new("-") {
                         Box::new(io::stdin())
@@ -1466,19 +1477,32 @@ fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {
                 Ok(())
             })
         },
-        DagCommand::Export { cid, output } => {
+        DagCommand::Export { cid, claims, history, output } => {
             fetch_first(repo.as_ref(), &cid)?;
             let repo = open_repo(repo)?;
+            let export = |out: &mut dyn io::Write| -> io::Result<()> {
+                let exported = if claims { car::export_with_claims(&repo, &cid, history, &mut { out }) } else { car::export_noting(&repo, &cid, &mut { out }) }?;
+                if exported.left_out > 0 {
+                    eprintln!("left out {} claims about this: --claims to take them", exported.left_out);
+                }
+                if claims {
+                    eprintln!("wrote {} blocks and {} claims", exported.blocks, exported.claims);
+                }
+                if exported.unreadable > 0 {
+                    eprintln!("{} blocks of older versions aren't here, so aren't there", exported.unreadable);
+                }
+                Ok(())
+            };
             if let Some(path) = output {
                 // Written aside and renamed, so a failed export leaves nothing
                 let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
                 let mut file = io::BufWriter::new(tempfile::NamedTempFile::new_in(dir)?);
-                car::export(&repo, &cid, &mut file)?;
+                export(&mut file)?;
                 file.into_inner().map_err(io::IntoInnerError::into_error)?.persist(&path)?;
             }
             else {
                 let mut out = io::BufWriter::new(io::stdout().lock());
-                car::export(&repo, &cid, &mut out)?;
+                export(&mut out)?;
                 out.flush()?;
             }
             Ok(())

@@ -30,7 +30,7 @@ Holokeep is early. What exists is the content-addressing core, each piece checke
 - **CIDs and multihashes**: v0 and v1; SHA-1, SHA-2, SHA-3, BLAKE2b-256 and murmur3 (no identity hash yet).
 - **Codecs**: dag-pb, dag-cbor and dag-json, strict and canonical, passing all of [ipld/codec-fixtures](https://github.com/ipld/codec-fixtures) and differential fuzzing against `serde_ipld_dagcbor`/`serde_ipld_dagjson`.
 - **Storage and retrieval**: `hk add` stores into a repo where a routing store sorts blocks by structure: UnixFS nodes as rows, dag-cbor and dag-json as queryable JSONB, large blocks and whole files in a flatfs-style sharded directory, file leaves as ranges of whole files kept there (or left in place with `--nocopy`), and everything else as raw bytes. `hk cat`/`hk get` read them back out, checked against the original files, and `hk mount` shows the soup as a filesystem (FUSE): the account's root anchor, what it names, beside `cid/<cid>`, `anchors/<anchor>`, writable, and `tags/<tag>/<cid>`.
-- **Interchange**: `hk dag export` writes a DAG as a CARv1 byte-for-byte identical to `ipfs dag export`, and `hk dag import` reads CARv1 and CARv2 files, Kubo's included, verifying every block. Legacy CIDv0 DAGs round-trip unchanged.
+- **Interchange**: `hk dag export` writes a DAG as a CARv1 byte-for-byte identical to `ipfs dag export`, or with `--claims` that and then what's said of it, and `hk dag import` reads CARv1 and CARv2 files, Kubo's included, verifying every block. Legacy CIDv0 DAGs round-trip unchanged.
 
 Nodes can join a private mesh (`hk node`) and fetch blocks from each other, so any file in the repo can be read from any running node, and they keep each other's blocks replicated, counting the risks each copy shares, so a block isn't one disk failure from being lost; see the [roadmap](#roadmap) for what isn't done.
 
@@ -314,7 +314,7 @@ Beliefs about other nodes' copies, *sightings*, are kept apart from `blocks`, wh
 Ideas:
 
 - *Failure-domain placement*: describe each blockstore's risk with a set of tags, eg `{living-room, home, new-mexico, us}` is very far from `{bangkok, data-center}` and very close to `{living-room, raid-3, home, new-mexico, us}`, and place replicas to maximize the distance between them. Volumes' risks, found and said, now do this for counting (see durability above); what's open is weighing distance beyond shared risks, perhaps with Ceph's CRUSH, perhaps latency-aware.
-- *CAR files* are the interchange format between repos, Kubo included, before any networking exists. Export walks the DAG depth first, writing each block the first time it's reached, which is Kubo's order. Import trusts nothing: every block is verified, sections are bounded as go-car's are (8 MiB, headers 32 MiB), and a CARv2's index is ignored, since the repo indexes for itself. Blocks are placed by structure like any others; importing into the offset store would need provenance into the CAR, which isn't a whole file of anything.
+- *CAR files* are the interchange format between repos, Kubo included, before any networking exists. Export walks the DAG depth first, writing each block the first time it's reached, which is Kubo's order. A plain export carries no claims, since they say what you've kept and tagged and sign it with your keys, which isn't what sharing a file should share; it says how many it left out. `--claims` carries them, as sections after the DAG, so what comes first is the same CAR and any reader can read it, a dissolved claim being a section under its identity CID. A claim says only what its signature makes it say, so imported claims count where their signer's user does and are only data anywhere else. Import trusts nothing: every block is verified, sections are bounded as go-car's are (8 MiB, headers 32 MiB), and a CARv2's index is ignored, since the repo indexes for itself. Blocks are placed by structure like any others; importing into the offset store would need provenance into the CAR, which isn't a whole file of anything.
 
 ## Roadmap
 
@@ -334,6 +334,7 @@ Checklist:
 - [x] Blockstore that keeps what `hk add` imports
 - [x] Retrieval (`hk cat`, `hk get`)
 - [x] CAR import/export
+  - [x] With what's said of a DAG (`hk dag export --claims`), and all that anchors have been (`--history`)
 - [x] UnixFSv1 indexing in SQL
 - [x] Backreference indexing
 - [x] Catalog over labelled volumes (the database, the shards)
@@ -474,6 +475,7 @@ $hk anchor root                     # this account's root anchor, the top of hk 
 $hk keep ls                         # what's kept
 $hk tag rm <name> <cid>...          # untag blocks, with tombs
 $hk dag export <cid> -o <file.car>  # a DAG as a CARv1, like `ipfs dag export`
+$hk dag export <anchor> --claims --history -o <file.car>  # all of it: claims, anchors followed, every version here
 $hk dag import <file.car>...        # CARv1 or v2 files, like `ipfs dag import`
 $hk repo stat                       # blocks per volume and form, and each database's bytes and free bytes
 $hk repo compact --dry-run          # what compacting would give back; prints volume, before, after, outcome

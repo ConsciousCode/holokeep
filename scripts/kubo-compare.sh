@@ -132,6 +132,21 @@ for f in *; do
     fi
 done
 fromcar="$work/fromcar-out"
+## A CAR with claims is the same CAR, then claims, which Kubo can read
+if [ ${#roots[@]} -gt 0 ]; then
+    root=${roots[0]}
+    "$hk" tag add kubo-compare "$root" >/dev/null
+    "$hk" dag export "$root" -o "$cars/plain.car" 2>/dev/null
+    "$hk" dag export "$root" --claims -o "$cars/claims.car" 2>/dev/null
+    if cmp -s "$cars/plain.car" <(head -c "$(stat -c %s "$cars/plain.car")" "$cars/claims.car") \
+        && ipfs dag import "$cars/claims.car" >/dev/null 2>&1; then
+        echo "ok   dag export --claims, read by Kubo"
+    else
+        echo "FAIL dag export --claims"
+        fail=1
+    fi
+fi
+
 mkdir -p "$fromcar"
 i=0
 for f in *; do

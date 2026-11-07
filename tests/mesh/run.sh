@@ -152,8 +152,8 @@ scenario_lost() {
     sleep 1
     sh_on one 'echo "changed too" > /tmp/too'
     wait_for "one to notice it changed too" sh_on one "! hk block get $too"
-    on one hk node scan-lost
-    wait_for "one's node to report it" sh_on one "hk lost ls | grep -q $too"
+    # Asked as the node may yet be noticing, as a day's wait would never be
+    wait_for "one's node to report it" sh_on one "hk node scan-lost; hk lost ls | grep -q $too"
 
     # Two hasn't got it, so wasn't told. The same bytes made there end it
     [ -z "$(on two hk lost ls)" ] || fail "two heard of what it hasn't got"
@@ -161,6 +161,34 @@ scenario_lost() {
     on one hk dag fetch "$cid" >/dev/null
     ! on one hk lost ls | grep -q "$cid" || fail "one still says it's lost, having it"
     [ "$(on one hk cat "$cid")" = "only here" ] || fail "it isn't what it was"
+}
+
+# A CAR carries what's said of a DAG to another device of the user, where it
+# counts, and to a stranger, where it's only data
+scenario_car() {
+    sh_on one 'mkdir -p /tmp/album && echo "a song" > /tmp/album/song'
+    local root
+    root=$(sh_on one 'hk add -q --no-keep /tmp/album | tail -1')
+    on one hk tag add album "$root" >/dev/null
+    on one hk keep add --copies 1 "$root" >/dev/null
+    on one hk dag export "$root" --claims -o /tmp/album.car 2>/dev/null
+    podman cp "$run-one:/tmp/album.car" "$run-two:/tmp/album.car"
+    on two hk dag import /tmp/album.car >/dev/null 2>&1
+    on two hk tag find album | grep -q "$root" || fail "two doesn't see the tag"
+    on two hk keep ls | grep -q "$root" || fail "two doesn't see the keep"
+    [ "$(sh_on two "hk get $root -o /tmp/got >/dev/null 2>&1; cat /tmp/got/song")" = "a song" ] || fail "two can't read it"
+
+    # What a tag retracted stays so, wherever it's imported
+    on one hk tag rm album "$root" >/dev/null
+    on one hk dag export "$root" --claims -o /tmp/album.car 2>/dev/null
+    podman cp "$run-one:/tmp/album.car" "$run-two:/tmp/album.car"
+    on two hk dag import /tmp/album.car >/dev/null 2>&1
+    ! on two hk tag find album | grep -q "$root" || fail "two still sees the tag"
+
+    machine stranger
+    podman cp "$run-one:/tmp/album.car" "$run-stranger:/tmp/album.car"
+    on stranger hk dag import /tmp/album.car >/dev/null 2>&1
+    on stranger hk keep add "$root" >/dev/null 2>&1 || fail "the stranger has the blocks"
 }
 
 # A member that's gone for good stays gone from here, though others say it's
@@ -235,7 +263,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read late_joiner fork_merge lost forget)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read late_joiner fork_merge lost forget car)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

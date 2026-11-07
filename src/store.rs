@@ -2199,32 +2199,95 @@ impl Catalog {
                 stack.extend(crate::links::links(cid.codec(), block.data()).unwrap_or_default());
             }
         }
-        // A claim's own links are what it's about, not part of the DAG;
-        // only what's about it, tombs, follows it
-        let mut dissolved = Vec::new();
-        while let Some(key) = claims.pop() {
-            if !seen.insert(key.to_bytes()) {
-                continue;
-            }
-            if key.code() == IDENTITY {
-                dissolved.extend(crate::claim::dissolved_cid(key.digest_ref()).as_ref().and_then(crate::claim::dissolved));
-                continue;
-            }
-            claims.extend(self.claims_about(key.as_ref())?);
+        let (precipitated, dissolved) = self.claims_following(&mut seen, claims, false)?;
+        for key in precipitated {
             copy(key)?;
-        }
-        // A tombed dissolved claim is gone, leaving its tomb, which says
-        // what it was
-        if let Some(store) = &self.claims {
-            for tomb in store.dissolved()? {
-                let about = |claim: &Claim| claim.target().iter().any(|target| seen.contains(&target.multihash().to_bytes()));
-                if tomb.target().iter().filter_map(crate::claim::dissolved).any(|claim| about(&claim)) {
-                    dissolved.push(tomb);
-                }
-            }
         }
         report.claims = self.copy_dissolved(v, &dissolved)?;
         Ok(report)
+    }
+
+    /// These claims and what's about them, however deep, as (precipitated,
+    /// dissolved), but those in `seen`, which they're added to. A claim's own
+    /// links are what it's about, not part of a DAG, so only what's about it
+    /// follows it: its signatures and its tombs. A dissolved claim that's
+    /// tombed is gone, leaving its tomb, which says what it was, so that goes
+    /// with what it was about. If `keys`, what signed them goes along too,
+    /// with its certificates, for them to count elsewhere; not the signs
+    /// before each, which would draw in all a device has ever said.
+    fn claims_following(&self, seen: &mut std::collections::HashSet<Vec<u8>>, mut pending: Vec<Multihash>, keys: bool) -> Result<(Vec<Multihash>, Vec<Claim>)> {
+        let (mut precipitated, mut dissolved) = (Vec::new(), Vec::new());
+        let tombs = self.claims.as_ref().map_or_else(|| Ok(Vec::new()), |claims| claims.tombs())?;
+        let mut taken = std::collections::HashSet::new();
+        loop {
+            while let Some(key) = pending.pop() {
+                if !seen.insert(key.to_bytes()) {
+                    continue;
+                }
+                pending.extend(self.claims_about(key.as_ref())?);
+                if key.code() == IDENTITY {
+                    let claim = crate::claim::dissolved_cid(key.digest_ref()).as_ref().and_then(crate::claim::dissolved);
+                    dissolved.extend(claim);
+                    continue;
+                }
+                if keys
+                    && let Some(Claim::Sign(sign)) = self.claim_at(key.as_ref())?
+                {
+                    pending.push(owned(sign.by().multihash())?);
+                }
+                precipitated.push(key);
+            }
+            for tomb in &tombs {
+                let about = |claim: &Claim| claim.target().iter().any(|target| seen.contains(&target.multihash().to_bytes()));
+                if tomb.target().iter().filter_map(crate::claim::dissolved).any(|claim| about(&claim)) && taken.insert(tomb.cid().to_bytes()) {
+                    pending.push(owned(tomb.cid().multihash())?);
+                }
+            }
+            if pending.is_empty() {
+                return Ok((precipitated, dissolved));
+            }
+        }
+    }
+
+    /// The claim a multihash names, dissolved or here.
+    fn claim_at(&self, key: Key<'_>) -> Result<Option<Claim>> {
+        if key.code() == IDENTITY {
+            return Ok(crate::claim::dissolved_cid(key.digest_ref()).as_ref().and_then(crate::claim::dissolved));
+        }
+        Ok(self.claims.as_ref().map_or(Ok(None), |claims| claims.get(key))?.and_then(|data| Claim::parse(&data)))
+    }
+
+    /// The claims about these blocks that this account can see, however deep,
+    /// and what makes them count elsewhere, as (CID, bytes) by CID, for a
+    /// reader with none of this. A block's claims are those targeting it, so
+    /// not a set saying it's what some anchor was: that's the anchor's.
+    pub fn claims_on(&self, blocks: &[Multihash]) -> Result<Vec<(Link, Vec<u8>)>> {
+        let mut pending = Vec::new();
+        for block in blocks {
+            for key in self.claims_about(block.as_ref())? {
+                if self.claim_at(key.as_ref())?.is_some_and(|claim| claim.target().iter().any(|target| target.multihash().to_bytes() == block.to_bytes())) {
+                    pending.push(key);
+                }
+            }
+        }
+        let mut seen = blocks.iter().map(Multihash::to_bytes).collect();
+        let (precipitated, dissolved) = self.claims_following(&mut seen, pending, true)?;
+        let mut claims = Vec::new();
+        for claim in dissolved {
+            if self.visible(claim.cid().multihash())? {
+                let block = claim.block();
+                claims.push((claim.cid(), block.data().to_vec()));
+            }
+        }
+        for key in precipitated {
+            if self.visible(key.as_ref())?
+                && let Some(claim) = self.claim_at(key.as_ref())?
+            {
+                claims.push((claim.cid(), claim.block().data().to_vec()));
+            }
+        }
+        claims.sort_by_key(|(cid, _)| cid.to_bytes());
+        Ok(claims)
     }
 
     /// Put a block in the first of a volume's stores which takes it.
@@ -2742,7 +2805,7 @@ impl Catalog {
     }
 
     /// A block's gone, without anyone having let go of it.
-    #[cfg(all(test, feature = "net"))]
+    #[cfg(test)]
     pub(crate) fn lose(&self, key: Key<'_>) -> Result<usize> {
         Ok(self.db.conn().execute("DELETE FROM blocks WHERE block = (SELECT id FROM multihashes WHERE multihash = ?1)", [key.to_bytes()])?)
     }

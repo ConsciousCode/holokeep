@@ -81,4 +81,31 @@ depth-first, each block the first time it's reached. `hk dag import`
 reads CARv1 and CARv2, verifies every block, bounds sections as go-car
 does (8 MiB, headers 32 MiB), and ignores a CARv2 index.
 
+`hk dag export --claims` writes that same CAR, then the claims about what's
+in it, each a section of its own, so any reader can read it: a precipitated
+claim under its hash, a dissolved one under its identity CID, with the claim
+as the block. They're sorted by CID bytes. Which claims:
+
+- those targeting a block written, and what's about those, however deep: their
+  signatures and tombs. A dissolved claim that's tombed is gone, so its tomb
+  goes for it.
+- for each signature, the claims about its key: certificates, and theirs. Not
+  the signs before it in its chain.
+- what this account can see. Not a set whose value is a block written, which
+  is its anchor's, nor the other claims a sign shares its signature with,
+  though it names them, so a dissolved one can be read there.
+
+An anchor reached, by a link or a mount point, is followed to what it is now,
+so the DAG under an account's root anchor is its whole soup, and its claims
+include every set: what it was is still said. `--history` follows it to what
+it's been too, passing over and counting what's not here. Claims about what's
+not here go too, such as that it's been [[Claims|reported lost]].
+
+A plain `hk dag export` says how many claims it left out, on stderr.
+
+`hk dag import` takes claims as it takes any block. Only a claim signed by a
+key the repo's user has authorized counts, so a fresh repo, whose device key
+is its own user, keeps them only as data until it joins that user. There's no
+restoring a user from a CAR: its root key isn't in one.
+
 Source: `src/multihash.rs`, `src/cid/`, `src/dagcbor.rs`, `src/dagjson.rs`, `src/pb.rs`, `src/car.rs`.

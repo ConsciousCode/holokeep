@@ -2220,6 +2220,24 @@ fn pair(volume: &str, form: &str) -> (String, String) {
     (volume.to_owned(), form.to_owned())
 }
 
+/// A dissolved claim copied to a volume takes its signature, or it says
+/// nothing when that's all there is of it.
+#[test]
+fn a_dissolved_claim_copied_takes_its_signature() {
+    let scratch = Scratch::new("volumes-signed");
+    let a = with_sqlite(&scratch, "shared.db");
+    let key = crate::keys::Key::generate().expect("key");
+    let leaf = raw(b"leaf");
+    a.put_block(&leaf, CidVersion::V1).expect("put");
+    let claim = Claim::Keep(crate::claim::Keep::new([link(&leaf)]).expect("keep"));
+    a.put_block(&claim.block(), CidVersion::V1).expect("put");
+    let sign = a.sign_with(&key, [claim.cid()]).expect("sign").expect("a sign");
+    a.copy_to("shared", &[link(&leaf)]).expect("copy");
+    let shared = rusqlite::Connection::open(scratch.path().join("shared.db")).expect("db");
+    let signs: i64 = shared.query_row("SELECT count(*) FROM claims WHERE kind = 'sign'", [], |row| row.get(0)).expect("signs");
+    assert_eq!(signs, 1, "{sign} left behind");
+}
+
 #[test]
 fn database_volumes_are_caught_up_with_by_generation() {
     let scratch = Scratch::new("volumes-generations");

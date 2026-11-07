@@ -158,3 +158,157 @@ fn rejects_what_it_cant_trust() {
         assert!(import_bytes(car, &mut router()).is_err(), "{label}");
     }
 }
+
+//------------//
+//-[ Claims ]-//
+//------------//
+
+fn export_claims(repo: &Catalog, root: &Link, history: bool) -> (Vec<u8>, Exported) {
+    let mut car = Vec::new();
+    let exported = export_with_claims(repo, root, history, &mut car).expect("export");
+    (car, exported)
+}
+
+fn import_into(repo: &mut Catalog, car: Vec<u8>) {
+    import_bytes(car, repo).expect("import");
+}
+
+/// A repo of its own, certified as a device of the same user, whenever: as
+/// one that's joined the mesh, or been told by the user's ticket.
+fn same_user(scratch: &Scratch, name: &str, here: &Catalog, root: &crate::keys::Key) -> Catalog {
+    let there = Catalog::open_repo(&scratch.path().join(name)).expect("catalog");
+    here.certify(root, &there.signer().expect("signer").id()).expect("certify");
+    there
+}
+
+fn raw_block(data: &[u8]) -> Block {
+    Block::hash(Cidv1Spec::default(), data.into())
+}
+
+fn link_of(block: &Block) -> Link {
+    block.cid().clone().into()
+}
+
+/// What's said of a DAG goes with it, dissolved or not, retraction and all.
+#[test]
+fn whats_said_of_a_dag_goes_with_it() {
+    let scratch = Scratch::new("car-claims");
+    let mut here = Catalog::open_repo(&scratch.path().join("here")).expect("catalog");
+    let user = here.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let mut fresh = same_user(&scratch, "fresh", &here, &user);
+    let root = tree(&mut here);
+    let tag = crate::claim::tag("music").expect("tag");
+    let other = crate::claim::tag("retracted").expect("tag");
+    here.tag(&root, &tag).expect("tag");
+    here.tag(&root, &other).expect("tag");
+    here.untag(&root, &other).expect("untag");
+    here.keep_as(&root, &[], Some(1)).expect("keep");
+    let (plain, (car, exported)) = (export_bytes(&here, &root), export_claims(&here, &root, false));
+    assert!(exported.claims > 0);
+    assert!(car.starts_with(&plain), "the DAG as it always is, then the claims");
+
+    import_into(&mut fresh, car.clone());
+    fresh.join_user(&user.id()).expect("join");
+    let claims = fresh.claims().expect("claims");
+    assert_eq!(claims.tagged(tag.multihash()).expect("tagged"), std::slice::from_ref(&root));
+    assert!(claims.tagged(other.multihash()).expect("tagged").is_empty(), "and what's retracted stays so");
+    assert!(claims.kept(root.multihash()).expect("kept"));
+    assert_eq!(fresh.copies_wanted(root.multihash(), 2).expect("copies"), Some(1));
+
+    // Exported from there, it's what it was, so nothing's lost on the way
+    let (again, _) = export_claims(&fresh, &root, false);
+    assert_eq!(again, car);
+
+    // To a repo of its own, or another user's, they're only data, as any
+    // stranger's are, since a CAR may come from anyone
+    let mut own = Catalog::open_repo(&scratch.path().join("own")).expect("catalog");
+    let mut other_user = Catalog::open_repo(&scratch.path().join("other")).expect("catalog");
+    other_user.found_user(b"other", crate::keys::Cost::NONE).expect("found");
+    for stranger in [&mut own, &mut other_user] {
+        import_into(stranger, car.clone());
+        let claims = stranger.claims().expect("claims");
+        assert!(claims.tagged(tag.multihash()).expect("tagged").is_empty());
+        assert!(!claims.kept(root.multihash()).expect("kept"));
+    }
+}
+
+/// A plain export says what it left out, and writes as it always has.
+#[test]
+fn a_plain_export_says_what_it_left_out() {
+    let scratch = Scratch::new("car-left-out");
+    let mut here = Catalog::open_repo(&scratch.path().join("here")).expect("catalog");
+    let root = tree(&mut here);
+    let plain = export_bytes(&here, &root);
+    let mut noted = Vec::new();
+    assert_eq!(export_noting(&here, &root, &mut noted).expect("export").left_out, 0);
+    here.tag(&root, &crate::claim::tag("music").expect("tag")).expect("tag");
+    noted.clear();
+    assert_eq!(export_noting(&here, &root, &mut noted).expect("export").left_out, 2, "the tag, and its signature");
+    assert_eq!(noted, plain);
+}
+
+/// A claim that merely says a block's what an anchor was belongs to the
+/// anchor, which doesn't come along with its old value.
+#[test]
+fn an_anchors_claims_come_with_it_not_its_value() {
+    let scratch = Scratch::new("car-anchor-value");
+    let here = Catalog::open_repo(&scratch.path().join("here")).expect("catalog");
+    let value = raw_block(b"value");
+    here.put_block(&value, CidVersion::V1).expect("put");
+    let anchor = here.new_anchor().expect("anchor");
+    here.set_anchor(&anchor, &link_of(&value)).expect("set");
+    let (_, exported) = export_claims(&here, &link_of(&value), false);
+    assert_eq!(exported.claims, 0);
+}
+
+/// From an anchor, it's what it is, and what's named through mount points, the
+/// way a whole soup's taken from its root; older versions only if asked for,
+/// as far as they're here.
+#[test]
+fn anchors_are_followed_to_what_they_are_and_were() {
+    let scratch = Scratch::new("car-anchors");
+    let mut here = Catalog::open_repo(&scratch.path().join("here")).expect("catalog");
+    let user = here.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let mut fresh = same_user(&scratch, "fresh", &here, &user);
+    let mut whole = same_user(&scratch, "whole", &here, &user);
+    let named = here.new_anchor().expect("anchor");
+    let (old, gone, now) = (raw_block(b"old"), raw_block(b"gone"), raw_block(b"now"));
+    for block in [&old, &gone, &now] {
+        here.put_block(block, CidVersion::V1).expect("put");
+    }
+    for value in [&gone, &old, &now] {
+        here.set_anchor(&named, &link_of(value)).expect("set");
+    }
+    here.lose(gone.cid().multihash()).expect("lose");
+    here.report_lost(&link_of(&gone)).expect("report").expect("a claim");
+    let t = scratch.path().join("t");
+    std::fs::create_dir_all(&t).expect("mkdir");
+    std::os::unix::fs::symlink(format!("/anchors/{named}"), t.join("wiki")).expect("symlink");
+    let top = AnyCid::V1(Importer::default().add_path(&t, &mut here, &mut |_, _| {}).expect("import").expect("top").cid);
+    let root = here.new_anchor().expect("anchor");
+    here.set_anchor(&root, &top).expect("set");
+    here.keep(&root).expect("keep");
+
+    let (car, exported) = export_claims(&here, &root, false);
+    assert_eq!(exported.unreadable, 0);
+    import_into(&mut fresh, car);
+    fresh.join_user(&user.id()).expect("join");
+    assert_eq!(fresh.anchor_value(&root).expect("value"), Some(top));
+    assert_eq!(fresh.anchor_value(&named).expect("value"), Some(link_of(&now)));
+    assert_eq!(fresh.anchor_history(&named).expect("history").len(), 3, "what it was is still said");
+    assert!(fresh.has(now.cid().multihash()).expect("has"));
+    assert!(!fresh.has(old.cid().multihash()).expect("has"), "but not there");
+    assert!(fresh.claims().expect("claims").kept(root.multihash()).expect("kept"));
+
+    let (car, exported) = export_claims(&here, &root, true);
+    assert_eq!(exported.unreadable, 1, "what's gone, passed over");
+    import_into(&mut whole, car);
+    whole.join_user(&user.id()).expect("join");
+    assert!(whole.has(old.cid().multihash()).expect("has"));
+    assert!(whole.lost_at(&link_of(&gone)).expect("lost").is_some(), "and said to be lost");
+    assert!(whole.missing_under(&root).expect("missing").is_empty());
+
+    // What it is now is another matter
+    here.lose(now.cid().multihash()).expect("lose");
+    assert!(export_with_claims(&here, &root, true, &mut Vec::new()).is_err());
+}

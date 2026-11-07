@@ -20,6 +20,7 @@ use crate::cid::{BaseCid, Cid, CidRef, CidVersion};
 use crate::dagcbor;
 use crate::export::Fetch;
 use crate::model::{Ipld, Link};
+use crate::multihash::Multihash;
 
 /// go-car's limits: no header or section is larger than these.
 const MAX_HEADER: u64 = 32 << 20;
@@ -180,21 +181,132 @@ fn write_section(out: &mut impl Write, cid: &Link, data: &[u8]) -> io::Result<()
 /// depth first, each block the first time it's reached. Returns how many
 /// blocks were written.
 pub fn export(src: &impl Fetch, root: &Link, out: &mut impl Write) -> io::Result<u64> {
+    write_dag(src, root, out).map(|blocks| count(blocks.len()))
+}
+
+/// As `export`, returning the blocks written.
+fn write_dag(src: &impl Fetch, root: &Link, out: &mut impl Write) -> io::Result<Vec<Link>> {
     write_header(out, std::slice::from_ref(root))?;
     let mut seen = HashSet::new();
     let mut stack = vec![root.clone()];
-    let mut count = 0u64;
+    let mut blocks = Vec::new();
     while let Some(cid) = stack.pop() {
         if !seen.insert(cid.to_bytes()) {
             continue;
         }
         let data = src.fetch(&cid)?;
         write_section(out, &cid, &data)?;
-        count = count.saturating_add(1);
         let links = crate::links::links(cid.codec(), &data).map_err(|e| invalid(format!("{cid}: {e}")))?;
         stack.extend(links.into_iter().rev());
+        blocks.push(cid);
     }
-    Ok(count)
+    Ok(blocks)
+}
+
+/// What an export wrote, or would have.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Exported {
+    /// Sections of the DAG.
+    pub blocks: u64,
+    /// Claims written after them.
+    pub claims: u64,
+    /// Claims about the DAG not asked for.
+    pub left_out: u64,
+    /// Blocks of older versions of anchors that aren't here to write.
+    pub unreadable: u64,
+}
+
+/// As `export`, noting what's left out: claims, which plain interchange
+/// doesn't carry, as they say who's kept and tagged what.
+pub fn export_noting(catalog: &crate::store::Catalog, root: &Link, out: &mut impl Write) -> io::Result<Exported> {
+    let blocks = write_dag(catalog, root, out)?;
+    let keys = keys_of(&blocks)?;
+    let left_out = catalog.claims_on(&keys).map_err(io::Error::other)?.len();
+    Ok(Exported { blocks: count(blocks.len()), left_out: count(left_out), ..Exported::default() })
+}
+
+fn count(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// Whether what couldn't be fetched isn't here to be: not found, or kept in a
+/// file that's changed or gone.
+fn gone(e: &io::Error) -> bool {
+    use crate::store::Error;
+    e.kind() == io::ErrorKind::NotFound
+        || matches!(e.get_ref().and_then(|e| e.downcast_ref::<Error>()), Some(Error::Stale(_) | Error::Missing(_) | Error::Corrupt(_)))
+}
+
+fn keys_of(blocks: &[Link]) -> io::Result<Vec<Multihash>> {
+    blocks.iter().map(|cid| Multihash::decode(&cid.multihash().to_bytes()).map_err(|e| invalid(format!("{cid}: {e:?}")))).collect()
+}
+
+/// As `export`, then the claims about what's written, however deep, with what
+/// makes them count elsewhere.
+///
+/// Dissolved ones are sections under their identity CIDs, like any block, so
+/// any CAR reader can read this, and what comes before them is what `export`
+/// writes. So far as a reader can tell they're blocks nothing links to.
+///
+/// An anchor reached, by a link or a mount point, is followed to what it is
+/// now, or if `history`, to all it's been, what's no longer here of that being
+/// counted and passed over. Otherwise its older sets say what it was, with
+/// nothing there, as with any block that isn't here.
+pub fn export_with_claims(catalog: &crate::store::Catalog, root: &Link, history: bool, out: &mut impl Write) -> io::Result<Exported> {
+    write_header(out, std::slice::from_ref(root))?;
+    let (mut seen, mut missed) = (HashSet::new(), HashSet::new());
+    let mut stack = vec![(root.clone(), true)];
+    let mut blocks = Vec::new();
+    let mut unreadable = Vec::new();
+    while let Some((cid, needed)) = stack.pop() {
+        let bytes = cid.to_bytes();
+        if needed && missed.contains(&bytes) {
+            return Err(invalid(format!("block {cid} not found")));
+        }
+        if !seen.insert(bytes.clone()) {
+            continue;
+        }
+        let data = match catalog.fetch(&cid) {
+            Ok(data) => data,
+            Err(e) if !needed && gone(&e) => {
+                missed.insert(bytes);
+                unreadable.push(cid);
+                continue;
+            },
+            Err(e) => return Err(e),
+        };
+        write_section(out, &cid, &data)?;
+        // Older versions first on the stack, so they come last, once what's
+        // needed has been found
+        if crate::claim::is_anchor(&cid) {
+            if history {
+                let was = catalog.anchor_history(&cid).map_err(io::Error::other)?;
+                stack.extend(was.into_iter().rev().map(|(_, value)| (value, false)));
+            }
+            let heads = catalog.anchor_heads(&cid).map_err(io::Error::other)?;
+            stack.extend(heads.into_iter().rev().map(|(_, value, _)| (value, needed)));
+        }
+        let mut links = crate::links::links(cid.codec(), &data).map_err(|e| invalid(format!("{cid}: {e}")))?;
+        links.extend(crate::store::mount_point(cid.codec(), &data));
+        stack.extend(links.into_iter().rev().map(|link| (link, needed)));
+        blocks.push(cid);
+    }
+    // What's not here may have been reported lost, which belongs with it
+    let about: Vec<Link> = blocks.iter().chain(&unreadable).cloned().collect();
+    let claims = catalog.claims_on(&keys_of(&about)?).map_err(io::Error::other)?;
+    let mut written = 0u64;
+    for (cid, data) in &claims {
+        if !seen.contains(&cid.to_bytes()) {
+            write_section(out, cid, data)?;
+            written = written.saturating_add(1);
+        }
+    }
+    Ok(Exported {
+        blocks: count(blocks.len()),
+        claims: written,
+        left_out: 0,
+        unreadable: count(unreadable.len()),
+    })
 }
 
 /// Somewhere to put the blocks of a CAR.
@@ -204,7 +316,8 @@ pub trait Import {
 
 impl Import for crate::store::Catalog {
     fn import(&mut self, block: &Block, version: CidVersion) -> io::Result<()> {
-        self.put_block(block, version).map(drop).map_err(io::Error::other)
+        self.put_block(block, version).map_err(io::Error::other)?;
+        self.breathe().map_err(io::Error::other)
     }
 }
 
