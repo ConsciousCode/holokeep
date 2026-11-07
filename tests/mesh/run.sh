@@ -123,6 +123,35 @@ scenario_late_joiner() {
     wait_for "three to see the wiki" holds three /soup/wiki/page.md "hello from one"
 }
 
+# A file imported in place changes, with no copy anywhere: it's found, and only
+# reported once every member's been asked. The same bytes made again end it.
+scenario_lost() {
+    sh_on one 'echo "only here" > /tmp/only'
+    local cid
+    cid=$(sh_on one 'hk add -q --nocopy --no-keep /tmp/only | tail -1')
+    on one hk keep add --copies 1 "$cid" >/dev/null
+    [ -z "$(on one hk lost scan --dry-run)" ] || fail "reported what's here"
+    sleep 1
+    sh_on one 'echo "changed since" > /tmp/only'
+    wait_for "one to notice it changed" sh_on one "! hk block get $cid"
+
+    cut_off two
+    wait_for "one to see two's gone" sh_on one 'hk node peers | grep -q -- "	-	"'
+    [ "$(on one hk lost scan 2>/dev/null)" = "$cid" ] || fail "the scan didn't find $cid"
+    [ -z "$(on one hk lost ls)" ] || fail "reported it with a member away"
+    put_back two
+    wait_for "one and two to reconnect" sh_on one '! hk node peers | grep -q -- "	-	"'
+
+    [ "$(on one hk lost scan)" = "$cid" ] || fail "the scan didn't report $cid"
+    [ "$(on one hk lost ls | cut -f1)" = "$cid" ] || fail "it isn't listed"
+    # Two hasn't got it, so wasn't told. The same bytes made there end it
+    [ -z "$(on two hk lost ls)" ] || fail "two heard of what it hasn't got"
+    sh_on two 'echo "only here" > /tmp/again && hk add -q /tmp/again >/dev/null'
+    on one hk dag fetch "$cid" >/dev/null
+    [ -z "$(on one hk lost ls)" ] || fail "one still says it's lost, having it"
+    [ "$(on one hk cat "$cid")" = "only here" ] || fail "it isn't what it was"
+}
+
 # Cut off, both sides change the same anchor; put back, both merge it the
 # same, conflicts side by side
 scenario_fork_merge() {
@@ -156,7 +185,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read late_joiner fork_merge)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read late_joiner fork_merge lost)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

@@ -82,6 +82,9 @@ enum Command {
     /// adds, or stop
     #[command(subcommand)]
     Keep(KeepCommand),
+    /// Say what's been lost, for what can't be found anywhere
+    #[command(subcommand)]
+    Lost(LostCommand),
     /// Keep things with friends, encrypted: in this account's vault, which
     /// joins their protected meshes
     #[command(subcommand)]
@@ -285,6 +288,32 @@ enum BlockCommand {
     Get {
         cid: Link,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum LostCommand {
+    /// Look for what was here and still matters, without anyone having let
+    /// go of it, asking the running node's members, and report what none
+    /// of them has. With members away, only says what it's still to ask
+    Scan {
+        /// Say what would be reported, and report nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Report blocks lost, as you know better than a scan: printing the claim
+    /// for each, unless it's here or reported already
+    Add {
+        #[arg(required = true)]
+        cids: Vec<Link>,
+    },
+    /// Take back reports of blocks lost, printing the tombs
+    Rm {
+        #[arg(required = true)]
+        cids: Vec<Link>,
+    },
+    /// List what's reported lost and isn't here, and as of when, in seconds
+    /// since the epoch. Whatever's turned up since isn't listed
+    Ls,
 }
 
 #[derive(Subcommand, Debug)]
@@ -732,6 +761,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Git(GitCommand::Import { git, no_keep }) => git_import(args.repo, &git, no_keep),
         Command::Tag(command) => tag_here_or_there(args.repo, command),
         Command::Keep(command) => keep_here_or_there(args.repo, command),
+        Command::Lost(command) => lost(args.repo, command),
         Command::Whoami => whoami(args.repo),
         Command::Protect(command) => protect(&repo_dir(args.repo)?, command),
         Command::Device(command) => device(&repo_dir(args.repo.clone())?, command),
@@ -1440,6 +1470,12 @@ fn hold_all(dir: Option<&PathBuf>, repo: &Catalog, cids: &[Link], shallow: bool)
         fetch_first(dir, cid)?;
         let missing = repo.missing_under(cid)?;
         anyhow::ensure!(!missing.contains(cid), "{cid} isn't here or on any connected member");
+        // What's lost isn't to be waited for: it's as far as it can be kept
+        if !shallow && missing.iter().all(|block| repo.lost_at(block).is_ok_and(|at| at.is_some())) {
+            eprintln!("keeping {cid} short of {} blocks reported lost", missing.len());
+            frontiers.push(missing);
+            continue;
+        }
         if shallow {
             if !missing.is_empty() {
                 eprintln!("keeping {cid} short of {} blocks which couldn't be had", missing.len());
@@ -1497,6 +1533,81 @@ fn anchor(dir: Option<&PathBuf>, mut repo: Catalog, command: AnchorCommand) -> a
         },
     }
     Ok(())
+}
+
+/// Whichever of these no member has, by asking them, and how many members
+/// were away to ask.
+#[cfg(feature = "net")]
+fn with_no_member(dir: &Path, blocks: Vec<Link>) -> anyhow::Result<(Vec<Link>, usize)> {
+    use holokeep::net::{daemon, mesh::Place};
+    let place = Place::main(dir);
+    let Some(peers) = daemon::ask(&place, "peers")? else {
+        anyhow::ensure!(daemon::members(&place)?.list()?.is_empty(), "this repo has members to ask: start `hk node run`");
+        return Ok((blocks, 0));
+    };
+    let away = peers.iter().filter(|line| !line.contains("connected")).count();
+    if blocks.is_empty() {
+        return Ok((blocks, away));
+    }
+    let (_, missing) = daemon::fetch_blocks(&place, &blocks)?.context("the node stopped")?;
+    let missing: std::collections::HashSet<String> = missing.into_iter().collect();
+    Ok((blocks.into_iter().filter(|cid| missing.contains(&cid.to_string())).collect(), away))
+}
+
+#[cfg(not(feature = "net"))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
+fn with_no_member(_: &Path, blocks: Vec<Link>) -> anyhow::Result<(Vec<Link>, usize)> {
+    Ok((blocks, 0))
+}
+
+fn lost(repo: Option<PathBuf>, command: LostCommand) -> anyhow::Result<()> {
+    use holokeep::store::BlockIndex as _;
+    let dir = repo_dir(repo)?;
+    let mut repo = open_repo(Some(dir.clone()))?;
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    match command {
+        LostCommand::Scan { dry_run } => {
+            let candidates = repo.lost_candidates()?;
+            let (lost, away) = with_no_member(&dir, candidates)?;
+            // Fetched since it was looked for, it's not
+            let lost: Vec<Link> = lost.into_iter().filter(|cid| !repo.has(cid.multihash()).unwrap_or(true)).collect();
+            if away > 0 {
+                eprintln!("{} blocks may be with the {away} members away, so none is reported", lost.len());
+            } else if !dry_run {
+                repo.batch(|repo| {
+                    for cid in &lost {
+                        repo.report_lost(cid)?;
+                    }
+                    anyhow::Ok(())
+                })?;
+            }
+            for cid in &lost {
+                writeln!(out, "{cid}")?;
+            }
+        },
+        LostCommand::Add { cids } => repo.batch(|repo| {
+            for cid in &cids {
+                if let Some(claim) = repo.report_lost(cid)? {
+                    writeln!(out, "{claim}")?;
+                }
+            }
+            anyhow::Ok(())
+        })?,
+        LostCommand::Rm { cids } => repo.batch(|repo| {
+            for cid in &cids {
+                for tomb in repo.unreport_lost(cid)? {
+                    writeln!(out, "{tomb}")?;
+                }
+            }
+            anyhow::Ok(())
+        })?,
+        LostCommand::Ls => {
+            for (cid, at) in repo.lost_blocks()? {
+                writeln!(out, "{cid}\t{at}")?;
+            }
+        },
+    }
+    Ok(out.flush()?)
 }
 
 fn keep(dir: Option<&PathBuf>, mut repo: Catalog, command: KeepCommand) -> anyhow::Result<()> {

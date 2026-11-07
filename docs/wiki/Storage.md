@@ -129,6 +129,7 @@ it. What usually only reads, like catching up, uses `Db::reading_first`,
 which starts without it, so isn't held up; if it needs to write beside a
 writer, it's undone and run again, waiting.
 
+A transaction need only be as big as it takes to keep states valid.
 `hk add` and `hk git import` take a breath: every second, they commit
 what they've done and leave the lock free for a tenth of a second, as
 long enough for whatever's waiting to look again. So if one fails, or is

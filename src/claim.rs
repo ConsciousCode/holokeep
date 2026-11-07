@@ -4,7 +4,8 @@
 //! targets, `Set`, which says what an anchor is now, and `Tomb`, which
 //! retracts; and, for who may say so, `Sign`, a key's signature of a
 //! claim, and `Device`, which a user's root key signs to say a node's key
-//! acts for it (see `keys`).
+//! acts for it (see `keys`). And `Lost`, a report that blocks couldn't be
+//! found.
 //!
 //! Signatures are claims about claims, rather than inside them, so equal
 //! claims stay equal blocks whoever makes them, and small ones dissolve.
@@ -116,6 +117,19 @@ pub struct Device {
     target: Vec<Link>,
 }
 
+/// "As of `at`, in seconds since the epoch, the targets couldn't be found."
+///
+/// A report, not a fact about them: a copy may yet turn up, or the same bytes
+/// be made again, and then that's that, with nothing to retract. Until then,
+/// it's why there's no point asking everyone for them again and again, why
+/// what they're under can be kept without them, and what's to be looked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lost {
+    /// Sorted by CID bytes and distinct.
+    target: Vec<Link>,
+    at: u64,
+}
+
 /// Any claim this understands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
@@ -125,6 +139,7 @@ pub enum Claim {
     Tomb(Tomb),
     Sign(Sign),
     Device(Device),
+    Lost(Lost),
 }
 
 /// Sort links by their bytes and drop repeats, making them a set.
@@ -287,6 +302,18 @@ impl Device {
     pub fn target(&self) -> &[Link] { &self.target }
 }
 
+impl Lost {
+    /// A report of the targets lost, if there are any.
+    pub fn new(target: impl IntoIterator<Item = Link>, at: u64) -> Option<Self> {
+        let target = set(target);
+        (!target.is_empty()).then_some(Self { target, at })
+    }
+
+    pub fn target(&self) -> &[Link] { &self.target }
+
+    pub const fn at(&self) -> u64 { self.at }
+}
+
 impl Claim {
     pub fn target(&self) -> &[Link] {
         match self {
@@ -296,6 +323,7 @@ impl Claim {
             Self::Tomb(tomb) => tomb.target(),
             Self::Sign(sign) => sign.signs(),
             Self::Device(device) => device.target(),
+            Self::Lost(lost) => lost.target(),
         }
     }
 
@@ -308,6 +336,7 @@ impl Claim {
             Self::Tomb(_) => "tomb",
             Self::Sign(_) => "sign",
             Self::Device(_) => "device",
+            Self::Lost(_) => "lost",
         }
     }
 
@@ -340,6 +369,7 @@ impl Claim {
             Self::Tomb(_) => ("tomb", BTreeMap::new()),
             Self::Sign(sign) => return Ipld::Map(sign.fields()),
             Self::Device(_) => ("device", BTreeMap::new()),
+            Self::Lost(lost) => ("lost", BTreeMap::from([("at".to_owned(), Ipld::Integer(lost.at.into()))])),
         };
         map.insert("claim".to_owned(), Ipld::String(kind.to_owned()));
         map.insert("target".to_owned(), links(self.target()));
@@ -425,6 +455,12 @@ impl Claim {
                 Self::Set(Set::new(target.clone(), value, u64::try_from(at).ok()?)?.after(prev))
             },
             "tomb" => Self::Tomb(Tomb::new(target.clone())?),
+            "lost" => {
+                let Ipld::Integer(at) = map.remove("at")? else {
+                    return None;
+                };
+                Self::Lost(Lost::new(target.clone(), u64::try_from(at).ok()?)?)
+            },
             "sign" => {
                 let (Ipld::Link(by), Ipld::Integer(at), Ipld::Bytes(sig)) = (map.remove("by")?, map.remove("at")?, map.remove("sig")?) else {
                     return None;
@@ -528,6 +564,16 @@ mod tests {
 
     fn group(target: &[Link], name: &str) -> Claim {
         Claim::Group(Group::new(target.iter().cloned(), tag(name).expect("tag")).expect("group"))
+    }
+
+    #[test]
+    fn a_lost_claim_says_when() {
+        let lost = Claim::Lost(Lost::new([cid(b"a")], 1_793_750_400).expect("lost"));
+        assert!(lost.dissolves());
+        assert_eq!(Claim::parse(lost.block().data()), Some(lost.clone()));
+        assert_eq!(lost.kind(), "lost");
+        assert_ne!(lost.cid(), Claim::Lost(Lost::new([cid(b"a")], 1_793_750_401).expect("lost")).cid(), "each time's a claim of its own");
+        assert!(Lost::new([], 1).is_none());
     }
 
     #[test]

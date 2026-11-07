@@ -25,6 +25,7 @@ use rusqlite::{OptionalExtension, params};
 use crate::block::{Block, IDENTITY};
 use crate::cid::{BaseCid, Cid, CidRef, Cidv1, DAG_CBOR_CODEC};
 use crate::claim::{Claim, Group, Keep, Set, Tomb};
+use super::decode_key;
 use crate::model::Link;
 use crate::multihash::Multihash;
 
@@ -214,7 +215,7 @@ const SCHEMA: &str =
          CREATE TABLE IF NOT EXISTS claims (
              id INTEGER PRIMARY KEY,
              claim INTEGER UNIQUE REFERENCES multihashes (id),
-             kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device'))
+             kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost'))
          );
          -- Every claim's targets, which every type has.
          CREATE TABLE IF NOT EXISTS claim_targets (
@@ -232,6 +233,11 @@ const SCHEMA: &str =
              at INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS set_claims_value ON set_claims (value);
+         -- When a lost claim says its targets couldn't be found.
+         CREATE TABLE IF NOT EXISTS lost_claims (
+             id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
+             at INTEGER NOT NULL
+         );
          -- The sets a set replaces, by their multihashes, as its `prev`
          -- says; a set saying none has none here, and `after` set.
          CREATE TABLE IF NOT EXISTS set_prev (
@@ -731,6 +737,12 @@ impl ClaimStore {
             "device" => crate::claim::Device::new(self.targets(id)?)
                 .map(Claim::Device)
                 .ok_or_else(|| Error::Invalid { store: NAME, reason: "a device claim of no keys".into() }),
+            "lost" => {
+                let at: i64 = self.db.conn().prepare_cached("SELECT at FROM lost_claims WHERE id = ?1")?.query_row([id], |row| row.get(0))?;
+                crate::claim::Lost::new(self.targets(id)?, u64::try_from(at).unwrap_or_default())
+                    .map(Claim::Lost)
+                    .ok_or_else(|| Error::Invalid { store: NAME, reason: "a lost claim of nothing".into() })
+            },
             _ => Err(Error::Invalid { store: NAME, reason: format!("a claim of kind {kind}") }),
         }
     }
@@ -919,6 +931,13 @@ impl ClaimStore {
                 same
             },
             Claim::Sign(_) => None,
+            Claim::Lost(lost) => self.db.conn()
+                .prepare_cached(
+                    "SELECT c.id FROM claims c JOIN lost_claims l ON l.id = c.id JOIN claim_targets t ON t.claim = c.id
+                     WHERE c.claim IS NULL AND t.target = ?1 AND t.prefix = ?2 AND l.at = ?3",
+                )?
+                .query_row(params![target, prefix, i64::try_from(lost.at()).unwrap_or(i64::MAX)], |r| r.get(0))
+                .optional()?,
             Claim::Keep(_) | Claim::Tomb(_) | Claim::Device(_) => {
                 let (n, copies) = match claim {
                     Claim::Keep(keep) => (keep.n(), keep.copies().unwrap_or_default()),
@@ -997,6 +1016,10 @@ impl ClaimStore {
                 stmt.execute(params![row, self.db.intern(multihash.as_ref())?, prefix])?;
             }
         }
+        if let Claim::Lost(lost) = claim {
+            conn.prepare_cached("INSERT INTO lost_claims (id, at) VALUES (?1, ?2)")?
+                .execute(params![row, i64::try_from(lost.at()).unwrap_or(i64::MAX)])?;
+        }
         if let Claim::Group(group) = claim {
             let (into_prefix, into) = split(group.group())?;
             conn.prepare_cached("INSERT INTO group_claims (id, into_, into_prefix) VALUES (?1, ?2, ?3)")?
@@ -1027,6 +1050,62 @@ impl ClaimStore {
             }
         }
         Ok(())
+    }
+
+    /// The latest a lost claim that counts says a block couldn't be found,
+    /// whether or not it's been found since.
+    pub fn lost(&self, target: Key<'_>) -> Result<Option<u64>> {
+        let at: Option<i64> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT max(l.at) FROM multihashes m JOIN claim_targets t ON t.target = m.id
+                 JOIN claims c ON c.id = t.claim JOIN lost_claims l ON l.id = c.id
+                 WHERE m.multihash = ?1 AND c.kind = 'lost' AND {LIVE}"
+            ))?
+            .query_row([target.to_bytes()], |row| row.get(0))?;
+        Ok(at.map(|at| u64::try_from(at).unwrap_or_default()))
+    }
+
+    /// What lost claims that count say, as (block, when), the latest of each.
+    pub fn all_lost(&self) -> Result<Vec<(Link, u64)>> {
+        let rows: Vec<(Vec<u8>, Vec<u8>, i64)> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT t.prefix, m.multihash, max(l.at) FROM claims c
+                 JOIN lost_claims l ON l.id = c.id
+                 JOIN claim_targets t ON t.claim = c.id JOIN multihashes m ON m.id = t.target
+                 WHERE c.kind = 'lost' AND {LIVE}
+                 GROUP BY t.target ORDER BY m.multihash"
+            ))?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter().map(|(prefix, multihash, at)| Ok((link(&prefix, &multihash)?, u64::try_from(at).unwrap_or_default()))).collect()
+    }
+
+    /// Up to `limit` blocks lost claims put after the row `cursor` are about,
+    /// counting or not, and the row to go on from.
+    pub fn lost_since(&self, cursor: i64, limit: usize) -> Result<(Vec<Multihash>, i64)> {
+        let rows: Vec<(i64, Vec<u8>)> = self.db.conn()
+            .prepare_cached(
+                "SELECT l.id, m.multihash FROM lost_claims l
+                 JOIN claim_targets t ON t.claim = l.id JOIN multihashes m ON m.id = t.target
+                 WHERE l.id > ?1 ORDER BY l.id LIMIT ?2",
+            )?
+            .query_map(params![cursor, i64::try_from(limit).unwrap_or(i64::MAX)], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let latest = rows.last().map_or(cursor, |(id, _)| *id);
+        let keys = rows.iter().map(|(_, key)| decode_key(NAME, key)).collect::<Result<_>>()?;
+        Ok((keys, latest))
+    }
+
+    /// The lost claims that count of a block, by their CIDs.
+    pub fn losing(&self, target: Key<'_>) -> Result<Vec<Link>> {
+        let rows: Vec<(Id, String)> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT DISTINCT c.id, c.kind FROM multihashes m JOIN claim_targets t ON t.target = m.id JOIN claims c ON c.id = t.claim
+                 WHERE m.multihash = ?1 AND c.kind = 'lost' AND {LIVE}"
+            ))?
+            .query_map([target.to_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter().map(|(id, kind)| Ok(self.claim(id, &kind)?.cid())).collect()
     }
 
     /// Whether a keep that counts targets a block, under any CID.
@@ -1142,7 +1221,7 @@ impl ClaimStore {
 /// constraint, which doesn't touch how rows are stored, is rewritten in
 /// place, as `SQLite` documents for such changes.
 fn widen_kinds(db: &Db) -> Result<()> {
-    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device'))";
+    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost'))";
     let conn = db.conn();
     let sql: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'claims'", [], |row| row.get(0))?;
     if sql.contains(KINDS) {

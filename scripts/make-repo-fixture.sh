@@ -45,6 +45,11 @@ done
 git -C "$tmp/git" repack -adfq
 git=$(h git import "$tmp/git" 2>/dev/null | awk '$2 == "HEAD" { print $1 }')
 
+# Reported lost: what's never been here, so it stays so
+printf 'lost from %s\n' "$name" > "$tmp/lost.txt"
+lost=$(h add -q -n "$tmp/lost.txt")
+h lost add "$lost" >/dev/null
+
 mkdir -p "$out"
 cp -a "$repo/." "$out/"
 rm -f "$out"/*.sock
@@ -57,6 +62,7 @@ root $root
 top $top
 copied $big
 git $git
+lost $lost
 EXPECT
 echo "made $out"
 du -sh "$out"

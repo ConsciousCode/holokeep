@@ -467,7 +467,7 @@ impl Soup {
             return Ok(true);
         }
         match &self.fetcher {
-            Some(fetcher) if fetcher(std::slice::from_ref(cid)) => catalog.visible(cid.multihash()).map_err(store_errno),
+            Some(fetcher) if catalog.worth_asking_for(cid) && fetcher(std::slice::from_ref(cid)) => catalog.visible(cid.multihash()).map_err(store_errno),
             _ => Ok(false),
         }
     }

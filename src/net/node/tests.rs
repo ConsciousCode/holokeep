@@ -187,6 +187,24 @@ async fn members_fetch_dags_from_each_other() {
     assert_eq!(fetch(&mut a, &mut b, root).await, (0, vec![]));
 }
 
+/// A block reported lost by one member, which another has, is lost no more.
+#[tokio::test]
+async fn what_one_reports_lost_another_makes_good() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    let leaf = blocks.get(2).expect("leaf");
+    b.catalog().report_lost(&link(leaf)).expect("report").expect("a claim");
+    assert!(b.catalog().lost_at(&link(leaf)).expect("lost").is_some());
+    // The claim travels as claims do, and the next audit there takes it up
+    b.announce().expect("announce");
+    let heard = |n: &[&mut Node]| n[0].catalog().claims().is_some_and(|claims| claims.lost(leaf.cid().multihash()).is_ok_and(|at| at.is_some()));
+    assert!(within(Duration::from_secs(10), &mut [&mut a, &mut b], heard).await, "never heard of it");
+    let id = a.trickle(2).expect("trickle");
+    assert!(id.is_some());
+    assert!(within(Duration::from_secs(10), &mut [&mut a, &mut b], |n| n[1].catalog().has(leaf.cid().multihash()).unwrap_or(false)).await, "it never came");
+    assert_eq!(b.catalog().lost_at(&link(leaf)).expect("lost"), None);
+    assert!(b.catalog().lost_blocks().expect("list").is_empty());
+}
+
 #[tokio::test]
 async fn fetching_blocks_takes_only_them() {
     let (mut a, mut b, blocks) = Box::pin(holding()).await;

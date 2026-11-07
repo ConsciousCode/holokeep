@@ -244,6 +244,10 @@ const BREATH: std::time::Duration = std::time::Duration::from_millis(110);
 /// as after all that work it's not to fail for another's being big too.
 const BREATHING_WAIT: std::time::Duration = std::time::Duration::from_mins(10);
 
+/// How often what's lost is asked for anyway, as it's read: a copy may have
+/// turned up where no one's said so.
+const ASK_FOR_LOST: std::time::Duration = std::time::Duration::from_hours(1);
+
 /// How long catching up as a catalog's opened waits for another writer,
 /// before leaving it for next time.
 const CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
@@ -462,6 +466,9 @@ pub struct Catalog {
     /// In a batch that breathes: how long between breaths, and when it last
     /// took one.
     breathing: std::cell::Cell<Option<(std::time::Duration, std::time::Instant)>>,
+    /// When each lost block was last asked for here, so it's only now and
+    /// then.
+    lost_asked: std::cell::RefCell<std::collections::HashMap<Vec<u8>, std::time::Instant>>,
     /// Forked anchors' merges, by their heads.
     merges: std::cell::RefCell<std::collections::HashMap<Vec<u8>, Link>>,
     /// Asks a running node for blocks that aren't here, if this fetches
@@ -1078,7 +1085,7 @@ impl Catalog {
         if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
             return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
         }
-        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, breathing: std::cell::Cell::new(None), merges: std::cell::RefCell::default(), fetcher: None, missed: std::cell::RefCell::default(), commits: std::cell::RefCell::default() };
+        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, breathing: std::cell::Cell::new(None), lost_asked: std::cell::RefCell::default(), merges: std::cell::RefCell::default(), fetcher: None, missed: std::cell::RefCell::default(), commits: std::cell::RefCell::default() };
         for volume in volumes {
             catalog.attach(volume)?;
         }
@@ -2676,7 +2683,89 @@ impl Catalog {
             self.missed.borrow_mut().extend_from_slice(cids);
             return false;
         }
-        fetcher(cids)
+        let asking: Vec<Link> = cids.iter().filter(|cid| self.worth_asking_for(cid)).cloned().collect();
+        !asking.is_empty() && fetcher(&asking)
+    }
+
+    /// Whether to ask members for a block that isn't here: yes, unless it's
+    /// reported lost and has been asked for lately.
+    pub fn worth_asking_for(&self, cid: &Link) -> bool {
+        if !self.lost_at(cid).is_ok_and(|at| at.is_some()) {
+            return true;
+        }
+        let mut asked = self.lost_asked.borrow_mut();
+        let due = asked.get(&cid.to_bytes()).is_none_or(|when| when.elapsed() >= ASK_FOR_LOST);
+        if due {
+            asked.insert(cid.to_bytes(), std::time::Instant::now());
+        }
+        due
+    }
+
+    /// When a block that isn't here was reported lost, if it was. One that's
+    /// here isn't, whatever was said: it's turned up.
+    pub fn lost_at(&self, cid: &Link) -> Result<Option<u64>> {
+        if self.has(cid.multihash())? {
+            return Ok(None);
+        }
+        self.claims.as_ref().map_or(Ok(None), |claims| claims.lost(cid.multihash()))
+    }
+
+    /// What's reported lost and isn't here, as (block, when), by multihash.
+    pub fn lost_blocks(&self) -> Result<Vec<(Link, u64)>> {
+        let Some(claims) = &self.claims else {
+            return Ok(Vec::new());
+        };
+        let mut lost = claims.all_lost()?;
+        lost.retain(|(cid, _)| !self.has(cid.multihash()).unwrap_or(true));
+        Ok(lost)
+    }
+
+    /// Report a block lost as of now, unless it's here or already said to be
+    /// lost. Returns the claim.
+    pub fn report_lost(&self, cid: &Link) -> Result<Option<Link>> {
+        if self.lost_at(cid)?.is_some() || self.has(cid.multihash())? {
+            return Ok(None);
+        }
+        let lost = crate::claim::Lost::new([cid.clone()], now()).ok_or(Error::NoClaims)?;
+        self.put_claim(&Claim::Lost(lost)).map(Some)
+    }
+
+    /// Take back reports that a block's lost. Returns the tombs' CIDs.
+    pub fn unreport_lost(&self, cid: &Link) -> Result<Vec<Link>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let mut tombs = Vec::new();
+        for lost in claims.losing(cid.multihash())? {
+            tombs.push(self.put_claim(&Claim::Tomb(Tomb::new([lost]).ok_or(Error::NoClaims)?))?);
+        }
+        Ok(tombs)
+    }
+
+    /// What's gone without anyone meaning it to, by what's known here, not
+    /// yet reported lost: blocks once held here, which nothing has let go of,
+    /// as collecting forgets they were, that something still refers to. A
+    /// file imported in place changed, say, or a volume's copy gone. Whether
+    /// it's lost is then for whoever else might have it to say.
+    pub fn lost_candidates(&self) -> Result<Vec<Link>> {
+        let rows: Vec<Vec<u8>> = self.db.conn()
+            .prepare_cached(
+                "SELECT DISTINCT m.multihash FROM holdings h JOIN multihashes m ON m.id = h.block
+                 WHERE h.block NOT IN (SELECT block FROM blocks) ORDER BY m.multihash",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut found = Vec::new();
+        for bytes in rows {
+            let key = decode_key("router", &bytes)?;
+            if self.has(key.as_ref())? || self.backrefs(key.as_ref())?.is_empty() {
+                continue;
+            }
+            if let Some(cid) = self.cid_of(key.as_ref())?
+                && self.lost_at(&cid)?.is_none()
+            {
+                found.push(cid);
+            }
+        }
+        Ok(found)
     }
 
     /// What was found missing in a transaction since last asked, to fetch

@@ -72,6 +72,42 @@ asker ranks below it by the holders' rendezvous order, so the
 lowest-ranked goes first. What's let go is announced (`dropped`), and
 members forget their sightings and audit it soon.
 
+## Lost blocks
+
+A `lost` [[Claims|claim]] reports a block couldn't be found as of a time.
+It's a report, not a verdict: only a block that isn't here is lost, so
+one that turns up, by any means, including the same bytes being added
+again, ends it with nothing to retract. Only claims that count, as any,
+are heeded, so a stranger can't stop anything being looked for.
+
+- **Reading.** A mount asks members for a lost block once an hour per
+  thread at most, rather than on every read; `hk cat`, `hk get` and
+  `hk dag fetch` ask whenever they're run. Failing, the error says it's
+  been reported lost.
+- **Keeping.** `hk keep add` keeps a DAG short of its lost blocks, as
+  `--shallow` would, saying so, if those are all it's missing. A root
+  that's lost itself can't be kept.
+- **Making good.** A claim reaches members as any does: those holding
+  what it's about want it, and others don't hear of it, so a member away
+  hears when it's back. A member's audit takes up lost claims it's newly
+  seen, once each time the node starts, if it holds what they're about,
+  so what's short of copies is copied on. A `keep --copies 1` it holds is
+  at its target, so isn't pushed. A member getting the block only after
+  it's heard nothing tells no one, but asking for it fetches it.
+
+`hk lost scan` finds what to report. A candidate is a block with a
+`holdings` row and no copy recorded here, that a block or claim here
+refers to. Collection deletes the holding as it lets go, so what's left
+went some other way: a file imported in place changed, say. Candidates
+are fetched through the running node. What no member has is reported, one
+claim each, unless any known member is away, when it only lists them. A
+repo with members needs its node running; one with none needs nothing. A
+reference counts even if it's only a version in an anchor's history.
+
+Scanning isn't automatic yet. `hk lost add` reports by hand, whatever's
+known, and `hk lost rm` tombs reports. `hk lost ls` lists what's reported
+and isn't here.
+
 ## Garbage collection
 
 A block is **condemned** when nothing here references it: no structure

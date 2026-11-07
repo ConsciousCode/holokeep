@@ -411,6 +411,110 @@ fn splits_cids() {
     }
 }
 
+/// Lost is only what's said of what isn't here: when it turns up, that's that.
+#[test]
+fn what_turns_up_is_not_lost() {
+    let scratch = Scratch::new("lost");
+    let repo = scratch.path().join("repo");
+    let catalog = Catalog::open_repo(&repo).expect("catalog");
+    let gone = raw(b"gone");
+    let cid: Link = gone.cid().clone().into();
+    assert_eq!(catalog.lost_at(&cid).expect("lost"), None);
+
+    let claim = catalog.report_lost(&cid).expect("report").expect("a claim");
+    assert!(claim.hashcode() == IDENTITY, "small enough to dissolve");
+    let at = catalog.lost_at(&cid).expect("lost").expect("it's lost");
+    assert_eq!(catalog.lost_blocks().expect("list"), [(cid.clone(), at)]);
+    assert_eq!(catalog.report_lost(&cid).expect("again"), None, "once is enough");
+    // Read back from its rows, it's the same claim
+    assert!(catalog.claims().expect("claims").dissolved().expect("dissolved").iter().any(|c| c.cid() == claim));
+
+    catalog.put_block(&gone, CidVersion::V1).expect("put");
+    assert_eq!(catalog.lost_at(&cid).expect("lost"), None, "it's here");
+    assert!(catalog.lost_blocks().expect("list").is_empty());
+    assert_eq!(catalog.report_lost(&cid).expect("report"), None, "what's here can't be lost");
+
+    let other: Link = raw(b"other").cid().clone().into();
+    catalog.report_lost(&other).expect("report").expect("a claim");
+    assert_eq!(catalog.unreport_lost(&other).expect("unreport").len(), 1);
+    assert_eq!(catalog.lost_at(&other).expect("lost"), None, "taken back");
+}
+
+/// A stranger can't talk a repo out of looking for something.
+#[test]
+fn only_those_who_count_can_say_a_block_is_lost() {
+    let scratch = Scratch::new("lost-stranger");
+    let repo = Catalog::open_repo(&scratch.path().join("repo")).expect("catalog");
+    repo.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let cid: Link = raw(b"wanted").cid().clone().into();
+    // Unsigned, as a stranger's would be
+    let lost = Claim::Lost(crate::claim::Lost::new([cid.clone()], 5).expect("lost"));
+    repo.put_block(&lost.block(), CidVersion::V1).expect("put");
+    assert_eq!(repo.lost_at(&cid).expect("lost"), None);
+    assert!(repo.lost_blocks().expect("list").is_empty());
+    assert!(repo.worth_asking_for(&cid) && repo.worth_asking_for(&cid));
+    // Its own key's does
+    repo.report_lost(&cid).expect("report").expect("a claim");
+    assert!(repo.lost_at(&cid).expect("lost").is_some());
+}
+
+/// Lost blocks are asked for now and then, not on every read.
+#[test]
+fn what_is_lost_is_not_asked_for_every_time() {
+    let scratch = Scratch::new("lost-asked");
+    let mut catalog = Catalog::open_repo(&scratch.path().join("repo")).expect("catalog");
+    let asks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&asks);
+    catalog.fetch_through(std::sync::Arc::new(move |_: &[Link]| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    }));
+    let (lost, unknown): (Link, Link) = (raw(b"lost").cid().clone().into(), raw(b"unknown").cid().clone().into());
+    catalog.report_lost(&lost).expect("report");
+    for _ in 0..5 {
+        assert!(!catalog.fetch_missing(std::slice::from_ref(&lost)));
+    }
+    assert_eq!(asks.load(std::sync::atomic::Ordering::Relaxed), 1, "once, then not for a while");
+    for _ in 0..5 {
+        catalog.fetch_missing(std::slice::from_ref(&unknown));
+    }
+    assert_eq!(asks.load(std::sync::atomic::Ordering::Relaxed), 6, "what isn't reported lost, every time");
+}
+
+/// A scan finds what was held, wasn't let go of, and something refers to.
+#[test]
+fn a_scan_finds_what_went_without_being_let_go() {
+    let scratch = Scratch::new("lost-scan");
+    let repo = scratch.path().join("repo");
+    let t = scratch.path().join("t");
+    std::fs::create_dir_all(&t).expect("mkdir");
+    std::fs::write(t.join("file"), "imported in place").expect("write");
+    let mut catalog = Catalog::open_repo(&repo).expect("catalog");
+    let (mount, root) = catalog.batch(|catalog| catalog.import_mounted(&Importer::default(), &t, &mut |_, _| {})).expect("import");
+    assert!(catalog.lost_candidates().expect("scan").is_empty(), "nothing's gone");
+
+    // Changed, what it was imported as is gone, though the anchor's value
+    // still links to it
+    std::fs::write(t.join("file"), "changed, as it may be").expect("write");
+    let files = catalog.external_files(None).expect("files");
+    assert_eq!(catalog.forget_changed(&files).expect("forget").len(), 1);
+    let leaf: Link = raw(b"imported in place").cid().clone().into();
+    assert_eq!(catalog.lost_candidates().expect("scan"), std::slice::from_ref(&leaf));
+    assert_eq!(catalog.missing_under(&root).expect("missing"), std::slice::from_ref(&leaf));
+    assert_eq!(catalog.anchor_value(&mount.anchor).expect("value"), Some(root));
+
+    catalog.report_lost(&leaf).expect("report").expect("a claim");
+    assert!(catalog.lost_candidates().expect("scan").is_empty(), "reported once");
+
+    // Nothing refers to what was only ever put on its own
+    let scratch2 = Scratch::new("lost-scan-alone");
+    let alone = Catalog::open_repo(&scratch2.path().join("repo")).expect("catalog");
+    let block = raw(b"alone");
+    alone.put_block(&block, CidVersion::V1).expect("put");
+    alone.db.conn().execute("DELETE FROM blocks", []).expect("gone");
+    assert!(alone.lost_candidates().expect("scan").is_empty(), "nothing refers to it");
+}
+
 /// A batch that breathes commits as it goes, between files, ending whole.
 #[test]
 fn a_big_import_lets_others_write_as_it_goes() {
@@ -2683,6 +2787,15 @@ fn repos_earlier_builds_made_still_open() {
             assert_eq!(seen_objects, 9, "{name}: three commits, trees and blobs");
             assert!(repo.claims().expect("claims").kept(git.multihash()).expect("kept"), "{name}: what the refs name");
         }
+
+        if let Some(lost) = expect.get("lost") {
+            assert!(repo.lost_at(lost).expect("lost").is_some(), "{name}: reported lost");
+            assert_eq!(repo.lost_blocks().expect("list").len(), 1, "{name}");
+        }
+        // Older ones can say so now too
+        let reported: Link = raw(name.as_bytes()).cid().clone().into();
+        repo.report_lost(&reported).expect("report").expect("a claim");
+        assert!(repo.lost_at(&reported).expect("lost").is_some(), "{name}");
 
         // And it takes more as ever
         let added = AnyCid::V1(Importer::default().add_path(&fixture.join("expect.txt"), &mut repo, &mut |_, _| {}).expect("add").expect("root").cid);

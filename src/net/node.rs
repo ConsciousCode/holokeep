@@ -165,6 +165,8 @@ pub struct Node {
     marks: Watermarks,
     /// Blocks members let go of which this node holds, to audit soon.
     suspects: Vec<Multihash>,
+    /// How far through lost claims this has looked for what's here.
+    lost_cursor: i64,
     /// The trickle's audit under way, and whether more arrived than it
     /// took in.
     trickling: Option<(AuditId, bool)>,
@@ -252,6 +254,7 @@ impl Node {
             next_trim: 0,
             marks: Watermarks::default(),
             suspects: Vec::new(),
+            lost_cursor: 0,
             trickling: None,
             cursors,
             notices: HashMap::new(),
@@ -388,10 +391,24 @@ impl Node {
         self.sightings.set_fresh_cursor(latest)?;
         let more = keys.len() >= durability::FRESH;
         keys.append(&mut self.suspects);
+        keys.extend(self.reported_lost_here()?);
         keys.extend(self.catalog.sample(Trickle::sample_size(self.catalog.block_count()?))?);
         // Before it starts, since one with nothing to ask finishes at once
         self.trickling = Some((self.next_audit, more));
         self.audit_of_keys(copies, keys).map(Some)
+    }
+
+    /// What's newly reported lost that's here after all, to audit: if it's
+    /// short of copies, as what's reported lost by another surely is, it's
+    /// then copied to someone, so that's the end of it.
+    fn reported_lost_here(&mut self) -> Result<Vec<Multihash>> {
+        let Some(claims) = self.catalog.claims() else {
+            return Ok(Vec::new());
+        };
+        let (mut keys, latest) = claims.lost_since(self.lost_cursor, durability::FRESH)?;
+        self.lost_cursor = latest;
+        keys.retain(|key| self.catalog.has(key.as_ref()).unwrap_or(false));
+        Ok(keys)
     }
 
     /// Forget whichever of these files imported in place have gone or

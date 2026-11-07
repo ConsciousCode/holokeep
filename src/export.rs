@@ -32,7 +32,10 @@ pub trait Fetch {
 impl Fetch for Catalog {
     /// A block here, or, if the catalog fetches through a node, fetched.
     fn fetch(&self, cid: &Link) -> io::Result<Vec<u8>> {
-        let missing = || io::Error::new(io::ErrorKind::NotFound, format!("block {cid} not found"));
+        let missing = || io::Error::new(io::ErrorKind::NotFound, match self.lost_at(cid) {
+            Ok(Some(at)) => format!("block {cid} not found: reported lost as of {at}"),
+            _ => format!("block {cid} not found"),
+        });
         // A block in a file of a mount's being moved out as that's written
         // over: where it was looked up, it's gone, and looking again finds it
         let got = match self.get_block(cid) {
