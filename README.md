@@ -1,6 +1,9 @@
 # Holokeep
 
-[<picture><source srcset="./static/AI-X-dark.svg" media="(prefers-color-scheme: dark)"><img src="./static/AI-X-light.svg" alt="AI:X" width="auto" height="32"></picture>](https://0rwx.com/)
+[<picture><source srcset="./static/AI-X-dark.svg" media="(prefers-color-scheme: dark)"><img src="./static/AI-X-light.svg" alt="AI:X" width="auto" height="32"></picture>](https://0rwx.com/) [![CC BY-SA 4.0][cc-by-sa-image]][cc-by-sa]
+
+[cc-by-sa]: http://creativecommons.org/licenses/by-sa/4.0/
+[cc-by-sa-image]: https://licensebuttons.net/l/by-sa/4.0/88x31.png
 
 Conventional filesystems are incredibly useful. They provide a unified interface for coordinating impossibly heterogeneous data in the form of "files" across multiple systems. However, the cost of this utility is the tyranny of *location*. A file must always "live" somewhere under a rigid ontology communicated by hierarchical directories. Does the album name or the year it was released come first? Where do you put a "School" folder? They must have a unique name even when that name would be meaningless - "Cat.jpg", "Cat (1).jpg", "Cat (1)-backup.jpg", "Cat (1) (1).jpg". Placing a file entails a decision about which drive it exists within, tying its lifetime to the health of the drive itself. There is no formal way to tie a backup to its file, particularly when that file is edited. Given long enough, any filesystem succumbs to entropy and the only choices are to give up or continue pushing the boulder against the gravity of decay.
 
