@@ -1,6 +1,6 @@
 # Holokeep
 
-<a href="https://0rwx.com/"><picture>
+<a href="https://0rwx.com/" title="AI-made, human-curated"><picture>
 <source srcset="./static/AI-X-dark.svg" media="(prefers-color-scheme: dark)">
 <img src="./static/AI-X-light.svg" alt="AI:X" width="auto" height="32">
 </picture></a>
