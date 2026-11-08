@@ -22,6 +22,11 @@ This is **data soup**, a content-addressable storage model where location is not
 - [Open questions](#open-questions)
 - [Development](#development)
 
+[<picture>
+<source srcset="./static/AI-X-dark.svg" media="(prefers-color-scheme: dark)">
+<img src="./static/AI-X-light.svg" alt="AI:X" width="auto" height="32">
+</picture>](https://0rwx.com/)
+
 ## Status
 
 Holokeep is early. What exists is the content-addressing core, each piece checked against an independent implementation (the reference is the [wiki](docs/wiki/Data%20Soup.md)):
