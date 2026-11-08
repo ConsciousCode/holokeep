@@ -112,23 +112,36 @@ it: two heads. Every node computes the same **merge** of the heads from
 the same claims, so nothing has to agree on it, and that's what the
 anchor is, in the mount and to `hk get`, till it's set again: the next
 set, by anyone, names every head, and so says what it is. `hk anchor
-show` lists the heads of a forked anchor.
+show` lists the heads of a forked anchor. Sets are taken in one order
+everywhere: by `at`, then the value's multihash, then the set's own.
 
-Directories merge three ways, name by name, against the value of the
-heads' latest common ancestor (by `prev`, an older build's set coming
+More than two heads merge two at a time, in that order, each pair over
+what it has in common, as two of them may share more than all of them
+do. Directories merge three ways, name by name, against the value of the
+pair's latest common ancestor (by `prev`, an older build's set coming
 after every set before it). With more than one, none coming after another,
 as when two devices each go on from the same merge, which no set says, it's
 those merged in turn, by these same rules, so what's measured from is what
-they saw:
+they saw.
+
+A side **changed** a name if where it ended differs from that ancestor,
+or if any set on its way since changed it from what whoever set it saw
+(the merge of what it came after), even back to how it was: a file
+removed and put back, or edited and undone, is a change, not nothing.
+Sets with nothing before them, of a past the pair doesn't share, say
+nothing of what changed.
 
 - what changed on one side only is taken, whether changed, added or
   removed;
 - what changed the same on every side that changed it is no conflict;
 - a directory changed on more than one side is merged in turn;
-- anything else changed differently is a **conflict**: the latest
-  head's version keeps the name, and each other's is kept beside it as
-  `name (conflict <tag>)`, before the extension (`page (conflict
-  ab3c2d).md`), the tag being the last six characters of its set's CID;
+- anything else changed differently is a **conflict**: each version is
+  of the latest set on its side's way that made it so (or the ancestor,
+  for the ancestor's own), not of whichever heads are being merged, so a
+  conflict comes out the same however it's come to. The latest version
+  keeps the name, and each other is kept beside it as `name (conflict
+  <tag>)`, before the extension (`page (conflict ab3c2d).md`), the tag
+  being the last six characters of the CID of the set it's of;
 - a change wins over a removal.
 
 Without a common ancestor, or once its value's been collected, every
@@ -136,5 +149,13 @@ name a head has is a change. Anything that isn't every head a directory
 is the latest head's value. Merged directories are built as the
 importer builds them; each head's value stays referenced while it's a
 head.
+
+A property test (`src/store/tests/converge.rs`) has replicas edit and
+sync in random orders, and checks that what they settle on keeps every
+write nothing came after, shows the last change to any file that was
+never in conflict, and is the same in another repo hearing the sets in
+another order. Where a file's been in conflict, a removal over it may not
+stand: the ancestor then holds one way of putting the conflict, and
+nothing's lost, but the file can come back.
 
 Source: `src/claim.rs` (`anchor`, `root_anchor`, `Set`), `src/store.rs` (`root_anchor`, `found_user`, `join_user`, `anchor_value`), `src/store/merge.rs`, `src/store/claims.rs` (`anchor_values`), `src/mount.rs`.

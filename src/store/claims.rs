@@ -828,7 +828,7 @@ impl ClaimStore {
     }
 
     /// An anchor's heads: the sets that count which no other replaces, as
-    /// (set, value, at), by `at` and then the value's multihash. More than
+    /// (set, value, at), by `at`, the value's multihash, and the set's. More than
     /// one is a fork, to be merged.
     pub fn heads(&self, anchor: Key<'_>) -> Result<Vec<(Link, Link, u64)>> {
         let mut stmt = self.db.conn().prepare_cached(
@@ -838,7 +838,7 @@ impl ClaimStore {
              JOIN claim_keys ck ON ck.claim = a.claim
              JOIN multihashes k ON k.id = ck.key
              WHERE m.multihash = ?1
-             ORDER BY a.at, v.multihash",
+             ORDER BY a.at, v.multihash, k.multihash",
         )?;
         let rows = stmt.query_map([anchor.to_bytes()], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?)))?;
         rows.map(|row| {
@@ -849,7 +849,8 @@ impl ClaimStore {
     }
 
     /// Every set of an anchor that counts, as (set, value, at, prev), by
-    /// `at` and then the value's multihash: its history, as a graph.
+    /// `at`, the value's multihash, and the set's: its history, as a graph,
+    /// in the same order wherever it is.
     pub fn sets(&self, anchor: Key<'_>) -> Result<Vec<super::SetOf>> {
         let ids: Vec<(Id, Vec<u8>)> = self.db.conn()
             .prepare_cached(&format!(
@@ -861,7 +862,7 @@ impl ClaimStore {
                  JOIN claim_keys ck ON ck.claim = c.id
                  JOIN multihashes k ON k.id = ck.key
                  WHERE m.multihash = ?1 AND {LIVE}
-                 ORDER BY s.at, v.multihash"
+                 ORDER BY s.at, v.multihash, k.multihash"
             ))?
             .query_map([anchor.to_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;

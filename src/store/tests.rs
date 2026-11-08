@@ -8,6 +8,8 @@ use crate::dag::Provenance;
 use crate::testutil::Scratch;
 use crate::unixfs;
 
+mod converge;
+
 fn router() -> Catalog {
     Catalog::standard(Db::memory().expect("db")).expect("router")
 }
@@ -3122,7 +3124,10 @@ fn a_forked_anchor_is_its_heads_merged_till_its_set_again() {
         ("a", "3"), // unchanged on the other side: no conflict
         ("b", "3"),
         (&format!("b (conflict {tag})"), "2"),
-        ("d/x", "1"), ("d/z", "1"), ("gone", "changed"),
+        ("d/x", "1"), ("d/z", "1"),
+        // Removed, then put back as it was: a change, even so, and so a
+        // conflict with the other side's
+        ("gone", "1"), (&format!("gone (conflict {tag})"), "changed"),
     ]));
 
     // Set again, by anyone, it's whatever that says
