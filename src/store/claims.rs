@@ -259,6 +259,12 @@ const SCHEMA: &str =
              PRIMARY KEY (claim, prev, prefix)
          ) WITHOUT ROWID;
          CREATE INDEX IF NOT EXISTS set_prev_prev ON set_prev (prev);
+         -- The paths a set says it wrote, though they hold what they did.
+         CREATE TABLE IF NOT EXISTS set_wrote (
+             claim INTEGER NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
+             path BLOB NOT NULL,
+             PRIMARY KEY (claim, path)
+         ) WITHOUT ROWID;
          -- Which time a keep keeps its targets, if not the first.
          CREATE TABLE IF NOT EXISTS keep_n (
              claim INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
@@ -815,8 +821,12 @@ impl ClaimStore {
             .prepare_cached("SELECT s.value_prefix, v.multihash, s.at, s.after FROM set_claims s JOIN multihashes v ON v.id = s.value WHERE s.id = ?1")?
             .query_row([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
         let prev = if after { Some(self.set_prev(id)?) } else { None };
+        let wrote: Vec<Vec<u8>> = self.db.conn()
+            .prepare_cached("SELECT path FROM set_wrote WHERE claim = ?1")?
+            .query_map([id], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         Set::new(self.targets(id)?, link(&prefix, &value)?, u64::try_from(at).unwrap_or_default())
-            .map(|set| set.after(prev))
+            .map(|set| set.after(prev).wrote(wrote))
             .ok_or_else(|| Error::Invalid { store: NAME, reason: "a set with no targets".into() })
     }
 
@@ -872,6 +882,24 @@ impl ClaimStore {
                 Ok((claim_link(&key)?, set.value().clone(), set.at(), set.prev().map(<[Link]>::to_vec)))
             })
             .collect()
+    }
+
+    /// The paths each set of an anchor that counts says it wrote, by the
+    /// set's CID, for those that say any.
+    pub fn wrote(&self, anchor: Key<'_>) -> Result<Vec<(Link, Vec<u8>)>> {
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT k.multihash, w.path FROM multihashes m
+                 JOIN claim_targets t ON t.target = m.id
+                 JOIN claims c ON c.id = t.claim
+                 JOIN set_wrote w ON w.claim = c.id
+                 JOIN claim_keys ck ON ck.claim = c.id
+                 JOIN multihashes k ON k.id = ck.key
+                 WHERE m.multihash = ?1 AND {LIVE}"
+            ))?
+            .query_map([anchor.to_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter().map(|(key, path)| Ok((claim_link(&key)?, path))).collect()
     }
 
     /// What an anchor is now, if any set says: its latest head. Where it's
@@ -1087,6 +1115,10 @@ impl ClaimStore {
             for prev in set.prev().unwrap_or_default() {
                 let (prefix, multihash) = split(prev)?;
                 stmt.execute(params![row, self.db.intern(multihash.as_ref())?, prefix])?;
+            }
+            let mut stmt = conn.prepare_cached("INSERT OR IGNORE INTO set_wrote (claim, path) VALUES (?1, ?2)")?;
+            for path in set.written() {
+                stmt.execute(params![row, path])?;
             }
         }
         if let Claim::Lost(lost) = claim {

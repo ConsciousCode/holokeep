@@ -686,7 +686,7 @@ impl Soup {
 
     /// What an anchor is now, if it's anything.
     fn anchor_root(catalog: &Catalog, anchor: &Link) -> Result<Option<Link>, Errno> {
-        catalog.anchor_value(anchor).map_err(store_errno)
+        catalog.anchor_shown(anchor).map_err(store_errno)
     }
 
     /// What's at a path of an anchor: what's in its work directory, else
@@ -1912,7 +1912,7 @@ mod tests {
         let value = AnyCid::V1(importer.add_path(&t, &mut catalog, &mut |_, _| {}).expect("import").expect("root").cid);
         let set = crate::claim::Set::new([anchor.clone()], value, at + 100).expect("set").after(Some(vec![start]));
         catalog.put_claim(&crate::claim::Claim::Set(set)).expect("put");
-        let merged = catalog.anchor_value(&anchor).expect("value").expect("value");
+        let merged = catalog.anchor_shown(&anchor).expect("value").expect("value");
         drop(catalog);
         soup.commit();
         let names_now = names(&soup, &format!("anchors/{anchor}"));
@@ -1923,6 +1923,56 @@ mod tests {
         let conflict = names_now.iter().find(|name| name.contains("conflict")).expect("a conflict").clone();
         assert_eq!(read(&soup, &format!("anchors/{anchor}/page")), b"theirs");
         assert_eq!(read(&soup, &format!("anchors/{anchor}/{conflict}")), b"mine");
+    }
+
+    /// A conflict's shown beside its name, but isn't stored; it stays shown
+    /// while other things are saved, and deleting the version beside it
+    /// resolves it to the latest, everywhere.
+    #[test]
+    fn a_conflict_is_shown_till_its_resolved() {
+        let scratch = Scratch::new("mount-conflict");
+        let (soup, anchor, repo) = writable(&scratch);
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let (start, _, at) = catalog.anchor_heads(&anchor).expect("heads").pop().expect("head");
+        let base = catalog.anchor_value(&anchor).expect("value").expect("value");
+        drop(catalog);
+        save(&soup, &anchor, "page", b"mine");
+        let mut catalog = Catalog::open_repo(&repo).expect("catalog");
+        let t = scratch.path().join("theirs");
+        crate::export::get(&catalog, &base, &t).expect("get");
+        std::fs::write(t.join("page"), b"theirs").expect("write");
+        let importer = Importer { hidden: true, ..Importer::default() };
+        let value = AnyCid::V1(importer.add_path(&t, &mut catalog, &mut |_, _| {}).expect("import").expect("root").cid);
+        let set = crate::claim::Set::new([anchor.clone()], value, at + 100).expect("set").after(Some(vec![start]));
+        catalog.put_claim(&crate::claim::Claim::Set(set)).expect("put");
+        drop(catalog);
+        // Seeing the fork, with nothing changed here, says nothing: no set
+        // only to merge, which two devices would each make
+        soup.commit();
+        let heads = |repo: &std::path::Path| Catalog::open_repo(repo).expect("catalog").anchor_heads(&anchor).expect("heads").len();
+        assert_eq!(heads(&repo), 2, "still forked");
+
+        // Shown beside it, and still, once something else is saved, which
+        // goes on from both
+        save(&soup, &anchor, "other", b"settled");
+        assert_eq!(heads(&repo), 1);
+        let conflict = names(&soup, &format!("anchors/{anchor}")).into_iter().find(|name| name.contains("conflict")).expect("a conflict");
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/page")), b"theirs");
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/{conflict}")), b"mine");
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let stored = catalog.anchor_value(&anchor).expect("value").expect("value");
+        assert!(!crate::export::list(&catalog, &stored).expect("list").iter().any(|entry| entry.name.starts_with(b"page (conflict")), "not stored");
+        assert_eq!(catalog.anchor_view(&anchor).expect("view").expect("view").state.in_conflict().count(), 1);
+        drop(catalog);
+
+        // Deleting the version beside it keeps the latest, and says so
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        soup.unlink(dir, OsStr::new(&conflict)).expect("unlink");
+        soup.commit();
+        assert!(!names(&soup, &format!("anchors/{anchor}")).iter().any(|name| name.contains("conflict")));
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/page")), b"theirs");
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        assert_eq!(catalog.anchor_view(&anchor).expect("view").expect("view").state.in_conflict().count(), 0, "resolved");
     }
 
     /// A file opened to read goes on reading what it was, whatever's saved

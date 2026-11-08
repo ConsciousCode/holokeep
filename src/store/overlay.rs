@@ -282,10 +282,15 @@ impl Catalog {
         Ok(())
     }
 
-    /// What an anchor is now, and the sets saying so.
+    /// What an anchor's shown as now, and the sets saying so.
     fn anchor_now(&self, anchor: &Link) -> Result<Option<(Link, Vec<Link>)>> {
-        let sets = self.anchor_heads(anchor)?.into_iter().map(|(set, ..)| set).collect();
-        Ok(self.anchor_value(anchor)?.map(|value| (value, sets)))
+        let sets: Vec<Link> = self.anchor_heads(anchor)?.into_iter().map(|(set, ..)| set).collect();
+        Ok(self.anchor_view(anchor)?.map(|view| (view.value, sets)))
+    }
+
+    /// What an anchor's shown as now, if anything.
+    pub fn anchor_shown(&self, anchor: &Link) -> Result<Option<Link>> {
+        Ok(self.anchor_view(anchor)?.map(|view| view.value))
     }
 
     fn set_overlay_base(&self, anchor: &Link, value: &Link, sets: &[Link]) -> Result<()> {
@@ -308,7 +313,7 @@ impl Catalog {
     /// Whether an anchor's been set to something an overlay isn't in step
     /// with, from elsewhere.
     pub fn overlay_behind(&self, anchor: &Link) -> Result<bool> {
-        let now = self.anchor_value(anchor)?;
+        let now = self.anchor_shown(anchor)?;
         Ok(self.overlay_base(anchor)?.map(|(value, _)| value) != now && now.is_some())
     }
 
@@ -333,7 +338,7 @@ impl Catalog {
     /// halfway through being written. Otherwise none.
     pub fn import_overlay_if(&mut self, mount: &Mount, still: &dyn Fn() -> bool) -> Result<Option<Link>> {
         let marks = self.overlay_marks(&mount.anchor)?;
-        let now = self.anchor_value(&mount.anchor)?;
+        let now = self.anchor_shown(&mount.anchor)?;
         // It's over what it was last in step with, whatever's been set
         // elsewhere since: what's changed is measured from there
         let base = self.overlay_base(&mount.anchor)?;
@@ -356,14 +361,27 @@ impl Catalog {
             self.overlay_in_step(&mount.anchor)?;
             return Ok(Some(value));
         }
+        // What it's over shows what's in conflict beside each name: what's
+        // said is without those it left be, and says which it resolved as
+        // they were. An overlay over what wasn't shown so, as from before
+        // conflicts were, is said as it is
+        let (said, wrote) = match &base {
+            Some((was, sets)) if !sets.is_empty() => match self.view_of(&mount.anchor, sets) {
+                Ok(view) if view.value == *was => self.unshow(&view, &value)?,
+                _ => (value, Vec::new()),
+            },
+            _ => (value, Vec::new()),
+        };
         // In place of what it's over: if that's what the anchor is, of that;
         // if not, a fork of what's been set since, which merging resolves
-        let set = match base {
-            Some((was, sets)) if now.as_ref() != Some(&was) => self.set_anchor_after(&mount.anchor, &value, sets)?,
-            _ => self.set_anchor(&mount.anchor, &value)?,
+        let prev = match base {
+            Some((was, sets)) if now.as_ref() != Some(&was) => sets,
+            _ => self.anchor_heads(&mount.anchor)?.into_iter().map(|(set, ..)| set).collect(),
         };
-        self.set_overlay_base(&mount.anchor, &value, std::slice::from_ref(&set))?;
-        Ok(Some(value))
+        let set = self.set_anchor_wrote(&mount.anchor, &said, prev, &wrote)?;
+        let shown = self.view_of(&mount.anchor, std::slice::from_ref(&set)).map_or(said, |view| view.value);
+        self.set_overlay_base(&mount.anchor, &shown, std::slice::from_ref(&set))?;
+        Ok(Some(shown))
     }
 
     /// What's at a path of an overlay now, built over what the anchor had

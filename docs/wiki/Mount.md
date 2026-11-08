@@ -175,8 +175,11 @@ unless a file of it is open to write or not yet committed:
 1. What's in the work directory is imported over the **base**. If that's
    changed anything, it's set, replacing the base's sets alone. So it forks
    what's been set since, and [[Anchors and Names#Forks and merges|merging]]
-   settles it, a conflict side by side if the same file changed, with the base
-   as the common ancestor.
+   settles it, a conflict if the same file changed, with the base as the
+   common ancestor. The mount shows each other version of a name in
+   conflict beside it (see [[Anchors and Names#Conflicts]]); those aren't
+   stored, and what's committed over them is without the ones left be,
+   and says which were resolved as they were.
 2. The blocks imported in place are moved out, so every version stays whole.
 3. The work directory is renamed aside and removed, and its marks forgotten.
 4. The base is what the anchor is now.

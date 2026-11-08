@@ -1691,6 +1691,16 @@ fn anchor(dir: Option<&PathBuf>, mut repo: Catalog, command: AnchorCommand) -> a
                     eprintln!("  {at}\t{value}\tby {set}");
                 }
             }
+            if let Some(view) = repo.anchor_view(&anchor)?
+                && view.state.in_conflict().next().is_some()
+            {
+                eprintln!("in conflict, till one's changed (the mount shows each version beside it):");
+                for (path, versions) in view.state.in_conflict() {
+                    let path: Vec<String> = path.iter().map(|name| String::from_utf8_lossy(name).into_owned()).collect();
+                    let versions: Vec<String> = versions.iter().rev().map(|version| format!("{} ({})", version.cid, version.tag())).collect();
+                    eprintln!("  {}\t{}", path.join("/"), versions.join(", "));
+                }
+            }
             for (at, value) in repo.anchor_history(&anchor)? {
                 out!("{at}\t{value}");
             }

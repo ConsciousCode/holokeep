@@ -23,7 +23,7 @@
 //! without being hashed, and a store keeps it as rows without a multihash.
 //! Anything bigger is precipitated, an ordinary sha2-256 block.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::block::{Block, IDENTITY, IDENTITY_MAX};
 use crate::cid::{AnyCid, BaseCid, CidRef, Cidv1, Cidv1Spec, DAG_CBOR_CODEC, RAW_CODEC};
@@ -89,6 +89,10 @@ pub struct Set {
     /// The sets this one replaces, sorted by CID bytes and distinct; none
     /// for one made by an older build, which replaces every set before it.
     prev: Option<Vec<Link>>,
+    /// Paths under the value it wrote though they hold what they did, as
+    /// when a conflict's resolved to its latest version: names joined by
+    /// `/`, sorted and distinct.
+    wrote: Vec<Vec<u8>>,
 }
 
 /// "`by` vouches for the targets, claims, as of `at`": `sig` is the key's
@@ -206,7 +210,7 @@ impl Set {
     /// A set of the anchors, if there are any.
     pub fn new(target: impl IntoIterator<Item = Link>, value: Link, at: u64) -> Option<Self> {
         let target = set(target);
-        (!target.is_empty()).then_some(Self { target, value, at, prev: None })
+        (!target.is_empty()).then_some(Self { target, value, at, prev: None, wrote: Vec::new() })
     }
 
     /// The same set, replacing the sets `prev`, empty for none, or, if
@@ -216,6 +220,17 @@ impl Set {
         self.prev = prev.map(set);
         self
     }
+
+    /// The same set, saying it wrote these paths, names joined by `/`.
+    #[must_use]
+    pub fn wrote(mut self, paths: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        let paths: BTreeSet<Vec<u8>> = paths.into_iter().collect();
+        self.wrote = paths.into_iter().collect();
+        self
+    }
+
+    /// The paths it says it wrote, names joined by `/`.
+    pub fn written(&self) -> &[Vec<u8>] { &self.wrote }
 
     /// The sets this replaces, if it says.
     pub fn prev(&self) -> Option<&[Link]> { self.prev.as_deref() }
@@ -364,6 +379,9 @@ impl Claim {
                 if let Some(prev) = &set.prev {
                     map.insert("prev".to_owned(), links(prev));
                 }
+                if !set.wrote.is_empty() {
+                    map.insert("wrote".to_owned(), Ipld::List(set.wrote.iter().cloned().map(Ipld::Bytes).collect()));
+                }
                 ("set", map)
             },
             Self::Tomb(_) => ("tomb", BTreeMap::new()),
@@ -452,7 +470,17 @@ impl Claim {
                     Some(_) => return None,
                     None => None,
                 };
-                Self::Set(Set::new(target.clone(), value, u64::try_from(at).ok()?)?.after(prev))
+                let wrote = match map.remove("wrote") {
+                    Some(Ipld::List(wrote)) if !wrote.is_empty() => wrote.into_iter()
+                        .map(|path| match path {
+                            Ipld::Bytes(path) => Some(path),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                    Some(_) => return None,
+                    None => Vec::new(),
+                };
+                Self::Set(Set::new(target.clone(), value, u64::try_from(at).ok()?)?.after(prev).wrote(wrote))
             },
             "tomb" => Self::Tomb(Tomb::new(target.clone())?),
             "lost" => {
@@ -702,6 +730,18 @@ mod tests {
         assert_eq!(dissolved(&set.cid()), Some(set.clone()));
         assert_eq!(Claim::parse(set.block().data()), Some(set));
         assert!(Set::new([], cid(b"v"), 0).is_none());
+    }
+
+    #[test]
+    fn sets_say_what_they_wrote_only_when_they_did() {
+        let anchor = super::anchor().expect("anchor");
+        let plain = Claim::Set(Set::new([anchor.clone()], cid(b"v"), 1).expect("set").after(Some(Vec::new())));
+        let wrote = Claim::Set(Set::new([anchor], cid(b"v"), 1).expect("set").after(Some(Vec::new())).wrote([b"b/page".to_vec(), b"a".to_vec(), b"a".to_vec()]));
+        assert!(!Claim::Set(Set::new([super::anchor().expect("anchor")], cid(b"v"), 1).expect("set").wrote([])).encode().windows(5).any(|w| w == b"wrote"), "left out when empty");
+        assert_ne!(plain.cid(), wrote.cid());
+        let Claim::Set(set) = Claim::parse(wrote.block().data()).expect("parses") else { panic!("a set") };
+        assert_eq!(set.written(), [b"a".to_vec(), b"b/page".to_vec()], "sorted and distinct");
+        assert_eq!(dissolved(&wrote.cid()).or_else(|| Claim::parse(wrote.block().data())), Some(wrote));
     }
 
     #[test]

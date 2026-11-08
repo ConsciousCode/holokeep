@@ -15,7 +15,7 @@ is not a claim; it's stored as ordinary data.
 |---|---|---|
 | `group` | `into: Link` | The targets belong to `into`. With a raw identity CID for `into`, a simple tag named by its bytes. |
 | `keep` | `beyond: [Link]` (omitted if empty), `n: int` (omitted if 0), `copies: int` (omitted for the mesh's own) | Keep the targets and what they link to, stopping at `beyond`. `n` is which time they're kept, since a tomb is forever. `copies`, at least 1, is how many failures it should take to lose what this is the nearest keep of (see [[Replication and Retention#Durability]]). |
-| `set` | `value: Link`, `at: int`, `prev: [Link]` (omitted by older builds) | The targets (anchors) are `value` as of `at`, seconds since the epoch, in place of the sets `prev` (an empty list for none). See [[Anchors and Names#Forks and merges]]. |
+| `set` | `value: Link`, `at: int`, `prev: [Link]` (omitted by older builds), `wrote: [bytes]` (omitted when empty) | The targets (anchors) are `value` as of `at`, seconds since the epoch, in place of the sets `prev` (an empty list for none). `wrote` lists paths under `value` (names joined by `/`, sorted and distinct) it wrote though they hold what they did, as when a conflict's resolved to its latest version. See [[Anchors and Names#Forks and merges]] and [[Anchors and Names#Conflicts]]. |
 | `tomb` | none | Retract the target claims. |
 | `sign` | `by: Link`, `at: int`, `prev: Link` (omitted for the first), `sig: bytes` | `by` vouches for the target claims. See [[Keys and Users]]. |
 | `device` | none | The target keys act for whoever signs this: a certificate when a user's root key signs it. |

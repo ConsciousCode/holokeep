@@ -38,7 +38,7 @@ mod compact;
 mod delta;
 mod git;
 mod ipld;
-mod merge;
+pub mod merge;
 mod offset;
 pub mod overlay;
 mod raw;
@@ -469,8 +469,9 @@ pub struct Catalog {
     /// When each lost block was last asked for here, so it's only now and
     /// then.
     lost_asked: std::cell::RefCell<std::collections::HashMap<Vec<u8>, std::time::Instant>>,
-    /// Forked anchors' merges, by their heads.
-    merges: std::cell::RefCell<std::collections::HashMap<Vec<u8>, Link>>,
+    /// Anchors' states, by the sets they're of, and how they're shown.
+    states: std::cell::RefCell<std::collections::HashMap<Vec<u8>, merge::State>>,
+    views: std::cell::RefCell<std::collections::HashMap<Vec<u8>, merge::View>>,
     /// Asks a running node for blocks that aren't here, if this fetches
     /// through one.
     fetcher: Option<Fetcher>,
@@ -1209,7 +1210,7 @@ impl Catalog {
         if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
             return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
         }
-        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, breathing: std::cell::Cell::new(None), lost_asked: std::cell::RefCell::default(), merges: std::cell::RefCell::default(), fetcher: None, missed: std::cell::RefCell::default(), commits: std::cell::RefCell::default() };
+        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, breathing: std::cell::Cell::new(None), lost_asked: std::cell::RefCell::default(), states: std::cell::RefCell::default(), views: std::cell::RefCell::default(), fetcher: None, missed: std::cell::RefCell::default(), commits: std::cell::RefCell::default() };
         for volume in volumes {
             catalog.attach(volume)?;
         }
@@ -2826,12 +2827,20 @@ impl Catalog {
         self.put_set(anchor, value, Vec::new())
     }
 
-    fn put_set(&self, anchor: &Link, value: &Link, prev: Vec<Link>) -> Result<Link> {
-        // After the latest, so it's what the anchor is even within a second
+    /// Say an anchor is `value`, in place of these of its sets, having
+    /// written these paths, though they hold what they did, as when a
+    /// conflict's resolved to its latest version.
+    pub fn set_anchor_wrote(&self, anchor: &Link, value: &Link, prev: Vec<Link>, wrote: &[merge::Path]) -> Result<Link> {
         let latest = self.anchor_history(anchor)?.last().map_or(0, |&(at, _)| at.saturating_add(1));
         let at = now().max(latest);
-        let set = crate::claim::Set::new([anchor.clone()], value.clone(), at).ok_or(Error::NoClaims)?.after(Some(prev));
+        let wrote = wrote.iter().map(|path| path.join(&b'/'));
+        let set = crate::claim::Set::new([anchor.clone()], value.clone(), at).ok_or(Error::NoClaims)?.after(Some(prev)).wrote(wrote);
         self.put_claim(&Claim::Set(set))
+    }
+
+    fn put_set(&self, anchor: &Link, value: &Link, prev: Vec<Link>) -> Result<Link> {
+        // After the latest, so it's what the anchor is even within a second
+        self.set_anchor_wrote(anchor, value, prev, &[])
     }
 
     /// What an anchor is now, if any set says: its head, or its heads,
@@ -2842,15 +2851,20 @@ impl Catalog {
             [] => Ok(None),
             [(_, value, _)] => Ok(Some(value.clone())),
             _ => {
-                let key: Vec<u8> = heads.iter().flat_map(|(set, _, _)| set.to_bytes()).collect();
-                if let Some(merged) = self.merges.borrow().get(&key) {
-                    return Ok(Some(merged.clone()));
-                }
-                let merged = self.merge_heads(anchor, &heads)?;
-                self.merges.borrow_mut().insert(key, merged.clone());
-                Ok(Some(merged))
+                Ok(Some(self.merge_heads(anchor, &heads)?))
             },
         }
+    }
+
+    /// What an anchor's shown as, as its heads say: its tree, with each
+    /// version of a name in conflict beside the latest, and what's in
+    /// conflict.
+    pub fn anchor_view(&self, anchor: &Link) -> Result<Option<merge::View>> {
+        let heads: Vec<Link> = self.claims.as_ref().ok_or(Error::NoClaims)?.heads(anchor.multihash())?.into_iter().map(|(set, ..)| set).collect();
+        if heads.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.view_of(anchor, &heads)?))
     }
 
     /// Every set of an anchor that counts, as (set, value, at, prev), by

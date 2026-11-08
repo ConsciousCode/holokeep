@@ -135,14 +135,35 @@ nothing of what changed.
   removed;
 - what changed the same on every side that changed it is no conflict;
 - a directory changed on more than one side is merged in turn;
-- anything else changed differently is a **conflict**: each version is
-  of the latest set on its side's way that made it so (or the ancestor,
-  for the ancestor's own), not of whichever heads are being merged, so a
-  conflict comes out the same however it's come to. The latest version
-  keeps the name, and each other is kept beside it as `name (conflict
-  <tag>)`, before the extension (`page (conflict ab3c2d).md`), the tag
-  being the last six characters of the CID of the set it's of;
+- anything else changed differently is a **conflict**;
 - a change wins over a removal.
+
+### Conflicts
+
+A conflict isn't stored in the tree. Every version of a name that's
+been written without any write after it having seen the others is
+**unresolved** (a multi-value register, name by name): that's worked out
+from the sets, the same everywhere, as each set's conflicts are those of
+what it came after, merged, less whatever it wrote. The tree a merge
+builds, and that a set says, holds one version of each name, the
+**latest**: of the latest set on its side's way that made it so, not of
+whichever heads are merged, so a conflict comes out the same however
+it's come to. Kubo, `hk get`, and older builds see a plain directory.
+
+The mount shows each other version beside it, as `name (conflict
+<tag>)`, before the extension (`page (conflict ab3c2d).md`), the tag
+being the last six characters of the CID of the set it's of; where that
+name's taken, with a number after the tag. Those names aren't stored:
+a file that's really called that is just a file, and nothing mistakes
+it for a conflict. `hk anchor show` lists what's in conflict.
+
+Changing a conflict, its name or any version shown beside it, resolves
+it: what the name then holds is the version, and whichever versions
+shown beside it are still there become files of those names, so nothing
+goes that wasn't deleted. Deleting the versions beside it keeps the
+latest. Writing what's there already changes nothing, so a set says
+which names it wrote, in its `wrote`, where the tree doesn't show it
+(see [[Claims]]): an older build doesn't read a set that says so.
 
 Without a common ancestor, or once its value's been collected, every
 name a head has is a change. Anything that isn't every head a directory
@@ -150,12 +171,14 @@ is the latest head's value. Merged directories are built as the
 importer builds them; each head's value stays referenced while it's a
 head.
 
-A property test (`src/store/tests/converge.rs`) has replicas edit and
-sync in random orders, and checks that what they settle on keeps every
-write nothing came after, shows the last change to any file that was
-never in conflict, and is the same in another repo hearing the sets in
-another order. Where a file's been in conflict, a removal over it may not
-stand: the ancestor then holds one way of putting the conflict, and
-nothing's lost, but the file can come back.
+A property test (`src/store/tests/converge.rs`) has replicas edit what the
+mount would show them, resolve conflicts, and sync in random orders, and
+checks that what they settle on keeps every write nothing came after,
+shows each file's last change where one came after all the rest, and is
+the same in another repo hearing the sets in another order.
+
+Nothing sets an anchor only to merge it: a fork stays forked, its heads
+merged wherever it's read, till something's changed, and that set names
+every head. So two devices each seeing a fork don't each settle it.
 
 Source: `src/claim.rs` (`anchor`, `root_anchor`, `Set`), `src/store.rs` (`root_anchor`, `found_user`, `join_user`, `anchor_value`), `src/store/merge.rs`, `src/store/claims.rs` (`anchor_values`), `src/mount.rs`.

@@ -3117,7 +3117,10 @@ fn a_forked_anchor_is_its_heads_merged_till_its_set_again() {
     // tagged by its set
     let three = tree(&mut repo, &scratch, &[("a", "3"), ("b", "3"), ("gone", "1"), ("d/x", "1")]);
     set_after(&repo, &anchor, &three, 103, vec![first]);
-    let merged = repo.anchor_value(&anchor).expect("value").expect("merged");
+    // What's stored holds the latest of each; each other version's shown
+    let stored = repo.anchor_value(&anchor).expect("value").expect("merged");
+    let merged = repo.anchor_view(&anchor).expect("view").expect("merged").value;
+    assert!(!files_of(&repo, &scratch, &stored).iter().any(|(path, _)| path.contains("conflict")), "not stored");
     let second = second.to_string();
     let tag = second.get(second.len() - 6..).expect("tag");
     assert_eq!(files_of(&repo, &scratch, &merged), files(&[
@@ -3164,7 +3167,7 @@ fn heads_beside_each_other_and_older_builds_sets() {
     repo.set_anchor(&root, &mesh).expect("set");
     let beside = repo.set_anchor_beside(&root, &mine).expect("set");
     assert_eq!(repo.anchor_heads(&root).expect("heads").len(), 2);
-    let merged = repo.anchor_value(&root).expect("value").expect("merged");
+    let merged = repo.anchor_view(&root).expect("view").expect("merged").value;
     let got = files_of(&repo, &scratch, &merged);
     let (latest, other) = if repo.anchor_heads(&root).expect("heads").last().map(|(set, _, _)| set) == Some(&beside) { ("mine", "theirs") } else { ("theirs", "mine") };
     assert_eq!(got.len(), 4, "{got:?}");
@@ -3211,4 +3214,19 @@ fn what_a_joining_repo_named_joins_what_its_user_names() {
         [("photos".to_owned(), "theirs".to_owned()), ("wiki".to_owned(), "mine".to_owned())],
         "both, neither replacing the other"
     );
+}
+
+/// A set's `wrote` is kept with it, so it's the same claim read back.
+#[test]
+fn what_a_set_wrote_is_kept_with_it() {
+    let scratch = Scratch::new("set-wrote");
+    let repo = Catalog::open_repo(&scratch.path().join("repo")).expect("open");
+    let anchor = repo.new_anchor().expect("anchor");
+    let value = link(&raw(b"v"));
+    repo.put_block(&raw(b"v"), CidVersion::V1).expect("put");
+    let set = repo.set_anchor_wrote(&anchor, &value, Vec::new(), &[vec![b"a".to_vec(), b"page".to_vec()]]).expect("set");
+    let read = repo.claim_at(set.multihash()).expect("read").expect("there");
+    assert_eq!(read.cid(), set, "the same claim");
+    let Claim::Set(read) = read else { panic!("a set") };
+    assert_eq!(read.written(), [b"a/page".to_vec()]);
 }
