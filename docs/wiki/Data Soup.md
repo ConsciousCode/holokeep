@@ -21,6 +21,7 @@ the holokeep repository; this wiki is the reference.
 - [[Mesh]]: joining, transport, and every wire protocol.
 - [[Replication and Retention]]: copies, risks, trimming, garbage collection.
 - [[Protected Meshes]]: vaults, encryption, recovery.
+- [[Sharing]]: users sharing machines and data (mostly planned).
 - [[Mount]]: the FUSE filesystem and writing through it.
 - [[Rules]]: `.souprules`, what's made through the mount becomes.
 - [[Git]]: git objects as `git-raw` blocks, and importing repositories.
@@ -48,6 +49,10 @@ the holokeep repository; this wiki is the reference.
 | account | One of the host's users, by uid, within a repo. |
 | mesh | The nodes of one user (private) or a vault's holders (protected). |
 | vault | An account's internal account for what it encrypts for friends to hold. |
+| machine | A mesh member, named by `node.key`; trusted by every user of the mesh. Planned to be distinct from devices, see [[Sharing]]. |
+| client | A device acting for its user through a member machine, not a member itself (planned; local clients exist). |
+| role | A set of privileges granted to users and other roles, as in SQL (planned). |
+| grant | A claim giving a user or role a privilege on an anchor or the mesh (planned). |
 | keep | A claim saying to keep a DAG; what nothing keeps is collected. |
 | tomb | A claim retracting other claims. |
 | mount point | A symlink to an anchor, which the mount shows as the anchor. |
