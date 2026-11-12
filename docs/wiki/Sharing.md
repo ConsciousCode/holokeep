@@ -80,23 +80,57 @@ member machine, is trusted to enforce them.
 | `WITH GRANT OPTION` | `grant`: pass on what one has. |
 | row-level security | Grants on a path within an anchor, if ever needed. |
 
-- **Grants are claims**, signed by a device of a user who may make them,
-  so they replicate like any [[Claims|claim]]. Their format isn't settled.
-- **The roster becomes claims too**: admitting a machine is signed by an
-  operator, so one user's stolen device can't admit a machine that would
-  then hold everyone's data. Today any member's roster merges into every
-  other's.
+- **Roles are names** within the mesh, not keys: the machines enforce
+  them, so nothing needs to prove it holds one.
+- **Users are keys.** A user is its root key, a `libp2p-key` CID, much as
+  a `did:key` is. Every key exists; a mesh **recognizes** one as a user
+  once a grant says so. An unrecognized key can't act in the mesh, as a
+  shell account can't be logged into before it's given a role.
+- **The roster is grants too**: admitting a machine is a grant an
+  operator signs, so one user's stolen device can't admit a machine that
+  would then hold everyone's data. Today any member's roster merges into
+  every other's.
 - **Writers share an anchor** as devices of one user do now: each name is
   a multi-value register, and concurrent writes show as conflicts (see
   [[Anchors and Names#Conflicts]]).
-- **Converging.** SQL applies grants in one order; here they must settle
-  the same whatever order they arrive in. A grant and its revocation are
-  ordered by their claims' history, not by arrival.
-- **Revoking** stops what the grantee does from then on and keeps what it
-  did before, as revoking a device does (see
-  [[Keys and Users#Revocation]]): the revocation names the last of the
-  grantee's sets that stands, since its clock can't be trusted to.
-  Revoking a `grant` privilege revokes what was granted with it.
+
+### Grants
+
+- **A `grant` is a claim type of its own**, signed by a device of the
+  user making it, so it replicates like any [[Claims|claim]]. It gives
+  or takes away privileges, of users, roles or machines, on the mesh or
+  an anchor. Its fields beyond these aren't settled.
+- **Grants have a history**: each names, as `prev`, the latest grants
+  its signer had seen, as a `set` does for an anchor. A mesh's grants are
+  one history, apart from its anchors'.
+- **The mesh is named by its first grant**, signed by the founder's root
+  key, which makes the founder its first operator.
+- **Taking away is a grant**, never a [[Claims|tomb]]: a tomb has no
+  place in a history, so it can't say what came before or after it.
+- **A grant counts if its signer could make it** in the state its `prev`
+  names. Whether someone was an operator when they signed is then one
+  answer, which every machine works out alike from the same grants,
+  whatever order they arrived in.
+- **Taking away undoes what was concurrent with it.** A grant by someone
+  whose privilege is taken away doesn't count unless the taking away came
+  after it (named it, or something after it, in its `prev`). So a stale
+  or stolen device can't act in the window before it hears it's lost a
+  privilege. When two operators take each other's away concurrently, the
+  one made operator earlier in the history keeps it; the founder always
+  does.
+- **Writes after access is taken away.** Sets on a shared anchor don't
+  name the grants they saw, or a writer whose access was taken away could
+  claim to have seen an old state forever. Instead, taking `write` away
+  names the last of the grantee's sets that stand, as revoking a device
+  does (see [[Keys and Users#Revocation]]); a later set of theirs doesn't
+  count, though it stays in history.
+- Taking away a `grant` privilege takes away what was granted with it,
+  unless it was granted again by someone else.
+
+Prior art: Matrix authorizes each event against the state at the events
+before it; Ink & Switch's Keyhive and `@localfirst/auth` keep signed
+membership histories, and `@localfirst/auth` undoes concurrent acts of
+a removed member as above.
 
 ## Across the boundary
 
@@ -125,12 +159,13 @@ Not yet implemented, beyond protected meshes.
 
 ## Open questions
 
-- The format of grants and roles: a claim type of their own, or `group`
-  and `device` claims put to new use.
-- What names a role: a key, like a user, or a name within the mesh.
-- What a user is to a mesh it was admitted to, and how an operator admits
-  one: inviting a user, as a machine is invited now, or a grant.
-- How a user's existing one-user mesh becomes a partition of a mesh with
-  others, if both have data.
+- The fields of a `grant`, and the privileges' names.
+- Whether `device` certificates, signed by a user's root, stay as they
+  are, or a mesh also has to recognize a user's devices.
+- Joining a mesh that already has data of its own (a user who ran a
+  one-user mesh) is likely simple: its machines are admitted, its user is
+  recognized, and its claims already count for that user, so its data
+  comes along with nothing granted. A new user in an existing mesh simply
+  has nothing granted to it.
 
 Source: `src/account.rs`, `src/keys.rs`, `src/net/daemon.rs`, `src/net/mesh.rs`, `src/vault.rs`.
