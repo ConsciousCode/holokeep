@@ -72,39 +72,71 @@ member machine, is trusted to enforce them.
 | SQL | Here |
 |---|---|
 | role | A user, or a named role granted to users and other roles. |
-| superuser, `CREATEROLE` | Mesh privileges: admitting machines, admitting users, setting quotas. The **operator** is a role holding them. |
-| database owner | The user whose first invite made the mesh: the first operator. |
-| table owner | The user who made an anchor, with every privilege on it. |
-| `SELECT` | `read`: see what an anchor's value reaches. |
-| `INSERT`, `UPDATE` | `write`: sets on an anchor count for its owner too. |
-| `WITH GRANT OPTION` | `grant`: pass on what one has. |
+| superuser, `CREATEROLE` | Mesh commands: `/mesh/admit`, `/mesh/user`, `/mesh/grant`. The **operator** is a role holding `/mesh`. |
+| database owner | The user whose first grant made the mesh: the first operator. |
+| table owner | The user who made an anchor, with `/anchor` on it. |
+| `SELECT` | `/anchor/read`: see what an anchor's value reaches. |
+| `INSERT`, `UPDATE` | `/anchor/write`: sets on an anchor count for its owner too. |
+| `WITH GRANT OPTION` | `/anchor/grant`, `/mesh/grant`: pass on what one has. |
+| `GRANT role TO user` | `/role/member` on the role. |
 | row-level security | Grants on a path within an anchor, if ever needed. |
 
-- **Roles are names** within the mesh, not keys: the machines enforce
-  them, so nothing needs to prove it holds one.
 - **Users are keys.** A user is its root key, a `libp2p-key` CID, much as
   a `did:key` is. Every key exists; a mesh **recognizes** one as a user
-  once a grant says so. An unrecognized key can't act in the mesh, as a
-  shell account can't be logged into before it's given a role.
-- **The roster is grants too**: admitting a machine is a grant an
-  operator signs, so one user's stolen device can't admit a machine that
-  would then hold everyone's data. Today any member's roster merges into
-  every other's.
+  once a grant of `/mesh/user` says so. An unrecognized key can't act in
+  the mesh, as a shell account can't be logged into before it's given a
+  role.
+- **Roles are names** within the mesh, not keys: the machines enforce
+  them, so nothing needs to prove it holds one. A role is the raw
+  identity CID of its name, as a tag is (see [[Claims]]).
+- **The roster is grants too**: admitting a machine is a grant of
+  `/mesh/admit` an operator signs, so one user's stolen device can't
+  admit a machine that would then hold everyone's data. Today any
+  member's roster merges into every other's.
 - **Writers share an anchor** as devices of one user do now: each name is
   a multi-value register, and concurrent writes show as conflicts (see
   [[Anchors and Names#Conflicts]]).
 
-### Grants
+### Commands
 
-- **A `grant` is a claim type of its own**, signed by a device of the
-  user making it, so it replicates like any [[Claims|claim]]. It gives
-  or takes away privileges, of users, roles or machines, on the mesh or
-  an anchor. Its fields beyond these aren't settled.
-- **Grants have a history**: each names, as `prev`, the latest grants
-  its signer had seen, as a `set` does for an anchor. A mesh's grants are
-  one history, apart from its anchors'.
-- **The mesh is named by its first grant**, signed by the founder's root
-  key, which makes the founder its first operator.
+Privileges are named as [UCAN](https://github.com/ucan-wg/spec) names
+commands: lower case paths starting with `/`, and a shorter path covers
+the longer ones under it (`/anchor` covers `/anchor/write`, but `/mesh`
+doesn't cover `/meshes`). `/` covers everything.
+
+| Command | On | Allows |
+|---|---|---|
+| `/mesh/admit` | the mesh | Admitting machines to the roster, and taking them out. |
+| `/mesh/user` | the mesh | Recognizing users. |
+| `/mesh/grant` | the mesh | Granting mesh commands one holds. |
+| `/anchor/read` | an anchor | Seeing what its value reaches. |
+| `/anchor/write` | an anchor | Sets on it, which count for its owner. |
+| `/anchor/grant` | an anchor | Granting commands one holds on it. |
+| `/role/member` | a role | Holding whatever the role holds. |
+
+### The `grant` claim
+
+A `grant` is a [[Claims|claim]] type of its own, signed by a device of the
+user making it (the first, by the founder's root key):
+
+| Key | Type | Meaning |
+|---|---|---|
+| `claim` | `"grant"` | |
+| `target` | `[Link]` | Who it's for: users' root keys, machines' keys, roles. A set, as every claim's is. |
+| `on` | `Link` | The anchor or role it's about; omitted for the mesh. |
+| `add` | `[string]` | Commands given, sorted and distinct; omitted when empty. |
+| `del` | `[string]` | Commands taken away, sorted and distinct; omitted when empty. |
+| `stands` | `[Link]` | Only with `/anchor/write` (or what covers it) in `del`: the last of the targets' sets on `on` that still count. |
+| `prev` | `[Link]` | The latest grants its signer had seen; empty for the first. |
+
+```json
+{"claim": "grant", "add": ["/anchor/write"], "on": {"/": "bafyqag…"}, "prev": [{"/": "bafyrei…"}], "target": [{"/": "bafzaa…"}]}
+```
+
+- **Grants have a history**: a mesh's grants are one history, by `prev`,
+  as an anchor's sets are, apart from its anchors'.
+- **The mesh is named by its first grant**, which gives the founder `/`,
+  making them its first operator.
 - **Taking away is a grant**, never a [[Claims|tomb]]: a tomb has no
   place in a history, so it can't say what came before or after it.
 - **A grant counts if its signer could make it** in the state its `prev`
@@ -112,25 +144,49 @@ member machine, is trusted to enforce them.
   answer, which every machine works out alike from the same grants,
   whatever order they arrived in.
 - **Taking away undoes what was concurrent with it.** A grant by someone
-  whose privilege is taken away doesn't count unless the taking away came
+  whose command is taken away doesn't count unless the taking away came
   after it (named it, or something after it, in its `prev`). So a stale
   or stolen device can't act in the window before it hears it's lost a
-  privilege. When two operators take each other's away concurrently, the
+  command. When two operators take each other's away concurrently, the
   one made operator earlier in the history keeps it; the founder always
   does.
 - **Writes after access is taken away.** Sets on a shared anchor don't
   name the grants they saw, or a writer whose access was taken away could
-  claim to have seen an old state forever. Instead, taking `write` away
-  names the last of the grantee's sets that stand, as revoking a device
-  does (see [[Keys and Users#Revocation]]); a later set of theirs doesn't
-  count, though it stays in history.
-- Taking away a `grant` privilege takes away what was granted with it,
+  claim to have seen an old state forever. Instead, taking
+  `/anchor/write` away names, in `stands`, the last of the grantee's sets
+  that count, as revoking a device does (see
+  [[Keys and Users#Revocation]]); a set of theirs not before one of those
+  doesn't count, though it stays in history.
+- Taking away a `grant` command takes away what was granted with it,
   unless it was granted again by someone else.
 
 Prior art: Matrix authorizes each event against the state at the events
 before it; Ink & Switch's Keyhive and `@localfirst/auth` keep signed
 membership histories, and `@localfirst/auth` undoes concurrent acts of
 a removed member as above.
+
+### Devices and certificates
+
+A user's `device` certificate says a key acts for the user. Whether the
+mesh must also recognize the key depends on what it can reach:
+
+- **Devices that only sign**, clients and accounts on another's machine:
+  the certificate is enough. The machine they act through checks it, and
+  that the user is recognized.
+- **A machine hosting only its own user** receives only what counts for
+  that user, so its certificate could be enough, if the mesh lets users
+  add such machines themselves: a setting of the mesh.
+- **A machine hosting other users** holds their plaintext, inside the
+  boundary, so it needs `/mesh/admit` from an operator.
+
+### Meshes don't merge
+
+A mesh's users come into another by being recognized there and importing
+a dump of what they had (`hk dag export`). Kept with their own root key,
+their certificates and signatures come along, so what they said counts
+for them as it did, with nothing signed again; under a new key it
+wouldn't. Merging meshes without sending everything over again may be
+worth looking into for efficiency.
 
 ## Across the boundary
 
@@ -147,25 +203,32 @@ Not yet implemented, beyond protected meshes.
   vault's keys are derived per block from one secret, so all or nothing.
 - Revoking a capability means encrypting again, which is one reason
   grants, not capabilities, are used inside the boundary.
+- **UCAN at the edge.** [UCAN](https://github.com/ucan-wg/spec) tokens,
+  signed chains of delegation from a resource's owner, suit a remote
+  client or someone outside the mesh: a member machine checks the chain
+  when it's used. Inside, they don't fit: revoking is a growing set of
+  revoked tokens with no place in a history, tokens expire by the clock,
+  a required nonce keeps equal grants from being equal blocks, and their
+  checking assumes one executor where every machine checks every claim.
 
 ## Phases
 
 1. Devices apart from machines; one daemon per machine serving every user
    of the mesh; hosting, serving and placement per user.
-2. Roles, the operator role, and a roster operators sign.
-3. Grants on anchors, `read` and `write`, and revoking them.
+2. The `grant` claim and its history: recognizing users, the operator
+   role, and a roster operators sign.
+3. Grants on anchors, `/anchor/read` and `/anchor/write`, and taking
+   them away.
 4. Remote clients.
 5. Capabilities for sharing outside the mesh.
 
 ## Open questions
 
-- The fields of a `grant`, and the privileges' names.
-- Whether `device` certificates, signed by a user's root, stay as they
-  are, or a mesh also has to recognize a user's devices.
-- Joining a mesh that already has data of its own (a user who ran a
-  one-user mesh) is likely simple: its machines are admitted, its user is
-  recognized, and its claims already count for that user, so its data
-  comes along with nothing granted. A new user in an existing mesh simply
-  has nothing granted to it.
+- How a grant's `del` of `/anchor/write` names `stands` when the grantee
+  wrote on several branches, and what happens to a set made after one of
+  `stands` concurrently with another.
+- The format of a mesh's setting for machines users add themselves.
+- How grants are fetched and checked by a machine joining late: the whole
+  history, or a snapshot of the state with its heads.
 
 Source: `src/account.rs`, `src/keys.rs`, `src/net/daemon.rs`, `src/net/mesh.rs`, `src/vault.rs`.
