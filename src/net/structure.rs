@@ -45,7 +45,12 @@ pub const BATCH: usize = 256;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Notice {
     blocks: Vec<(ByteBuf, Vec<ByteBuf>)>,
+    /// Whose structure this is, as `Want`'s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<ByteBuf>,
 }
+
+super::hosts::for_user!(Notice);
 
 impl Notice {
     pub const fn is_empty(&self) -> bool {
@@ -225,21 +230,25 @@ impl Cursors {
         Ok(Self { db, prefix })
     }
 
-    fn name(&self, peer: &PeerId) -> String {
-        format!("{}{peer}", self.prefix)
+    /// A cursor's name: the peer's, for the node's own account, and with
+    /// `#` and the uid for another account it serves.
+    fn name(&self, peer: &PeerId, account: Option<u32>) -> String {
+        account.map_or_else(|| format!("{}{peer}", self.prefix), |uid| format!("{}{peer}#{uid}", self.prefix))
     }
 
-    pub fn get(&self, peer: &PeerId) -> Result<i64> {
+    /// How far a member's been noticed for the node's own account, or
+    /// another it serves.
+    pub fn get(&self, peer: &PeerId, account: Option<u32>) -> Result<i64> {
         Ok(self.db.conn()
             .prepare_cached("SELECT generation FROM notice_cursors WHERE peer = ?1")?
-            .query_row([self.name(peer)], |row| row.get(0))
+            .query_row([self.name(peer, account)], |row| row.get(0))
             .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(0) } else { Err(e) })?)
     }
 
-    pub fn set(&self, peer: &PeerId, generation: i64) -> Result<()> {
+    pub fn set(&self, peer: &PeerId, account: Option<u32>, generation: i64) -> Result<()> {
         self.db.conn()
             .prepare_cached("INSERT OR REPLACE INTO notice_cursors (peer, generation) VALUES (?1, ?2)")?
-            .execute(params![self.name(peer), generation])?;
+            .execute(params![self.name(peer, account), generation])?;
         Ok(())
     }
 

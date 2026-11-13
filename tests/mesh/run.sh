@@ -316,6 +316,34 @@ scenario_fork_merge() {
         || fail "no conflict beside page.md: $(listing one /soup/wiki | tr '\n' ' ')"
 }
 
+# Another user sharing the mesh's machines: one serves an account for them,
+# made as it invites their machine, which hosts only them; their copies go
+# to one, and neither user's blocks reach the other's machines
+scenario_shared() {
+    local peer ticket theirs ours
+    machine ezra
+    peer=$(on ezra hk node id)
+    ticket=$(on one hk node invite "$peer" --account 4000000001 2>/dev/null)
+    on ezra hk node join "$ticket" >/dev/null
+    node_up ezra
+    wait_for "ezra to connect" sh_on one "hk node peers | grep '$peer' | grep -q connected"
+    on one hk node status | grep -q "^serving	4000000001$" || fail "one doesn't serve ezra's account"
+    # Each says which accounts the other's users are, and two's only one's own
+    local one_peer two_peer
+    one_peer=$(on one hk node id)
+    two_peer=$(on two hk node id)
+    wait_for "one to see ezra hosts its account" sh_on one "hk node peers | grep '^$peer	connected	' | grep -q '	4000000001$'"
+    wait_for "ezra to see one hosts its user" sh_on ezra "hk node peers | grep '^$one_peer	connected	' | grep -q '	0$'"
+    on one hk node peers | grep "^$two_peer" | grep -q '	0$' || fail "one doesn't see two hosts only its own"
+    theirs=$(sh_on ezra 'echo "a note of ezra'"'"'s" | hk add -q -')
+    ours=$(sh_on one 'echo "a note of one'"'"'s" | hk add -q -')
+    ! on two hk dag fetch "$theirs" >/dev/null 2>&1 || fail "two fetched ezra's note"
+    ! on two hk block get "$theirs" >/dev/null 2>&1 || fail "two has ezra's note"
+    ! on ezra hk dag fetch "$ours" >/dev/null 2>&1 || fail "ezra fetched one's note"
+    ! on one hk block get "$theirs" >/dev/null 2>&1 || fail "one's owner reads ezra's note"
+    on two hk dag fetch "$ours" >/dev/null || fail "two can't fetch one's note"
+}
+
 # --- Main ----------------------------------------------------------------
 
 say "building hk and the machine image"
@@ -333,7 +361,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke shared)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

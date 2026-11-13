@@ -67,7 +67,12 @@ const UNKNOWN_FREE_MIB: u64 = 1024;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Advert {
     blocks: Vec<(ByteBuf, Vec<Replica>)>,
+    /// Whose blocks these are, as `Want`'s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<ByteBuf>,
 }
+
+super::hosts::for_user!(Advert);
 
 /// An answer to an advert: the copies this node holds of the blocks, and
 /// where it would keep one it's sent.
@@ -84,7 +89,12 @@ pub struct Push {
     blocks: Vec<(ByteBuf, ByteBuf)>,
     #[serde(default)]
     copies: Vec<Vec<Replica>>,
+    /// Whose blocks these are, as `Want`'s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<ByteBuf>,
 }
+
+super::hosts::for_user!(Push);
 
 impl Push {
     /// Pushes of these blocks, each about a few megabytes at most, with
@@ -887,6 +897,7 @@ mod tests {
         let push = |block: &Block| Push {
             blocks: vec![(ByteBuf::from(block.cid().to_bytes()), ByteBuf::from(block.data().to_vec()))],
             copies: Vec::new(),
+            user: None,
         };
         catalog.set_quota(Some(100));
         let small = block(&[1; 60]);
@@ -898,7 +909,7 @@ mod tests {
         assert!(answer_push(&catalog, &sightings, &peer, push(&more), &marks).expect("push").kept.is_empty());
         assert!(!catalog.has(more.cid().multihash()).expect("has"));
         // And its offers say as much
-        let advert = Advert { blocks: Vec::new() };
+        let advert = Advert::default();
         assert_eq!(answer_advert(&catalog, &sightings, &peer, &advert, &marks).expect("advert").offer.and_then(|offer| offer.free), Some(40));
     }
 

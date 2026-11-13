@@ -50,7 +50,12 @@ const BATCH: usize = 512;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Intent {
     keys: Vec<ByteBuf>,
+    /// Whose blocks these are, as `Want`'s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<ByteBuf>,
 }
+
+super::hosts::for_user!(Intent);
 
 /// An answer to an intent: the copies held here of what it names, and
 /// what this node means to let go of first.
@@ -183,7 +188,7 @@ impl Trim {
         }
         trim.report.considered = trim.candidates.len();
         let keys: Vec<ByteBuf> = trim.candidates.keys().cloned().map(ByteBuf::from).collect();
-        let intents = keys.chunks(BATCH).map(|keys| Intent { keys: keys.to_vec() }).collect();
+        let intents = keys.chunks(BATCH).map(|keys| Intent { keys: keys.to_vec(), user: None }).collect();
         Ok((trim, intents))
     }
 

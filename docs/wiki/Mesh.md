@@ -1,6 +1,7 @@
 A **mesh** is the set of nodes that replicate and serve each other's
-blocks: one user's devices (private), or a vault's holders (protected,
-see [[Protected Meshes]]). `hk node run` is the
+blocks: machines serving one or more users (private), or a vault's
+holders (protected, see [[Protected Meshes]]). A user's blocks go only to
+the machines hosting the user (see [[#Users sharing a mesh]]). `hk node run` is the
 daemon. It owns the mesh on one thread, along with the catalog's
 database, and other `hk` commands ask it over a Unix socket in the repo
 for anything that needs the network.
@@ -53,9 +54,57 @@ mesh runs alone: an ephemeral swarm key, no listening, no dialing, but
 still watching files imported in place and collecting.
 
 **Several meshes.** A node may be in several, each with its own swarm
-key, members and daemon (`--mesh <name>`, files in `meshes/<name>/`),
-acting for one account each. A daemon hears of, holds and serves only
-its account's view.
+key, members and daemon (`--mesh <name>`, files in `meshes/<name>/`). A
+daemon hears of, holds and serves only the views of the accounts its mesh
+serves: its own, and for the main mesh, any others joined to it.
+
+## Users sharing a mesh
+
+The main mesh's daemon serves the owner's account and any other account
+joined to it, each a user sharing the machine, listed in `mesh_accounts`.
+Each has a device key of its own in `accounts/` and a user, whose root
+certifies it.
+
+- `hk node invite <peer> --account <uid>` on the main mesh serves that
+  account too, making it a user first if it has none (asking that user's
+  passphrase), and certifies the joiner as that user's device.
+- `hk node join <ticket> --account <uid>` makes that account a device of
+  the ticket's user, served by the main mesh.
+- `<uid>` may be a host user's, or an unused number for a user this
+  machine hosts who has no login here (`hk node id --account <uid>` prints
+  the key it'd act for them with, for an invite's `--device`).
+
+**Hosting.** On connecting, and whenever what it hosts changes, each
+machine tells the other which users it hosts (`/holokeep/hosts/1.0.0`):
+for each served account with a user, the user's key, the device key it
+acts for the user with, and that key's signature over the machine's peer
+ID:
+
+```
+sig = ed25519(device, "holokeep hosts\x00" || peer ID bytes)
+```
+
+A machine takes another to host a user only if it serves that user too,
+the signature checks, and the device is certified by the user here and
+not revoked. So a machine can't claim to host a user without one of the
+user's device keys, and learns nothing from what it's told of users it
+doesn't serve.
+
+**Serving.** Every request about blocks names, as `user`, the user's key
+CID whose blocks it's about. The answering machine works it out as its
+account for that user, and only if the asker hosts the user; otherwise it
+answers as though it had none of them. Audits, trims and fetches run for
+each account served, among the members hosting its user. Nothing is asked
+of a member until it's answered what this machine hosts, as it now is.
+
+An account with no user yet, such as a vault's, acts for its device key,
+and its blocks go to any member, as before there were users. A machine of
+an older build, which doesn't answer `hosts`, is taken to host the user
+of the answering daemon's own account, and its requests, which name no
+user, are for that account.
+
+`hk node peers` lists, for each connected member, the accounts here whose
+users it hosts.
 
 ## Connections
 
@@ -77,16 +126,19 @@ below are CBOR byte strings. A "key" is a multihash's bytes; a "CID" is a
 CID's binary form. A **replica** is `{label: bytes, risks: [string]}`,
 one copy of a block: the volume it's on, by its random label, and what
 that volume risks (see [[Replication and Retention]]).
-An **offer** is `{risks: [string], free: uint | null}`.
+An **offer** is `{risks: [string], free: uint | null}`. `user?` is
+`user: CID`, the key of the user whose blocks a request is about, omitted
+by older builds (see [[#Users sharing a mesh]]).
 
 | Protocol | Request | Response | Purpose |
 |---|---|---|---|
 | `/holokeep/members/1.0.0` | `{members: [[peer, [addr]]]}` | same | Exchange rosters. |
-| `/holokeep/blocks/1.0.0` | `{want: [key]}` | `{blocks: [[CID, data]], missing: [key], copies: [[replica]]}` | Fetch blocks. |
-| `/holokeep/adverts/1.0.0` | `{blocks: [[key, [replica]]]}` | `{held: [[key, [replica]]], offer: offer \| null}` | "These may be under-replicated." |
-| `/holokeep/push/1.0.0` | `{blocks: [[CID, data]], copies: [[replica]]}` | `{kept: [[key, [replica]]]}` | Send copies to keep. |
-| `/holokeep/notices/1.0.0` | `{blocks: [[CID, [key]]]}` | `{want: [CID]}` | Notice structure and what it links to. |
-| `/holokeep/trim/1.0.0` | `{keys: [key]}` | `{held: [[key, [replica]]], refused: [key]}` | "I mean to let go of these." |
+| `/holokeep/hosts/1.0.0` | `{hosts: [{user: CID, device: CID, sig: bytes}]}` | same | Say which users each hosts. |
+| `/holokeep/blocks/1.0.0` | `{want: [key], user?}` | `{blocks: [[CID, data]], missing: [key], copies: [[replica]]}` | Fetch blocks. |
+| `/holokeep/adverts/1.0.0` | `{blocks: [[key, [replica]]], user?}` | `{held: [[key, [replica]]], offer: offer \| null}` | "These may be under-replicated." |
+| `/holokeep/push/1.0.0` | `{blocks: [[CID, data]], copies: [[replica]], user?}` | `{kept: [[key, [replica]]]}` | Send copies to keep. |
+| `/holokeep/notices/1.0.0` | `{blocks: [[CID, [key]]], user?}` | `{want: [CID]}` | Notice structure and what it links to. |
+| `/holokeep/trim/1.0.0` | `{keys: [key], user?}` | `{held: [[key, [replica]]], refused: [key]}` | "I mean to let go of these." |
 | `/holokeep/dropped/1.0.0` | `{keys: [key]}` | `{}` | "I let go of these." |
 | `/holokeep/condemn/1.0.0` | `{blocks: [key]}` | `{kept: [key]}` | "Does a keep of yours reach these?" |
 
@@ -114,8 +166,10 @@ spreading everything everywhere:
   here.
 
 Each member has a cursor over the catalog's generations (see
-[[Storage]]), moved only once it answers, so a member that was
-away hears of what it missed. A block sent to a member, by push, fetch
+[[Storage]]) for each account served whose user it hosts, moved only once
+it answers, so a member that was away hears of what it missed. The
+daemon's own account's is named by the peer ID; another's adds `#` and
+the account's uid. A block sent to a member, by push, fetch
 or want, takes the structure linking to it along. It's one hop: what
 links to what a member holds, not what links to that.
 
@@ -123,7 +177,7 @@ Durability (`adverts`, `push`), trimming (`trim`, `dropped`) and garbage
 collection (`condemn`) are described in
 [[Replication and Retention]].
 
-Source: `src/net/node.rs`, `src/net/mesh.rs`, `src/net/blocks.rs`, `src/net/structure.rs`, `src/net/daemon.rs`.
+Source: `src/net/node.rs`, `src/net/hosts.rs`, `src/net/mesh.rs`, `src/net/blocks.rs`, `src/net/structure.rs`, `src/net/daemon.rs`.
 
 ## Forgetting members
 

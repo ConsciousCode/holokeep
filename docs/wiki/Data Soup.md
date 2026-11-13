@@ -46,8 +46,8 @@ the holokeep repository; this wiki is the reference.
 | node | One machine running holokeep, named by its ed25519 key (= libp2p peer ID). |
 | device | A node's key, certified by a user. |
 | user | A root key, sealed with a passphrase, that certifies devices. |
-| account | One of the host's users, by uid, within a repo. |
-| mesh | The nodes of one user (private) or a vault's holders (protected). |
+| account | A user a repo serves, by uid: one of the host's users, or a user with no login there. |
+| mesh | Machines serving one or more users, each user's blocks only on machines hosting them (private), or a vault's holders (protected). |
 | vault | An account's internal account for what it encrypts for friends to hold. |
 | machine | A mesh member, named by `node.key`; trusted by every user of the mesh. Planned to be distinct from devices, see [[Sharing]]. |
 | client | A device acting for its user through a member machine, not a member itself (planned; local clients exist). |

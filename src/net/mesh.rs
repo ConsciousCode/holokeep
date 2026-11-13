@@ -225,7 +225,14 @@ impl Members {
                  uid INTEGER NOT NULL,
                  protected INTEGER NOT NULL DEFAULT 0,
                  quota INTEGER
-             );",
+             );
+             -- The accounts, by uid, a mesh serves besides its own: users
+             -- sharing its machines.
+             CREATE TABLE IF NOT EXISTS mesh_accounts (
+                 mesh TEXT NOT NULL,
+                 uid INTEGER NOT NULL,
+                 PRIMARY KEY (mesh, uid)
+             ) WITHOUT ROWID;",
         )?;
         if !db.conn().prepare("SELECT 1 FROM pragma_table_info('meshes') WHERE name = 'protected'")?.exists([])? {
             db.conn().execute_batch("ALTER TABLE meshes ADD COLUMN protected INTEGER NOT NULL DEFAULT 0; ALTER TABLE meshes ADD COLUMN quota INTEGER;")?;
@@ -259,6 +266,21 @@ impl Members {
             .prepare_cached("INSERT INTO meshes (name, uid) VALUES (?1, ?2) ON CONFLICT (name) DO UPDATE SET uid = excluded.uid")?
             .execute(params![self.mesh, uid])?;
         Ok(())
+    }
+
+    /// The accounts, by uid, the mesh serves besides its own.
+    pub fn others(&self) -> Result<Vec<u32>> {
+        Ok(self.db.conn()
+            .prepare_cached("SELECT uid FROM mesh_accounts WHERE mesh = ?1 ORDER BY uid")?
+            .query_map([&self.mesh], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Serve another account in the mesh too. Returns whether it's new.
+    pub fn serve(&self, uid: u32) -> Result<bool> {
+        Ok(self.db.conn()
+            .prepare_cached("INSERT OR IGNORE INTO mesh_accounts (mesh, uid) VALUES (?1, ?2)")?
+            .execute(params![self.mesh, uid])? > 0)
     }
 
     /// Say the mesh is protected, and how many bytes its account may have

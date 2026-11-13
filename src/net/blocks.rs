@@ -46,7 +46,13 @@ const BUDGET: usize = 4 << 20;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Want {
     want: Vec<ByteBuf>,
+    /// Whose these are wanted for, by the user's key CID: omitted by older
+    /// builds, for the user the mesh was for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<ByteBuf>,
 }
+
+super::hosts::for_user!(Want);
 
 /// An answer to a want: blocks as (CID, bytes), and the multihashes of
 /// those the peer doesn't have; and the copies the peer holds of each
@@ -92,6 +98,12 @@ pub fn answer(catalog: &Catalog, want: &Want) -> Blocks {
         answer.found.push((ByteBuf::from(cid.to_bytes()), ByteBuf::from(data)));
     }
     answer
+}
+
+/// An answer to a want refused, as from an account whose user the asker
+/// doesn't host: none of it's here.
+pub fn refuse(want: &Want) -> Blocks {
+    Blocks { missing: want.want.clone(), ..Blocks::default() }
 }
 
 /// A block being wanted: its CID, and how many members have been asked.
@@ -176,7 +188,7 @@ impl Fetch {
 
     /// The want for a batch.
     pub fn want(batch: &Batch) -> Want {
-        Want { want: batch.keys().cloned().map(ByteBuf::from).collect() }
+        Want { want: batch.keys().cloned().map(ByteBuf::from).collect(), user: None }
     }
 
     pub fn sent(&mut self, request: OutboundRequestId, batch: Batch) {

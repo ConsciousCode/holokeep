@@ -69,6 +69,17 @@ pub struct Verdict {
     kept: Vec<ByteBuf>,
 }
 
+impl Verdict {
+    /// Say it's kept of whatever another verdict does too.
+    pub fn join(&mut self, other: Self) {
+        for key in other.kept {
+            if !self.kept.contains(&key) {
+                self.kept.push(key);
+            }
+        }
+    }
+}
+
 /// What collecting did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {

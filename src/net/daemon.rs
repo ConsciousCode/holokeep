@@ -400,7 +400,17 @@ fn open_node(place: &Place) -> Result<(Node, bool)> {
     if let Some(quota) = members.protected()? {
         catalog.set_quota(quota);
     }
-    Ok((Node::tcp(&key, swarm_key, catalog, members)?, alone))
+    let mut node = Node::tcp(&key, swarm_key, catalog, members)?;
+    serve_accounts(&mut node, dir)?;
+    Ok((node, alone))
+}
+
+/// Serve the accounts the mesh is for besides its own, users sharing this
+/// machine, each with its key here.
+fn serve_accounts(node: &mut Node, dir: &Path) -> Result<()> {
+    let others = node.members().others()?;
+    let keys = others.into_iter().map(|uid| Ok((uid, crate::keys::account_key(dir, uid)?))).collect::<Result<Vec<_>>>()?;
+    node.serve(keys)
 }
 
 /// Listen and connect to members, and say so, unless alone.
@@ -762,6 +772,10 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
     let _ = writeln!(out, "collecting\t{}", if collecting { "yes" } else { "no" });
     let _ = writeln!(out, "condemned\t{}", node.condemned().count()?);
     let _ = writeln!(out, "account\t{}", node.catalog().uid());
+    let others: Vec<String> = node.accounts().iter().skip(1).map(ToString::to_string).collect();
+    if !others.is_empty() {
+        let _ = writeln!(out, "serving\t{}", others.join(" "));
+    }
     let keeps = node.catalog().claims().map(crate::store::ClaimStore::keeps).transpose()?.map_or(0, |keeps| keeps.len());
     let _ = writeln!(out, "keeps\t{keeps}");
     let _ = writeln!(out, "lost\t{}", node.catalog().lost_blocks()?.len());
@@ -805,7 +819,10 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
             for (peer, addrs) in node.members().list()?.into_iter().filter(|(peer, _)| *peer != node.peer_id()) {
                 let state = if connected.contains(&peer) { "connected" } else { "-" };
                 let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
-                let _ = writeln!(out, "{peer}\t{state}\t{}", addrs.join(" "));
+                // Which accounts here its users are, once it's said
+                let hosts: Vec<String> = if connected.contains(&peer) { node.hosted_by(&peer)?.iter().map(ToString::to_string).collect() } else { Vec::new() };
+                let hosts = if hosts.is_empty() { "-".to_owned() } else { hosts.join(" ") };
+                let _ = writeln!(out, "{peer}\t{state}\t{}\t{hosts}", addrs.join(" "));
             }
         },
         "status" => out.push_str(&status(node, copies, collecting, alone)?),
@@ -826,6 +843,7 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
                 let _ = writeln!(out, "{}", if *join { "joined" } else { "alone" });
             } else {
                 node.reload()?;
+                serve_accounts(node, &place.repo)?;
                 node.dial_members()?;
             }
         },
@@ -838,7 +856,7 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
         command if command.starts_with("fetch-blocks ") => {
             let cids: std::result::Result<Vec<crate::model::Link>, _> = command.trim_start_matches("fetch-blocks ").split_whitespace().map(str::parse).collect();
             match cids {
-                Ok(cids) => return Ok(Some((Waiter::Fetch(node.fetch_blocks(cids)?), write))),
+                Ok(cids) => return Ok(Some((Waiter::Fetch(node.fetch_blocks_for(uid, cids)?), write))),
                 Err(_) => {
                     let _ = writeln!(out, "error: not a list of CIDs");
                 },
@@ -847,7 +865,7 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
         command if command.starts_with("fetch ") => {
             let cid = command.trim_start_matches("fetch ").trim();
             match cid.parse::<crate::model::Link>() {
-                Ok(root) => return Ok(Some((Waiter::Fetch(node.fetch(root)?), write))),
+                Ok(root) => return Ok(Some((Waiter::Fetch(node.fetch_for(uid, root)?), write))),
                 Err(_) => {
                     let _ = writeln!(out, "error: not a CID: {cid}");
                 },

@@ -23,18 +23,25 @@ other side enforces anything.
 
 ## What exists
 
-- **Accounts.** One repo serves several of the host's users, each an
-  account by uid with a device key in `accounts/` (see
-  [[Keys and Users#Accounts]]). What an account sees is what counts for
-  its user, and blocks it has; another account's are as good as absent.
+- **Accounts.** One repo serves several users, each an account by uid
+  with a device key in `accounts/` (see [[Keys and Users#Accounts]]):
+  a host user's, or one with no login there. What an account sees is
+  what counts for its user, and blocks it has; another account's are as
+  good as absent.
+- **A mesh serves several users.** The main mesh's one daemon serves the
+  owner's account and any other joined to it, and machines tell each
+  other which users they host, each proved by a device key's signature
+  over the machine's peer ID, checked against the user's certificates. A
+  user's blocks are served, noticed and pushed only to machines hosting
+  the user, and audits, trims and fetches run per user among those
+  machines (see [[Mesh#Users sharing a mesh]]).
 - **A daemon's peer ID is its machine's.** Every daemon of a repo uses
   `node.key` for libp2p, whichever account it acts for.
 - **The owner's device is the machine.** The owner's device key *is*
-  `node.key`, so the owner's devices and the mesh's machines are the same
-  keys.
-- **A mesh acts for one account**, with its own swarm key, roster, port
-  and daemon (`--mesh <name>`). Users sharing machines today means a mesh
-  each, over the same machines, which can't share anything between them.
+  `node.key`, so the owner's devices and the machines are the same keys.
+- **Other meshes act for one account each** (`--mesh <name>`), with their
+  own swarm key, roster, port and daemon: protected meshes, and any made
+  that way before the main mesh served several.
 - **Local clients.** With `hk node run --shared`, the host's other users
   ask the daemon over its socket, as their own accounts.
 - **Block access tokens** are computed and checked (see
@@ -42,23 +49,13 @@ other side enforces anything.
 
 ## Machines, users and devices
 
-Not yet implemented.
+Not yet implemented, beyond what's above.
 
-- **A mesh is its machines.** One daemon per machine serves every user
-  the mesh has; a user is a partition of it, not a mesh of its own.
-  Today's mesh is the case of one user.
 - **Devices apart from machines.** The owner gets a device key of their
   own, like any other account's, and `node.key` names only the machine.
-- **Hosting.** On connecting, a machine says which of the mesh's users it
-  hosts, each by its device key's signature over the machine's peer ID
-  and a time, with the user's certificate of that device. A block is
-  served, noticed or pushed to a machine only if it counts for a user
-  that machine hosts: a laptop of one user never hears of another's
-  blocks, and a server hosting everyone holds everything.
-- **Placement.** [[Replication and Retention#Durability|Rendezvous hashing]]
-  chooses among the machines hosting a block's users, with every
-  machine's risks and free space in one picture. Blocks are stored once
-  however many accounts have them, as now.
+  This waits for machines to be admitted by grants of their own, since
+  until then an invite certifies the joining machine as a device, and
+  one ID is all it needs.
 - **Remote clients.** A device needn't be a machine. A client connects to
   a member machine and acts as its user, seeing only what that user may.
   An agent running on a machine outside the mesh (a hosted assistant) is
@@ -213,10 +210,10 @@ Not yet implemented, beyond protected meshes.
 
 ## Phases
 
-1. Devices apart from machines; one daemon per machine serving every user
-   of the mesh; hosting, serving and placement per user.
+1. One daemon per machine serving every user of the mesh; hosting,
+   serving and placement per user. Done.
 2. The `grant` claim and its history: recognizing users, the operator
-   role, and a roster operators sign.
+   role, a roster operators sign, and devices apart from machines.
 3. Grants on anchors, `/anchor/read` and `/anchor/write`, and taking
    them away.
 4. Remote clients.
@@ -231,4 +228,4 @@ Not yet implemented, beyond protected meshes.
 - How grants are fetched and checked by a machine joining late: the whole
   history, or a snapshot of the state with its heads.
 
-Source: `src/account.rs`, `src/keys.rs`, `src/net/daemon.rs`, `src/net/mesh.rs`, `src/vault.rs`.
+Source: `src/account.rs`, `src/keys.rs`, `src/net/daemon.rs`, `src/net/hosts.rs`, `src/net/mesh.rs`, `src/net/node.rs`, `src/vault.rs`.

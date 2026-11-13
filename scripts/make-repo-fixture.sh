@@ -50,6 +50,12 @@ printf 'lost from %s\n' "$name" > "$tmp/lost.txt"
 lost=$(h add -q -n "$tmp/lost.txt")
 h lost add "$lost" >/dev/null
 
+# A mesh, with another account it serves, a user sharing this machine,
+# whose user certifies the machine invited (the owner's root stays its
+# device's, as the checks expect)
+peer() { "$hk" --repo "$tmp/$1" node id; }
+HK_PASSPHRASE=fixture h node invite "$(peer other)" --account 4000000000 >/dev/null 2>&1
+
 mkdir -p "$out"
 cp -a "$repo/." "$out/"
 rm -f "$out"/*.sock

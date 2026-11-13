@@ -151,8 +151,10 @@ struct NodeArgs {
 enum NodeCommand {
     /// Print this node's peer id, for another node to invite
     Id {
-        /// Print instead the key this repo signs with for one of the host's
-        /// accounts, by uid, for an invite's --device
+        /// Print instead the key this repo signs with for one of its
+        /// accounts, by uid, for an invite's --device: a host user's, or
+        /// an unused number for a user this machine hosts who has no login
+        /// here
         #[arg(long)]
         account: Option<u32>,
     },
@@ -164,7 +166,9 @@ enum NodeCommand {
         /// the peer's own: an account's on a shared host (`hk whoami`)
         #[arg(long)]
         device: Option<String>,
-        /// Whose mesh a new one is, by uid [default: yours]
+        /// Whose user certifies the machine, by uid [default: yours]. Of the
+        /// main mesh, another account is served by this node too, a user
+        /// sharing it, made now if it has none; a new mesh is its
         #[arg(long)]
         account: Option<u32>,
         /// Make a new mesh protected: a friend's, whose vault this node
@@ -180,8 +184,9 @@ enum NodeCommand {
     /// Join a mesh with a ticket from a node already in it
     Join {
         ticket: String,
-        /// Whose mesh it is, by uid, for one other than the main one
-        /// [default: yours]
+        /// Which account joins, by uid [default: yours]: of the main mesh,
+        /// another account, served by this node too, as a device of the
+        /// user the ticket's for
         #[arg(long)]
         account: Option<u32>,
     },
@@ -1116,22 +1121,30 @@ const FRIENDS: u32 = 0xC000_0000;
 
 /// The account a mesh is for, by uid: the main one's owner's, unless
 /// it's said, and a new one's whoever's said, or the owner's, recorded.
+/// Another account said of the main mesh is served by it too, a user
+/// sharing this machine.
 #[cfg(feature = "net")]
 fn mesh_account(members: &holokeep::net::mesh::Members, said: Option<u32>) -> anyhow::Result<u32> {
     let (uid, new) = mesh_uid(members, said)?;
     if new {
-        members.set_account(uid)?;
+        if members.mesh() == holokeep::net::mesh::MAIN {
+            members.serve(uid)?;
+        } else {
+            members.set_account(uid)?;
+        }
     }
     Ok(uid)
 }
 
-/// The account a mesh is for, by uid, and whether the mesh is new.
+/// The account a mesh is for, by uid, and whether it's new to the mesh.
 #[cfg(feature = "net")]
 fn mesh_uid(members: &holokeep::net::mesh::Members, said: Option<u32>) -> anyhow::Result<(u32, bool)> {
     let me = rustix::process::getuid().as_raw();
     if members.mesh() == holokeep::net::mesh::MAIN {
-        anyhow::ensure!(said.is_none_or(|uid| uid == me), "the main mesh is the owner's: give another --mesh for another account");
-        return Ok((me, false));
+        return Ok(match said {
+            Some(uid) if uid != me => (uid, !members.others()?.contains(&uid)),
+            _ => (me, false),
+        });
     }
     if let Some(uid) = members.account()? {
         anyhow::ensure!(said.is_none_or(|said| said == uid), "mesh {} is uid {uid}'s", members.mesh());
@@ -1168,7 +1181,7 @@ fn peers(place: &holokeep::net::mesh::Place) -> anyhow::Result<()> {
         eprintln!("this node isn't running; members it knows of:");
         for (peer, addrs) in daemon::members(place)?.list()? {
             let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
-            out!("{peer}\t-\t{}", addrs.join(" "));
+            out!("{peer}\t-\t{}\t-", addrs.join(" "));
         }
     }
     Ok(())

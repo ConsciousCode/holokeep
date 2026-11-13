@@ -49,8 +49,9 @@ async fn within(time: Duration, nodes: &mut [&mut Node], mut done: impl FnMut(&[
     true
 }
 
+/// Connected, each knowing what the other hosts.
 fn connected(a: &Node, b: &Node) -> bool {
-    a.connected().contains(&b.peer_id()) && b.connected().contains(&a.peer_id())
+    a.ready().contains(&b.peer_id()) && b.ready().contains(&a.peer_id())
 }
 
 #[tokio::test]
@@ -536,7 +537,7 @@ async fn copies_take_what_links_to_them_along() {
     // Only what's copied, not what's noticed from a's cursor
     for (peer, node) in [(b.peer_id(), &a), (c.peer_id(), &a)] {
         let latest = node.catalog().structure_since(0, usize::MAX).expect("latest").1;
-        node.cursors.set(&peer, latest).expect("cursor");
+        node.cursors.set(&peer, None, latest).expect("cursor");
     }
     let id = a.audit(2).expect("audit");
     audited(&mut [&mut a, &mut b, &mut c], &[(0, id)]).await;
@@ -667,9 +668,12 @@ async fn a_devices_claims_count_where_they_go_and_a_strangers_dont() {
         a.catalog().put_block(block, CidVersion::V1).expect("put");
     }
     a.catalog().tag(&link(signed), &link(&tag)).expect("tag");
-    // A key the user never certified, as a stranger's
+    // A key the user never certified, as a stranger's; then the device's
+    // again, or the machine couldn't say it hosts the user
+    let device = a.catalog().signer().cloned().expect("device");
     a.catalog_mut().set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
     a.catalog().tag(&link(unsigned), &link(&other)).expect("tag");
+    a.catalog_mut().set_signer(device).expect("signer");
     assert!(tags(&a, unsigned).is_empty(), "not even where it was made");
 
     assert_eq!(fetch(&mut a, &mut b, link(signed)).await.0, 1);
@@ -758,9 +762,9 @@ async fn surplus_copies_are_let_go_of_once() {
     // Three copies of each where two will do: all three mean to let go of
     // every leaf at once, and for each the lowest-ranked does
     let trims = [
-        (0, a.trim(2, keys(&blocks)).expect("trim")),
-        (1, b.trim(2, keys(&blocks)).expect("trim")),
-        (2, c.trim(2, keys(&blocks)).expect("trim")),
+        (0, a.trim(2, &keys(&blocks)).expect("trim")),
+        (1, b.trim(2, &keys(&blocks)).expect("trim")),
+        (2, c.trim(2, &keys(&blocks)).expect("trim")),
     ];
     let reports = trimmed(&mut [&mut a, &mut b, &mut c], &trims).await;
     assert!(reports.iter().all(|report| report.considered == 16), "the root is structure: {reports:?}");
@@ -778,7 +782,7 @@ async fn surplus_copies_are_let_go_of_once() {
     })
     .await);
     // Two copies left, none spare
-    let trims = [(0, a.trim(2, keys(&blocks)).expect("trim")), (1, b.trim(2, keys(&blocks)).expect("trim"))];
+    let trims = [(0, a.trim(2, &keys(&blocks)).expect("trim")), (1, b.trim(2, &keys(&blocks)).expect("trim"))];
     let reports = trimmed(&mut [&mut a, &mut b, &mut c], &trims).await;
     assert!(reports.iter().all(|report| report.dropped == 0), "{reports:?}");
 }
@@ -793,7 +797,7 @@ async fn sightings_arent_trusted_with_the_last_copies() {
     // a believes b holds it, but b has let it go without saying
     b.catalog().drop_copies(leaf.cid().multihash()).expect("drop");
     // One copy will do, and a believes there'd be one left
-    let id = a.trim(1, keys(std::slice::from_ref(leaf))).expect("trim");
+    let id = a.trim(1, &keys(std::slice::from_ref(leaf))).expect("trim");
     let reports = trimmed(&mut [&mut a, &mut b], &[(0, id)]).await;
     assert_eq!(reports, [trim::Report { considered: 1, dropped: 0, freed: 0 }]);
     assert!(has(&a, leaf));
@@ -902,7 +906,7 @@ async fn condemned_copies_dont_count_to_a_trimmer() {
     audited(&mut [&mut a, &mut b], &[(0, id)]).await;
     // b means to collect its copy, so a mustn't let go of its own for it
     b.condemned().condemn(&keys(std::slice::from_ref(leaf)), None).expect("condemn");
-    let id = a.trim(1, keys(std::slice::from_ref(leaf))).expect("trim");
+    let id = a.trim(1, &keys(std::slice::from_ref(leaf))).expect("trim");
     let reports = trimmed(&mut [&mut a, &mut b], &[(0, id)]).await;
     assert_eq!(reports[0].dropped, 0, "{reports:?}");
     assert!(has(&a, leaf));
@@ -1123,4 +1127,94 @@ async fn an_audit_finishes_beside_another_writer() {
     writer.execute_batch("COMMIT").expect("unlock");
     let id = b.audit(2).expect("audit");
     assert_eq!(audited(&mut [&mut a, &mut b], &[(1, id)]).await.len(), 1);
+}
+
+//------------------------//
+//-[ Users sharing nodes ]-//
+//------------------------//
+
+/// A server hosting two users, an account for each, and a laptop of each,
+/// all members of one mesh. Returns the server, the laptops, and the
+/// server's account for the second user, by uid.
+async fn shared() -> (Node, Node, Node, u32) {
+    use crate::keys::Key;
+    let (mut server, mut mine, mut theirs) = Box::pin(three()).await;
+    let (me, them) = (Key::generate().expect("key"), Key::generate().expect("key"));
+    let (server_mine, server_theirs) = (Key::generate().expect("key"), Key::generate().expect("key"));
+    let (laptop_mine, laptop_theirs) = (Key::generate().expect("key"), Key::generate().expect("key"));
+    let other = server.catalog().uid().wrapping_add(1);
+    for node in [&server, &mine, &theirs] {
+        for device in [&server_mine, &laptop_mine] {
+            node.catalog().certify(&me, &device.id()).expect("certify");
+        }
+        for device in [&server_theirs, &laptop_theirs] {
+            node.catalog().certify(&them, &device.id()).expect("certify");
+        }
+    }
+    let claims = server.catalog().claims().expect("claims");
+    claims.set_device(other, &server_theirs.id()).expect("device");
+    claims.set_user(other, &them.id()).expect("user");
+    server.catalog().set_user(&me.id()).expect("user");
+    server.catalog_mut().set_signer(server_mine).expect("signer");
+    server.serve(vec![(other, server_theirs)]).expect("serve");
+    mine.catalog().set_user(&me.id()).expect("user");
+    mine.catalog_mut().set_signer(laptop_mine).expect("signer");
+    theirs.catalog().set_user(&them.id()).expect("user");
+    theirs.catalog_mut().set_signer(laptop_theirs).expect("signer");
+    for node in [&mut server, &mut mine, &mut theirs] {
+        node.announce().expect("announce");
+    }
+    // Each laptop knows the server hosts its user, and the server both
+    let hosting = |n: &[&mut Node]| {
+        let (server, mine, theirs) = (&n[0], &n[1], &n[2]);
+        [(server, mine), (server, theirs), (mine, server), (theirs, server)].iter().all(|(a, b)| a.ready().contains(&b.peer_id()))
+    };
+    assert!(until(&mut [&mut server, &mut mine, &mut theirs], hosting).await);
+    (server, mine, theirs, other)
+}
+
+/// Whether a node's account by uid has a block in its repo.
+fn sees(node: &mut Node, uid: u32, block: &Block) -> bool {
+    node.catalog_mut().viewing(uid, |catalog| catalog.visible(block.cid().multihash()).expect("visible")).expect("view")
+}
+
+#[tokio::test]
+async fn a_users_blocks_go_only_to_machines_hosting_them() {
+    let (mut server, mut mine, mut theirs, other) = Box::pin(shared()).await;
+    let home = server.catalog().uid();
+    let (ours, yours) = (raw(b"mine"), raw(b"theirs"));
+    mine.catalog().put_block(&ours, CidVersion::V1).expect("put");
+    theirs.catalog().put_block(&yours, CidVersion::V1).expect("put");
+
+    // Each laptop's copies go to the server, for the account of its user,
+    // with what certifies its devices
+    let audits = [(1, mine.audit(2).expect("audit")), (2, theirs.audit(2).expect("audit"))];
+    let reports = audited(&mut [&mut server, &mut mine, &mut theirs], &audits).await;
+    assert!(reports.iter().all(|report| report.copied >= 1), "{reports:?}");
+    assert!(has(&server, &ours) && has(&server, &yours));
+    assert!(!has(&theirs, &ours) && !has(&mine, &yours), "never to the other user's laptop");
+    assert!(sees(&mut server, home, &ours) && !sees(&mut server, home, &yours));
+    assert!(sees(&mut server, other, &yours) && !sees(&mut server, other, &ours));
+
+    // Nor can either fetch the other's from the server
+    assert_eq!(fetch(&mut server, &mut theirs, link(&ours)).await, (0, vec![link(&ours)]));
+    assert_eq!(fetch(&mut server, &mut mine, link(&yours)).await, (0, vec![link(&yours)]));
+    // But each its own user's
+    let more = raw(b"more of theirs");
+    server.catalog_mut().viewing(other, |catalog| catalog.put_block(&more, CidVersion::V1)).expect("view").expect("put");
+    assert_eq!(fetch(&mut server, &mut theirs, link(&more)).await, (1, vec![]));
+    assert_eq!(fetch(&mut server, &mut mine, link(&more)).await, (0, vec![link(&more)]));
+}
+
+#[tokio::test]
+async fn a_machine_says_it_hosts_only_users_whose_device_it_has() {
+    let (mut server, mut mine, mut theirs, _) = Box::pin(shared()).await;
+    // A key the second user never certified, as a thief's machine might
+    // claim to host them with
+    theirs.catalog_mut().set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
+    let yours = raw(b"theirs");
+    server.catalog().put_block(&yours, CidVersion::V1).expect("put");
+    theirs.announce().expect("announce");
+    assert!(until(&mut [&mut server, &mut mine, &mut theirs], |n| n[0].ready().contains(&n[2].peer_id()) && n[2].ready().contains(&n[0].peer_id())).await);
+    assert_eq!(fetch(&mut server, &mut theirs, link(&yours)).await.0, 0);
 }

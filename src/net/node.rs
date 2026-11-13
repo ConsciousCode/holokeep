@@ -16,6 +16,9 @@
 //!   `structure`.
 //! - Members let go of copies the mesh can spare when space runs short;
 //!   see `trim`.
+//! - A node serves several accounts, users sharing its machine, and
+//!   members tell each other which users they host; a user's blocks go
+//!   only to machines hosting the user. See `hosts`.
 
 use std::path::PathBuf;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -38,11 +41,13 @@ use serde::{Deserialize, Serialize};
 use super::blocks::{self, Blocks, Fetch, Want};
 use super::collect::{self, Condemn, Condemned, Verdict};
 use super::durability::{self, Advert, Audit, Haves, Kept, Push, Report, Sightings, Trickle};
+use super::hosts::{self, Host, Hosts};
 use crate::multihash::Multihash;
 use crate::store::BlockIndex;
 use super::mesh::{Error, Members, Result, unless_busy};
 use super::structure::{self, Cursors, Notice, Wants};
 use super::trim::{self, Ack, Dropped, Grant, Intent, Trim, Watermarks};
+use crate::cid::CidRef;
 use crate::model::Link;
 use crate::store::{Catalog, ExternalFile};
 
@@ -97,6 +102,7 @@ pub struct Behaviour {
     trim: request_response::cbor::Behaviour<Intent, Grant>,
     dropped: request_response::cbor::Behaviour<Dropped, Ack>,
     condemn: request_response::cbor::Behaviour<Condemn, Verdict>,
+    hosts: request_response::cbor::Behaviour<Hosts, Hosts>,
 }
 
 /// A fetch, as the node knows it.
@@ -150,17 +156,63 @@ where
         .boxed())
 }
 
+/// One of the accounts a node serves, by uid, and who it acts for: its
+/// user's key, or until it has one, its device's, as a vault's account
+/// does. Until it has a user, its blocks are any member's, as before
+/// there were users.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Local {
+    uid: u32,
+    user: Option<Link>,
+    /// Whether it has a user, a root key, so is a mesh's partition.
+    rooted: bool,
+}
+
+impl Local {
+    /// The user's key CID's bytes, as a request names it.
+    fn user_bytes(&self) -> Option<Vec<u8>> {
+        self.user.as_ref().map(CidRef::to_bytes)
+    }
+}
+
+/// What a member hosts, as far as it's said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Hosting {
+    /// An older build, which doesn't say: the mesh was for one user, so
+    /// it hosts the user this node's own account is for.
+    Older,
+    /// These users, by their keys' CIDs' bytes, as it's shown.
+    Users(std::collections::BTreeSet<Vec<u8>>),
+}
+
+/// Who a node hosts, by (user, device), as key CIDs' bytes.
+type Hosted = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Audits or trims run as one, one for each account served: done when
+/// every part is.
+#[derive(Debug, Default)]
+struct Group<R> {
+    parts: std::collections::BTreeSet<u64>,
+    report: R,
+}
+
 pub struct Node {
     swarm: Swarm<Behaviour>,
     members: Members,
     catalog: Catalog,
-    fetches: BTreeMap<FetchId, Fetch>,
+    /// Fetches, and for which account each is.
+    fetches: BTreeMap<FetchId, (u32, Fetch)>,
     next_fetch: FetchId,
     sightings: Sightings,
-    audits: BTreeMap<AuditId, Audit>,
+    /// Audits, and for which account each is.
+    audits: BTreeMap<AuditId, (u32, Audit)>,
+    /// Audits of every account served, made of an audit of each.
+    audit_groups: BTreeMap<AuditId, Group<Report>>,
     next_audit: AuditId,
     trickle: Trickle,
-    trims: BTreeMap<TrimId, Trim>,
+    /// Trims, and for which account each is.
+    trims: BTreeMap<TrimId, (u32, Trim)>,
+    trim_groups: BTreeMap<TrimId, Group<trim::Report>>,
     next_trim: TrimId,
     marks: Watermarks,
     /// Blocks members let go of which this node holds, to audit soon.
@@ -173,11 +225,28 @@ pub struct Node {
     /// took in.
     trickling: Option<(AuditId, bool)>,
     cursors: Cursors,
-    /// Notices sent: to whom, and for one from a cursor, where it moves to
-    /// once answered.
-    notices: HashMap<request_response::OutboundRequestId, (PeerId, Option<i64>)>,
-    /// Members with a notice from their cursor unanswered.
-    noticing: HashSet<PeerId>,
+    /// Notices sent: to whom, for which account, and for one from a
+    /// cursor, where it moves to once answered.
+    notices: HashMap<request_response::OutboundRequestId, (PeerId, u32, Option<i64>)>,
+    /// Members with a notice from their cursor unanswered, for each
+    /// account.
+    noticing: HashSet<(PeerId, u32)>,
+    /// Pushes sent, and for which account each was.
+    pushed: HashMap<request_response::OutboundRequestId, u32>,
+    /// The accounts served besides the catalog's own, by uid, and the
+    /// keys this node acts for each with.
+    others: Vec<(u32, crate::keys::Key)>,
+    /// Who this node last told members it hosts, by (user, device), and
+    /// what it told them.
+    told: (Hosted, Hosts),
+    /// What each connected member hosts, as it's said.
+    hosting: HashMap<PeerId, Hosting>,
+    /// Connected members which know what this node hosts as it now is, so
+    /// may be asked things: until then, nothing's asked of one.
+    heard: HashSet<PeerId>,
+    /// Members told what this node hosts, yet to answer, and what each was
+    /// told.
+    telling: HashMap<request_response::OutboundRequestId, (PeerId, Hosts)>,
     condemned: Condemned,
     /// Files imported in place found changed, for whoever runs the node
     /// to import again if they're mounted.
@@ -236,6 +305,10 @@ impl Node {
                 [(collect::PROTOCOL, ProtocolSupport::Full)],
                 request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
             ),
+            hosts: request_response::cbor::Behaviour::new(
+                [(hosts::PROTOCOL, ProtocolSupport::Full)],
+                request_response::Config::default().with_request_timeout(Duration::from_secs(20)),
+            ),
         };
         let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(IDLE);
         let swarm = Swarm::new(transport, behaviour, peer, config);
@@ -250,9 +323,11 @@ impl Node {
             next_fetch: 0,
             sightings,
             audits: BTreeMap::new(),
+            audit_groups: BTreeMap::new(),
             next_audit: 0,
             trickle: Trickle::default(),
             trims: BTreeMap::new(),
+            trim_groups: BTreeMap::new(),
             next_trim: 0,
             marks: Watermarks::default(),
             suspects: Vec::new(),
@@ -262,6 +337,12 @@ impl Node {
             cursors,
             notices: HashMap::new(),
             noticing: HashSet::new(),
+            pushed: HashMap::new(),
+            others: Vec::new(),
+            told: (Vec::new(), Hosts::default()),
+            hosting: HashMap::new(),
+            heard: HashSet::new(),
+            telling: HashMap::new(),
             condemned,
             changed: Vec::new(),
             condemning: HashMap::new(),
@@ -291,73 +372,271 @@ impl Node {
         &self.sightings
     }
 
-    /// Notice each connected member of structure which arrived since it
-    /// was last noticed, unless it's still to answer the last.
-    pub fn announce(&mut self) -> Result<()> {
+    /// Serve these accounts too, besides the catalog's own, acting for
+    /// each with its key here: users sharing this machine.
+    pub fn serve(&mut self, others: Vec<(u32, crate::keys::Key)>) -> Result<()> {
+        self.others = others;
+        self.tell_hosts()
+    }
+
+    /// The uids of the accounts served, the catalog's own first.
+    pub fn accounts(&self) -> Vec<u32> {
+        let home = self.catalog.uid();
+        std::iter::once(home).chain(self.others.iter().map(|&(uid, _)| uid).filter(|&uid| uid != home)).collect()
+    }
+
+    /// The accounts served, the catalog's own first.
+    fn locals(&self) -> Result<Vec<Local>> {
+        self.accounts().into_iter().map(|uid| self.local(uid)).collect()
+    }
+
+    fn local(&self, uid: u32) -> Result<Local> {
+        let account = match self.catalog.claims() {
+            Some(claims) => claims.account(uid)?,
+            None => None,
+        };
+        let rooted = account.as_ref().is_some_and(|account| account.user.is_some());
+        Ok(Local { uid, user: account.as_ref().and_then(|account| account.acts_for().cloned()), rooted })
+    }
+
+    /// Whether a member hosts an account's user, so may have its blocks.
+    fn hosts(&self, peer: &PeerId, local: &Local) -> bool {
+        let (Some(user), true) = (local.user_bytes(), local.rooted) else {
+            return true;
+        };
+        match self.hosting.get(peer) {
+            Some(Hosting::Users(users)) => users.contains(&user),
+            // As when a mesh was for one user; one that's yet to say isn't
+            // asked anything, so asks nothing of a newer build
+            Some(Hosting::Older) | None => local.uid == self.catalog.uid(),
+        }
+    }
+
+    /// The connected members which may be asked of an account's blocks.
+    fn peers_for(&self, local: &Local) -> Vec<PeerId> {
+        let mut peers: Vec<PeerId> = self.connected().into_iter().filter(|peer| self.heard.contains(peer) && self.hosts(peer, local)).collect();
+        peers.sort();
+        peers
+    }
+
+    /// The account a member asks of, by the user it names, or naming none,
+    /// as an older build, the catalog's own: if the member hosts its user.
+    fn serving(&self, peer: &PeerId, user: Option<&[u8]>) -> Result<Option<Local>> {
+        let mut locals = self.locals()?.into_iter();
+        let local = match user {
+            Some(user) => locals.find(|local| local.user_bytes().as_deref() == Some(user)),
+            None => locals.next(),
+        };
+        Ok(local.filter(|local| self.hosts(peer, local)))
+    }
+
+    /// Tell connected members what this node hosts, if that's changed
+    /// since they were told: until they answer, nothing's asked of them.
+    fn tell_hosts(&mut self) -> Result<()> {
+        let me = self.peer_id();
+        let mut who = Vec::new();
+        let mut keys = Vec::new();
+        for local in self.locals()? {
+            let Some(user) = local.user else {
+                continue;
+            };
+            let key = if local.uid == self.catalog.uid() {
+                self.catalog.signer()
+            } else {
+                self.others.iter().find(|(uid, _)| *uid == local.uid).map(|(_, key)| key)
+            };
+            if let Some(key) = key {
+                who.push((user.to_bytes(), key.id().to_bytes()));
+                keys.push((user, key));
+            }
+        }
+        if who == self.told.0 {
+            return Ok(());
+        }
+        let hosts = Hosts::new(keys.iter().map(|(user, key)| Host::new(&me, user, key)).collect());
+        self.told = (who, hosts);
+        self.heard.clear();
         for peer in self.connected() {
-            self.announce_to(peer)?;
+            self.tell(peer);
         }
         Ok(())
     }
 
+    /// Tell a member what this node hosts.
+    fn tell(&mut self, peer: PeerId) {
+        let hosts = self.told.1.clone();
+        let request = self.swarm.behaviour_mut().hosts.send_request(&peer, hosts.clone());
+        self.telling.insert(request, (peer, hosts));
+    }
+
+    /// Take in what a member says it hosts: those of the users served here
+    /// whose devices, as certified here, signed for it.
+    fn heard_hosts(&mut self, peer: PeerId, hosts: &Hosts) -> Result<()> {
+        let locals = self.locals()?;
+        let mut users = std::collections::BTreeSet::new();
+        for host in hosts.hosts() {
+            let Some((user, device)) = host.verify(&peer) else {
+                continue;
+            };
+            let Some(local) = locals.iter().find(|local| local.user.as_ref() == Some(&user)) else {
+                continue;
+            };
+            let certified = self.catalog.viewing(local.uid, |catalog| catalog.claims().map_or(Ok(false), |claims| claims.authorized(&device)))??;
+            if certified {
+                users.insert(user.to_bytes());
+            }
+        }
+        self.hosting.insert(peer, Hosting::Users(users));
+        Ok(())
+    }
+
+    /// A member knows what this hosts: go on with what's waiting on it.
+    fn heard_by(&mut self, peer: PeerId) -> Result<()> {
+        self.heard.insert(peer);
+        unless_busy(self.announce_to(peer), "telling a member what's here")?;
+        self.redrive()
+    }
+
+    fn on_hosts(&mut self, event: request_response::Event<Hosts, Hosts>) -> Result<()> {
+        match event {
+            request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
+                self.heard_hosts(peer, &request)?;
+                self.tell_hosts()?;
+                // The asker may be gone already
+                let _ = self.swarm.behaviour_mut().hosts.send_response(channel, self.told.1.clone());
+                if self.heard.contains(&peer) {
+                    unless_busy(self.announce_to(peer), "telling a member what's here")?;
+                }
+            },
+            request_response::Event::Message { peer, message: request_response::Message::Response { request_id, response }, .. } => {
+                if let Some((_, told)) = self.telling.remove(&request_id) {
+                    self.heard_hosts(peer, &response)?;
+                    // Told what this hosted before isn't knowing it now
+                    if told == self.told.1 {
+                        self.heard_by(peer)?;
+                    }
+                }
+            },
+            request_response::Event::OutboundFailure { peer, request_id, error, .. } => {
+                let Some(_) = self.telling.remove(&request_id) else {
+                    return Ok(());
+                };
+                if matches!(error, request_response::OutboundFailure::UnsupportedProtocols) {
+                    self.hosting.insert(peer, Hosting::Older);
+                    self.heard_by(peer)?;
+                } else {
+                    // Told again on the next announce
+                    self.redrive()?;
+                }
+            },
+            _ => {},
+        }
+        Ok(())
+    }
+
+    /// Notice each connected member of structure which arrived since it
+    /// was last noticed, unless it's still to answer the last.
+    pub fn announce(&mut self) -> Result<()> {
+        self.tell_hosts()?;
+        let telling: HashSet<PeerId> = self.telling.values().map(|(peer, _)| *peer).collect();
+        for peer in self.connected() {
+            if self.heard.contains(&peer) {
+                self.announce_to(peer)?;
+            } else if !telling.contains(&peer) {
+                self.tell(peer);
+            }
+        }
+        Ok(())
+    }
+
+    /// Notice a member of what's arrived, of each account whose user it
+    /// hosts, once it knows what this node hosts.
     fn announce_to(&mut self, peer: PeerId) -> Result<()> {
-        if self.noticing.contains(&peer) {
+        if !self.heard.contains(&peer) {
             return Ok(());
         }
-        let mut cursor = self.cursors.get(&peer)?;
+        for local in self.locals()? {
+            if self.hosts(&peer, &local) {
+                self.announce_as(peer, &local)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The cursor a member's noticed from for an account: the catalog's
+    /// own, as before there were others, or another's of its own.
+    fn cursor_of(&self, uid: u32) -> Option<u32> {
+        (uid != self.catalog.uid()).then_some(uid)
+    }
+
+    fn announce_as(&mut self, peer: PeerId, local: &Local) -> Result<()> {
+        if self.noticing.contains(&(peer, local.uid)) {
+            return Ok(());
+        }
+        let account = self.cursor_of(local.uid);
+        let mut cursor = self.cursors.get(&peer, account)?;
         loop {
             let (arrived, latest) = self.catalog.structure_since(cursor, structure::BATCH)?;
             if latest == cursor {
                 return Ok(());
             }
             // Fewer than a batch arrived, so they make one notice at most
-            if let Some(notice) = structure::notices(&self.catalog, &arrived)?.into_iter().next() {
-                let request = self.swarm.behaviour_mut().notices.send_request(&peer, notice);
-                self.notices.insert(request, (peer, Some(latest)));
-                self.noticing.insert(peer);
+            let notice = self.catalog.viewing(local.uid, |catalog| structure::notices(catalog, &arrived))??.into_iter().next();
+            if let Some(notice) = notice {
+                let request = self.swarm.behaviour_mut().notices.send_request(&peer, notice.for_user(local.user_bytes().as_deref()));
+                self.notices.insert(request, (peer, local.uid, Some(latest)));
+                self.noticing.insert((peer, local.uid));
                 return Ok(());
             }
             // Nothing that links anywhere
-            self.cursors.set(&peer, latest)?;
+            self.cursors.set(&peer, account, latest)?;
             cursor = latest;
         }
     }
 
-    /// Notice a member of the structure here linking to blocks it's been
-    /// sent.
-    fn notice_backrefs(&mut self, peer: PeerId, keys: &[Vec<u8>]) -> Result<()> {
-        let linking = structure::backrefs(&self.catalog, keys.iter().map(Vec::as_slice))?;
-        for notice in structure::notices(&self.catalog, &linking)? {
-            let request = self.swarm.behaviour_mut().notices.send_request(&peer, notice);
-            self.notices.insert(request, (peer, None));
+    /// Notice a member of the structure here linking to blocks of an
+    /// account's it's been sent.
+    fn notice_backrefs(&mut self, peer: PeerId, keys: &[Vec<u8>], local: &Local) -> Result<()> {
+        let notices = self.catalog.viewing(local.uid, |catalog| {
+            let linking = structure::backrefs(catalog, keys.iter().map(Vec::as_slice))?;
+            structure::notices(catalog, &linking)
+        })??;
+        for notice in notices {
+            let request = self.swarm.behaviour_mut().notices.send_request(&peer, notice.for_user(local.user_bytes().as_deref()));
+            self.notices.insert(request, (peer, local.uid, None));
         }
         Ok(())
     }
 
     fn on_notice(&mut self, event: request_response::Event<Notice, Wants>) -> Result<()> {
         match event {
-            request_response::Event::Message { message: request_response::Message::Request { request, channel, .. }, .. } => {
-                let wants = structure::answer(&self.catalog, &request)?;
+            request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
+                let wants = match self.serving(&peer, request.user())? {
+                    Some(local) => self.catalog.viewing(local.uid, |catalog| structure::answer(catalog, &request))??,
+                    None => Wants::default(),
+                };
                 // The noticer may be gone already
                 let _ = self.swarm.behaviour_mut().notices.send_response(channel, wants);
             },
             request_response::Event::Message { message: request_response::Message::Response { request_id, response }, .. } => {
-                let Some((peer, cursor)) = self.notices.remove(&request_id) else {
+                let Some((peer, uid, cursor)) = self.notices.remove(&request_id) else {
                     return Ok(());
                 };
-                for push in structure::pushes(&self.catalog, &response)? {
-                    self.swarm.behaviour_mut().push.send_request(&peer, push);
+                let local = self.local(uid)?;
+                for push in self.catalog.viewing(uid, |catalog| structure::pushes(catalog, &response))?? {
+                    let request = self.swarm.behaviour_mut().push.send_request(&peer, push.for_user(local.user_bytes().as_deref()));
+                    self.pushed.insert(request, uid);
                 }
                 if let Some(cursor) = cursor {
-                    self.cursors.set(&peer, cursor)?;
-                    self.noticing.remove(&peer);
-                    self.announce_to(peer)?;
+                    self.cursors.set(&peer, self.cursor_of(uid), cursor)?;
+                    self.noticing.remove(&(peer, uid));
+                    self.announce_as(peer, &local)?;
                 }
             },
             request_response::Event::OutboundFailure { request_id, .. } => {
                 // Noticed again from its cursor, later
-                if let Some((peer, Some(_))) = self.notices.remove(&request_id) {
-                    self.noticing.remove(&peer);
+                if let Some((peer, uid, Some(_))) = self.notices.remove(&request_id) {
+                    self.noticing.remove(&(peer, uid));
                 }
             },
             _ => {},
@@ -529,33 +808,74 @@ impl Node {
 
     /// Let go of what the mesh can spare of these blocks' copies here. It's
     /// done when `next` returns `Trimmed` with the id.
-    pub fn trim(&mut self, copies: usize, keys: Vec<Multihash>) -> Result<TrimId> {
-        let id = self.next_trim;
-        self.next_trim = id.wrapping_add(1);
-        let peers = self.connected();
-        let (mut trim, intents) = Trim::start(&self.catalog, &self.sightings, &peers, copies, keys)?;
-        for intent in intents {
-            for peer in &peers {
-                let request = self.swarm.behaviour_mut().trim.send_request(peer, intent.clone());
-                trim.sent(request);
+    pub fn trim(&mut self, copies: usize, keys: &[Multihash]) -> Result<TrimId> {
+        self.tell_hosts()?;
+        let group = self.next_trim;
+        self.next_trim = group.wrapping_add(1);
+        let mut parts = std::collections::BTreeSet::new();
+        // Each account's, among the members hosting its user
+        let mut trims = Vec::new();
+        for local in self.locals()? {
+            let id = self.next_trim;
+            self.next_trim = id.wrapping_add(1);
+            let peers = self.peers_for(&local);
+            let (mut trim, intents) = self.catalog.viewing(local.uid, |catalog| Trim::start(catalog, &self.sightings, &peers, copies, keys.iter().cloned()))??;
+            for intent in intents {
+                let intent = intent.for_user(local.user_bytes().as_deref());
+                for peer in &peers {
+                    let request = self.swarm.behaviour_mut().trim.send_request(peer, intent.clone());
+                    trim.sent(request);
+                }
             }
+            trims.push((id, local.uid, trim));
+            parts.insert(id);
         }
-        self.trims.insert(id, trim);
-        self.drive_trim(id)?;
-        Ok(id)
+        self.trim_groups.insert(group, Group { parts, report: trim::Report::default() });
+        for (id, uid, trim) in trims {
+            self.trims.insert(id, (uid, trim));
+            self.drive_trim(id)?;
+        }
+        self.trim_part_done(group, None);
+        Ok(group)
+    }
+
+    /// A part of a trim group finished, if any did: once every part has,
+    /// the group has.
+    fn trim_part_done(&mut self, group_or_part: TrimId, done: Option<trim::Report>) {
+        let found = match done {
+            Some(_) => self.trim_groups.iter().find(|(_, group)| group.parts.contains(&group_or_part)).map(|(&id, _)| id),
+            None => Some(group_or_part),
+        };
+        let Some(id) = found else {
+            return;
+        };
+        let Some(group) = self.trim_groups.get_mut(&id) else {
+            return;
+        };
+        if let Some(report) = done {
+            group.parts.remove(&group_or_part);
+            group.report.considered = group.report.considered.saturating_add(report.considered);
+            group.report.dropped = group.report.dropped.saturating_add(report.dropped);
+            group.report.freed = group.report.freed.saturating_add(report.freed);
+        }
+        if group.parts.is_empty()
+            && let Some(group) = self.trim_groups.remove(&id)
+        {
+            self.ready.push_back(Event::Trimmed { id, report: group.report });
+        }
     }
 
     /// Let go of what's spare of a sample of what's here, under pressure,
     /// or of everything when asked.
     pub fn trim_some(&mut self, copies: usize, all: bool) -> Result<TrimId> {
         let keys = if all { self.catalog.keys()? } else { self.catalog.sample(durability::FRESH)? };
-        self.trim(copies, keys)
+        self.trim(copies, &keys)
     }
 
     /// Once every member's answered a trim's intent, let go of what can
     /// go, tell the members, and finish.
     fn drive_trim(&mut self, id: TrimId) -> Result<()> {
-        let Some(trim) = self.trims.get_mut(&id) else {
+        let Some((_, trim)) = self.trims.get_mut(&id) else {
             return Ok(());
         };
         if trim.waiting() {
@@ -577,7 +897,7 @@ impl Node {
                 self.swarm.behaviour_mut().dropped.send_request(&peer, dropped.clone());
             }
         }
-        self.ready.push_back(Event::Trimmed { id, report });
+        self.trim_part_done(id, Some(report));
         Ok(())
     }
 
@@ -585,21 +905,26 @@ impl Node {
         match event {
             request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
                 let me = self.peer_id();
-                let mut trims: Vec<&mut Trim> = self.trims.values_mut().collect();
-                let mut grant = trim::answer(&self.catalog, &me, &peer, &request, &mut trims)?;
+                let mut grant = match self.serving(&peer, request.user())? {
+                    Some(local) => {
+                        let mut trims: Vec<&mut Trim> = self.trims.values_mut().map(|(_, trim)| trim).collect();
+                        self.catalog.viewing(local.uid, |catalog| trim::answer(catalog, &me, &peer, &request, &mut trims))??
+                    },
+                    None => Grant::default(),
+                };
                 // Copies about to be collected aren't worth trimming others for
                 grant.withhold(|key| <Multihash>::decode(key).is_ok_and(|key| self.condemned.is_condemned(key.as_ref()).unwrap_or(true)));
                 // The asker may be gone already
                 let _ = self.swarm.behaviour_mut().trim.send_response(channel, grant);
             },
             request_response::Event::Message { peer, message: request_response::Message::Response { request_id, response }, .. } => {
-                if let Some((&id, trim)) = self.trims.iter_mut().find(|(_, trim)| trim.asked(request_id)) {
+                if let Some((&id, (_, trim))) = self.trims.iter_mut().find(|(_, (_, trim))| trim.asked(request_id)) {
                     trim.granted(request_id, peer, response);
                     self.drive_trim(id)?;
                 }
             },
             request_response::Event::OutboundFailure { request_id, .. } => {
-                if let Some((&id, trim)) = self.trims.iter_mut().find(|(_, trim)| trim.asked(request_id)) {
+                if let Some((&id, (_, trim))) = self.trims.iter_mut().find(|(_, (_, trim))| trim.asked(request_id)) {
                     trim.failed(request_id);
                     self.drive_trim(id)?;
                 }
@@ -719,7 +1044,11 @@ impl Node {
     fn on_condemn(&mut self, event: request_response::Event<Condemn, Verdict>) -> Result<()> {
         match event {
             request_response::Event::Message { message: request_response::Message::Request { request, channel, .. }, .. } => {
-                let verdict = collect::answer(&self.catalog, &request)?;
+                // Kept by any account here is kept
+                let mut verdict = Verdict::default();
+                for uid in self.accounts() {
+                    verdict.join(self.catalog.viewing(uid, |catalog| collect::answer(catalog, &request))??);
+                }
                 // The asker may be gone already
                 let _ = self.swarm.behaviour_mut().condemn.send_response(channel, verdict);
             },
@@ -753,43 +1082,64 @@ impl Node {
         self.trickle.interval()
     }
 
+    /// Audit these blocks: each account's, among the members hosting its
+    /// user, as one.
     fn audit_of_keys(&mut self, copies: usize, mut keys: Vec<Multihash>) -> Result<AuditId> {
         // What's to be collected isn't worth more copies
         keys.retain(|key| !self.condemned.is_condemned(key.as_ref()).unwrap_or(false));
-        // Nor is another account's this mesh's to copy
-        keys.retain(|key| self.catalog.visible(key.as_ref()).unwrap_or(false));
-        let id = self.next_audit;
-        self.next_audit = id.wrapping_add(1);
-        let mut peers = self.connected();
-        peers.sort();
-        let (mut audit, adverts) = Audit::start(&self.catalog, &self.sightings, self.peer_id(), &peers, copies, keys)?;
-        for advert in &adverts {
-            for &peer in &peers {
-                let request = self.swarm.behaviour_mut().adverts.send_request(&peer, advert.clone());
-                audit.sent_advert(request, peer, advert);
+        self.tell_hosts()?;
+        let group = self.next_audit;
+        self.next_audit = group.wrapping_add(1);
+        let me = self.peer_id();
+        let mut audits = Vec::new();
+        for local in self.locals()? {
+            // Nor is another account's this one's to copy
+            let theirs: Vec<Multihash> = self.catalog.viewing(local.uid, |catalog| keys.iter().filter(|key| catalog.visible(key.as_ref()).unwrap_or(false)).cloned().collect())?;
+            let id = self.next_audit;
+            self.next_audit = id.wrapping_add(1);
+            let peers = self.peers_for(&local);
+            let (mut audit, adverts) = self.catalog.viewing(local.uid, |catalog| Audit::start(catalog, &self.sightings, me, &peers, copies, theirs))??;
+            for advert in adverts {
+                let advert = advert.for_user(local.user_bytes().as_deref());
+                for &peer in &peers {
+                    let request = self.swarm.behaviour_mut().adverts.send_request(&peer, advert.clone());
+                    audit.sent_advert(request, peer, &advert);
+                }
             }
+            audits.push((id, local.uid, audit));
         }
-        self.audits.insert(id, audit);
-        self.drive_audit(id)?;
-        Ok(id)
+        self.audit_groups.insert(group, Group { parts: audits.iter().map(|(id, ..)| *id).collect(), report: Report::default() });
+        for (id, uid, audit) in audits {
+            self.audits.insert(id, (uid, audit));
+            self.drive_audit(id)?;
+        }
+        self.audit_part_done(group, None);
+        Ok(group)
     }
 
-    /// Send what an audit has to push, once it's heard back, or finish it.
-    fn drive_audit(&mut self, id: AuditId) -> Result<()> {
-        let Some(audit) = self.audits.get_mut(&id) else {
-            return Ok(());
+    /// A part of an audit group finished, if any did: once every part has,
+    /// the group has.
+    fn audit_part_done(&mut self, group_or_part: AuditId, done: Option<Report>) {
+        let found = match done {
+            Some(_) => self.audit_groups.iter().find(|(_, group)| group.parts.contains(&group_or_part)).map(|(&id, _)| id),
+            None => Some(group_or_part),
         };
-        if audit.waiting() {
-            return Ok(());
+        let Some(id) = found else {
+            return;
+        };
+        let Some(group) = self.audit_groups.get_mut(&id) else {
+            return;
+        };
+        if let Some(report) = done {
+            group.parts.remove(&group_or_part);
+            group.report.advertised = group.report.advertised.saturating_add(report.advertised);
+            group.report.copied = group.report.copied.saturating_add(report.copied);
+            group.report.short = group.report.short.saturating_add(report.short);
         }
-        if let Some(pushes) = audit.decide(&self.catalog)? {
-            for (peer, push, keys) in pushes {
-                let request = self.swarm.behaviour_mut().push.send_request(&peer, push);
-                audit.sent_push(request, peer, keys);
-            }
-        } else {
-            let report = audit.report();
-            self.audits.remove(&id);
+        if group.parts.is_empty()
+            && let Some(group) = self.audit_groups.remove(&id)
+        {
+            let report = group.report;
             if let Some((trickled, more)) = self.trickling
                 && trickled == id
             {
@@ -798,24 +1148,52 @@ impl Node {
             }
             self.ready.push_back(Event::Audited { id, report });
         }
+    }
+
+    /// Send what an audit has to push, once it's heard back, or finish it.
+    fn drive_audit(&mut self, id: AuditId) -> Result<()> {
+        let Some(&(uid, _)) = self.audits.get(&id) else {
+            return Ok(());
+        };
+        let user = self.local(uid)?.user_bytes();
+        let Some((_, audit)) = self.audits.get_mut(&id) else {
+            return Ok(());
+        };
+        if audit.waiting() {
+            return Ok(());
+        }
+        if let Some(pushes) = self.catalog.viewing(uid, |catalog| audit.decide(catalog))?? {
+            for (peer, push, keys) in pushes {
+                let request = self.swarm.behaviour_mut().push.send_request(&peer, push.for_user(user.as_deref()));
+                audit.sent_push(request, peer, keys);
+                self.pushed.insert(request, uid);
+            }
+        } else {
+            let report = audit.report();
+            self.audits.remove(&id);
+            self.audit_part_done(id, Some(report));
+        }
         Ok(())
     }
 
     fn on_advert(&mut self, event: request_response::Event<Advert, Haves>) -> Result<()> {
         match event {
             request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
-                let haves = durability::answer_advert(&self.catalog, &self.sightings, &peer, &request, &self.marks)?;
+                let haves = match self.serving(&peer, request.user())? {
+                    Some(local) => self.catalog.viewing(local.uid, |catalog| durability::answer_advert(catalog, &self.sightings, &peer, &request, &self.marks))??,
+                    None => Haves::default(),
+                };
                 // The advertiser may be gone already
                 let _ = self.swarm.behaviour_mut().adverts.send_response(channel, haves);
                 return Ok(());
             },
             request_response::Event::Message { message: request_response::Message::Response { request_id, response }, .. } => {
-                if let Some(audit) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
+                if let Some((_, audit)) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
                     unless_busy(audit.haves(&self.sightings, request_id, response), "noting what a member has")?;
                 }
             },
             request_response::Event::OutboundFailure { request_id, .. } => {
-                if let Some(audit) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
+                if let Some((_, audit)) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
                     audit.advert_failed(request_id);
                 }
             },
@@ -827,7 +1205,10 @@ impl Node {
     fn on_push(&mut self, event: request_response::Event<Push, Kept>) -> Result<()> {
         match event {
             request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
-                let kept = durability::answer_push(&self.catalog, &self.sightings, &peer, request, &self.marks)?;
+                let kept = match self.serving(&peer, request.user())? {
+                    Some(local) => self.catalog.viewing(local.uid, |catalog| durability::answer_push(catalog, &self.sightings, &peer, request, &self.marks))??,
+                    None => Kept::default(),
+                };
                 let _ = self.swarm.behaviour_mut().push.send_response(channel, kept);
                 return Ok(());
             },
@@ -836,15 +1217,20 @@ impl Node {
                 // not: claims about it may have been noticed before it
                 // was there to want them for
                 let kept = response.keys();
-                if let Some(audit) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
+                let uid = self.pushed.remove(&request_id);
+                if let Some((_, audit)) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
                     unless_busy(audit.kept(&self.sightings, request_id, response), "noting what a member kept")?;
                 } else {
                     response.sight(&self.catalog, &self.sightings, &peer)?;
                 }
-                self.notice_backrefs(peer, &kept)?;
+                if let Some(uid) = uid {
+                    let local = self.local(uid)?;
+                    self.notice_backrefs(peer, &kept, &local)?;
+                }
             },
             request_response::Event::OutboundFailure { request_id, .. } => {
-                if let Some(audit) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
+                self.pushed.remove(&request_id);
+                if let Some((_, audit)) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
                     audit.push_failed(request_id);
                 }
             },
@@ -864,42 +1250,63 @@ impl Node {
 
     /// The audit which sent an advert or push.
     fn audit_of(&self, request: request_response::OutboundRequestId) -> Option<AuditId> {
-        self.audits.iter().find(|(_, audit)| audit.asked(request)).map(|(&id, _)| id)
+        self.audits.iter().find(|(_, (_, audit))| audit.asked(request)).map(|(&id, _)| id)
     }
 
     /// Fetch the DAG under a root from other members, keeping what's
     /// fetched. It's done when `next` returns `Fetched` with the id.
     pub fn fetch(&mut self, root: Link) -> Result<FetchId> {
-        let id = self.next_fetch;
-        self.next_fetch = id.wrapping_add(1);
-        self.fetches.insert(id, Fetch::new(root));
-        self.drive(id)?;
-        Ok(id)
+        self.fetch_for(self.catalog.uid(), root)
+    }
+
+    /// Fetch the DAG under a root for one of the accounts served, from the
+    /// members hosting its user, as `fetch` does.
+    pub fn fetch_for(&mut self, uid: u32, root: Link) -> Result<FetchId> {
+        self.start_fetch(uid, Fetch::new(root))
     }
 
     /// Fetch just these blocks from other members, not what they link
     /// to. It's done when `next` returns `Fetched` with the id.
     pub fn fetch_blocks(&mut self, blocks: Vec<Link>) -> Result<FetchId> {
+        self.fetch_blocks_for(self.catalog.uid(), blocks)
+    }
+
+    /// Fetch just these blocks for one of the accounts served.
+    pub fn fetch_blocks_for(&mut self, uid: u32, blocks: Vec<Link>) -> Result<FetchId> {
+        self.start_fetch(uid, Fetch::blocks(blocks))
+    }
+
+    fn start_fetch(&mut self, uid: u32, fetch: Fetch) -> Result<FetchId> {
+        self.tell_hosts()?;
+        let uid = if self.accounts().contains(&uid) { uid } else { self.catalog.uid() };
         let id = self.next_fetch;
         self.next_fetch = id.wrapping_add(1);
-        self.fetches.insert(id, Fetch::blocks(blocks));
+        self.fetches.insert(id, (uid, fetch));
         self.drive(id)?;
         Ok(id)
     }
 
     /// Send what a fetch has to ask, or finish it.
     fn drive(&mut self, id: FetchId) -> Result<()> {
-        let mut peers = self.connected();
-        peers.sort();
-        let Some(fetch) = self.fetches.get_mut(&id) else {
+        // A member yet to say what it hosts may host whose this is
+        if !self.telling.is_empty() {
+            return Ok(());
+        }
+        let Some(&(uid, _)) = self.fetches.get(&id) else {
             return Ok(());
         };
-        for (peer, batch) in fetch.plan(&self.catalog, &peers)? {
-            let request = self.swarm.behaviour_mut().blocks.send_request(&peer, Fetch::want(&batch));
+        let local = self.local(uid)?;
+        let peers = self.peers_for(&local);
+        let user = local.user_bytes();
+        let Some((_, fetch)) = self.fetches.get_mut(&id) else {
+            return Ok(());
+        };
+        for (peer, batch) in self.catalog.viewing(uid, |catalog| fetch.plan(catalog, &peers))?? {
+            let request = self.swarm.behaviour_mut().blocks.send_request(&peer, Fetch::want(&batch).for_user(user.as_deref()));
             fetch.sent(request, batch);
         }
         if fetch.done()
-            && let Some(fetch) = self.fetches.remove(&id)
+            && let Some((_, fetch)) = self.fetches.remove(&id)
         {
             let (fetched, missing) = fetch.outcome();
             if self.lost_scan == Some(id) {
@@ -917,7 +1324,7 @@ impl Node {
 
     /// The fetch which sent a want.
     fn fetch_of(&self, request: request_response::OutboundRequestId) -> Option<FetchId> {
-        self.fetches.iter().find(|(_, fetch)| fetch.asked(request)).map(|(&id, _)| id)
+        self.fetches.iter().find(|(_, (_, fetch))| fetch.asked(request)).map(|(&id, _)| id)
     }
 
     /// Let in every member, and learn where they listen, as of the list.
@@ -941,6 +1348,18 @@ impl Node {
 
     pub fn connected(&self) -> Vec<PeerId> {
         self.swarm.connected_peers().copied().collect()
+    }
+
+    /// The accounts served here, by uid, whose users a member hosts, as
+    /// far as it's said.
+    pub fn hosted_by(&self, peer: &PeerId) -> Result<Vec<u32>> {
+        Ok(self.locals()?.into_iter().filter(|local| local.rooted && self.hosts(peer, local)).map(|local| local.uid).collect())
+    }
+
+    /// The connected members which know what this node hosts, so may be
+    /// asked things.
+    pub fn ready(&self) -> Vec<PeerId> {
+        self.swarm.connected_peers().copied().filter(|peer| self.heard.contains(peer)).collect()
     }
 
     /// Dial every member with an address which isn't connected.
@@ -1023,8 +1442,9 @@ impl Node {
     fn on_connected(&mut self, peer: PeerId) -> Result<()> {
         let roster = self.roster()?;
         self.swarm.behaviour_mut().members.send_request(&peer, roster);
-        // Told again on the next announce
-        unless_busy(self.announce_to(peer), "telling a new member what's here")?;
+        // What's here is noticed once it knows what this node hosts
+        self.tell_hosts()?;
+        self.tell(peer);
         self.sightings.connected(peer);
         self.trickle.alarm();
         Ok(())
@@ -1048,9 +1468,55 @@ impl Node {
     }
 
     fn on_disconnected(&mut self, peer: &PeerId) {
-        self.noticing.remove(peer);
+        self.noticing.retain(|(noticed, _)| noticed != peer);
+        self.hosting.remove(peer);
+        self.heard.remove(peer);
         self.sightings.disconnected(peer);
         self.trickle.alarm();
+    }
+
+    /// A want asked of this node, answered as the account whose user it
+    /// names, or a fetch's answered.
+    fn on_blocks(&mut self, event: request_response::Event<Want, Blocks>) -> Result<()> {
+        match event {
+            request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
+                let Some(local) = self.serving(&peer, request.user())? else {
+                    // Another account's is as good as not here
+                    let _ = self.swarm.behaviour_mut().blocks.send_response(channel, blocks::refuse(&request));
+                    return Ok(());
+                };
+                let answer = self.catalog.viewing(local.uid, |catalog| blocks::answer(catalog, &request))?;
+                let served = answer.served();
+                // The asker may be gone already
+                let _ = self.swarm.behaviour_mut().blocks.send_response(channel, answer);
+                self.notice_backrefs(peer, &served, &local)?;
+            },
+            request_response::Event::Message { peer, message: request_response::Message::Response { request_id, response }, .. } => {
+                if let Some(id) = self.fetch_of(request_id) {
+                    let received = match self.fetches.get_mut(&id) {
+                        Some((uid, fetch)) => self.catalog.viewing(*uid, |catalog| fetch.received(catalog, &self.sightings, &peer, request_id, response)).map_err(Error::from).and_then(|received| received),
+                        None => Ok(()),
+                    };
+                    // What couldn't be kept is wanted still, and asked for
+                    // again on the next `redrive`, not at once, which
+                    // would only send it all over again meanwhile
+                    if !received.as_ref().is_err_and(Error::is_busy) {
+                        self.drive(id)?;
+                    }
+                    received?;
+                }
+            },
+            request_response::Event::OutboundFailure { request_id, .. } => {
+                if let Some(id) = self.fetch_of(request_id) {
+                    if let Some((_, fetch)) = self.fetches.get_mut(&id) {
+                        fetch.failed(request_id);
+                    }
+                    self.drive(id)?;
+                }
+            },
+            _ => {},
+        }
+        Ok(())
     }
 
     fn handle(&mut self, event: SwarmEvent<BehaviourEvent>) -> Result<Option<Event>> {
@@ -1100,36 +1566,8 @@ impl Node {
                     (!new.is_empty()).then_some(Event::Learned(new))
                 },
             },
-            SwarmEvent::Behaviour(BehaviourEvent::Blocks(request_response::Event::Message { peer, message, .. })) => match message {
-                request_response::Message::Request { request, channel, .. } => {
-                    let answer = blocks::answer(&self.catalog, &request);
-                    let served = answer.served();
-                    // The asker may be gone already
-                    let _ = self.swarm.behaviour_mut().blocks.send_response(channel, answer);
-                    self.notice_backrefs(peer, &served)?;
-                    None
-                },
-                request_response::Message::Response { request_id, response } => {
-                    if let Some(id) = self.fetch_of(request_id) {
-                        let received = self.fetches.get_mut(&id).map_or(Ok(()), |fetch| fetch.received(&self.catalog, &self.sightings, &peer, request_id, response));
-                        // What couldn't be kept is wanted still, and asked for
-                        // again on the next `redrive`, not at once, which
-                        // would only send it all over again meanwhile
-                        if !received.as_ref().is_err_and(Error::is_busy) {
-                            self.drive(id)?;
-                        }
-                        received?;
-                    }
-                    None
-                },
-            },
-            SwarmEvent::Behaviour(BehaviourEvent::Blocks(request_response::Event::OutboundFailure { request_id, .. })) => {
-                if let Some(id) = self.fetch_of(request_id) {
-                    if let Some(fetch) = self.fetches.get_mut(&id) {
-                        fetch.failed(request_id);
-                    }
-                    self.drive(id)?;
-                }
+            SwarmEvent::Behaviour(BehaviourEvent::Blocks(event)) => {
+                self.on_blocks(event)?;
                 None
             },
             SwarmEvent::Behaviour(BehaviourEvent::Adverts(event)) => {
@@ -1154,6 +1592,10 @@ impl Node {
             },
             SwarmEvent::Behaviour(BehaviourEvent::Condemn(event)) => {
                 self.on_condemn(event)?;
+                None
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Hosts(event)) => {
+                self.on_hosts(event)?;
                 None
             },
             _ => None,

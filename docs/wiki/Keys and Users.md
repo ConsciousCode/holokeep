@@ -87,11 +87,14 @@ of the root than anyone.
 
 ## Accounts
 
-One [[Storage|repo]] can serve several of the host's users, each an **account** by
+One [[Storage|repo]] can serve several users, each an **account** by
 uid, with a device key in `accounts/` (the owner's is `node.key`) and,
-once in a mesh, a user. A catalog acts for one account at a time: what
-it says is signed with that account's key, and what it sees (tags,
-keeps, anchors, devices) is what counts for that account's user.
+once in a mesh, a user. An account is a host user's, or an unused uid
+for a user the machine hosts who has no login on it. A catalog acts for
+one account at a time: what it says is signed with that account's key,
+and what it sees (tags, keeps, anchors, devices) is what counts for that
+account's user. A daemon serving several accounts looks as each in turn
+(see [[Mesh#Users sharing a mesh]]).
 
 Blocks belong to whoever has them: each account's view is the blocks it
 put here within the grace period, plus whatever a counting keep of its
@@ -102,7 +105,8 @@ while any account has them.
 
 `hk node run --shared` lets other host users use the daemon's socket,
 identified by `SO_PEERCRED`. The owner and root may ask anything;
-others may fetch, keep and tag as their own account.
+others may fetch, keep and tag as their own account, and what a host user
+fetches is fetched for their account if the mesh serves it.
 
 Source: `src/keys.rs`, `src/claim.rs` (`Sign`), `src/account.rs`, `src/store/claims.rs`.
 

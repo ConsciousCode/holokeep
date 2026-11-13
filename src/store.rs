@@ -685,6 +685,25 @@ impl Catalog {
         self.refresh_acting()
     }
 
+    /// See and hold as another account for a while, as a node serving
+    /// several does: what `f` reads is what counts for that account, and
+    /// what it puts is held for it. Nothing's signed meanwhile, the key
+    /// being this account's, nor is its quota the other's; then it acts
+    /// for this account again.
+    pub fn viewing<R>(&mut self, uid: u32, f: impl FnOnce(&Self) -> R) -> Result<R> {
+        if uid == self.uid {
+            return Ok(f(self));
+        }
+        let (home, signer, quota) = (self.uid, self.signer.take(), self.quota.take());
+        self.uid = uid;
+        let seen = self.refresh_acting().map(|()| f(self));
+        self.uid = home;
+        self.signer = signer;
+        self.quota = quota;
+        self.refresh_acting()?;
+        seen
+    }
+
     /// Sign claims with this key from now on, as this account's.
     pub fn set_signer(&mut self, key: crate::keys::Key) -> Result<()> {
         self.act_for(self.uid, key)
