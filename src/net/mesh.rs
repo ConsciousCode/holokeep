@@ -30,6 +30,7 @@ use libp2p::pnet::PreSharedKey;
 use libp2p::{Multiaddr, PeerId};
 use rusqlite::{OptionalExtension, params};
 
+use crate::cid::{Cid as _, CidRef as _};
 use crate::model::{Ipld, Link};
 use crate::store::Db;
 
@@ -232,7 +233,13 @@ impl Members {
                  mesh TEXT NOT NULL,
                  uid INTEGER NOT NULL,
                  PRIMARY KEY (mesh, uid)
-             ) WITHOUT ROWID;",
+             ) WITHOUT ROWID;
+             -- A mesh's first grant, by CID, once it has grants: who's in
+             -- it is then what they say.
+             CREATE TABLE IF NOT EXISTS mesh_grants (
+                 mesh TEXT PRIMARY KEY,
+                 genesis BLOB NOT NULL
+             );",
         )?;
         if !db.conn().prepare("SELECT 1 FROM pragma_table_info('meshes') WHERE name = 'protected'")?.exists([])? {
             db.conn().execute_batch("ALTER TABLE meshes ADD COLUMN protected INTEGER NOT NULL DEFAULT 0; ALTER TABLE meshes ADD COLUMN quota INTEGER;")?;
@@ -281,6 +288,24 @@ impl Members {
         Ok(self.db.conn()
             .prepare_cached("INSERT OR IGNORE INTO mesh_accounts (mesh, uid) VALUES (?1, ?2)")?
             .execute(params![self.mesh, uid])? > 0)
+    }
+
+    /// The mesh's first grant, once it has grants.
+    pub fn genesis(&self) -> Result<Option<Link>> {
+        let bytes: Option<Vec<u8>> = self.db.conn()
+            .prepare_cached("SELECT genesis FROM mesh_grants WHERE mesh = ?1")?
+            .query_row([&self.mesh], |row| row.get(0))
+            .optional()?;
+        bytes.map(|bytes| Link::decode(&bytes).map_err(|e| Error::Invalid(format!("the mesh's first grant: {e:?}")))).transpose()
+    }
+
+    /// Say which grant is the mesh's first: who's in it is what its
+    /// grants say from now on.
+    pub fn set_genesis(&self, genesis: &Link) -> Result<()> {
+        self.db.conn()
+            .prepare_cached("INSERT INTO mesh_grants (mesh, genesis) VALUES (?1, ?2) ON CONFLICT (mesh) DO UPDATE SET genesis = excluded.genesis")?
+            .execute(params![self.mesh, genesis.to_bytes()])?;
+        Ok(())
     }
 
     /// Say the mesh is protected, and how many bytes its account may have
@@ -375,6 +400,12 @@ impl Members {
         Ok(was)
     }
 
+    /// No longer list a peer, nor where it listens, without forgetting it:
+    /// as when grants no longer say it's a machine of the mesh.
+    pub fn remove(&self, peer: &PeerId) -> Result<bool> {
+        Ok(self.db.conn().prepare_cached("DELETE FROM mesh_members WHERE mesh = ?1 AND peer = ?2")?.execute([&self.mesh, &peer.to_string()])? > 0)
+    }
+
     fn forgotten(&self, peer: &PeerId) -> Result<bool> {
         Ok(self.db.conn()
             .prepare_cached("SELECT 1 FROM mesh_forgotten WHERE mesh = ?1 AND peer = ?2")?
@@ -424,6 +455,9 @@ pub struct Ticket {
     pub sealed: Vec<Vec<u8>>,
     /// ...and the rest of what it keeps there: the manifests, to restore.
     pub held: Vec<Link>,
+    /// The mesh's first grant, if it has grants, and every grant, with
+    /// what makes each count: who's in the mesh is what they say.
+    pub grants: Option<(Link, Vec<Vec<u8>>)>,
 }
 
 impl Ticket {
@@ -452,6 +486,10 @@ impl Ticket {
         }
         if !self.held.is_empty() {
             ticket.insert("held".to_owned(), Ipld::List(self.held.iter().cloned().map(Ipld::Link).collect()));
+        }
+        if let Some((genesis, grants)) = &self.grants {
+            ticket.insert("mesh".to_owned(), Ipld::Link(genesis.clone()));
+            ticket.insert("grants".to_owned(), Ipld::List(grants.iter().cloned().map(Ipld::Bytes).collect()));
         }
         let ticket = Ipld::Map(ticket);
         multibase::encode(multibase::Base::Base32Lower, crate::dagcbor::to_vec(&ticket).unwrap_or_default())
@@ -523,7 +561,15 @@ impl Ticket {
             }).collect::<Result<_>>()?,
             Some(_) => return Err(invalid("held")),
         };
-        Ok(Self { swarm_key, inviter, members, user, protected, sealed, held })
+        let grants = match (map.remove("mesh"), map.remove("grants")) {
+            (None, None) => None,
+            (Some(Ipld::Link(genesis)), Some(Ipld::List(list))) => Some((genesis, list.into_iter().map(|item| match item {
+                Ipld::Bytes(bytes) => Ok(bytes),
+                _ => Err(invalid("grants")),
+            }).collect::<Result<_>>()?)),
+            _ => return Err(invalid("grants")),
+        };
+        Ok(Self { swarm_key, inviter, members, user, protected, sealed, held, grants })
     }
 }
 

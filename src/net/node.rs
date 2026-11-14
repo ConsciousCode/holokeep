@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use super::blocks::{self, Blocks, Fetch, Want};
 use super::collect::{self, Condemn, Condemned, Verdict};
 use super::durability::{self, Advert, Audit, Haves, Kept, Push, Report, Sightings, Trickle};
+use super::grants::{Have, Sent};
 use super::hosts::{self, Host, Hosts};
 use crate::multihash::Multihash;
 use crate::store::BlockIndex;
@@ -103,6 +104,7 @@ pub struct Behaviour {
     dropped: request_response::cbor::Behaviour<Dropped, Ack>,
     condemn: request_response::cbor::Behaviour<Condemn, Verdict>,
     hosts: request_response::cbor::Behaviour<Hosts, Hosts>,
+    grants: request_response::cbor::Behaviour<Have, Sent>,
 }
 
 /// A fetch, as the node knows it.
@@ -253,6 +255,9 @@ pub struct Node {
     changed: Vec<PathBuf>,
     /// Condemnations asked of members and unanswered: whom, and of what.
     condemning: HashMap<request_response::OutboundRequestId, (PeerId, collect::BatchId)>,
+    /// The mesh's first grant and its grants, worked out, once it has
+    /// them: who's in it is what they say.
+    granted: Option<(Link, crate::grants::State)>,
     /// Events which happened outside `next`, for it to return first.
     ready: VecDeque<Event>,
 }
@@ -309,6 +314,10 @@ impl Node {
                 [(hosts::PROTOCOL, ProtocolSupport::Full)],
                 request_response::Config::default().with_request_timeout(Duration::from_secs(20)),
             ),
+            grants: request_response::cbor::Behaviour::new(
+                [(super::grants::PROTOCOL, ProtocolSupport::Full)],
+                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
+            ),
         };
         let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(IDLE);
         let swarm = Swarm::new(transport, behaviour, peer, config);
@@ -346,6 +355,7 @@ impl Node {
             condemned,
             changed: Vec::new(),
             condemning: HashMap::new(),
+            granted: None,
             ready: VecDeque::new(),
         };
         node.reload()?;
@@ -404,12 +414,130 @@ impl Node {
         let (Some(user), true) = (local.user_bytes(), local.rooted) else {
             return true;
         };
+        if !self.recognizes(local) {
+            return false;
+        }
         match self.hosting.get(peer) {
             Some(Hosting::Users(users)) => users.contains(&user),
             // As when a mesh was for one user; one that's yet to say isn't
             // asked anything, so asks nothing of a newer build
             Some(Hosting::Older) | None => local.uid == self.catalog.uid(),
         }
+    }
+
+    /// Whether the mesh's grants say an account's user is one of its users:
+    /// any, before it has grants.
+    fn recognizes(&self, local: &Local) -> bool {
+        match (&self.granted, &local.user) {
+            (Some((_, state)), Some(user)) if local.rooted => state.holds(user, crate::grants::USER),
+            _ => true,
+        }
+    }
+
+    /// The machines the mesh's grants say are in it, given /mesh/machine
+    /// itself, not by holding /mesh, as an operator does, if it has grants.
+    fn machines(&self) -> Option<std::collections::BTreeSet<PeerId>> {
+        let (_, state) = self.granted.as_ref()?;
+        Some(state.holders().into_iter()
+            .filter(|(_, held)| held.iter().any(|command| command == crate::grants::MACHINE))
+            .filter_map(|(who, _)| PeerId::from_bytes(&who.multihash().to_bytes()).ok())
+            .collect())
+    }
+
+    /// Work out the mesh's grants afresh, if it has them, and list as
+    /// members the machines they say are in it, and only those, shutting
+    /// out any other. Returns whether any grants arrived since.
+    fn refresh_grants(&mut self) -> Result<bool> {
+        let before: Vec<Link> = self.granted.as_ref().map(|(_, state)| state.grants().chain(state.waiting()).cloned().collect()).unwrap_or_default();
+        self.granted = match self.members.genesis()? {
+            Some(genesis) => {
+                let state = self.catalog.grant_state(&genesis)?;
+                if state.is_none() {
+                    eprintln!("the mesh's first grant, {genesis}, isn't here: its members are its roster, as before grants");
+                }
+                state.map(|state| (genesis, state))
+            },
+            None => None,
+        };
+        let after: Vec<Link> = self.granted.as_ref().map(|(_, state)| state.grants().chain(state.waiting()).cloned().collect()).unwrap_or_default();
+        let Some(machines) = self.machines() else {
+            return Ok(before != after);
+        };
+        let me = self.peer_id();
+        for peer in self.members.list()?.into_keys() {
+            if !machines.contains(&peer) {
+                // As forgetting it: copies it was believed to hold don't count
+                self.members.remove(&peer)?;
+                self.sightings.forget_peer(&peer)?;
+                self.swarm.behaviour_mut().allowed.disallow_peer(peer);
+                let _ = self.swarm.disconnect_peer_id(peer);
+            }
+        }
+        for peer in machines {
+            if peer != me {
+                self.members.add(&peer)?;
+            }
+        }
+        Ok(before != after)
+    }
+
+    /// Tell a member which grants this has, if the mesh has any: it
+    /// answers with those it has that this hasn't.
+    fn ask_grants(&mut self, peer: PeerId) -> Result<()> {
+        let have = match (&self.granted, self.members.genesis()?) {
+            (Some((genesis, state)), _) => Have::new(genesis, state.grants().chain(state.waiting()).cloned()),
+            // Its first grant known, as a ticket says, but not yet here
+            (None, Some(genesis)) => Have::new(&genesis, []),
+            (None, None) => return Ok(()),
+        };
+        self.swarm.behaviour_mut().grants.send_request(&peer, have);
+        Ok(())
+    }
+
+    /// Take in grants a member sent, and what makes them count; if that's
+    /// news, work them out again, and tell every member.
+    fn took_grants(&mut self, sent: &Sent) -> Result<()> {
+        if sent.is_empty() {
+            return Ok(());
+        }
+        for claim in sent.claims() {
+            self.catalog.put_block(&claim.block(), crate::cid::CidVersion::V1)?;
+        }
+        if self.refresh_grants()? {
+            self.reload_allowed()?;
+            for peer in self.connected() {
+                self.ask_grants(peer)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn on_grants(&mut self, event: request_response::Event<Have, Sent>) -> Result<()> {
+        match event {
+            request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
+                let known = self.members.genesis()?;
+                let (sent, behind) = match &self.granted {
+                    None if known.as_ref().is_some_and(|genesis| request.of(genesis)) => (Sent::default(), !request.grants().is_empty()),
+                    Some((genesis, state)) if request.of(genesis) => {
+                        let theirs: HashSet<Vec<u8>> = request.grants().iter().map(CidRef::to_bytes).collect();
+                        let mine: Vec<Link> = state.grants().chain(state.waiting()).cloned().collect();
+                        let missing: Vec<Link> = mine.iter().filter(|cid| !theirs.contains(&cid.to_bytes())).cloned().collect();
+                        let ours: HashSet<Vec<u8>> = mine.iter().map(CidRef::to_bytes).collect();
+                        let blocks = if missing.is_empty() { Vec::new() } else { self.catalog.grant_blocks(&missing)? };
+                        (Sent::new(blocks), theirs.iter().any(|cid| !ours.contains(cid)))
+                    },
+                    _ => (Sent::default(), false),
+                };
+                // The asker may be gone already
+                let _ = self.swarm.behaviour_mut().grants.send_response(channel, sent);
+                if behind {
+                    self.ask_grants(peer)?;
+                }
+            },
+            request_response::Event::Message { message: request_response::Message::Response { response, .. }, .. } => self.took_grants(&response)?,
+            _ => {},
+        }
+        Ok(())
     }
 
     /// The connected members which may be asked of an account's blocks.
@@ -686,6 +814,9 @@ impl Node {
     pub fn forget_member(&mut self, peer: &PeerId) -> Result<()> {
         if self.connected().contains(peer) {
             return Err(Error::Invalid(format!("{peer} is connected")));
+        }
+        if self.machines().is_some_and(|machines| machines.contains(peer)) {
+            return Err(Error::Invalid(format!("the mesh's grants say {peer} is one of its machines: take that away with `hk node grant rm {peer} /mesh/machine`")));
         }
         if !self.members.forget(peer)? {
             return Err(Error::Invalid(format!("{peer} isn't a member")));
@@ -1327,8 +1458,20 @@ impl Node {
         self.fetches.iter().find(|(_, (_, fetch))| fetch.asked(request)).map(|(&id, _)| id)
     }
 
-    /// Let in every member, and learn where they listen, as of the list.
+    /// Let in every member, and learn where they listen, as of the list,
+    /// and of the mesh's grants, if it has them: telling every member,
+    /// if they've changed.
     pub fn reload(&mut self) -> Result<()> {
+        if self.refresh_grants()? {
+            for peer in self.connected() {
+                self.ask_grants(peer)?;
+            }
+        }
+        self.reload_allowed()
+    }
+
+    /// Let in every member, and learn where they listen.
+    fn reload_allowed(&mut self) -> Result<()> {
         for (peer, addrs) in self.members.list()? {
             self.swarm.behaviour_mut().allowed.allow_peer(peer);
             for addr in addrs {
@@ -1391,6 +1534,10 @@ impl Node {
     fn learn(&mut self, roster: &Roster) -> Result<Vec<PeerId>> {
         let mut theirs = roster.to_members();
         theirs.remove(&self.peer_id());
+        // With grants, they say who's a member; a roster only where
+        if let Some(machines) = self.machines() {
+            theirs.retain(|peer, _| machines.contains(peer));
+        }
         let new = self.members.merge(&theirs)?;
         self.reload()?;
         for peer in &new {
@@ -1442,6 +1589,7 @@ impl Node {
     fn on_connected(&mut self, peer: PeerId) -> Result<()> {
         let roster = self.roster()?;
         self.swarm.behaviour_mut().members.send_request(&peer, roster);
+        self.ask_grants(peer)?;
         // What's here is noticed once it knows what this node hosts
         self.tell_hosts()?;
         self.tell(peer);
@@ -1596,6 +1744,10 @@ impl Node {
             },
             SwarmEvent::Behaviour(BehaviourEvent::Hosts(event)) => {
                 self.on_hosts(event)?;
+                None
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Grants(event)) => {
+                self.on_grants(event)?;
                 None
             },
             _ => None,

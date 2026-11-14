@@ -38,10 +38,19 @@ other side enforces anything.
 - **A daemon's peer ID is its machine's.** Every daemon of a repo uses
   `node.key` for libp2p, whichever account it acts for.
 - **The owner's device is the machine.** The owner's device key *is*
-  `node.key`, so the owner's devices and the machines are the same keys.
+  `node.key`, so the owner's devices and the machines are the same keys,
+  and an invite certifies the joining machine as a device as well as
+  giving it `/mesh/machine`.
 - **Other meshes act for one account each** (`--mesh <name>`), with their
   own swarm key, roster, port and daemon: protected meshes, and any made
   that way before the main mesh served several.
+- **Grants.** The main mesh's machines and users are those its grants
+  say, a history of claims from a first grant giving the founder `/`
+  (see [[Grants]]): `/mesh/machine` makes a machine, `/mesh/user` a
+  user, `/mesh/grant` lets one give what one holds, and an operator holds
+  `/mesh`. Taking away undoes what was concurrent with it, the senior
+  operator winning, and what's given goes with the giver's power to give
+  it. Machines share grants as they connect.
 - **Local clients.** With `hk node run --shared`, the host's other users
   ask the daemon over its socket, as their own accounts.
 - **Block access tokens** are computed and checked (see
@@ -63,13 +72,14 @@ Not yet implemented, beyond what's above.
 
 ## Roles and grants
 
-Not yet implemented. Modelled on SQL's, since a SQL server, like a
-member machine, is trusted to enforce them.
+Grants on the mesh are implemented (see [[Grants]]); roles, grants on
+anchors, and `stands` are not yet. Modelled on SQL's, since a SQL
+server, like a member machine, is trusted to enforce them.
 
 | SQL | Here |
 |---|---|
 | role | A user, or a named role granted to users and other roles. |
-| superuser, `CREATEROLE` | Mesh commands: `/mesh/admit`, `/mesh/user`, `/mesh/grant`. The **operator** is a role holding `/mesh`. |
+| superuser, `CREATEROLE` | Mesh commands: `/mesh/machine`, `/mesh/user`, `/mesh/grant`. The **operator** holds `/mesh`. |
 | database owner | The user whose first grant made the mesh: the first operator. |
 | table owner | The user who made an anchor, with `/anchor` on it. |
 | `SELECT` | `/anchor/read`: see what an anchor's value reaches. |
@@ -80,16 +90,17 @@ member machine, is trusted to enforce them.
 
 - **Users are keys.** A user is its root key, a `libp2p-key` CID, much as
   a `did:key` is. Every key exists; a mesh **recognizes** one as a user
-  once a grant of `/mesh/user` says so. An unrecognized key can't act in
-  the mesh, as a shell account can't be logged into before it's given a
-  role.
+  once it's given `/mesh/user`. An unrecognized key can't act in the
+  mesh, as a shell account can't be logged into before it's given a
+  role. (Implemented.)
 - **Roles are names** within the mesh, not keys: the machines enforce
   them, so nothing needs to prove it holds one. A role is the raw
   identity CID of its name, as a tag is (see [[Claims]]).
-- **The roster is grants too**: admitting a machine is a grant of
-  `/mesh/admit` an operator signs, so one user's stolen device can't
-  admit a machine that would then hold everyone's data. Today any
-  member's roster merges into every other's.
+- **The roster is grants too**: admitting a machine is giving it
+  `/mesh/machine`, which only someone holding it and `/mesh/grant` can
+  do, so one user's stolen device can't admit a machine that would then
+  hold everyone's data. (Implemented; a mesh without grants still merges
+  any member's roster into every other's.)
 - **Writers share an anchor** as devices of one user do now: each name is
   a multi-value register, and concurrent writes show as conflicts (see
   [[Anchors and Names#Conflicts]]).
@@ -99,13 +110,17 @@ member machine, is trusted to enforce them.
 Privileges are named as [UCAN](https://github.com/ucan-wg/spec) names
 commands: lower case paths starting with `/`, and a shorter path covers
 the longer ones under it (`/anchor` covers `/anchor/write`, but `/mesh`
-doesn't cover `/meshes`). `/` covers everything.
+doesn't cover `/meshes`). `/` covers everything. A command names what
+its holder may do itself: being a user is holding `/mesh/user`, and
+recognizing others is holding that and `/mesh/grant`. The mesh's
+commands are implemented, as [[Grants#Commands]] describes; the rest
+aren't yet.
 
 | Command | On | Allows |
 |---|---|---|
-| `/mesh/admit` | the mesh | Admitting machines to the roster, and taking them out. |
-| `/mesh/user` | the mesh | Recognizing users. |
-| `/mesh/grant` | the mesh | Granting mesh commands one holds. |
+| `/mesh/machine` | the mesh | Being a machine of the mesh. |
+| `/mesh/user` | the mesh | Being a user of the mesh. |
+| `/mesh/grant` | the mesh | Giving and taking away mesh commands one holds. |
 | `/anchor/read` | an anchor | Seeing what its value reaches. |
 | `/anchor/write` | an anchor | Sets on it, which count for its owner. |
 | `/anchor/grant` | an anchor | Granting commands one holds on it. |
@@ -113,8 +128,10 @@ doesn't cover `/meshes`). `/` covers everything.
 
 ### The `grant` claim
 
-A `grant` is a [[Claims|claim]] type of its own, signed by a device of the
-user making it (the first, by the founder's root key):
+Implemented for the mesh, as [[Grants#The grant claim]] describes; what
+follows is the whole design. A `grant` is a [[Claims|claim]] type of its
+own, signed by a device of the user making it (the first, by the
+founder's root key):
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -174,7 +191,8 @@ mesh must also recognize the key depends on what it can reach:
   that user, so its certificate could be enough, if the mesh lets users
   add such machines themselves: a setting of the mesh.
 - **A machine hosting other users** holds their plaintext, inside the
-  boundary, so it needs `/mesh/admit` from an operator.
+  boundary, so it needs `/mesh/machine` from an operator. (Today every
+  machine does.)
 
 ### Meshes don't merge
 
@@ -212,8 +230,9 @@ Not yet implemented, beyond protected meshes.
 
 1. One daemon per machine serving every user of the mesh; hosting,
    serving and placement per user. Done.
-2. The `grant` claim and its history: recognizing users, the operator
-   role, a roster operators sign, and devices apart from machines.
+2. The `grant` claim and its history: recognizing users, the operator,
+   and a roster of grants. Done, but for devices apart from machines and
+   named roles.
 3. Grants on anchors, `/anchor/read` and `/anchor/write`, and taking
    them away.
 4. Remote clients.
@@ -226,6 +245,10 @@ Not yet implemented, beyond protected meshes.
   `stands` concurrently with another.
 - The format of a mesh's setting for machines users add themselves.
 - How grants are fetched and checked by a machine joining late: the whole
-  history, or a snapshot of the state with its heads.
+  history, as now, or a snapshot of the state with its heads, once there
+  are too many to send each time or to work out quadratically.
+- Whether a device that's revoked takes its grants with it: today a
+  grant counts only while a key that signed it is certified, so revoking
+  needs to sign again what it trusts, as it does for other claims.
 
-Source: `src/account.rs`, `src/keys.rs`, `src/net/daemon.rs`, `src/net/hosts.rs`, `src/net/mesh.rs`, `src/net/node.rs`, `src/vault.rs`.
+Source: `src/account.rs`, `src/grants.rs`, `src/keys.rs`, `src/net/daemon.rs`, `src/net/grants.rs`, `src/net/hosts.rs`, `src/net/mesh.rs`, `src/net/node.rs`, `src/vault.rs`.

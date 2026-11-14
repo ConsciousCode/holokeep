@@ -20,6 +20,7 @@ is not a claim; it's stored as ordinary data.
 | `sign`   | `by: Link`, `at: int`, `prev: Link` (omitted for the first), `sig: bytes`                                 | `by` vouches for the target claims. See [[Keys and Users]].                                                                                                                                                                                                                                                                                                                             |
 | `device` | none                                                                                                      | The target keys act for whoever signs this: a certificate when a user's root key signs it.                                                                                                                                                                                                                                                                                              |
 | `lost`   | `at: int`                                                                                                 | The targets couldn't be found as of `at`, seconds since the epoch. See [[Replication and Retention#Lost blocks]].                                                                                                                                                                                                                                                                       |
+| `grant`  | `on: Link` (omitted for the mesh), `add: [string]`, `del: [string]` (each omitted if empty), `stands: [Link]` (omitted if empty), `prev: [Link]` | The targets hold the commands `add`, and no longer `del`, after the grants `prev`. Never dissolved. See [[Grants]]. |
 
 Examples, in dag-json for readability:
 
@@ -32,7 +33,7 @@ Examples, in dag-json for readability:
 ```
 
 A node of an older build doesn't know `copies`, so it takes such a keep
-for ordinary data, not a keep; likewise `lost`.
+for ordinary data, not a keep; likewise `lost` and `grant`.
 
 Not yet implemented, but planned: `same` (targets are the same bytes
 under different hashes), `attr` (attributes, with `prev` history),

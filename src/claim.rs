@@ -5,7 +5,8 @@
 //! retracts; and, for who may say so, `Sign`, a key's signature of a
 //! claim, and `Device`, which a user's root key signs to say a node's key
 //! acts for it (see `keys`). And `Lost`, a report that blocks couldn't be
-//! found.
+//! found; and `Grant`, which gives or takes away what users and machines
+//! may do in a mesh (see `grants`).
 //!
 //! Signatures are claims about claims, rather than inside them, so equal
 //! claims stay equal blocks whoever makes them, and small ones dissolve.
@@ -134,6 +135,31 @@ pub struct Lost {
     at: u64,
 }
 
+/// "The targets hold the commands `add`, and no longer `del`, on `on`,
+/// after the grants `prev`."
+///
+/// Targets are users, machines or roles; `on` is an anchor or role, or
+/// the mesh when it's left out; `prev` is empty for a mesh's first.
+///
+/// Grants are one history per mesh, by `prev`, as an anchor's sets are,
+/// so taking away has a place in it, which a tomb wouldn't. A command is
+/// a lower case path from `/`, and covers the longer ones under it (see
+/// `covers`). `stands` names, for a `del` of `/anchor/write`, the
+/// targets' last sets on `on` that still count. Never dissolved: a grant
+/// is an entry in a history, linked to by the grants after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grant {
+    /// Sorted by CID bytes and distinct.
+    target: Vec<Link>,
+    on: Option<Link>,
+    /// Sorted and distinct, as `del` is, and in only one of them.
+    add: Vec<String>,
+    del: Vec<String>,
+    /// Sorted by CID bytes and distinct, as `prev` is.
+    stands: Vec<Link>,
+    prev: Vec<Link>,
+}
+
 /// Any claim this understands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
@@ -144,6 +170,7 @@ pub enum Claim {
     Sign(Sign),
     Device(Device),
     Lost(Lost),
+    Grant(Grant),
 }
 
 /// Sort links by their bytes and drop repeats, making them a set.
@@ -329,6 +356,65 @@ impl Lost {
     pub const fn at(&self) -> u64 { self.at }
 }
 
+/// Whether a string is a command: `/`, or lower case names, of letters,
+/// digits and `-`, each after a `/`.
+pub fn is_command(command: &str) -> bool {
+    command == "/" || command.strip_prefix('/').is_some_and(|rest| {
+        rest.split('/').all(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
+    })
+}
+
+/// Whether holding one command allows another: it's the same, or a path
+/// the other is under (`/anchor` covers `/anchor/write`, not
+/// `/anchors`), and `/` covers everything.
+pub fn covers(held: &str, command: &str) -> bool {
+    held == "/" || held == command || command.strip_prefix(held).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Sorted, distinct commands, if they're all commands.
+fn commands(commands: impl IntoIterator<Item = String>) -> Option<Vec<String>> {
+    let set: BTreeSet<String> = commands.into_iter().collect();
+    set.iter().all(|command| is_command(command)).then(|| set.into_iter().collect())
+}
+
+impl Grant {
+    /// A grant to the targets, on an anchor or role or the mesh, after
+    /// the grants `prev`, if there are targets, commands are commands, and
+    /// something's given or taken away, nothing both. `stands` is only for
+    /// taking `/anchor/write` away.
+    pub fn new(
+        target: impl IntoIterator<Item = Link>,
+        on: Option<Link>,
+        add: impl IntoIterator<Item = String>,
+        del: impl IntoIterator<Item = String>,
+        stands: impl IntoIterator<Item = Link>,
+        prev: impl IntoIterator<Item = Link>,
+    ) -> Option<Self> {
+        let (target, add, del, stands) = (set(target), commands(add)?, commands(del)?, set(stands));
+        (!target.is_empty() && (!add.is_empty() || !del.is_empty())).then_some(())?;
+        (!add.iter().any(|command| del.contains(command))).then_some(())?;
+        (stands.is_empty() || del.iter().any(|command| covers(command, "/anchor/write"))).then_some(())?;
+        Some(Self { target, on, add, del, stands, prev: set(prev) })
+    }
+
+    pub fn target(&self) -> &[Link] { &self.target }
+
+    /// The anchor or role it's about; none for the mesh.
+    pub const fn on(&self) -> Option<&Link> { self.on.as_ref() }
+
+    /// The commands given.
+    pub fn add(&self) -> &[String] { &self.add }
+
+    /// The commands taken away.
+    pub fn del(&self) -> &[String] { &self.del }
+
+    /// The targets' last sets that still count, taking `/anchor/write` away.
+    pub fn stands(&self) -> &[Link] { &self.stands }
+
+    /// The grants its signer had seen last; none for a mesh's first.
+    pub fn prev(&self) -> &[Link] { &self.prev }
+}
+
 impl Claim {
     pub fn target(&self) -> &[Link] {
         match self {
@@ -339,6 +425,7 @@ impl Claim {
             Self::Sign(sign) => sign.signs(),
             Self::Device(device) => device.target(),
             Self::Lost(lost) => lost.target(),
+            Self::Grant(grant) => grant.target(),
         }
     }
 
@@ -352,6 +439,7 @@ impl Claim {
             Self::Sign(_) => "sign",
             Self::Device(_) => "device",
             Self::Lost(_) => "lost",
+            Self::Grant(_) => "grant",
         }
     }
 
@@ -388,6 +476,23 @@ impl Claim {
             Self::Sign(sign) => return Ipld::Map(sign.fields()),
             Self::Device(_) => ("device", BTreeMap::new()),
             Self::Lost(lost) => ("lost", BTreeMap::from([("at".to_owned(), Ipld::Integer(lost.at.into()))])),
+            Self::Grant(grant) => {
+                let strings = |commands: &[String]| Ipld::List(commands.iter().cloned().map(Ipld::String).collect());
+                let mut map = BTreeMap::from([("prev".to_owned(), links(&grant.prev))]);
+                if let Some(on) = &grant.on {
+                    map.insert("on".to_owned(), Ipld::Link(on.clone()));
+                }
+                if !grant.add.is_empty() {
+                    map.insert("add".to_owned(), strings(&grant.add));
+                }
+                if !grant.del.is_empty() {
+                    map.insert("del".to_owned(), strings(&grant.del));
+                }
+                if !grant.stands.is_empty() {
+                    map.insert("stands".to_owned(), links(&grant.stands));
+                }
+                ("grant", map)
+            },
         };
         map.insert("claim".to_owned(), Ipld::String(kind.to_owned()));
         map.insert("target".to_owned(), links(self.target()));
@@ -403,7 +508,7 @@ impl Claim {
     /// is always of all of its target.
     pub fn dissolves(&self) -> bool {
         let bounded = matches!(self, Self::Keep(keep) if !keep.beyond.is_empty());
-        !bounded && !matches!(self, Self::Sign(_)) && self.target().len() == 1 && self.encode().len() <= IDENTITY_MAX
+        !bounded && !matches!(self, Self::Sign(_) | Self::Grant(_)) && self.target().len() == 1 && self.encode().len() <= IDENTITY_MAX
     }
 
     /// The claim as a dag-cbor block: an identity block if it dissolves,
@@ -501,11 +606,40 @@ impl Claim {
                 Self::Sign(Sign::from_parts(target.clone(), by, u64::try_from(at).ok()?, prev, sig)?)
             },
             "device" => Self::Device(Device::new(target.clone())?),
+            "grant" => Self::Grant(parse_grant(&mut map, target.clone())?),
             _ => return None,
         };
         // Nothing else, sorted and distinct already, and canonical dag-cbor
         (map.is_empty() && claim.target() == target && claim.encode() == data).then_some(claim)
     }
+}
+
+/// A grant's fields but its type and targets, taken from its map.
+fn parse_grant(map: &mut BTreeMap<String, Ipld>, target: Vec<Link>) -> Option<Grant> {
+    let mut list = |name: &str| match map.remove(name) {
+        Some(Ipld::List(list)) if !list.is_empty() => Some(Some(list)),
+        Some(_) => None,
+        None => Some(None),
+    };
+    let strings = |list: Option<Vec<Ipld>>| {
+        list.unwrap_or_default().into_iter()
+            .map(|command| match command {
+                Ipld::String(command) => Some(command),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+    };
+    let (add, del) = (strings(list("add")?)?, strings(list("del")?)?);
+    let stands = link_list(list("stands")?.unwrap_or_default())?;
+    let Ipld::List(prev) = map.remove("prev")? else {
+        return None;
+    };
+    let on = match map.remove("on") {
+        Some(Ipld::Link(on)) => Some(on),
+        Some(_) => return None,
+        None => None,
+    };
+    Grant::new(target, on, add, del, stands, link_list(prev)?)
 }
 
 fn link_list(list: Vec<Ipld>) -> Option<Vec<Link>> {
@@ -592,6 +726,37 @@ mod tests {
 
     fn group(target: &[Link], name: &str) -> Claim {
         Claim::Group(Group::new(target.iter().cloned(), tag(name).expect("tag")).expect("group"))
+    }
+
+    #[test]
+    fn a_grant_round_trips_and_is_never_dissolved() {
+        let user = crate::keys::Key::generate().expect("key").id();
+        let cmds = |list: &[&str]| list.iter().map(|&c| c.to_owned()).collect::<Vec<_>>();
+        let first = Grant::new([user.clone()], None, cmds(&["/"]), [], [], []).expect("grant");
+        let claim = Claim::Grant(first);
+        assert!(!claim.dissolves(), "a grant is an entry in a history");
+        assert_eq!(Claim::parse(claim.block().data()), Some(claim.clone()));
+        let next = Grant::new([user.clone(), cid(b"m")], Some(cid(b"a")), cmds(&["/mesh/user", "/anchor/read"]), cmds(&["/anchor/write"]), [cid(b"s")], [claim.cid()])
+            .expect("grant");
+        assert_eq!(next.add(), ["/anchor/read", "/mesh/user"], "sorted");
+        let next = Claim::Grant(next);
+        assert_eq!(Claim::parse(next.block().data()), Some(next));
+        // Nothing given or taken, both at once, not commands, or stands without writes taken away
+        assert!(Grant::new([user.clone()], None, [], [], [], []).is_none());
+        assert!(Grant::new([user.clone()], None, cmds(&["/mesh"]), cmds(&["/mesh"]), [], []).is_none());
+        assert!(Grant::new([user.clone()], None, cmds(&["/Mesh"]), [], [], []).is_none());
+        assert!(Grant::new([user.clone()], None, cmds(&["/mesh/"]), [], [], []).is_none());
+        assert!(Grant::new([user], None, [], cmds(&["/anchor/read"]), [cid(b"s")], []).is_none());
+    }
+
+    #[test]
+    fn commands_cover_the_paths_under_them() {
+        assert!(covers("/", "/mesh/user"));
+        assert!(covers("/mesh", "/mesh/user"));
+        assert!(covers("/mesh/user", "/mesh/user"));
+        assert!(!covers("/mesh", "/meshes"));
+        assert!(!covers("/mesh/user", "/mesh"));
+        assert!(is_command("/") && is_command("/anchor/write") && !is_command("anchor") && !is_command("//"));
     }
 
     #[test]

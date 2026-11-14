@@ -25,7 +25,9 @@ protocols below.
 Every node of a mesh shares the swarm key, and each keeps the list of
 members it lets in, so one can be shut out without changing the key.
 Members exchange rosters whenever they connect, so a machine invited by
-one is let in by all.
+one is let in by all. Once the mesh has [[Grants|grants]], which the
+main mesh's first invite makes, the members are exactly the machines
+given `/mesh/machine`, and a roster is heeded only for those.
 
 1. `hk node id` on the new machine prints its peer ID.
 2. `hk node invite <id>` on a member prints a ticket.
@@ -47,6 +49,8 @@ A **ticket** is dag-cbor, multibase base32-lower encoded:
 | `protected` | `true` for a protected mesh (omitted otherwise) |
 | `sealed` | list of bytes: a vault's sealed blocks, for recovery |
 | `held` | list of links: the vault's manifests, for recovery |
+| `mesh` | link: the mesh's first grant (when it has grants) |
+| `grants` | list of bytes: every grant, with what makes each count (see [[Grants#Sharing grants]]) |
 
 The keys are files beside the catalog (`node.key`, `swarm.key`), not rows
 in it, since the database is a volume another node may open. A repo in no
@@ -85,8 +89,8 @@ sig = ed25519(device, "holokeep hosts\x00" || peer ID bytes)
 ```
 
 A machine takes another to host a user only if it serves that user too,
-the signature checks, and the device is certified by the user here and
-not revoked. So a machine can't claim to host a user without one of the
+the signature checks, the device is certified by the user here and
+not revoked, and, if the mesh has grants, the user holds `/mesh/user`. So a machine can't claim to host a user without one of the
 user's device keys, and learns nothing from what it's told of users it
 doesn't serve.
 
@@ -134,6 +138,7 @@ by older builds (see [[#Users sharing a mesh]]).
 |---|---|---|---|
 | `/holokeep/members/1.0.0` | `{members: [[peer, [addr]]]}` | same | Exchange rosters. |
 | `/holokeep/hosts/1.0.0` | `{hosts: [{user: CID, device: CID, sig: bytes}]}` | same | Say which users each hosts. |
+| `/holokeep/grants/1.0.0` | `{mesh: CID, have: [CID]}` | `{blocks: [[CID, data]]}` | Share grants (see [[Grants#Sharing grants]]). |
 | `/holokeep/blocks/1.0.0` | `{want: [key], user?}` | `{blocks: [[CID, data]], missing: [key], copies: [[replica]]}` | Fetch blocks. |
 | `/holokeep/adverts/1.0.0` | `{blocks: [[key, [replica]]], user?}` | `{held: [[key, [replica]]], offer: offer \| null}` | "These may be under-replicated." |
 | `/holokeep/push/1.0.0` | `{blocks: [[CID, data]], copies: [[replica]], user?}` | `{kept: [[key, [replica]]]}` | Send copies to keep. |
@@ -177,9 +182,14 @@ Durability (`adverts`, `push`), trimming (`trim`, `dropped`) and garbage
 collection (`condemn`) are described in
 [[Replication and Retention]].
 
-Source: `src/net/node.rs`, `src/net/hosts.rs`, `src/net/mesh.rs`, `src/net/blocks.rs`, `src/net/structure.rs`, `src/net/daemon.rs`.
+Source: `src/net/node.rs`, `src/net/hosts.rs`, `src/net/grants.rs`, `src/net/mesh.rs`, `src/net/blocks.rs`, `src/net/structure.rs`, `src/net/daemon.rs`.
 
 ## Forgetting members
+
+In a mesh with grants, a machine is taken out by taking away its
+`/mesh/machine` (`hk node grant rm <peer> /mesh/machine`), which every
+machine heeds as the grant reaches it, and `hk node forget` refuses a
+machine the grants say is in. In one without:
 
 `hk node forget <peer>` is for a member that's gone for good, as a node's
 old key. A member away holds up [[Replication and Retention#Garbage collection|collection]]

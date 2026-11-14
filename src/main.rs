@@ -240,6 +240,13 @@ enum NodeCommand {
     Forget { peer: libp2p::PeerId },
     /// List the mesh's members, and which are connected
     Peers,
+    /// Give and take away what users and machines may do in the mesh. Once
+    /// the mesh has grants, its machines are those given /mesh/machine, its
+    /// users those given /mesh/user
+    Grant {
+        #[command(subcommand)]
+        command: GrantCommand,
+    },
     /// How the running node is: connected members, blocks, and the
     /// trickle's pace
     Status,
@@ -250,6 +257,33 @@ enum NodeCommand {
         #[arg(short, long)]
         copies: Option<usize>,
     },
+}
+
+#[cfg(feature = "net")]
+#[derive(Subcommand, Debug)]
+enum GrantCommand {
+    /// Keep who's in the mesh as grants from now on: a first grant, which
+    /// the user's root key signs, making them its founder, then grants of
+    /// /mesh/machine to every member and /mesh/user to every other user
+    /// served. The first invite of a new mesh does this itself
+    Init,
+    /// Give a user or machine, by peer ID, commands: /mesh/user,
+    /// /mesh/machine, /mesh/grant (to give what one holds), or /mesh for an
+    /// operator
+    Add {
+        who: String,
+        #[arg(required = true)]
+        commands: Vec<String>,
+    },
+    /// Take commands away from a user or machine, by peer ID; and from
+    /// those they gave them to, unless someone else did too
+    Rm {
+        who: String,
+        #[arg(required = true)]
+        commands: Vec<String>,
+    },
+    /// List who holds what: the founder first, holding everything
+    Ls,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1013,6 +1047,7 @@ fn invite(place: &holokeep::net::mesh::Place, peer: &str, device: Option<&str>, 
         root
     };
     repo.batch(|repo| repo.certify(&root, &device))?;
+    let grants = invite_grants(place, uid, &root, &peer)?;
     let user = root.id();
     let blocks = user_blocks(&repo)?;
     // A running node hears of the new member, or, if it was alone, joins
@@ -1020,7 +1055,7 @@ fn invite(place: &holokeep::net::mesh::Place, peer: &str, device: Option<&str>, 
     reload(place)?;
     let listening = daemon::ask(place, "listeners")?.unwrap_or_default();
     list.insert(me, listening.iter().filter_map(|addr| addr.parse().ok()).collect());
-    out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: Some((user, blocks)), protected: false, sealed: Vec::new(), held: Vec::new() }.encode());
+    out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: Some((user, blocks)), protected: false, sealed: Vec::new(), held: Vec::new(), grants }.encode());
     if listening.is_empty() {
         eprintln!("note: this node isn't running, so the ticket says nowhere to find it; it'll be found on the LAN, or start `hk node run` and invite again");
     }
@@ -1111,7 +1146,7 @@ fn invite_friend(place: &holokeep::net::mesh::Place, peer: &str, vault: &str, qu
     reload(place)?;
     let listening = daemon::ask(place, "listeners")?.unwrap_or_default();
     list.insert(me, listening.iter().filter_map(|addr| addr.parse().ok()).collect());
-    out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: None, protected: true, sealed, held }.encode());
+    out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: None, protected: true, sealed, held, grants: None }.encode());
     Ok(())
 }
 
@@ -1233,6 +1268,9 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
             mesh::set_swarm_key(&place.dir(), ticket.swarm_key)?;
             let uid = mesh_account(&members, account)?;
             members.merge(&ticket.members)?;
+            if let Some((genesis, blocks)) = &ticket.grants {
+                join_grants(place, genesis, blocks)?;
+            }
             if let Some((user, blocks)) = &ticket.user {
                 join_user(dir, uid, user, blocks)?;
             }
@@ -1279,6 +1317,161 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
             }
         },
         NodeCommand::Peers => peers(place)?,
+        NodeCommand::Grant { command } => grant(place, command)?,
+    }
+    Ok(())
+}
+
+/// A user's or machine's key, by peer ID or CID.
+#[cfg(feature = "net")]
+fn key_named(text: &str) -> anyhow::Result<Link> {
+    holokeep::keys::from_peer_id(text)
+        .or_else(|| text.parse::<Link>().ok().filter(holokeep::keys::is_key))
+        .with_context(|| format!("not a key, by peer ID or CID: {text}"))
+}
+
+/// A peer's key.
+#[cfg(feature = "net")]
+fn peer_key(peer: &libp2p::PeerId) -> anyhow::Result<Link> {
+    holokeep::keys::from_peer_id(&peer.to_string()).with_context(|| format!("{peer} isn't an ed25519 key"))
+}
+
+/// Give a mesh grants, founded by its owner's user with their root key:
+/// every member is given /mesh/machine, and every other account's user
+/// served /mesh/user. Returns the first grant.
+#[cfg(feature = "net")]
+fn found_grants(place: &holokeep::net::mesh::Place, repo: &mut Catalog, root: &holokeep::keys::Key) -> anyhow::Result<Link> {
+    use holokeep::grants::{MACHINE, USER};
+    let members = holokeep::net::daemon::members(place)?;
+    anyhow::ensure!(members.genesis()?.is_none(), "this mesh has grants already");
+    anyhow::ensure!(repo.user()?.as_ref() == Some(&root.id()), "the mesh's grants are founded by its owner's user");
+    let me = holokeep::net::mesh::node_key(&place.repo)?.public().to_peer_id();
+    let mut machines = vec![peer_key(&me)?];
+    for peer in members.list()?.into_keys() {
+        machines.push(peer_key(&peer)?);
+    }
+    let mut users = Vec::new();
+    if let Some(claims) = repo.claims() {
+        for uid in members.others()? {
+            users.extend(claims.account(uid)?.and_then(|account| account.user));
+        }
+    }
+    let genesis = repo.batch(|repo| {
+        let genesis = repo.found_grants(root)?;
+        repo.grant(&genesis, &machines, &[MACHINE.to_owned()], &[])?;
+        if !users.is_empty() {
+            repo.grant(&genesis, &users, &[USER.to_owned()], &[])?;
+        }
+        anyhow::Ok(genesis)
+    })?;
+    members.set_genesis(&genesis)?;
+    eprintln!("who's in this mesh is kept as grants from now on, founded by {}", holokeep::keys::peer_id(&root.id()));
+    Ok(genesis)
+}
+
+/// The mesh's first grant, and every grant with what makes it count, as
+/// a ticket brings them.
+#[cfg(feature = "net")]
+fn grant_blocks(repo: &Catalog, genesis: &Link) -> anyhow::Result<(Link, Vec<Vec<u8>>)> {
+    let state = repo.grant_state(genesis)?.context("the mesh's grants aren't here")?;
+    let grants: Vec<Link> = state.grants().cloned().collect();
+    Ok((genesis.clone(), repo.grant_blocks(&grants)?.into_iter().map(|(_, data)| data).collect()))
+}
+
+/// What an invite gives, on a mesh with grants, or the first invite of
+/// the owner's account makes it: the machine, /mesh/machine; the user of
+/// an account another than the owner's, /mesh/user. Returns the grants,
+/// for the ticket, if there are any.
+#[cfg(feature = "net")]
+fn invite_grants(place: &holokeep::net::mesh::Place, uid: u32, root: &holokeep::keys::Key, peer: &libp2p::PeerId) -> anyhow::Result<Option<(Link, Vec<Vec<u8>>)>> {
+    use holokeep::grants::{MACHINE, USER};
+    if !place.is_main() {
+        return Ok(None);
+    }
+    let mut owner = Catalog::open_repo(&place.repo)?;
+    let members = holokeep::net::daemon::members(place)?;
+    let genesis = match members.genesis()? {
+        Some(genesis) => genesis,
+        None if uid == owner.uid() => found_grants(place, &mut owner, root)?,
+        None => return Ok(None),
+    };
+    let state = owner.grant_state(&genesis)?.context("the mesh's grants aren't here")?;
+    let machine = peer_key(peer)?;
+    owner.batch(|owner| {
+        if !state.holds(&machine, MACHINE) {
+            owner.grant(&genesis, std::slice::from_ref(&machine), &[MACHINE.to_owned()], &[])?;
+        }
+        if uid != owner.uid() && !state.holds(&root.id(), USER) {
+            owner.grant(&genesis, &[root.id()], &[USER.to_owned()], &[])?;
+        }
+        anyhow::Ok(())
+    })?;
+    grant_blocks(&owner, &genesis).map(Some)
+}
+
+/// Put what a ticket brings of a mesh's grants, which say who's in it.
+#[cfg(feature = "net")]
+fn join_grants(place: &holokeep::net::mesh::Place, genesis: &Link, blocks: &[Vec<u8>]) -> anyhow::Result<()> {
+    let members = holokeep::net::daemon::members(place)?;
+    if let Some(had) = members.genesis()? {
+        anyhow::ensure!(had == *genesis, "this node's mesh has other grants: join another with --mesh");
+    }
+    let mut repo = Catalog::open_repo(&place.repo)?;
+    repo.batch(|repo| {
+        for data in blocks {
+            let claim = claim::Claim::parse(data).context("a ticket's grants are claims")?;
+            repo.put_block(&claim.block(), holokeep::cid::CidVersion::V1)?;
+        }
+        anyhow::Ok(())
+    })?;
+    anyhow::ensure!(repo.grant_state(genesis)?.is_some(), "the ticket's grants aren't a mesh's");
+    members.set_genesis(genesis)?;
+    Ok(())
+}
+
+/// Give and take away what users and machines may do in the main mesh,
+/// as its owner's user, or list who holds what.
+#[cfg(feature = "net")]
+fn grant(place: &holokeep::net::mesh::Place, command: GrantCommand) -> anyhow::Result<()> {
+    anyhow::ensure!(place.is_main(), "only the main mesh has grants");
+    let members = holokeep::net::daemon::members(place)?;
+    let mut repo = Catalog::open_repo(&place.repo)?;
+    if matches!(command, GrantCommand::Init) {
+        anyhow::ensure!(members.genesis()?.is_none(), "this mesh has grants already");
+        anyhow::ensure!(repo.user()?.is_some(), "this repo has no user yet: the first invite makes one, and the mesh's grants");
+        let root = root_key(&repo, &place.repo)?;
+        found_grants(place, &mut repo, &root)?;
+        return reload(place);
+    }
+    let genesis = members.genesis()?.context("this mesh has no grants: `hk node grant init` to keep who's in it as grants")?;
+    let commands = |commands: Vec<String>| -> anyhow::Result<Vec<String>> {
+        for command in &commands {
+            anyhow::ensure!(claim::is_command(command), "not a command: {command} (lower case names, each after a /)");
+        }
+        Ok(commands)
+    };
+    match command {
+        GrantCommand::Init => {},
+        GrantCommand::Add { who, commands: given } => {
+            out!("{}", repo.grant(&genesis, &[key_named(&who)?], &commands(given)?, &[])?);
+            reload(place)?;
+        },
+        GrantCommand::Rm { who, commands: taken } => {
+            out!("{}", repo.grant(&genesis, &[key_named(&who)?], &[], &commands(taken)?)?);
+            reload(place)?;
+        },
+        GrantCommand::Ls => {
+            let state = repo.grant_state(&genesis)?.context("the mesh's first grant isn't here")?;
+            out!("{}\t/", holokeep::keys::peer_id(state.founder()));
+            for (who, held) in state.holders() {
+                if who != *state.founder() {
+                    out!("{}\t{}", holokeep::keys::peer_id(&who), if held.is_empty() { "-".to_owned() } else { held.join(" ") });
+                }
+            }
+            if !state.waiting().is_empty() {
+                eprintln!("{} grants wait for grants before them that aren't here yet", state.waiting().len());
+            }
+        },
     }
     Ok(())
 }

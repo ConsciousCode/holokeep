@@ -3230,3 +3230,49 @@ fn what_a_set_wrote_is_kept_with_it() {
     let Claim::Set(read) = read else { panic!("a set") };
     assert_eq!(read.written(), [b"a/page".to_vec()]);
 }
+
+/// A mesh's grants, made by its founder's root and devices, work out the
+/// same on a machine they're sent to with what makes them count: a user
+/// and a machine recognized, and a grant by a device no one certified
+/// counting for no one.
+#[test]
+fn grants_count_where_theyre_sent_with_their_certificates() {
+    use crate::grants::{MACHINE, USER};
+    let scratch = Scratch::new("grants");
+    let here = Catalog::open_repo(&scratch.path().join("here")).expect("catalog");
+    let root = here.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let genesis = here.found_grants(&root).expect("found");
+    let (ezra, machine) = (crate::keys::Key::generate().expect("key"), crate::keys::Key::generate().expect("key"));
+    let recognized = here.grant(&genesis, &[ezra.id()], &[USER.to_owned()], &[]).expect("grant");
+    here.grant(&genesis, &[machine.id()], &[MACHINE.to_owned()], &[]).expect("grant");
+    let state = here.grant_state(&genesis).expect("state").expect("a mesh");
+    assert_eq!(state.founder(), &root.id());
+    assert!(state.counts(&recognized) && state.holds(&ezra.id(), USER) && state.holds(&machine.id(), MACHINE));
+    assert_eq!(state.heads().len(), 1, "each after the last");
+
+    // Elsewhere, by what's sent: grants, signs, and certificates
+    let grants: Vec<Link> = state.grants().cloned().collect();
+    let blocks = here.grant_blocks(&grants).expect("blocks");
+    let there = Catalog::open_repo(&scratch.path().join("there")).expect("catalog");
+    for (cid, data) in &blocks {
+        let claim = crate::claim::Claim::parse(data).expect("a claim");
+        assert_eq!(&claim.cid(), cid);
+        there.put_block(&claim.block(), CidVersion::V1).expect("put");
+    }
+    let state = there.grant_state(&genesis).expect("state").expect("a mesh");
+    assert!(state.holds(&ezra.id(), USER) && state.holds(&machine.id(), MACHINE));
+
+    // A user can't grant what they don't hold, nor a stranger's device at all
+    let mut ezras = Catalog::open_repo(&scratch.path().join("ezra")).expect("catalog");
+    ezras.set_signer(ezra.clone()).expect("signer");
+    for (cid, data) in &blocks {
+        let _ = cid;
+        ezras.put_block(&crate::claim::Claim::parse(data).expect("claim").block(), CidVersion::V1).expect("put");
+    }
+    ezras.set_user(&ezra.id()).expect("user");
+    assert!(ezras.grant(&genesis, &[machine.id()], &[], &[MACHINE.to_owned()]).is_err());
+    let forged = crate::claim::Grant::new([ezra.id()], None, ["/mesh".to_owned()], [], [], state.heads()).expect("grant");
+    let forged = ezras.put_claim(&crate::claim::Claim::Grant(forged)).expect("put");
+    let state = ezras.grant_state(&genesis).expect("state").expect("a mesh");
+    assert!(!state.counts(&forged) && !state.holds(&ezra.id(), MACHINE));
+}

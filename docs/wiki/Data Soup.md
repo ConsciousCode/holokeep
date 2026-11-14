@@ -21,7 +21,8 @@ the holokeep repository; this wiki is the reference.
 - [[Mesh]]: joining, transport, and every wire protocol.
 - [[Replication and Retention]]: copies, risks, trimming, garbage collection.
 - [[Protected Meshes]]: vaults, encryption, recovery.
-- [[Sharing]]: users sharing machines and data (mostly planned).
+- [[Grants]]: who may do what in a mesh, as a history of claims.
+- [[Sharing]]: users sharing machines and data (partly planned).
 - [[Mount]]: the FUSE filesystem and writing through it.
 - [[Rules]]: `.souprules`, what's made through the mount becomes.
 - [[Git]]: git objects as `git-raw` blocks, and importing repositories.
@@ -49,7 +50,10 @@ the holokeep repository; this wiki is the reference.
 | account | A user a repo serves, by uid: one of the host's users, or a user with no login there. |
 | mesh | Machines serving one or more users, each user's blocks only on machines hosting them (private), or a vault's holders (protected). |
 | vault | An account's internal account for what it encrypts for friends to hold. |
-| machine | A mesh member, named by `node.key`; trusted by every user of the mesh. Planned to be distinct from devices, see [[Sharing]]. |
+| machine | A mesh member, named by `node.key`; trusted by every user of the mesh. In a mesh with grants, one given `/mesh/machine`. Planned to be distinct from devices, see [[Sharing]]. |
+| grant | A claim giving or taking away commands in a mesh, after the grants before it; see [[Grants]]. |
+| command | What a grant gives, as a path from `/`: `/mesh/user`, `/mesh/machine`, `/mesh/grant`. |
+| operator | A user holding `/mesh`; the **founder**, whose first grant names the mesh, holds `/`. |
 | client | A device acting for its user through a member machine, not a member itself (planned; local clients exist). |
 | role | A set of privileges granted to users and other roles, as in SQL (planned). |
 | grant | A claim giving a user or role a privilege on an anchor or the mesh (planned). |

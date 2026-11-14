@@ -227,7 +227,7 @@ const SCHEMA: &str =
          CREATE TABLE IF NOT EXISTS claims (
              id INTEGER PRIMARY KEY,
              claim INTEGER UNIQUE REFERENCES multihashes (id),
-             kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost'))
+             kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant'))
          );
          -- Every claim's targets, which every type has.
          CREATE TABLE IF NOT EXISTS claim_targets (
@@ -275,6 +275,12 @@ const SCHEMA: &str =
          CREATE TABLE IF NOT EXISTS keep_copies (
              claim INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
              copies INTEGER NOT NULL
+         );
+         -- A grant, as its canonical bytes: they're read only to work out
+         -- who holds what in a mesh, all at once.
+         CREATE TABLE IF NOT EXISTS grant_claims (
+             id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
+             data BLOB NOT NULL
          );
          -- What's particular to each type; a tomb has nothing but targets.
          CREATE TABLE IF NOT EXISTS group_claims (
@@ -812,6 +818,12 @@ impl ClaimStore {
                     .map(Claim::Lost)
                     .ok_or_else(|| Error::Invalid { store: NAME, reason: "a lost claim of nothing".into() })
             },
+            "grant" => {
+                let data: Vec<u8> = self.db.conn().prepare_cached("SELECT data FROM grant_claims WHERE id = ?1")?.query_row([id], |row| row.get(0))?;
+                Claim::parse(&data)
+                    .filter(|claim| matches!(claim, Claim::Grant(_)))
+                    .ok_or_else(|| Error::Invalid { store: NAME, reason: "a grant that isn't one".into() })
+            },
             _ => Err(Error::Invalid { store: NAME, reason: format!("a claim of kind {kind}") }),
         }
     }
@@ -1022,7 +1034,7 @@ impl ClaimStore {
                 }
                 same
             },
-            Claim::Sign(_) => None,
+            Claim::Sign(_) | Claim::Grant(_) => None,
             Claim::Lost(lost) => self.db.conn()
                 .prepare_cached(
                     "SELECT c.id FROM claims c JOIN lost_claims l ON l.id = c.id JOIN claim_targets t ON t.claim = c.id
@@ -1066,6 +1078,53 @@ impl ClaimStore {
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         rows.into_iter().map(|id| self.claim(id, "tomb")).collect()
+    }
+
+    /// Every grant here, by CID, and the keys that signed each.
+    pub fn grants(&self) -> Result<Vec<(Link, crate::claim::Grant, Vec<Link>)>> {
+        let rows: Vec<(Id, Vec<u8>)> = self.db.conn()
+            .prepare_cached("SELECT c.id, m.multihash FROM claims c JOIN multihashes m ON m.id = c.claim WHERE c.kind = 'grant' ORDER BY c.id")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut grants = Vec::new();
+        for (id, multihash) in rows {
+            let Claim::Grant(grant) = self.claim(id, "grant")? else {
+                continue;
+            };
+            let by: Vec<Vec<u8>> = self.db.conn()
+                .prepare_cached(
+                    "SELECT DISTINCT b.multihash FROM claim_keys k JOIN claim_targets st ON st.target = k.key
+                     JOIN sign_claims sg ON sg.id = st.claim JOIN multihashes b ON b.id = sg.by WHERE k.claim = ?1 ORDER BY b.multihash",
+                )?
+                .query_map([id], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let by = by.iter().map(|multihash| link(&KEY_PREFIX, multihash)).collect::<Result<_>>()?;
+            grants.push((link(&[0x01, 0x71], &multihash)?, grant, by));
+        }
+        Ok(grants)
+    }
+
+    /// The users whose root key is this key, or who've certified it as a
+    /// device and not revoked it: whoever it can sign for.
+    pub fn users_of(&self, key: &Link) -> Result<Vec<Link>> {
+        let rows: Vec<Vec<u8>> = self.db.conn()
+            .prepare_cached(
+                "SELECT DISTINCT u.multihash FROM multihashes m JOIN claim_targets t ON t.target = m.id
+                 JOIN claims d ON d.id = t.claim JOIN claim_keys dk ON dk.claim = d.id
+                 JOIN claim_targets rt ON rt.target = dk.key JOIN sign_claims rs ON rs.id = rt.claim JOIN multihashes u ON u.id = rs.by
+                 WHERE m.multihash = ?1 AND d.kind = 'device' AND NOT EXISTS (
+                     SELECT 1 FROM claim_targets tt JOIN claims tb ON tb.id = tt.claim JOIN claim_keys tbk ON tbk.claim = tb.id
+                     JOIN claim_targets rt2 ON rt2.target = tbk.key JOIN sign_claims rs2 ON rs2.id = rt2.claim
+                     WHERE tt.target = dk.key AND tb.kind = 'tomb' AND rs2.by = rs.by)
+                 ORDER BY u.multihash",
+            )?
+            .query_map([key.multihash().to_bytes()], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut users = vec![key.clone()];
+        for multihash in rows {
+            users.push(link(&KEY_PREFIX, &multihash)?);
+        }
+        Ok(users)
     }
 
     /// Every dissolved claim here.
@@ -1120,6 +1179,9 @@ impl ClaimStore {
             for path in set.written() {
                 stmt.execute(params![row, path])?;
             }
+        }
+        if let Claim::Grant(_) = claim {
+            conn.prepare_cached("INSERT INTO grant_claims (id, data) VALUES (?1, ?2)")?.execute(params![row, claim.block().data()])?;
         }
         if let Claim::Lost(lost) = claim {
             conn.prepare_cached("INSERT INTO lost_claims (id, at) VALUES (?1, ?2)")?
@@ -1326,7 +1388,7 @@ impl ClaimStore {
 /// constraint, which doesn't touch how rows are stored, is rewritten in
 /// place, as `SQLite` documents for such changes.
 fn widen_kinds(db: &Db) -> Result<()> {
-    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost'))";
+    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant'))";
     let conn = db.conn();
     let sql: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'claims'", [], |row| row.get(0))?;
     if sql.contains(KINDS) {

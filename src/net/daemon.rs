@@ -327,6 +327,12 @@ pub fn trim(place: &Place) -> Result<Option<super::trim::Report>> {
 pub fn forget(place: &Place, peer: &libp2p::PeerId) -> Result<()> {
     let Some(lines) = ask(place, &format!("forget {peer}"))? else {
         let members = members(place)?;
+        if let Some(genesis) = members.genesis()?
+            && let Some(state) = crate::store::Catalog::open_repo(&place.repo)?.grant_state(&genesis)?
+            && crate::keys::from_peer_id(&peer.to_string()).is_some_and(|key| state.holders().iter().any(|(who, held)| *who == key && held.iter().any(|c| c == crate::grants::MACHINE)))
+        {
+            return Err(Error::Invalid(format!("the mesh's grants say {peer} is one of its machines: take that away with `hk node grant rm {peer} /mesh/machine`")));
+        }
         if !members.forget(peer)? {
             return Err(Error::Invalid(format!("{peer} isn't a member")));
         }

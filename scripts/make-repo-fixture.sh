@@ -51,10 +51,13 @@ lost=$(h add -q -n "$tmp/lost.txt")
 h lost add "$lost" >/dev/null
 
 # A mesh, with another account it serves, a user sharing this machine,
-# whose user certifies the machine invited (the owner's root stays its
-# device's, as the checks expect)
+# whose user certifies the machine invited; then the owner's first invite,
+# which makes the owner a user, whose root anchor names what the device's
+# did, and the mesh's grants
 peer() { "$hk" --repo "$tmp/$1" node id; }
 HK_PASSPHRASE=fixture h node invite "$(peer other)" --account 4000000000 >/dev/null 2>&1
+HK_PASSPHRASE=fixture h node invite "$(peer third)" >/dev/null 2>&1
+root=$(h anchor root | head -1)
 
 mkdir -p "$out"
 cp -a "$repo/." "$out/"

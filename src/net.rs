@@ -8,6 +8,7 @@
 pub mod blocks;
 pub mod collect;
 pub mod durability;
+pub mod grants;
 pub mod hosts;
 pub mod mesh;
 pub mod node;

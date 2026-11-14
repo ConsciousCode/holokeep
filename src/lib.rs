@@ -8,6 +8,7 @@
 pub mod cid;
 pub mod car;
 pub mod claim;
+pub mod grants;
 pub mod keys;
 pub mod account;
 pub mod vault;

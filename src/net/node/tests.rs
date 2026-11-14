@@ -24,7 +24,7 @@ fn invite(inviter: &Node, joiner: &Node, swarm_key: PreSharedKey) {
     inviter.members().add(&joiner.peer_id()).expect("add");
     let mut members = inviter.members().list().expect("list");
     members.insert(inviter.peer_id(), inviter.listeners());
-    let ticket = Ticket { swarm_key, inviter: inviter.peer_id(), members, user: None, protected: false, sealed: Vec::new(), held: Vec::new() };
+    let ticket = Ticket { swarm_key, inviter: inviter.peer_id(), members, user: None, protected: false, sealed: Vec::new(), held: Vec::new(), grants: None };
     let ticket = Ticket::decode(&ticket.encode()).expect("round trip");
     joiner.members().merge(&ticket.members).expect("join");
 }
@@ -1137,6 +1137,12 @@ async fn an_audit_finishes_beside_another_writer() {
 /// all members of one mesh. Returns the server, the laptops, and the
 /// server's account for the second user, by uid.
 async fn shared() -> (Node, Node, Node, u32) {
+    let (server, mine, theirs, other, _) = Box::pin(shared_by()).await;
+    (server, mine, theirs, other)
+}
+
+/// As `shared`, with the two users' root keys, mine first.
+async fn shared_by() -> (Node, Node, Node, u32, (crate::keys::Key, crate::keys::Key)) {
     use crate::keys::Key;
     let (mut server, mut mine, mut theirs) = Box::pin(three()).await;
     let (me, them) = (Key::generate().expect("key"), Key::generate().expect("key"));
@@ -1170,7 +1176,7 @@ async fn shared() -> (Node, Node, Node, u32) {
         [(server, mine), (server, theirs), (mine, server), (theirs, server)].iter().all(|(a, b)| a.ready().contains(&b.peer_id()))
     };
     assert!(until(&mut [&mut server, &mut mine, &mut theirs], hosting).await);
-    (server, mine, theirs, other)
+    (server, mine, theirs, other, (me, them))
 }
 
 /// Whether a node's account by uid has a block in its repo.
@@ -1217,4 +1223,72 @@ async fn a_machine_says_it_hosts_only_users_whose_device_it_has() {
     theirs.announce().expect("announce");
     assert!(until(&mut [&mut server, &mut mine, &mut theirs], |n| n[0].ready().contains(&n[2].peer_id()) && n[2].ready().contains(&n[0].peer_id())).await);
     assert_eq!(fetch(&mut server, &mut theirs, link(&yours)).await.0, 0);
+}
+
+//------------//
+//-[ Grants ]-//
+//------------//
+
+use crate::grants::{MACHINE, USER};
+
+fn key_of(node: &Node) -> Link {
+    crate::keys::from_peer_id(&node.peer_id().to_string()).expect("key")
+}
+
+/// Whether a node's worked out grants saying someone holds a command.
+fn says(node: &Node, who: &Link, command: &str) -> bool {
+    node.granted.as_ref().is_some_and(|(_, state)| state.holds(who, command))
+}
+
+/// Give a mesh grants, founded by a root key, on the first node, which
+/// gives each node /mesh/machine; the others know only its first grant,
+/// as a ticket would tell them, and ask for the rest.
+fn found(nodes: &mut [&mut Node], root: &crate::keys::Key) -> Link {
+    let first = nodes.first().expect("a node");
+    let genesis = first.catalog().found_grants(root).expect("found");
+    let machines: Vec<Link> = nodes.iter().map(|node| key_of(node)).collect();
+    first.catalog().grant(&genesis, &machines, &[MACHINE.to_owned()], &[]).expect("grant");
+    for node in nodes.iter_mut() {
+        node.members().set_genesis(&genesis).expect("genesis");
+        node.reload().expect("reload");
+    }
+    genesis
+}
+
+#[tokio::test]
+async fn grants_say_which_machines_are_let_in() {
+    let (mut a, mut b, mut c) = Box::pin(three()).await;
+    let root = one_user(&mut [&mut a, &mut b, &mut c]);
+    let genesis = found(&mut [&mut a, &mut b, &mut c], &root);
+    let (kc, peer_c) = (key_of(&c), c.peer_id());
+    // The others learn the grants from the first
+    assert!(until(&mut [&mut a, &mut b, &mut c], |n| says(n[1], &kc, MACHINE) && says(n[2], &kc, MACHINE)).await);
+
+    // Taken away on one, every machine shuts it out
+    a.catalog().grant(&genesis, std::slice::from_ref(&kc), &[], &[MACHINE.to_owned()]).expect("grant");
+    a.reload().expect("reload");
+    let shut = |n: &[&mut Node]| {
+        !n[0].connected().contains(&peer_c) && !n[1].connected().contains(&peer_c) && !n[1].members().contains(&peer_c).expect("contains")
+    };
+    assert!(until(&mut [&mut a, &mut b, &mut c], shut).await);
+    assert!(a.forget_member(&b.peer_id()).is_err(), "a machine the grants say is in isn't forgotten");
+    // Nor is it let back in by a roster that lists it
+    c.dial_members().expect("dial");
+    assert!(!within(Duration::from_secs(2), &mut [&mut a, &mut b, &mut c], |n| connected(n[0], n[2]) || connected(n[1], n[2])).await);
+}
+
+#[tokio::test]
+async fn only_users_the_grants_recognize_are_hosted() {
+    let (mut server, mut mine, mut theirs, other, (me, them)) = Box::pin(shared_by()).await;
+    let genesis = found(&mut [&mut server, &mut mine, &mut theirs], &me);
+    let ks = key_of(&server);
+    assert!(until(&mut [&mut server, &mut mine, &mut theirs], |n| says(n[1], &ks, MACHINE) && says(n[2], &ks, MACHINE)).await);
+    let yours = raw(b"theirs");
+    server.catalog_mut().viewing(other, |catalog| catalog.put_block(&yours, CidVersion::V1)).expect("view").expect("put");
+    assert_eq!(fetch(&mut server, &mut theirs, link(&yours)).await.0, 0, "their user isn't one of the mesh's");
+
+    server.catalog().grant(&genesis, &[them.id()], &[USER.to_owned()], &[]).expect("grant");
+    server.reload().expect("reload");
+    assert!(until(&mut [&mut server, &mut mine, &mut theirs], |n| says(n[2], &them.id(), USER)).await);
+    assert_eq!(fetch(&mut server, &mut theirs, link(&yours)).await.0, 1);
 }

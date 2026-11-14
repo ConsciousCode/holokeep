@@ -1014,6 +1014,64 @@ impl Catalog {
         Ok(claim.cid())
     }
 
+    /// Found a mesh's grants with the user's root key: the first grant,
+    /// giving the user `/`, which names the mesh. Returns its CID.
+    pub fn found_grants(&self, root: &crate::keys::Key) -> Result<Link> {
+        let grant = crate::claim::Grant::new([root.id()], None, ["/".to_owned()], [], [], []).ok_or(Error::NoClaims)?;
+        let claim = Claim::Grant(grant);
+        self.put_block(&claim.block(), CidVersion::V1)?;
+        self.sign_with(root, [claim.cid()])?;
+        Ok(claim.cid())
+    }
+
+    /// A mesh's grants, from its first, worked out: who holds what. None,
+    /// if its first isn't here, or isn't a mesh's.
+    pub fn grant_state(&self, genesis: &Link) -> Result<Option<crate::grants::State>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let mut signed = Vec::new();
+        for (cid, grant, keys) in claims.grants()? {
+            let mut by = Vec::new();
+            for key in keys {
+                by.extend(claims.users_of(&key)?);
+            }
+            signed.push(crate::grants::Signed { cid, grant, by });
+        }
+        Ok(crate::grants::State::new(genesis, signed))
+    }
+
+    /// Give or take away mesh commands, as the user this acts for, after
+    /// every grant of the mesh here: a grant signed with this device's
+    /// key. Refused if it wouldn't count. Returns its CID.
+    pub fn grant(&self, genesis: &Link, target: &[Link], add: &[String], del: &[String]) -> Result<Link> {
+        let state = self.grant_state(genesis)?.ok_or_else(|| Error::User("this mesh's grants aren't here".into()))?;
+        let user = self.user()?.ok_or_else(|| Error::User("this account has no user to grant as".into()))?;
+        for need in [crate::grants::USER, crate::grants::GRANT].into_iter().chain(add.iter().chain(del).map(String::as_str)) {
+            if !state.holds(&user, need) {
+                return Err(Error::User(format!("{} doesn't hold {need}, so can't give or take it away", crate::keys::peer_id(&user))));
+            }
+        }
+        let grant = crate::claim::Grant::new(target.iter().cloned(), None, add.iter().cloned(), del.iter().cloned(), [], state.heads())
+            .ok_or_else(|| Error::User("a grant names someone, and commands given or taken away, not both".into()))?;
+        self.put_claim(&Claim::Grant(grant))
+    }
+
+    /// Every grant here, with what makes each count elsewhere: the signs
+    /// of it, and the certificates and revocations of the keys that
+    /// signed them, as (CID, bytes), for another machine of the mesh.
+    pub fn grant_blocks(&self, grants: &[Link]) -> Result<Vec<(Link, Vec<u8>)>> {
+        let pending = grants.iter().map(|cid| owned(cid.multihash())).collect::<Result<Vec<_>>>()?;
+        let mut seen = std::collections::HashSet::new();
+        let (precipitated, dissolved) = self.claims_following(&mut seen, pending, true)?;
+        let mut blocks: Vec<(Link, Vec<u8>)> = dissolved.iter().map(|claim| (claim.cid(), claim.block().data().to_vec())).collect();
+        for key in precipitated {
+            if let Some(claim) = self.claim_at(key.as_ref())? {
+                blocks.push((claim.cid(), claim.block().data().to_vec()));
+            }
+        }
+        blocks.sort_by_key(|(cid, _)| cid.to_bytes());
+        Ok(blocks)
+    }
+
     /// Revoke a device with the user's root key: a tomb of its certificate,
     /// which the root signs. What it signed in its sign `cutoff` or before
     /// it in its chain, and nothing else authorized has, is signed again,

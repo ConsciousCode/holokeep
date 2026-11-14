@@ -277,8 +277,12 @@ scenario_forget() {
     }
     reconnect_two
     wait_for "two to hear of the ghost" sh_on two "hk node peers | grep -q $ghost"
-    on one hk node forget "$ghost"
+    # The mesh has grants, from its first invite: so it's forgotten by
+    # taking away what makes it a machine of the mesh
+    ! on one hk node forget "$ghost" 2>/dev/null || fail "forgot a machine the grants say is in"
+    on one hk node grant rm "$ghost" /mesh/machine >/dev/null
     ! on one hk node peers | grep "$ghost" >/dev/null || fail "still a member"
+    wait_for "two to hear it's gone" sh_on two "! hk node peers | grep -q $ghost"
     reconnect_two
     sleep 2
     ! on one hk node peers | grep "$ghost" >/dev/null || fail "two brought it back"
@@ -328,6 +332,10 @@ scenario_shared() {
     node_up ezra
     wait_for "ezra to connect" sh_on one "hk node peers | grep '$peer' | grep -q connected"
     on one hk node status | grep -q "^serving	4000000001$" || fail "one doesn't serve ezra's account"
+    # The invite made ezra's user one of the mesh's, and its machine one
+    [ "$(on one hk node grant ls | grep -c '	/mesh/user$')" = 1 ] || fail "ezra's user isn't given /mesh/user"
+    on one hk node grant ls | grep -q "^$peer	/mesh/machine$" || fail "ezra's machine isn't given /mesh/machine"
+    wait_for "two to have the grants" sh_on two "hk node grant ls | grep -q '^$peer	'"
     # Each says which accounts the other's users are, and two's only one's own
     local one_peer two_peer
     one_peer=$(on one hk node id)
