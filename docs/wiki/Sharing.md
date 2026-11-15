@@ -158,12 +158,15 @@ founder's root key):
   answer, which every machine works out alike from the same grants,
   whatever order they arrived in.
 - **Taking away undoes what was concurrent with it.** A grant by someone
-  whose command is taken away doesn't count unless the taking away came
-  after it (named it, or something after it, in its `prev`). So a stale
-  or stolen device can't act in the window before it hears it's lost a
-  command. When two operators take each other's away concurrently, the
-  one made operator earlier in the history keeps it; the founder always
-  does.
+  who loses a command it needed doesn't count unless the taking away came
+  after it (named it, or something after it, in its `prev`): whether the
+  command was taken from them, or went because whoever gave it to them
+  was taken away. So a stale or stolen device can't act in the window
+  before it hears it's lost a command, nor ever after by naming grants
+  from before then: there's no cutoff by time, since a grant naming an
+  old `prev` is concurrent with the taking away, however late it's made.
+  When two operators take each other's away concurrently, the one made
+  operator earlier in the history keeps it; the founder always does.
 - **Writes after access is taken away.** Sets on a shared anchor don't
   name the grants they saw, or a writer whose access was taken away could
   claim to have seen an old state forever. Instead, taking
@@ -171,8 +174,17 @@ founder's root key):
   that count, as revoking a device does (see
   [[Keys and Users#Revocation]]); a set of theirs not before one of those
   doesn't count, though it stays in history.
-- Taking away a `grant` command takes away what was granted with it,
-  unless it was granted again by someone else.
+- What was given goes when its giver can no longer give it, however
+  that comes about (taking away their `grant` command, the command
+  itself, or `/mesh/user`), unless someone else gave it too.
+- A grant gives or takes away, not both of the same: nothing in its
+  `add` may overlap anything in its `del`, so each grant means one
+  thing.
+- **Revoking a device** works for grants as for other claims (see
+  [[Keys and Users#Revocation]]): those it signed up to the sign trusted
+  are signed again and still count; those after don't, whatever `prev`
+  they name, since its chain of signs is the boundary, not a time. The
+  revocation and signing again travel with the grants to every machine.
 
 Prior art: Matrix authorizes each event against the state at the events
 before it; Ink & Switch's Keyhive and `@localfirst/auth` keep signed
@@ -247,8 +259,5 @@ Not yet implemented, beyond protected meshes.
 - How grants are fetched and checked by a machine joining late: the whole
   history, as now, or a snapshot of the state with its heads, once there
   are too many to send each time or to work out quadratically.
-- Whether a device that's revoked takes its grants with it: today a
-  grant counts only while a key that signed it is certified, so revoking
-  needs to sign again what it trusts, as it does for other claims.
 
 Source: `src/account.rs`, `src/grants.rs`, `src/keys.rs`, `src/net/daemon.rs`, `src/net/grants.rs`, `src/net/hosts.rs`, `src/net/mesh.rs`, `src/net/node.rs`, `src/vault.rs`.

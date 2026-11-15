@@ -380,8 +380,9 @@ fn commands(commands: impl IntoIterator<Item = String>) -> Option<Vec<String>> {
 impl Grant {
     /// A grant to the targets, on an anchor or role or the mesh, after
     /// the grants `prev`, if there are targets, commands are commands, and
-    /// something's given or taken away, nothing both. `stands` is only for
-    /// taking `/anchor/write` away.
+    /// something's given or taken away, and nothing given overlaps
+    /// (covers, or is covered by) anything taken away, so each grant means
+    /// one thing. `stands` is only for taking `/anchor/write` away.
     pub fn new(
         target: impl IntoIterator<Item = Link>,
         on: Option<Link>,
@@ -392,7 +393,7 @@ impl Grant {
     ) -> Option<Self> {
         let (target, add, del, stands) = (set(target), commands(add)?, commands(del)?, set(stands));
         (!target.is_empty() && (!add.is_empty() || !del.is_empty())).then_some(())?;
-        (!add.iter().any(|command| del.contains(command))).then_some(())?;
+        (!add.iter().any(|given| del.iter().any(|taken| covers(given, taken) || covers(taken, given)))).then_some(())?;
         (stands.is_empty() || del.iter().any(|command| covers(command, "/anchor/write"))).then_some(())?;
         Some(Self { target, on, add, del, stands, prev: set(prev) })
     }
@@ -744,6 +745,10 @@ mod tests {
         // Nothing given or taken, both at once, not commands, or stands without writes taken away
         assert!(Grant::new([user.clone()], None, [], [], [], []).is_none());
         assert!(Grant::new([user.clone()], None, cmds(&["/mesh"]), cmds(&["/mesh"]), [], []).is_none());
+        // Nor anything given overlapping anything taken away, either way
+        assert!(Grant::new([user.clone()], None, cmds(&["/mesh"]), cmds(&["/mesh/machine"]), [], []).is_none());
+        assert!(Grant::new([user.clone()], None, cmds(&["/mesh/user"]), cmds(&["/mesh"]), [], []).is_none());
+        assert!(Grant::new([user.clone()], None, cmds(&["/mesh/user"]), cmds(&["/mesh/machine"]), [], []).is_some());
         assert!(Grant::new([user.clone()], None, cmds(&["/Mesh"]), [], [], []).is_none());
         assert!(Grant::new([user.clone()], None, cmds(&["/mesh/"]), [], [], []).is_none());
         assert!(Grant::new([user], None, [], cmds(&["/anchor/read"]), [cid(b"s")], []).is_none());

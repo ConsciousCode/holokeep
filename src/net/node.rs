@@ -444,11 +444,23 @@ impl Node {
             .collect())
     }
 
+    /// Every grant of the mesh here, and what makes each count, as sent
+    /// to another member: by CID, with the bytes.
+    fn grant_evidence(&self) -> Result<Vec<(Link, Vec<u8>)>> {
+        let Some((_, state)) = &self.granted else {
+            return Ok(Vec::new());
+        };
+        let grants: Vec<Link> = state.grants().chain(state.waiting()).cloned().collect();
+        Ok(self.catalog.grant_blocks(&grants)?)
+    }
+
     /// Work out the mesh's grants afresh, if it has them, and list as
     /// members the machines they say are in it, and only those, shutting
-    /// out any other. Returns whether any grants arrived since.
+    /// out any other. Returns whether any grants, or anything bearing on
+    /// whether they count, arrived since: a revocation, or a signing again.
     fn refresh_grants(&mut self) -> Result<bool> {
-        let before: Vec<Link> = self.granted.as_ref().map(|(_, state)| state.grants().chain(state.waiting()).cloned().collect()).unwrap_or_default();
+        let cids = |blocks: Vec<(Link, Vec<u8>)>| blocks.into_iter().map(|(cid, _)| cid).collect::<Vec<_>>();
+        let before = cids(self.grant_evidence()?);
         self.granted = match self.members.genesis()? {
             Some(genesis) => {
                 let state = self.catalog.grant_state(&genesis)?;
@@ -459,7 +471,7 @@ impl Node {
             },
             None => None,
         };
-        let after: Vec<Link> = self.granted.as_ref().map(|(_, state)| state.grants().chain(state.waiting()).cloned().collect()).unwrap_or_default();
+        let after = cids(self.grant_evidence()?);
         let Some(machines) = self.machines() else {
             return Ok(before != after);
         };
@@ -481,11 +493,12 @@ impl Node {
         Ok(before != after)
     }
 
-    /// Tell a member which grants this has, if the mesh has any: it
-    /// answers with those it has that this hasn't.
+    /// Tell a member which grants this has, and what makes them count, if
+    /// the mesh has any: it answers with what it has that this hasn't.
     fn ask_grants(&mut self, peer: PeerId) -> Result<()> {
+        let evidence = self.grant_evidence()?;
         let have = match (&self.granted, self.members.genesis()?) {
-            (Some((genesis, state)), _) => Have::new(genesis, state.grants().chain(state.waiting()).cloned()),
+            (Some((genesis, _)), _) => Have::new(genesis, evidence.into_iter().map(|(cid, _)| cid)),
             // Its first grant known, as a ticket says, but not yet here
             (None, Some(genesis)) => Have::new(&genesis, []),
             (None, None) => return Ok(()),
@@ -518,13 +531,13 @@ impl Node {
                 let known = self.members.genesis()?;
                 let (sent, behind) = match &self.granted {
                     None if known.as_ref().is_some_and(|genesis| request.of(genesis)) => (Sent::default(), !request.grants().is_empty()),
-                    Some((genesis, state)) if request.of(genesis) => {
+                    Some((genesis, _)) if request.of(genesis) => {
                         let theirs: HashSet<Vec<u8>> = request.grants().iter().map(CidRef::to_bytes).collect();
-                        let mine: Vec<Link> = state.grants().chain(state.waiting()).cloned().collect();
-                        let missing: Vec<Link> = mine.iter().filter(|cid| !theirs.contains(&cid.to_bytes())).cloned().collect();
-                        let ours: HashSet<Vec<u8>> = mine.iter().map(CidRef::to_bytes).collect();
-                        let blocks = if missing.is_empty() { Vec::new() } else { self.catalog.grant_blocks(&missing)? };
-                        (Sent::new(blocks), theirs.iter().any(|cid| !ours.contains(cid)))
+                        let mine = self.grant_evidence()?;
+                        let ours: HashSet<Vec<u8>> = mine.iter().map(|(cid, _)| cid.to_bytes()).collect();
+                        let behind = theirs.iter().any(|cid| !ours.contains(cid));
+                        let missing = mine.into_iter().filter(|(cid, _)| !theirs.contains(&cid.to_bytes())).collect();
+                        (Sent::new(missing), behind)
                     },
                     _ => (Sent::default(), false),
                 };

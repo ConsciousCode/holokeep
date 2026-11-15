@@ -3,10 +3,12 @@
 //! Once a mesh has grants (see `crate::grants`), who's in it is what they
 //! say, so every machine needs every grant, with what makes each count:
 //! the signs of it, and the certificates and revocations of the keys that
-//! signed them. On connecting, and whenever its grants change, a machine
-//! tells each member which grants it has, by CID, under the mesh's first;
-//! the member answers with the grants it has that the asker doesn't, and
-//! if the asker has some it doesn't, asks back in turn.
+//! signed them. On connecting, and whenever these change, a machine tells
+//! each member which of them it has, by CID, under the mesh's first: the
+//! grants and all that bears on them, so a revocation, or a signing again,
+//! travels as a new grant does. The member answers with what it has that
+//! the asker doesn't, and if the asker has some it doesn't, asks back in
+//! turn.
 //!
 //! Grants are few, so they're named in full each time, not by heads.
 //! A machine of an older build doesn't speak this, and a machine of
@@ -22,7 +24,8 @@ use crate::model::Link;
 
 pub const PROTOCOL: StreamProtocol = StreamProtocol::new("/holokeep/grants/1.0.0");
 
-/// The grants a machine has of a mesh, by CID, under its first.
+/// The grants a machine has of a mesh, and what makes them count, by CID,
+/// under its first.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Have {
     mesh: ByteBuf,
@@ -46,7 +49,7 @@ impl Have {
         self.mesh.as_slice() == genesis.to_bytes()
     }
 
-    /// The grants it has, by CID, those that are CIDs.
+    /// What it has, by CID, those that are CIDs.
     pub fn grants(&self) -> Vec<Link> {
         self.have.iter().filter_map(|cid| Link::decode(cid).ok()).collect()
     }

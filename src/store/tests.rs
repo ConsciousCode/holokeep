@@ -3276,3 +3276,56 @@ fn grants_count_where_theyre_sent_with_their_certificates() {
     let state = ezras.grant_state(&genesis).expect("state").expect("a mesh");
     assert!(!state.counts(&forged) && !state.holds(&ezra.id(), MACHINE));
 }
+
+/// Revoking a device that made grants: those it signed up to the sign
+/// trusted still count, signed again; those after don't, however they
+/// name what came before. What's sent of the grants changes with it, so
+/// a machine which had them all learns of the revocation.
+#[test]
+fn revoking_a_device_keeps_the_grants_it_made_before_the_cutoff() {
+    use crate::grants::{MACHINE, USER};
+    let scratch = Scratch::new("grants-revoked");
+    let here = Catalog::open_repo(&scratch.path().join("here")).expect("catalog");
+    let root = here.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let genesis = here.found_grants(&root).expect("found");
+    let old = crate::keys::Key::generate().expect("key");
+    here.certify(&root, &old.id()).expect("certify");
+    let (ezra, machine) = (crate::keys::Key::generate().expect("key"), crate::keys::Key::generate().expect("key"));
+    let mut last = None;
+    let mut made = Vec::new();
+    for (who, command) in [(&ezra, USER), (&machine, MACHINE)] {
+        let heads = here.grant_state(&genesis).expect("state").expect("a mesh").heads();
+        let grant = Claim::Grant(crate::claim::Grant::new([who.id()], None, [command.to_owned()], [], [], heads).expect("grant"));
+        here.put_block(&grant.block(), CidVersion::V1).expect("put");
+        let sign = Claim::Sign(crate::claim::Sign::new(&old, [grant.cid()], last.clone(), 1).expect("sign"));
+        here.put_block(&sign.block(), CidVersion::V1).expect("put");
+        last = Some(sign.cid());
+        made.push((grant.cid(), sign.cid()));
+    }
+    let [(recognized, first), (admitted, _)] = made.as_slice() else { panic!("two grants made") };
+    let state = here.grant_state(&genesis).expect("state").expect("a mesh");
+    assert!(state.counts(recognized) && state.counts(admitted));
+    let sent = |grants: &[Link]| here.grant_blocks(grants).expect("blocks");
+    let grants: Vec<Link> = state.grants().cloned().collect();
+    let before = sent(&grants);
+    let there = Catalog::open_repo(&scratch.path().join("there")).expect("catalog");
+    let take = |blocks: &[(Link, Vec<u8>)]| {
+        for (_, data) in blocks {
+            there.put_block(&Claim::parse(data).expect("a claim").block(), CidVersion::V1).expect("put");
+        }
+    };
+    take(&before);
+    assert!(there.grant_state(&genesis).expect("state").expect("a mesh").holds(&machine.id(), MACHINE));
+
+    // Revoked, trusting its first sign: the second grant goes
+    assert_eq!(here.revoke_trusting(&root, &old.id(), std::slice::from_ref(first)).expect("revoke"), 1);
+    let state = here.grant_state(&genesis).expect("state").expect("a mesh");
+    assert!(state.counts(recognized) && state.holds(&ezra.id(), USER));
+    assert!(!state.counts(admitted) && !state.holds(&machine.id(), MACHINE));
+    let after = sent(&grants);
+    let cids = |blocks: &[(Link, Vec<u8>)]| blocks.iter().map(|(cid, _)| cid.clone()).collect::<Vec<_>>();
+    assert_ne!(cids(&before), cids(&after), "the revocation and signing again are sent");
+    take(&after);
+    let state = there.grant_state(&genesis).expect("state").expect("a mesh");
+    assert!(state.holds(&ezra.id(), USER) && !state.holds(&machine.id(), MACHINE));
+}

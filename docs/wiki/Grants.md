@@ -37,7 +37,9 @@ the user making it: its root key, or a device it certified (see
 | `stands` | `[Link]` | Only with a `del` covering `/anchor/write`: the targets' last sets on `on` that count. Not yet worked out. |
 | `prev` | `[Link]` | The grants its signer had seen last, sorted by CID bytes; empty for the first. |
 
-At least one of `add` and `del`, and no command in both.
+At least one of `add` and `del`, and nothing in one overlapping
+(covering, or covered by) anything in the other: `add: ["/mesh"], del:
+["/mesh/machine"]` isn't a grant. Each grant means one thing.
 
 ```json
 {"add": ["/"], "claim": "grant", "prev": [], "target": [{"/": "bafzaa…"}]}
@@ -62,9 +64,13 @@ signed it, or who certified a key that did and haven't revoked it.
 2. **Concurrent.** Two grants are concurrent if neither is among the
    other's ancestors.
 3. **Taking away undoes what was concurrent with it.** A valid grant
-   doesn't count for a signer if a grant that counts, concurrent with
-   it, targets that signer with a `del` overlapping (covering, or
-   covered by) a command it needed. Grants with a `del` are decided
+   doesn't count for a signer who no longer holds what it needed in its
+   state at its `prev` with the grants taking away that count and are
+   concurrent with it heeded too: whether a command was taken from
+   them, or went with what they were given by someone taken away (5).
+   Only what its ancestors gave is held there; what's given
+   concurrently makes nothing valid. So naming an old `prev` gains
+   nothing, however late a grant's made. Grants with a `del` are decided
    first, in order of their most senior signer: the founder, then
    whoever was given a command covering `/mesh/grant` earliest, by
    position in the order below. So of two operators taking each other's
@@ -82,8 +88,14 @@ signed it, or who certified a key that did and haven't revoked it.
 6. The founder holds everything, always.
 
 Grants are ordered by depth (the longest `prev` path back to the first)
-and then CID bytes. Working out is quadratic in grants for each grant,
-fine for the dozens a mesh has.
+and then CID bytes. Every grant's state at its `prev` is worked out
+afresh, and again with what's taken away concurrently with it, if
+anything is: polynomial of low degree in grants, fine for the dozens a
+mesh has.
+
+A device's revocation is the boundary for what it signed, not a time:
+grants it signed up to the sign trusted are signed again and count,
+those after don't (see [[Keys and Users#Revocation]]).
 
 ## Using them
 
@@ -113,10 +125,11 @@ fine for the dozens a mesh has.
 `/holokeep/grants/1.0.0`, request-response with the CBOR codec. On
 connecting, and whenever its grants change, a machine sends each member
 `{mesh: CID, have: [CID]}`: the mesh's first grant, and every grant it
-has. The member answers `{blocks: [[CID, bytes]]}`: the grants it has
-that the asker doesn't, with the signs of each, and the certificates and
-revocations of the keys that signed them. If the asker has grants it
-doesn't, it asks back. Only claims arriving under their own CIDs are
+has with what makes each count: the signs of it, and the certificates
+and revocations of the keys that signed them. The member answers
+`{blocks: [[CID, bytes]]}`: those of these it has that the asker
+doesn't. If the asker has some it doesn't, it asks back. So a
+revocation, or a signing again, travels as a new grant does. Only claims arriving under their own CIDs are
 kept. A machine of another mesh, or without grants, answers with
 nothing; one that knows the first grant but hasn't any grants yet asks
 for them.

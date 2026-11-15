@@ -8,11 +8,15 @@
 //!   state its `prev` names (its ancestors, worked out alone), `/mesh/user`,
 //!   `/mesh/grant`, and each command it gives or takes away.
 //! - **Taking away undoes what was concurrent with it.** A valid grant
-//!   doesn't count if a grant that counts, concurrent with it (neither is
-//!   before the other), takes from its signer a command it needed. Grants
-//!   taking away are decided first, the most senior signer's first (whoever
-//!   was given `/mesh/grant` earliest, the founder before all), so when two
-//!   take each other's commands away concurrently, the senior keeps theirs.
+//!   doesn't count for a signer who, once the grants taking away that
+//!   count and are concurrent with it (neither is before the other) are
+//!   heeded too, no longer holds what it needs: whether taken from them,
+//!   or gone with what they were given by someone taken away. So a `prev`
+//!   from before one's power went gains nothing, however late it's made.
+//!   Grants taking away are decided first, the most senior signer's first
+//!   (whoever was given `/mesh/grant` earliest, the founder before all),
+//!   so when two take each other's commands away concurrently, the senior
+//!   keeps theirs.
 //! - **Taking away wins.** A command given is held unless a grant that
 //!   counts takes it away after, or concurrently.
 //! - **What was given goes with the giver's power to give it**: a command
@@ -22,8 +26,9 @@
 //!
 //! Grants on an anchor or role (`on`) are kept, but not yet worked out.
 //!
-//! Working out is quadratic in grants per grant, as every grant's state at
-//! its `prev` is worked out afresh: fine for the dozens a mesh has.
+//! Every grant's state at its `prev` is worked out afresh, and again with
+//! what's taken away concurrently with it, if anything is: polynomial, of
+//! low degree, in grants, fine for the dozens a mesh has.
 
 use std::collections::BTreeMap;
 
@@ -88,6 +93,8 @@ pub struct State {
     /// The users each valid grant's valid for: those of its signers who
     /// held what it needs.
     valid: Vec<Vec<Link>>,
+    /// Each grant's state at its `prev`: its ancestors, worked out alone.
+    prior: Vec<Judged>,
     judged: Judged,
     /// Grants which name a grant that isn't here, or that do, however far
     /// back: they wait till it is.
@@ -159,18 +166,20 @@ impl State {
             nodes.push(Node { cid: signed.cid.clone(), grant: signed.grant.clone(), by: signed.by.clone(), before, depth: *depth });
         }
 
-        let mut state = Self { founder, nodes, valid: Vec::new(), judged: Judged { counts: Vec::new(), supported: Vec::new() }, waiting };
-        for i in 0..state.nodes.len() {
+        let n = nodes.len();
+        let mut state = Self { founder, nodes, valid: Vec::new(), prior: Vec::new(), judged: Judged { counts: Vec::new(), supported: Vec::new() }, waiting };
+        for i in 0..n {
+            let members = state.nodes.get(i).map(|node| node.before.clone()).unwrap_or_default();
+            let judged = state.judge(&members);
             let valid = if i == 0 {
                 vec![state.founder.clone()]
             } else {
-                let members = state.nodes.get(i).map(|node| node.before.clone()).unwrap_or_default();
-                let judged = state.judge(&members);
                 state.nodes.get(i).map(|node| {
                     node.by.iter().filter(|&by| *by == state.founder || node.needs().all(|need| state.holds_in(&judged, by, need))).cloned().collect()
                 }).unwrap_or_default()
             };
             state.valid.push(valid);
+            state.prior.push(judged);
         }
         let everything = vec![true; state.nodes.len()];
         state.judged = state.judge(&everything);
@@ -200,19 +209,33 @@ impl State {
         let rank_of = |who: &Link| rank.get(&who.to_bytes()).copied().unwrap_or(usize::MAX);
 
         let mut counts: Vec<Option<Vec<Link>>> = vec![None; n];
-        // Who of its signers a grant still counts for, given what counts
-        // that takes away from them concurrently.
+        // Who of its signers a grant still counts for: those who, in its
+        // state at its `prev` with the takings decided so far that are
+        // concurrent with it heeded too, still hold what it needs. Only
+        // what its ancestors gave is held there: what's given concurrently
+        // makes nothing valid.
         let standing = |i: usize, counts: &[Option<Vec<Link>>]| -> Vec<Link> {
-            let (Some(node), Some(valid)) = (self.nodes.get(i), self.valid.get(i)) else {
+            let (Some(node), Some(valid), Some(prior)) = (self.nodes.get(i), self.valid.get(i), self.prior.get(i)) else {
                 return Vec::new();
             };
-            valid.iter().filter(|&signer| {
-                *signer == self.founder || !counts.iter().enumerate().any(|(j, counted)| {
-                    counted.is_some() && concurrent(i, j) && self.nodes.get(j).is_some_and(|taker| {
-                        taker.on_mesh() && taker.targets(signer) && taker.grant.del().iter().any(|del| node.needs().any(|need| overlap(del, need)))
-                    })
+            let ancestor = |j: usize| node.before.get(j).copied().unwrap_or(false);
+            let taken = |j: usize| counts.get(j).is_some_and(Option::is_some) && concurrent(i, j);
+            if !(0..n).any(taken) {
+                return valid.clone();
+            }
+            let seen: Vec<Option<Vec<Link>>> = (0..n)
+                .map(|j| {
+                    if ancestor(j) {
+                        prior.counts.get(j).cloned().flatten()
+                    } else if taken(j) {
+                        counts.get(j).cloned().flatten()
+                    } else {
+                        None
+                    }
                 })
-            }).cloned().collect()
+                .collect();
+            let heeded = self.support(seen, ancestor);
+            valid.iter().filter(|&signer| *signer == self.founder || node.needs().all(|need| self.holds_in(&heeded, signer, need))).cloned().collect()
         };
         let mut taking: Vec<usize> = (0..n).filter(|&i| member(i) && self.nodes.get(i).is_some_and(|node| node.on_mesh() && !node.grant.del().is_empty())).collect();
         taking.sort_by_key(|&i| {
@@ -233,12 +256,18 @@ impl State {
             }
         }
 
-        // What's given is held while its giver can give it: from the
-        // founder out, as far as that goes
+        self.support(counts, |_| true)
+    }
+
+    /// Which grants giving, among some that count, are supported: what's
+    /// given is held while its giver can give it, from the founder out, as
+    /// far as that goes.
+    fn support(&self, counts: Vec<Option<Vec<Link>>>, among: impl Fn(usize) -> bool) -> Judged {
+        let n = self.nodes.len();
         let mut judged = Judged { counts, supported: vec![false; n] };
         loop {
             let mut grew = false;
-            for i in 0..n {
+            for i in (0..n).filter(|&i| among(i)) {
                 if judged.supported.get(i).copied().unwrap_or(true) {
                     continue;
                 }
@@ -450,6 +479,47 @@ mod tests {
         assert!(state.counts(&admitted), "it counted, made before");
         assert!(!state.holds(&stranger, MACHINE), "but goes with the power to give it");
         assert!(state.holds(&op, MACHINE));
+    }
+
+    #[test]
+    fn a_prev_from_before_ones_power_went_gains_nothing() {
+        let (founder, op, deputy, machine, other) = (key(), key(), key(), key(), key());
+        let mut history = History::new(&founder);
+        let g = history.genesis.clone();
+        let made = history.grant(&founder, &op, &[OPERATOR], &[], &[&g]);
+        let deputized = history.grant(&op, &deputy, &[OPERATOR], &[], &[&made]);
+        let admitted = history.grant(&founder, &machine, &[MACHINE], &[], &[&deputized]);
+        // The operator's taken away, and with them what they gave the deputy
+        let removed = history.grant(&founder, &op, &[], &[OPERATOR], &[&admitted]);
+        assert!(!history.state().holds(&deputy, GRANT));
+        // Ever after, the deputy, naming grants from before that, takes a
+        // machine away, and gives one: neither counts
+        let taken = history.grant(&deputy, &machine, &[], &[MACHINE], &[&admitted]);
+        let given = history.grant(&deputy, &other, &[MACHINE], &[], &[&admitted]);
+        let state = history.state();
+        assert!(state.counts(&removed));
+        assert!(!state.counts(&taken) && !state.counts(&given));
+        assert!(state.holds(&machine, MACHINE) && !state.holds(&other, MACHINE));
+        // Before the operator went, what the deputy did stands
+        let mut history = History::new(&founder);
+        let made = history.grant(&founder, &op, &[OPERATOR], &[], &[&g]);
+        let deputized = history.grant(&op, &deputy, &[OPERATOR], &[], &[&made]);
+        let admitted = history.grant(&founder, &machine, &[MACHINE], &[], &[&deputized]);
+        let taken = history.grant(&deputy, &machine, &[], &[MACHINE], &[&admitted]);
+        history.grant(&founder, &op, &[], &[OPERATOR], &[&taken]);
+        let state = history.state();
+        assert!(state.counts(&taken) && !state.holds(&machine, MACHINE));
+        // And given the deputy's power another way concurrently, a stale
+        // `prev` still gains nothing: it's what its ancestors gave that counts
+        let mut history = History::new(&founder);
+        let made = history.grant(&founder, &op, &[OPERATOR], &[], &[&g]);
+        let deputized = history.grant(&op, &deputy, &[OPERATOR], &[], &[&made]);
+        let admitted = history.grant(&founder, &machine, &[MACHINE], &[], &[&deputized]);
+        let removed = history.grant(&founder, &op, &[], &[OPERATOR], &[&admitted]);
+        history.grant(&founder, &deputy, &[OPERATOR], &[], &[&removed]);
+        let taken = history.grant(&deputy, &machine, &[], &[MACHINE], &[&admitted]);
+        let state = history.state();
+        assert!(state.holds(&deputy, GRANT) && !state.counts(&taken) && state.holds(&machine, MACHINE));
     }
 
     #[test]
