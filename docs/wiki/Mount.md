@@ -34,6 +34,12 @@ one anywhere writable.
 
 - **Writes** under a mount point go to its anchor; the directory holding
   the mount point doesn't change.
+- **Another user's view** of an anchor (see [[Anchors and Names#Views]]),
+  `anchors/<view>` or a mount point to it, shows what counts in their
+  view, if they've let this user read it. Writing to it fails with
+  `EROFS` unless they've let this user write it too; then what's
+  written is set for their view. A mount point within it is to their
+  view of the anchor it names.
 - **Renaming** a mount point renames the link. Moving a file across one
   is between anchors, so `rename` fails with `EXDEV` and `mv` copies.
 - **`rmdir`** of a mount point removes the link, whatever the anchor

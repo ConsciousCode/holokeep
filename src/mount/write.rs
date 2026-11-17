@@ -804,6 +804,10 @@ impl Soup {
             Inode::Root if self.work.is_some() => (Self::root(&*self.catalog()?)?.ok_or(Errno::EROFS)?, PathBuf::new()),
             _ => return Err(Errno::EROFS),
         };
+        // Another user's view of an anchor, they've not let this one write
+        if !self.catalog()?.may_write(&anchor).map_err(store_errno)? {
+            return Err(Errno::EROFS);
+        }
         self.catch_up(&anchor)?;
         Ok((anchor, rel))
     }

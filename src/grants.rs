@@ -2,11 +2,18 @@
 //!
 //! A mesh's grants are one history, by `prev`, from its first, which gives
 //! its founder `/`. Every machine works out the same answer from the same
-//! grants, whatever order they arrived in:
+//! grants, whatever order they arrived in. Grants are worked out in
+//! **scopes**: the mesh's own, those without `on`, from its founder; and
+//! each user's view of an anchor, those `on` it, from that user, who holds
+//! `/anchor` on their own view of every anchor. A grant on an anchor is
+//! about the view of whoever it's judged from: "I'll take your sets on
+//! this as mine", not anything of the anchor's everywhere. In each:
 //!
 //! - **A grant is valid** if one of the users who signed it held, in the
-//!   state its `prev` names (its ancestors, worked out alone), `/mesh/user`,
-//!   `/mesh/grant`, and each command it gives or takes away.
+//!   state its `prev` names (its ancestors, worked out alone), what it
+//!   needs: `/mesh/user`, the scope's power to give (`/mesh/grant`, or
+//!   `/anchor/grant` on the anchor), and each command it gives or takes
+//!   away.
 //! - **Taking away undoes what was concurrent with it.** A valid grant
 //!   doesn't count for a signer who, once the grants taking away that
 //!   count and are concurrent with it (neither is before the other) are
@@ -14,17 +21,19 @@
 //!   or gone with what they were given by someone taken away. So a `prev`
 //!   from before one's power went gains nothing, however late it's made.
 //!   Grants taking away are decided first, the most senior signer's first
-//!   (whoever was given `/mesh/grant` earliest, the founder before all),
-//!   so when two take each other's commands away concurrently, the senior
-//!   keeps theirs.
+//!   (whoever was given the power to give earliest, whoever it's judged
+//!   from before all), so when two take each other's commands away
+//!   concurrently, the senior keeps theirs.
 //! - **Taking away wins.** A command given is held unless a grant that
 //!   counts takes it away after, or concurrently.
 //! - **What was given goes with the giver's power to give it**: a command
-//!   given is held only while whoever gave it holds `/mesh/grant` and the
-//!   command, however that came about, unless someone else gave it too.
-//! - **The founder always holds everything.**
+//!   given is held only while whoever gave it holds the power to give and
+//!   the command, and `/mesh/user`, however that came about, unless
+//!   someone else gave it too.
+//! - **The founder always holds everything**, and a user everything on
+//!   their own view of an anchor, while they're a user of the mesh.
 //!
-//! Grants on an anchor or role (`on`) are kept, but not yet worked out.
+//! Grants on roles are kept, but not yet worked out.
 //!
 //! Every grant's state at its `prev` is worked out afresh, and again with
 //! what's taken away concurrently with it, if anything is: polynomial, of
@@ -44,6 +53,14 @@ pub const MACHINE: &str = "/mesh/machine";
 pub const GRANT: &str = "/mesh/grant";
 /// Every mesh command: an operator's.
 pub const OPERATOR: &str = "/mesh";
+/// Every command on an anchor: its owner's, on their own view of it.
+pub const ANCHOR: &str = "/anchor";
+/// Seeing what someone's view of an anchor is, and reaches.
+pub const READ: &str = "/anchor/read";
+/// Sets on an anchor, for its owner, that count in their view of it.
+pub const WRITE: &str = "/anchor/write";
+/// Giving and taking away the commands on an anchor one holds.
+pub const ANCHOR_GRANT: &str = "/anchor/grant";
 
 /// A grant, and the users who signed it: a user's root key signing, or a
 /// device the user certified.
@@ -64,15 +81,42 @@ struct Node {
     depth: usize,
 }
 
-impl Node {
-    /// What its signer must hold: the commands it gives and takes away,
-    /// and to act at all.
-    fn needs(&self) -> impl Iterator<Item = &str> {
-        [USER, GRANT].into_iter().chain(self.grant.add().iter().chain(self.grant.del()).map(String::as_str))
+/// Whose commands, on what: the mesh's, from its founder, or one user's on
+/// their view of an anchor.
+#[derive(Clone)]
+struct Scope {
+    founder: Link,
+    on: Option<Link>,
+}
+
+impl Scope {
+    /// The command to give and take away in it.
+    const fn grant(&self) -> &'static str {
+        if self.on.is_none() { GRANT } else { ANCHOR_GRANT }
     }
 
-    const fn on_mesh(&self) -> bool {
-        self.grant.on().is_none()
+    const fn is_mesh(&self) -> bool {
+        self.on.is_none()
+    }
+}
+
+impl Node {
+    /// What its signer must hold in a scope: the commands it gives and
+    /// takes away, and the scope's power to give, and on the mesh, to act
+    /// at all. (On an anchor, being a user is a matter for the mesh.)
+    fn needs<'a>(&'a self, scope: &Scope) -> impl Iterator<Item = &'a str> {
+        let base: &[&'static str] = if scope.is_mesh() { &[USER, GRANT] } else { &[ANCHOR_GRANT] };
+        base.iter().copied().chain(self.grant.add().iter().chain(self.grant.del()).map(String::as_str))
+    }
+
+    /// What its giver must hold for what it gives to be held.
+    fn gift_needs<'a>(&'a self, scope: &Scope) -> impl Iterator<Item = &'a str> {
+        let base: &[&'static str] = if scope.is_mesh() { &[USER, GRANT] } else { &[ANCHOR_GRANT] };
+        base.iter().copied().chain(self.grant.add().iter().map(String::as_str))
+    }
+
+    fn in_scope(&self, scope: &Scope) -> bool {
+        self.grant.on() == scope.on.as_ref()
     }
 
     fn targets(&self, who: &Link) -> bool {
@@ -86,27 +130,56 @@ fn overlap(a: &str, b: &str) -> bool {
     covers(a, b) || covers(b, a)
 }
 
-/// A mesh's grants, worked out.
-pub struct State {
-    founder: Link,
-    nodes: Vec<Node>,
+/// One scope's grants, worked out.
+struct Judgement {
+    scope: Scope,
     /// The users each valid grant's valid for: those of its signers who
-    /// held what it needs.
+    /// held what it needs. Empty for those not in the scope.
     valid: Vec<Vec<Link>>,
     /// Each grant's state at its `prev`: its ancestors, worked out alone.
     prior: Vec<Judged>,
     judged: Judged,
-    /// Grants which name a grant that isn't here, or that do, however far
-    /// back: they wait till it is.
-    waiting: Vec<Link>,
 }
 
 /// Which grants of some set count, and which given commands are held.
+#[derive(Clone)]
 struct Judged {
     /// Grants that count, each with the signers it counts for.
     counts: Vec<Option<Vec<Link>>>,
     /// Grants giving commands whose giver can give them still.
     supported: Vec<bool>,
+}
+
+impl Judged {
+    const fn empty() -> Self {
+        Self { counts: Vec::new(), supported: Vec::new() }
+    }
+}
+
+/// What a user holds on someone's view of an anchor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Share {
+    /// Whose view.
+    pub owner: Link,
+    pub anchor: Link,
+    pub user: Link,
+    /// The commands on it they hold, of those given them.
+    pub held: Vec<String>,
+    /// Their sets that still count in the owner's view, write taken away
+    /// from them: those `stands` named, and before them.
+    pub stands: Vec<Link>,
+}
+
+/// A mesh's grants, worked out.
+pub struct State {
+    founder: Link,
+    nodes: Vec<Node>,
+    mesh: Judgement,
+    /// Each view of an anchor someone's granted on, by (owner, anchor).
+    anchors: Vec<Judgement>,
+    /// Grants which name a grant that isn't here, or that do, however far
+    /// back: they wait till it is.
+    waiting: Vec<Link>,
 }
 
 impl State {
@@ -166,41 +239,86 @@ impl State {
             nodes.push(Node { cid: signed.cid.clone(), grant: signed.grant.clone(), by: signed.by.clone(), before, depth: *depth });
         }
 
-        let n = nodes.len();
-        let mut state = Self { founder, nodes, valid: Vec::new(), prior: Vec::new(), judged: Judged { counts: Vec::new(), supported: Vec::new() }, waiting };
-        for i in 0..n {
-            let members = state.nodes.get(i).map(|node| node.before.clone()).unwrap_or_default();
-            let judged = state.judge(&members);
-            let valid = if i == 0 {
-                vec![state.founder.clone()]
-            } else {
-                state.nodes.get(i).map(|node| {
-                    node.by.iter().filter(|&by| *by == state.founder || node.needs().all(|need| state.holds_in(&judged, by, need))).cloned().collect()
-                }).unwrap_or_default()
-            };
-            state.valid.push(valid);
-            state.prior.push(judged);
+        let mut state = Self {
+            founder: founder.clone(),
+            nodes,
+            mesh: Judgement { scope: Scope { founder, on: None }, valid: Vec::new(), prior: Vec::new(), judged: Judged::empty() },
+            anchors: Vec::new(),
+            waiting,
+        };
+        state.mesh = state.work_out(state.mesh.scope.clone(), None);
+        // Every view of an anchor granted on: by whoever signed a grant on it
+        let mut views: BTreeMap<(Vec<u8>, Vec<u8>), (Link, Link)> = BTreeMap::new();
+        for node in &state.nodes {
+            if let Some(anchor) = node.grant.on().filter(|on| crate::claim::is_anchor(on)) {
+                for by in &node.by {
+                    views.entry((by.to_bytes(), anchor.to_bytes())).or_insert_with(|| (by.clone(), anchor.clone()));
+                }
+            }
         }
-        let everything = vec![true; state.nodes.len()];
-        state.judged = state.judge(&everything);
+        let anchors = views.into_values().map(|(owner, anchor)| state.work_out(Scope { founder: owner, on: Some(anchor) }, Some(&state.mesh))).collect();
+        state.anchors = anchors;
         Some(state)
     }
 
-    /// Which of a set of grants count, and which of those giving are
-    /// supported, from which of them are valid.
-    fn judge(&self, members: &[bool]) -> Judged {
+    /// Work out a scope's grants: each one's state at its `prev`, whom it's
+    /// valid for, and then all of them. An anchor's scope, given the mesh's,
+    /// asks it whether a signer's a user.
+    fn work_out(&self, scope: Scope, mesh: Option<&Judgement>) -> Judgement {
         let n = self.nodes.len();
-        let member = |i: usize| members.get(i).copied().unwrap_or(false) && self.valid.get(i).is_some_and(|valid| !valid.is_empty());
-        let concurrent = |i: usize, j: usize| {
-            let (Some(a), Some(b)) = (self.nodes.get(i), self.nodes.get(j)) else {
-                return false;
+        let mut judgement = Judgement { scope, valid: Vec::with_capacity(n), prior: Vec::with_capacity(n), judged: Judged::empty() };
+        for i in 0..n {
+            let Some(node) = self.nodes.get(i) else {
+                continue;
             };
-            i != j && !a.before.get(j).copied().unwrap_or(false) && !b.before.get(i).copied().unwrap_or(false)
+            let in_scope = node.in_scope(&judgement.scope);
+            // The mesh's state at every grant's `prev`, since an anchor's
+            // scope asks it; an anchor's, only at its own grants
+            if !in_scope && !judgement.scope.is_mesh() {
+                judgement.valid.push(Vec::new());
+                judgement.prior.push(Judged::empty());
+                continue;
+            }
+            let users = mesh.and_then(|mesh| mesh.prior.get(i).map(|prior| (mesh, prior)));
+            let judged = self.judge(&judgement, users, &node.before);
+            let valid = if !in_scope {
+                Vec::new()
+            } else if i == 0 {
+                vec![self.founder.clone()]
+            } else {
+                let scope = &judgement.scope;
+                node.by
+                    .iter()
+                    .filter(|&by| {
+                        let user = users.is_none_or(|(mesh, prior)| self.holds_in(mesh, prior, by, USER));
+                        user && (*by == scope.founder || node.needs(scope).all(|need| self.holds_in(&judgement, &judged, by, need)))
+                    })
+                    .cloned()
+                    .collect()
+            };
+            judgement.valid.push(valid);
+            judgement.prior.push(judged);
+        }
+        let everything = vec![true; n];
+        judgement.judged = self.judge(&judgement, mesh.map(|mesh| (mesh, &mesh.judged)), &everything);
+        judgement
+    }
+
+    /// Which of a set of grants count, and which of those giving are
+    /// supported, from which of them are valid, in a scope; on an anchor,
+    /// with who's a user as a state of the mesh's says.
+    fn judge(&self, judgement: &Judgement, users: Option<(&Judgement, &Judged)>, members: &[bool]) -> Judged {
+        let scope = &judgement.scope;
+        let n = self.nodes.len();
+        let member = |i: usize| {
+            members.get(i).copied().unwrap_or(false)
+                && self.nodes.get(i).is_some_and(|node| node.in_scope(scope))
+                && judgement.valid.get(i).is_some_and(|valid| !valid.is_empty())
         };
         // Seniority: when each user was first given what lets them give
-        let mut rank: BTreeMap<Vec<u8>, usize> = BTreeMap::from([(self.founder.to_bytes(), 0)]);
+        let mut rank: BTreeMap<Vec<u8>, usize> = BTreeMap::from([(scope.founder.to_bytes(), 0)]);
         for (i, node) in self.nodes.iter().enumerate() {
-            if member(i) && node.on_mesh() && node.grant.add().iter().any(|add| covers(add, GRANT)) {
+            if member(i) && node.grant.add().iter().any(|add| covers(add, scope.grant())) {
                 for target in node.grant.target() {
                     rank.entry(target.to_bytes()).or_insert_with(|| i.saturating_add(1));
                 }
@@ -211,35 +329,26 @@ impl State {
         let mut counts: Vec<Option<Vec<Link>>> = vec![None; n];
         // Who of its signers a grant still counts for: those who, in its
         // state at its `prev` with the takings decided so far that are
-        // concurrent with it heeded too, still hold what it needs. Only
-        // what its ancestors gave is held there: what's given concurrently
-        // makes nothing valid.
+        // concurrent with it heeded too, still hold what it needs; and on
+        // an anchor, are users still, in the mesh's state so heeded.
         let standing = |i: usize, counts: &[Option<Vec<Link>>]| -> Vec<Link> {
-            let (Some(node), Some(valid), Some(prior)) = (self.nodes.get(i), self.valid.get(i), self.prior.get(i)) else {
+            let (Some(node), Some(valid)) = (self.nodes.get(i), judgement.valid.get(i)) else {
                 return Vec::new();
             };
-            let ancestor = |j: usize| node.before.get(j).copied().unwrap_or(false);
-            let taken = |j: usize| counts.get(j).is_some_and(Option::is_some) && concurrent(i, j);
-            if !(0..n).any(taken) {
-                return valid.clone();
-            }
-            let seen: Vec<Option<Vec<Link>>> = (0..n)
-                .map(|j| {
-                    if ancestor(j) {
-                        prior.counts.get(j).cloned().flatten()
-                    } else if taken(j) {
-                        counts.get(j).cloned().flatten()
-                    } else {
-                        None
-                    }
+            let mesh = users.map(|(mesh, _)| (mesh, self.heeded(mesh, None, i, &mesh.judged.counts)));
+            let heeded = self.heeded(judgement, mesh.as_ref().map(|(mesh, state)| (*mesh, state)), i, counts);
+            valid
+                .iter()
+                .filter(|&signer| {
+                    let user = mesh.as_ref().is_none_or(|(mesh, state)| self.holds_in(mesh, state, signer, USER));
+                    user && (*signer == scope.founder || node.needs(scope).all(|need| self.holds_in(judgement, &heeded, signer, need)))
                 })
-                .collect();
-            let heeded = self.support(seen, ancestor);
-            valid.iter().filter(|&signer| *signer == self.founder || node.needs().all(|need| self.holds_in(&heeded, signer, need))).cloned().collect()
+                .cloned()
+                .collect()
         };
-        let mut taking: Vec<usize> = (0..n).filter(|&i| member(i) && self.nodes.get(i).is_some_and(|node| node.on_mesh() && !node.grant.del().is_empty())).collect();
+        let mut taking: Vec<usize> = (0..n).filter(|&i| member(i) && self.nodes.get(i).is_some_and(|node| !node.grant.del().is_empty())).collect();
         taking.sort_by_key(|&i| {
-            let senior = self.valid.get(i).and_then(|valid| valid.iter().map(rank_of).min()).unwrap_or(usize::MAX);
+            let senior = judgement.valid.get(i).and_then(|valid| valid.iter().map(rank_of).min()).unwrap_or(usize::MAX);
             (senior, self.nodes.get(i).map(|node| (node.depth, node.cid.to_bytes())))
         });
         for &i in &taking {
@@ -255,14 +364,50 @@ impl State {
                 *slot = (!stands.is_empty()).then_some(stands);
             }
         }
+        self.support(judgement, users, counts, |_| true)
+    }
 
-        self.support(counts, |_| true)
+    /// Whether neither of two grants is before the other.
+    fn concurrent(&self, i: usize, j: usize) -> bool {
+        let (Some(a), Some(b)) = (self.nodes.get(i), self.nodes.get(j)) else {
+            return false;
+        };
+        i != j && !a.before.get(j).copied().unwrap_or(false) && !b.before.get(i).copied().unwrap_or(false)
+    }
+
+    /// A grant's state at its `prev` in a scope, with what counts of these,
+    /// concurrent with it, heeded too: only what its ancestors gave is held
+    /// there, as what's given concurrently makes nothing valid.
+    fn heeded(&self, judgement: &Judgement, users: Option<(&Judgement, &Judged)>, i: usize, counts: &[Option<Vec<Link>>]) -> Judged {
+        let n = self.nodes.len();
+        let (Some(node), Some(prior)) = (self.nodes.get(i), judgement.prior.get(i)) else {
+            return Judged::empty();
+        };
+        let ancestor = |j: usize| node.before.get(j).copied().unwrap_or(false);
+        let taken = |j: usize| counts.get(j).is_some_and(Option::is_some) && self.concurrent(i, j);
+        if !(0..n).any(taken) {
+            return prior.clone();
+        }
+        let seen: Vec<Option<Vec<Link>>> = (0..n)
+            .map(|j| {
+                if ancestor(j) {
+                    prior.counts.get(j).cloned().flatten()
+                } else if taken(j) {
+                    counts.get(j).cloned().flatten()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        self.support(judgement, users, seen, ancestor)
     }
 
     /// Which grants giving, among some that count, are supported: what's
-    /// given is held while its giver can give it, from the founder out, as
-    /// far as that goes.
-    fn support(&self, counts: Vec<Option<Vec<Link>>>, among: impl Fn(usize) -> bool) -> Judged {
+    /// given is held while its giver can give it, from whoever it's judged
+    /// from out, as far as that goes; on an anchor, while its giver's a
+    /// user, in a state of the mesh's.
+    fn support(&self, judgement: &Judgement, users: Option<(&Judgement, &Judged)>, counts: Vec<Option<Vec<Link>>>, among: impl Fn(usize) -> bool) -> Judged {
+        let scope = &judgement.scope;
         let n = self.nodes.len();
         let mut judged = Judged { counts, supported: vec![false; n] };
         loop {
@@ -274,12 +419,12 @@ impl State {
                 let (Some(node), Some(Some(signers))) = (self.nodes.get(i), judged.counts.get(i)) else {
                     continue;
                 };
-                if node.grant.add().is_empty() || !node.on_mesh() {
+                if node.grant.add().is_empty() || !node.in_scope(scope) {
                     continue;
                 }
                 let gives = signers.iter().any(|signer| {
-                    *signer == self.founder
-                        || [USER, GRANT].into_iter().chain(node.grant.add().iter().map(String::as_str)).all(|need| self.holds_in(&judged, signer, need))
+                    let user = users.is_none_or(|(mesh, state)| self.holds_in(mesh, state, signer, USER));
+                    user && (*signer == scope.founder || node.gift_needs(scope).all(|need| self.holds_in_judged(scope, &judged, signer, need)))
                 });
                 if gives && let Some(slot) = judged.supported.get_mut(i) {
                     *slot = true;
@@ -292,21 +437,25 @@ impl State {
         }
     }
 
-    /// Whether someone holds a command on the mesh, as some grants are
+    /// Whether someone holds a command in a scope, as some grants are
     /// judged: given by a supported grant, and not taken away after or
     /// concurrently by one that counts.
-    fn holds_in(&self, judged: &Judged, who: &Link, command: &str) -> bool {
-        if *who == self.founder {
+    fn holds_in(&self, judgement: &Judgement, judged: &Judged, who: &Link, command: &str) -> bool {
+        self.holds_in_judged(&judgement.scope, judged, who, command)
+    }
+
+    fn holds_in_judged(&self, scope: &Scope, judged: &Judged, who: &Link, command: &str) -> bool {
+        if *who == scope.founder {
             return true;
         }
         self.nodes.iter().enumerate().any(|(i, giving)| {
             judged.supported.get(i).copied().unwrap_or(false)
-                && giving.on_mesh()
+                && giving.in_scope(scope)
                 && giving.targets(who)
                 && giving.grant.add().iter().any(|add| covers(add, command))
                 && !self.nodes.iter().enumerate().any(|(j, taking)| {
                     judged.counts.get(j).is_some_and(Option::is_some)
-                        && taking.on_mesh()
+                        && taking.in_scope(scope)
                         && taking.targets(who)
                         && !giving.before.get(j).copied().unwrap_or(false)
                         && taking.grant.del().iter().any(|del| overlap(del, command))
@@ -316,7 +465,60 @@ impl State {
 
     /// Whether someone holds a command on the mesh.
     pub fn holds(&self, who: &Link, command: &str) -> bool {
-        self.holds_in(&self.judged, who, command)
+        self.holds_in(&self.mesh, &self.mesh.judged, who, command)
+    }
+
+    /// The view of an anchor an owner's granted on, if they have.
+    fn view(&self, owner: &Link, anchor: &Link) -> Option<&Judgement> {
+        self.anchors.iter().find(|view| view.scope.founder == *owner && view.scope.on.as_ref() == Some(anchor))
+    }
+
+    /// Whether someone holds a command on an owner's view of an anchor:
+    /// the owner, everything while they're a user of the mesh; anyone
+    /// else, as the owner's grants on it, and those they let others make,
+    /// say.
+    pub fn holds_on(&self, owner: &Link, anchor: &Link, who: &Link, command: &str) -> bool {
+        if !self.holds(owner, USER) || !self.holds(who, USER) {
+            return false;
+        }
+        if who == owner {
+            return true;
+        }
+        self.view(owner, anchor).is_some_and(|view| self.holds_in(view, &view.judged, who, command))
+    }
+
+    /// Who holds what on each view of an anchor that's been granted on:
+    /// everyone given anything there, with which of the commands given them
+    /// they hold, and, write taken from them, which of their sets still
+    /// count.
+    pub fn shares(&self) -> Vec<Share> {
+        let mut shares = Vec::new();
+        for view in &self.anchors {
+            let (owner, Some(anchor)) = (&view.scope.founder, &view.scope.on) else {
+                continue;
+            };
+            let mut given: BTreeMap<Vec<u8>, (Link, std::collections::BTreeSet<String>, Vec<Link>)> = BTreeMap::new();
+            for (i, node) in self.nodes.iter().enumerate().filter(|(_, node)| node.in_scope(&view.scope)) {
+                let counts = view.judged.counts.get(i).is_some_and(Option::is_some);
+                for target in node.grant.target().iter().filter(|target| *target != owner) {
+                    let entry = given.entry(target.to_bytes()).or_insert_with(|| (target.clone(), std::collections::BTreeSet::new(), Vec::new()));
+                    entry.1.extend(node.grant.add().iter().cloned());
+                    if counts && node.grant.del().iter().any(|del| covers(del, WRITE)) {
+                        entry.2.extend(node.grant.stands().iter().cloned());
+                    }
+                }
+            }
+            for (user, commands, mut stands) in given.into_values() {
+                let held: Vec<String> = commands.into_iter().filter(|command| self.holds_on(owner, anchor, &user, command)).collect();
+                if held.iter().any(|command| covers(command, WRITE)) {
+                    stands.clear();
+                }
+                stands.sort_by_key(Link::to_bytes);
+                stands.dedup();
+                shares.push(Share { owner: owner.clone(), anchor: anchor.clone(), user, held, stands });
+            }
+        }
+        shares
     }
 
     /// The mesh's founder, its first operator.
@@ -324,9 +526,12 @@ impl State {
         &self.founder
     }
 
-    /// Whether a grant counts.
+    /// Whether a grant counts: on the mesh, or on an anchor, for whoever's
+    /// view it's judged in.
     pub fn counts(&self, cid: &Link) -> bool {
-        self.nodes.iter().position(|node| node.cid == *cid).and_then(|i| self.judged.counts.get(i)).is_some_and(Option::is_some)
+        self.nodes.iter().position(|node| node.cid == *cid).is_some_and(|i| {
+            std::iter::once(&self.mesh).chain(&self.anchors).any(|view| view.judged.counts.get(i).is_some_and(Option::is_some))
+        })
     }
 
     /// The grants nothing here follows, which a new grant names as `prev`.
@@ -352,7 +557,7 @@ impl State {
     /// they were given they hold now.
     pub fn holders(&self) -> Vec<(Link, Vec<String>)> {
         let mut given: BTreeMap<Vec<u8>, (Link, std::collections::BTreeSet<String>)> = BTreeMap::new();
-        for node in self.nodes.iter().filter(|node| node.on_mesh()) {
+        for node in self.nodes.iter().filter(|node| node.in_scope(&self.mesh.scope)) {
             for target in node.grant.target() {
                 given.entry(target.to_bytes()).or_insert_with(|| (target.clone(), std::collections::BTreeSet::new())).1.extend(node.grant.add().iter().cloned());
             }
@@ -393,6 +598,26 @@ mod tests {
         fn grant(&mut self, by: &Link, to: &Link, add: &[&str], del: &[&str], prev: &[&Link]) -> Link {
             let strings = |list: &[&str]| list.iter().map(|&c| c.to_owned()).collect::<Vec<_>>();
             let grant = Grant::new([to.clone()], None, strings(add), strings(del), [], prev.iter().map(|&p| p.clone())).expect("grant");
+            let cid = Claim::Grant(grant.clone()).cid();
+            self.grants.push(Signed { cid: cid.clone(), grant, by: vec![by.clone()] });
+            cid
+        }
+
+        /// `by` gives or takes away commands on their view of `anchor`, or
+        /// one they hold commands on, from `to`.
+        fn grant_on(&mut self, by: &Link, to: &Link, anchor: &Link, add: &[&str], del: &[&str], prev: &[&Link]) -> Link {
+            self.push_on(by, to, anchor, (add, del), &[], prev)
+        }
+
+        /// `by` takes `/anchor/write` away from `to`, these of their sets
+        /// standing.
+        fn take_write(&mut self, by: &Link, to: &Link, anchor: &Link, stands: &[&Link], prev: &[&Link]) -> Link {
+            self.push_on(by, to, anchor, (&[], &[WRITE]), stands, prev)
+        }
+
+        fn push_on(&mut self, by: &Link, to: &Link, anchor: &Link, (add, del): (&[&str], &[&str]), stands: &[&Link], prev: &[&Link]) -> Link {
+            let strings = |list: &[&str]| list.iter().map(|&c| c.to_owned()).collect::<Vec<_>>();
+            let grant = Grant::new([to.clone()], Some(anchor.clone()), strings(add), strings(del), stands.iter().map(|&s| s.clone()), prev.iter().map(|&p| p.clone())).expect("grant");
             let cid = Claim::Grant(grant.clone()).cid();
             self.grants.push(Signed { cid: cid.clone(), grant, by: vec![by.clone()] });
             cid
@@ -537,6 +762,74 @@ mod tests {
         // Nor can anyone take the founder's away
         history.grant(&first, &founder, &[], &["/"], &[&two]);
         assert!(history.state().holds(&founder, OPERATOR));
+    }
+
+    /// A history with a founder, and users `u`, `b` and `c`.
+    fn users() -> (History, Link, Link, Link, Link, Link) {
+        let (founder, u, b, c) = (key(), key(), key(), key());
+        let mut history = History::new(&founder);
+        let g = history.genesis.clone();
+        let one = history.grant(&founder, &u, &[USER], &[], &[&g]);
+        let two = history.grant(&founder, &b, &[USER], &[], &[&one]);
+        let three = history.grant(&founder, &c, &[USER], &[], &[&two]);
+        (history, founder, u, b, c, three)
+    }
+
+    #[test]
+    fn grants_on_an_anchor_are_of_whoever_its_judged_from() {
+        let (mut history, founder, u, b, c, last) = users();
+        let anchor = crate::claim::anchor().expect("anchor");
+        let shared = history.grant_on(&u, &b, &anchor, &[ANCHOR_GRANT, READ], &[], &[&last]);
+        let passed = history.grant_on(&b, &c, &anchor, &[READ], &[], &[&shared]);
+        let beyond = history.grant_on(&b, &c, &anchor, &[WRITE], &[], &[&passed]);
+        let state = history.state();
+        assert!(state.holds_on(&u, &anchor, &u, ANCHOR), "an owner holds everything on their own view");
+        assert!(state.holds_on(&u, &anchor, &b, READ) && !state.holds_on(&u, &anchor, &b, WRITE));
+        assert!(state.holds_on(&u, &anchor, &c, READ), "passed on");
+        assert!(!state.holds_on(&u, &anchor, &c, WRITE), "b can't give what b doesn't hold on u's view");
+        assert!(state.holds_on(&b, &anchor, &c, WRITE) && state.counts(&beyond), "but on b's own view, b holds everything");
+        assert!(!state.holds_on(&u, &anchor, &founder, READ), "the founder holds nothing on a user's view");
+        let other = crate::claim::anchor().expect("anchor");
+        assert!(!state.holds_on(&u, &other, &b, READ), "nor does a grant on one anchor give anything on another");
+
+        // u takes away b's power to give: what b gave c on u's view goes
+        let heads = state.heads();
+        let heads: Vec<&Link> = heads.iter().collect();
+        history.grant_on(&u, &b, &anchor, &[], &[ANCHOR_GRANT], &heads);
+        let state = history.state();
+        assert!(state.holds_on(&u, &anchor, &b, READ) && !state.holds_on(&u, &anchor, &c, READ));
+        assert!(state.holds_on(&b, &anchor, &c, READ), "not on b's own view");
+    }
+
+    #[test]
+    fn a_user_taken_from_the_mesh_holds_nothing_on_anchors() {
+        let (mut history, founder, u, b, c, last) = users();
+        let anchor = crate::claim::anchor().expect("anchor");
+        let shared = history.grant_on(&u, &b, &anchor, &[ANCHOR_GRANT, READ, WRITE], &[], &[&last]);
+        let removed = history.grant(&founder, &b, &[], &[USER], &[&shared]);
+        // b, naming grants from before, passes it on anyway
+        let backdated = history.grant_on(&b, &c, &anchor, &[READ], &[], &[&shared]);
+        let state = history.state();
+        assert!(state.counts(&removed) && !state.counts(&backdated));
+        assert!(!state.holds_on(&u, &anchor, &b, READ) && !state.holds_on(&u, &anchor, &c, READ));
+        assert!(!state.holds_on(&b, &anchor, &b, READ), "nor on their own view, no longer a user");
+    }
+
+    #[test]
+    fn taking_write_away_says_which_sets_stand() {
+        let (mut history, _, u, b, _, last) = users();
+        let anchor = crate::claim::anchor().expect("anchor");
+        let (set, other) = (Claim::Tomb(crate::claim::Tomb::new([key()]).expect("tomb")).cid(), Claim::Tomb(crate::claim::Tomb::new([key()]).expect("tomb")).cid());
+        let given = history.grant_on(&u, &b, &anchor, &[READ, WRITE], &[], &[&last]);
+        let shares = history.state().shares();
+        assert_eq!(shares.len(), 1);
+        assert_eq!((&shares[0].owner, &shares[0].user, shares[0].held.as_slice()), (&u, &b, [READ.to_owned(), WRITE.to_owned()].as_slice()));
+        history.take_write(&u, &b, &anchor, &[&set, &other], &[&given]);
+        let after = history.state().shares();
+        assert_eq!(after[0].held, [READ.to_owned()]);
+        let mut stands = vec![set, other];
+        stands.sort_by_key(Link::to_bytes);
+        assert_eq!(after[0].stands, stands);
     }
 
     #[test]

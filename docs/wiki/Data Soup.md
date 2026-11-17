@@ -39,6 +39,7 @@ the holokeep repository; this wiki is the reference.
 | precipitated | A claim stored as an ordinary sha2-256 block. |
 | anchor | A stable identity whose value changes, by `set` claims. |
 | root anchor | An account's top-level anchor, the top of `hk mount`. |
+| view | One user's view of an anchor, what the sets that count for them say, named by an anchor CID of its own; see [[Anchors and Names#Views]]. |
 | repo | Everything one node keeps: its catalog database and volumes (`~/.holokeep`). |
 | volume | A place bytes are kept: a SQLite file, a flatfs directory, a drive. |
 | form | How a volume breaks a block down: rows, JSONB, raw bytes, file ranges, deltas. |
@@ -52,11 +53,10 @@ the holokeep repository; this wiki is the reference.
 | vault | An account's internal account for what it encrypts for friends to hold. |
 | machine | A mesh member, named by `node.key`; trusted by every user of the mesh. In a mesh with grants, one given `/mesh/machine`. Planned to be distinct from devices, see [[Sharing]]. |
 | grant | A claim giving or taking away commands in a mesh, after the grants before it; see [[Grants]]. |
-| command | What a grant gives, as a path from `/`: `/mesh/user`, `/mesh/machine`, `/mesh/grant`. |
+| command | What a grant gives, as a path from `/`: `/mesh/user`, `/mesh/machine`, `/mesh/grant`, and on a view of an anchor `/anchor/read`, `/anchor/write`, `/anchor/grant`. |
 | operator | A user holding `/mesh`; the **founder**, whose first grant names the mesh, holds `/`. |
 | client | A device acting for its user through a member machine, not a member itself (planned; local clients exist). |
 | role | A set of privileges granted to users and other roles, as in SQL (planned). |
-| grant | A claim giving a user or role a privilege on an anchor or the mesh (planned). |
 | keep | A claim saying to keep a DAG; what nothing keeps is collected. |
 | tomb | A claim retracting other claims. |
 | mount point | A symlink to an anchor, which the mount shows as the anchor. |

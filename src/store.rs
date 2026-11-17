@@ -610,7 +610,7 @@ fn free_space(path: &Path) -> Option<u64> {
 }
 
 /// A multihash of one's own.
-fn owned(key: Key<'_>) -> Result<Multihash> {
+pub(crate) fn owned(key: Key<'_>) -> Result<Multihash> {
     Multihash::try_wrap(key.code(), key.digest_ref()).map_err(|_| Error::Oversized(key.len()))
 }
 
@@ -1037,6 +1037,56 @@ impl Catalog {
             signed.push(crate::grants::Signed { cid, grant, by });
         }
         Ok(crate::grants::State::new(genesis, signed))
+    }
+
+    /// Work out who may read and write users' views of anchors, as a mesh's
+    /// grants say, for counting sets: as no one may but their owners, if
+    /// its grants aren't here.
+    pub fn refresh_access(&self, genesis: &Link) -> Result<()> {
+        let shares = self.grant_state(genesis)?.map(|state| state.shares()).unwrap_or_default();
+        self.set_access(&shares)
+    }
+
+    /// Put who may read and write users' views of anchors, as grants worked
+    /// out say, in place of what was.
+    pub fn set_access(&self, shares: &[crate::grants::Share]) -> Result<()> {
+        self.claims.as_ref().ok_or(Error::NoClaims)?.set_access(shares)
+    }
+
+    /// Give or take away commands on a view of an anchor, as the user this
+    /// acts for, after every grant of the mesh here: on their own view, if
+    /// `anchor` is an anchor, or on another's they may give these on, if
+    /// it's a view of one (see `claim::view`). Taking write away, `stands`
+    /// says which of the targets' sets still count. Refused if it wouldn't
+    /// count. Returns its CID.
+    pub fn grant_on(&self, genesis: &Link, anchor: &Link, target: &[Link], add: &[String], del: &[String], stands: &[Link]) -> Result<Link> {
+        use crate::grants::{ANCHOR_GRANT, USER};
+        let state = self.grant_state(genesis)?.ok_or_else(|| Error::User("this mesh's grants aren't here".into()))?;
+        let user = self.user()?.ok_or_else(|| Error::User("this account has no user to grant as".into()))?;
+        let (of, owner) = crate::claim::viewed(anchor).unwrap_or_else(|| (anchor.clone(), user.clone()));
+        if !state.holds(&user, USER) {
+            return Err(Error::User(format!("{} isn't a user of the mesh", crate::keys::peer_id(&user))));
+        }
+        for need in std::iter::once(ANCHOR_GRANT).chain(add.iter().chain(del).map(String::as_str)) {
+            if !state.holds_on(&owner, &of, &user, need) {
+                return Err(Error::User(format!("{} doesn't hold {need} on {}'s {of}", crate::keys::peer_id(&user), crate::keys::peer_id(&owner))));
+            }
+        }
+        let grant = crate::claim::Grant::new(target.iter().cloned(), Some(of), add.iter().cloned(), del.iter().cloned(), stands.iter().cloned(), state.heads())
+            .ok_or_else(|| Error::User("a grant names someone, and commands on an anchor given or taken away, not both".into()))?;
+        let cid = self.put_claim(&Claim::Grant(grant))?;
+        self.refresh_access(genesis)?;
+        Ok(cid)
+    }
+
+    /// The sets of a user's that count in a view of an anchor, that no other
+    /// of theirs came after: what stands of theirs, taking their write away.
+    pub fn latest_sets_by(&self, anchor: &Link, writer: &Link) -> Result<Vec<Link>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let sets = claims.sets(anchor.multihash())?;
+        let theirs: Vec<&SetOf> = sets.iter().filter(|(set, ..)| claims.signed_by_user(set, writer).unwrap_or(false)).collect();
+        let replaced: std::collections::HashSet<Vec<u8>> = theirs.iter().flat_map(|(.., prev)| prev.iter().flatten().map(Link::to_bytes)).collect();
+        Ok(theirs.into_iter().filter(|(set, ..)| !replaced.contains(&set.to_bytes())).map(|(set, ..)| set.clone()).collect())
     }
 
     /// Give or take away mesh commands, as the user this acts for, after
@@ -2724,10 +2774,37 @@ impl Catalog {
                  WHERE m.multihash = ?1 AND h.uid = ?2 AND h.since >= ?3",
             )?
             .exists(params![key.to_bytes(), self.uid, held_since()])?;
-        if held || self.kept_for_acting(key)? {
+        if held || self.kept_for_acting(key)? || self.shared_with_acting(key)? {
             return Ok(true);
         }
         Ok(claims.has(key)? && !claims.withheld(key, self.uid)?)
+    }
+
+    /// Whether a block is what another user's view of an anchor reaches,
+    /// that the acting user may read: what it is or was, or what that
+    /// links to, however indirectly, through what it mounts.
+    fn shared_with_acting(&self, key: Key<'_>) -> Result<bool> {
+        let shared = self.db.conn()
+            .prepare_cached("SELECT 1 FROM anchor_access WHERE command = 'read' AND user = (SELECT id FROM multihashes WHERE multihash = acting_user()) LIMIT 1")?
+            .exists([])?;
+        if !shared {
+            return Ok(false);
+        }
+        Ok(self.db.conn()
+            .prepare_cached(&format!(
+                "WITH RECURSIVE up (id) AS (
+                     SELECT id FROM multihashes WHERE multihash = ?1
+                     UNION SELECT l.source FROM links l JOIN up ON l.target = up.id
+                     UNION SELECT a.anchor FROM anchor_history a JOIN up ON a.value = up.id
+                 )
+                 SELECT 1 FROM up
+                 JOIN set_claims s ON s.value = up.id JOIN claims c ON c.id = s.id JOIN claim_targets t ON t.claim = c.id
+                 JOIN anchor_access ar ON ar.anchor = t.target AND ar.command = 'read'
+                     AND ar.user = (SELECT id FROM multihashes WHERE multihash = acting_user())
+                 WHERE {} LIMIT 1",
+                claims::in_view("c", "s", "t", "ar.owner"),
+            ))?
+            .exists([key.to_bytes()])?)
     }
 
     /// Whether a block is in any other account's repo: put here by it
@@ -2907,12 +2984,40 @@ impl Catalog {
     /// Say an anchor is `value`, in place of these of its sets, having
     /// written these paths, though they hold what they did, as when a
     /// conflict's resolved to its latest version.
+    ///
+    /// `anchor` may be a user's view of one (see `claim::view`): the set's
+    /// then of the anchor, for their view, which counts there if the user
+    /// this acts for may write it, and is refused if not.
     pub fn set_anchor_wrote(&self, anchor: &Link, value: &Link, prev: Vec<Link>, wrote: &[merge::Path]) -> Result<Link> {
         let latest = self.anchor_history(anchor)?.last().map_or(0, |&(at, _)| at.saturating_add(1));
         let at = now().max(latest);
         let wrote = wrote.iter().map(|path| path.join(&b'/'));
-        let set = crate::claim::Set::new([anchor.clone()], value.clone(), at).ok_or(Error::NoClaims)?.after(Some(prev)).wrote(wrote);
+        let (of, owner) = match crate::claim::viewed(anchor) {
+            Some((of, owner)) => {
+                if !self.may_write(anchor)? {
+                    return Err(Error::User(format!("{} hasn't let this user write their {of}", crate::keys::peer_id(&owner))));
+                }
+                let own = self.claims.as_ref().and_then(|claims| claims.acting()).is_some_and(|acting| acting == owner.multihash().to_bytes());
+                (of, (!own).then_some(owner))
+            },
+            None => (anchor.clone(), None),
+        };
+        let set = crate::claim::Set::new([of], value.clone(), at).ok_or(Error::NoClaims)?.after(Some(prev)).wrote(wrote).for_view(owner);
         self.put_claim(&Claim::Set(set))
+    }
+
+    /// Whether the user this acts for may set an anchor, or a user's view
+    /// of one (see `claim::view`): their own view of any, and another's if
+    /// they've been given `/anchor/write` on it.
+    pub fn may_write(&self, anchor: &Link) -> Result<bool> {
+        self.claims.as_ref().map_or(Ok(true), |claims| claims.may_write(anchor))
+    }
+
+    /// Whether the user this acts for may see an anchor, or a user's view
+    /// of one: their own view of any, and another's if they've been given
+    /// `/anchor/read` on it.
+    pub fn may_read(&self, anchor: &Link) -> Result<bool> {
+        self.claims.as_ref().map_or(Ok(true), |claims| claims.may_read(anchor))
     }
 
     fn put_set(&self, anchor: &Link, value: &Link, prev: Vec<Link>) -> Result<Link> {
@@ -3266,6 +3371,9 @@ impl Catalog {
         self.db.conn()
             .prepare_cached("INSERT OR IGNORE INTO refs (source, target) VALUES (?1, ?2)")?
             .execute(params![id, self.db.intern(anchor.multihash())?])?;
+        if let Some(claims) = &self.claims {
+            claims.note_view(anchor)?;
+        }
         Ok(())
     }
 

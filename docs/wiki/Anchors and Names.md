@@ -28,6 +28,29 @@ Anchors carry everything mutable:
 - **Overlay mounts**: anchors written through `hk mount` (see [[Mount]]).
 - **Names**: the root anchor, below.
 
+## Views
+
+What an anchor is depends on whose sets count: a user's own sets, and
+those for their view by whoever they've let write it (see
+[[Grants#Grants on anchors]]). A **view**, one user's view of an anchor,
+is named by an anchor CID of its own:
+
+```
+view = identity CID of dag-cbor {"anchor": <the anchor's nonce>, "of": <user's key>}
+```
+
+`hk anchor view <anchor> <owner>` prints it. Showing a view (`hk anchor
+show`, `hk get`, the mount's `anchors/<view>`) shows what counts in the
+owner's view of the anchor, if the acting user may read it, and nothing
+otherwise. Setting one (`hk anchor set <view> <cid>`, or writing under
+it in the mount) makes a set of the anchor for the owner's view (its
+`for`; see [[Claims]]), refused unless the acting user may write it.
+A user's view of their own anchor is the anchor.
+
+A mount point within a view is to the owner's view of the anchor it
+names, not the reader's: so someone reading another's root sees it as
+its owner does, as far as they may read each anchor in it.
+
 ## The root anchor
 
 Each account has a **root anchor**, the top of what it has named and the

@@ -526,10 +526,20 @@ impl Soup {
 
     /// What a link in `dir` mounts, if it's to an anchor itself (not into
     /// one), which is something here and isn't above `dir`.
+    ///
+    /// Within another user's view of an anchor, a link to an anchor is to
+    /// their view of it, as they see it, not this user's own.
     fn mount_point(&self, catalog: &Catalog, dir: u64, target: &[u8], via: Via) -> Result<Option<Inode>, Errno> {
-        let Some(anchor) = crate::claim::anchor_target(target) else {
+        let Some(mut anchor) = crate::claim::anchor_target(target) else {
             return Ok(None);
         };
+        if let Inode::Path(within, ..) = self.inode(dir)?
+            && let Some((_, owner)) = crate::claim::viewed(&within)
+            && catalog.user().map_err(store_errno)?.as_ref() != Some(&owner)
+            && let Some(theirs) = crate::claim::view(&anchor, &owner)
+        {
+            anchor = theirs;
+        }
         let Some(value) = Self::anchor_root(catalog, &anchor)? else {
             return Ok(None);
         };
@@ -2616,5 +2626,73 @@ mod tests {
         );
         let cid = AnyCid::V1(block.cid().clone());
         assert_eq!(ino(&soup, &format!("cid/{cid}")).err(), Some(Errno::ENOENT));
+    }
+
+    /// Another user's view of an anchor, shared to read: shown as they see
+    /// it, mount points in it to their views too, and not writable till
+    /// they let it be, then written for them.
+    #[test]
+    fn another_users_view_is_shown_as_they_see_it_and_written_if_let() {
+        use crate::grants::{READ, USER, WRITE};
+        let scratch = Scratch::new("mount-view");
+        let repo = scratch.path().join("repo");
+        let mut catalog = Catalog::open_repo(&repo).expect("catalog");
+        let root = catalog.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+        let genesis = catalog.found_grants(&root).expect("found");
+        let bob = catalog.uid().wrapping_add(1);
+        let (bobs, bob_root) = (crate::keys::Key::generate().expect("key"), crate::keys::Key::generate().expect("key"));
+        catalog.certify(&bob_root, &bobs.id()).expect("certify");
+        catalog.grant(&genesis, &[bob_root.id()], &[USER.to_owned()], &[]).expect("grant");
+
+        // The owner's anchor, mounting another of theirs
+        let importer = Importer { hidden: true, ..Importer::default() };
+        let inner_tree = scratch.path().join("inner");
+        std::fs::create_dir_all(&inner_tree).expect("mkdir");
+        std::fs::write(inner_tree.join("deep"), "down").expect("write");
+        let inner = catalog.new_anchor().expect("anchor");
+        let value = AnyCid::V1(importer.add_path(&inner_tree, &mut catalog, &mut |_, _| {}).expect("import").expect("root").cid);
+        catalog.set_anchor(&inner, &value).expect("set");
+        let outer_tree = scratch.path().join("outer");
+        std::fs::create_dir_all(&outer_tree).expect("mkdir");
+        std::fs::write(outer_tree.join("a"), "first").expect("write");
+        std::os::unix::fs::symlink(format!("/anchors/{inner}"), outer_tree.join("in")).expect("symlink");
+        let outer = catalog.new_anchor().expect("anchor");
+        let value = AnyCid::V1(importer.add_path(&outer_tree, &mut catalog, &mut |_, _| {}).expect("import").expect("root").cid);
+        catalog.set_anchor(&outer, &value).expect("set");
+        for anchor in [&outer, &inner] {
+            catalog.grant_on(&genesis, anchor, &[bob_root.id()], &[READ.to_owned()], &[], &[]).expect("grant");
+        }
+        catalog.act_for(bob, bobs.clone()).expect("act");
+        catalog.set_user(&bob_root.id()).expect("user");
+        drop(catalog);
+
+        let opened = repo.clone();
+        let key = bobs.clone();
+        let soup = Soup::new(Box::new(move || {
+            let mut catalog = Catalog::open_repo(&opened)?;
+            catalog.act_for(bob, key.clone())?;
+            Ok(catalog)
+        }), None).writable(repo.join("work"));
+        let view = crate::claim::view(&outer, &root.id()).expect("view");
+        assert_eq!(read(&soup, &format!("anchors/{view}/a")), b"first");
+        assert_eq!(read(&soup, &format!("anchors/{view}/in/deep")), b"down", "a mount point in their view is to their view");
+        assert_eq!(ino(&soup, &format!("anchors/{outer}/a")).err(), Some(Errno::ENOENT), "bob's own view of it is nothing");
+        let dir = ino(&soup, &format!("anchors/{view}")).expect("view").ino.0;
+        assert_eq!(soup.create(dir, OsStr::new("b")).err(), Some(Errno::EROFS), "read, not write");
+
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        catalog.grant_on(&genesis, &outer, &[bob_root.id()], &[WRITE.to_owned()], &[], &[]).expect("grant");
+        drop(catalog);
+        let (_, fh) = soup.create(dir, OsStr::new("b")).expect("create");
+        soup.write(fh, 0, b"bob's").expect("write");
+        soup.release(fh);
+        let later = std::time::Instant::now() + Duration::from_hours(1);
+        let mut bobs_catalog = Catalog::open_repo(&repo).expect("catalog");
+        bobs_catalog.act_for(bob, bobs).expect("act");
+        soup.committer.commit_as_of(&mut bobs_catalog, false, later);
+        drop(bobs_catalog);
+        let owners = Catalog::open_repo(&repo).expect("catalog");
+        let now = owners.anchor_value(&outer).expect("value").expect("set");
+        assert_eq!(read(&soup, &format!("cid/{now}/b")), b"bob's", "written for the owner, in their view");
     }
 }

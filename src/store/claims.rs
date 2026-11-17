@@ -97,6 +97,58 @@ const AUTHORIZED: &str = "
             WHERE tt.target = dk.key AND tb.kind = 'tomb' AND rs2.by = rs.by
         )";
 
+/// The id of the user whose view of anchors is looked at: the one the
+/// catalog views (`viewing_owner()`), or else the one it acts for. NULL
+/// when it acts for everyone and views no one in particular.
+const OWNER: &str = "(SELECT id FROM multihashes WHERE multihash = coalesce(viewing_owner(), acting_user()))";
+
+/// Whether the set `s`, the claims row `c`, on the anchor `t.target`,
+/// counts in the view of the user with id `owner`: a set for its signer's
+/// own view, signed by them, or one for theirs (`s.owner`), signed by
+/// them, a user they've given `/anchor/write` on it, or one whose set they
+/// said stands on taking it away; not tombed by them. With no users,
+/// every set counts that no tomb targets.
+pub(super) fn in_view(c: &str, s: &str, t: &str, owner: &str) -> String {
+    format!(
+        "(CASE WHEN NOT EXISTS (SELECT 1 FROM users) THEN NOT EXISTS (
+             SELECT 1 FROM claim_keys tk JOIN claim_targets x ON x.target = tk.key JOIN claims k ON k.id = x.claim
+             WHERE tk.claim = {c}.id AND k.kind = 'tomb')
+         ELSE EXISTS (
+             SELECT 1 FROM claim_keys sk JOIN claim_targets st ON st.target = sk.key
+             JOIN sign_claims sg ON sg.id = st.claim JOIN authorized au ON au.key = sg.by
+             WHERE sk.claim = {c}.id AND (
+                 ({s}.owner IS NULL AND au.user = {owner})
+                 OR ({s}.owner = {owner} AND (
+                     au.user = {owner}
+                     OR EXISTS (SELECT 1 FROM anchor_access aw WHERE aw.owner = {owner} AND aw.anchor = {t}.target AND aw.user = au.user AND aw.command = 'write')
+                     OR EXISTS (SELECT 1 FROM anchor_stood ao WHERE ao.owner = {owner} AND ao.anchor = {t}.target AND ao.user = au.user AND ao.claim = sk.key)))))
+             AND NOT EXISTS (
+                 SELECT 1 FROM claim_keys tk JOIN claim_targets x ON x.target = tk.key JOIN claims k ON k.id = x.claim
+                 JOIN claim_keys kk ON kk.claim = k.id JOIN claim_targets kt ON kt.target = kk.key
+                 JOIN sign_claims ks ON ks.id = kt.claim JOIN authorized ka ON ka.key = ks.by AND ka.user = {owner}
+                 WHERE tk.claim = {c}.id AND k.kind = 'tomb') END)"
+    )
+}
+
+/// Whether the user with id `user` may read `owner`'s view of the anchor
+/// `t.target`: it's theirs, or they've been given `/anchor/read` on it.
+fn may_read(t: &str, owner: &str, user: &str) -> String {
+    format!("({owner} = {user} OR EXISTS (SELECT 1 FROM anchor_access ar WHERE ar.owner = {owner} AND ar.anchor = {t}.target AND ar.user = {user} AND ar.command = 'read'))")
+}
+
+/// Whether the set `s`, the claims row `c`, on `t.target`, counts in the
+/// view looked at (see `OWNER`), if the acting user may read it: for no
+/// one in particular, if it counts for anyone.
+fn here(c: &str, s: &str, t: &str) -> String {
+    let live = LIVE.replace("c.id", &format!("{c}.id"));
+    format!(
+        "(CASE WHEN coalesce(viewing_owner(), acting_user()) IS NULL THEN {live}
+         ELSE (viewing_owner() IS NULL OR acting_user() IS NULL OR {readable}) AND {counts} END)",
+        readable = may_read(t, OWNER, acting!()),
+        counts = in_view(c, s, t, OWNER),
+    )
+}
+
 /// The views below, each `CREATE VIEW` as it's kept, if they're as they are
 /// now: they're only made again if not, since that's a write, and makes
 /// every connection prepare what it had again.
@@ -151,10 +203,41 @@ const AUTH_TABLES: &str = "
              key INTEGER NOT NULL,
              PRIMARY KEY (user, key)
          ) WITHOUT ROWID;
-         CREATE INDEX IF NOT EXISTS authorized_key ON authorized (key);";
+         CREATE INDEX IF NOT EXISTS authorized_key ON authorized (key);
+         -- Who may read or write users' views of anchors, as the main
+         -- mesh's grants say: worked out from them, and kept here for
+         -- counting sets, by `owner`'s view, `user` given `command`.
+         CREATE TABLE IF NOT EXISTS anchor_access (
+             owner INTEGER NOT NULL,
+             anchor INTEGER NOT NULL,
+             user INTEGER NOT NULL,
+             command TEXT NOT NULL CHECK (command IN ('read', 'write')),
+             PRIMARY KEY (owner, anchor, user, command)
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS anchor_access_user ON anchor_access (user, anchor);
+         -- Sets, by multihash, that count in `owner`'s view of an anchor
+         -- though `user`, who made them, may no longer write it: what a
+         -- grant taking write away said stands, and before it.
+         CREATE TABLE IF NOT EXISTS anchor_stood (
+             owner INTEGER NOT NULL,
+             anchor INTEGER NOT NULL,
+             user INTEGER NOT NULL,
+             claim INTEGER NOT NULL,
+             PRIMARY KEY (owner, anchor, user, claim)
+         ) WITHOUT ROWID;
+         -- Users' views of anchors linked to here (see `claim::view`):
+         -- what each is a view of, and whose, as SQL can't work it out.
+         CREATE TABLE IF NOT EXISTS anchor_views (
+             view INTEGER PRIMARY KEY,
+             anchor INTEGER NOT NULL,
+             owner INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS anchor_views_anchor ON anchor_views (anchor);";
 
 /// The views, made afresh each time, since what counts changes.
 fn views() -> String {
+    // Sets for the acting user's view by others: their own are `LIVE`
+    let mine = ["(s.owner = ", acting!(), " AND ", &in_view("c", "s", "t", acting!()), ")"].concat();
     format!(
         "DROP VIEW IF EXISTS tags;
          DROP VIEW IF EXISTS anchor_values;
@@ -174,20 +257,36 @@ fn views() -> String {
              JOIN group_claims g ON g.id = c.id
              JOIN multihashes i ON i.id = g.into_
              WHERE {LIVE};
-         {acting}
+         {values}
          {any}
          -- Everything an anchor's been: what's referenced, as it's the
-         -- anchor's history, till the sets saying so are tombed.
+         -- anchor's history, till the sets saying so are tombed. For the
+         -- acting user, what counts in any view of it they may read, and
+         -- in each view of it linked to here, as that view.
          CREATE VIEW anchor_history (anchor, value) AS
              SELECT t.target, s.value FROM set_claims s
              JOIN claims c ON c.id = s.id JOIN claim_targets t ON t.claim = c.id
-             WHERE {LIVE};
+             WHERE {LIVE} OR (acting_user() IS NOT NULL AND ({mine} OR EXISTS (
+                 SELECT 1 FROM anchor_access ar WHERE ar.anchor = t.target AND ar.user = {acting} AND ar.command = 'read' AND {read})))
+             UNION ALL
+             SELECT v.view, s.value FROM anchor_views v
+             JOIN claim_targets t ON t.target = v.anchor JOIN claims c ON c.id = t.claim JOIN set_claims s ON s.id = c.id
+             WHERE (acting_user() IS NULL OR {readable}) AND {viewed};
          CREATE VIEW anchor_history_any (anchor, value) AS
              SELECT t.target, s.value FROM set_claims s
              JOIN claims c ON c.id = s.id JOIN claim_targets t ON t.claim = c.id
-             WHERE {LIVE_ANY};",
-        acting = anchor_values("anchor_values", LIVE),
-        any = anchor_values("anchor_values_any", LIVE_ANY),
+             WHERE {LIVE_ANY}
+             UNION ALL
+             SELECT v.view, s.value FROM anchor_views v
+             JOIN claim_targets t ON t.target = v.anchor JOIN claims c ON c.id = t.claim JOIN set_claims s ON s.id = c.id
+             WHERE {viewed};",
+        acting = acting!(),
+        mine = mine,
+        read = in_view("c", "s", "t", "ar.owner"),
+        readable = may_read("t", "v.owner", acting!()),
+        viewed = in_view("c", "s", "t", "v.owner"),
+        values = anchor_values("anchor_values", &here("c", "s", "t"), &here("c2", "s2", "t2")),
+        any = anchor_values("anchor_values_any", LIVE_ANY, &LIVE_ANY.replace("c.id", "c2.id")),
     )
 }
 
@@ -195,8 +294,7 @@ fn views() -> String {
 /// no other that counts replaces, by naming it in its `prev` or, for an
 /// older build's set, saying none, by coming after it, by `at` and then the
 /// value's multihash. More than one row for an anchor is a fork.
-fn anchor_values(name: &str, live: &str) -> String {
-    let live2 = live.replace("c.id", "c2.id");
+fn anchor_values(name: &str, live: &str, live2: &str) -> String {
     format!(
         "CREATE VIEW {name} (anchor, value, prefix, claim, at) AS
              SELECT t.target, s.value, s.value_prefix, c.id, s.at FROM set_claims s
@@ -206,6 +304,7 @@ fn anchor_values(name: &str, live: &str) -> String {
              WHERE {live} AND NOT EXISTS (
                  SELECT 1 FROM set_prev p
                  JOIN claims c2 ON c2.id = p.claim
+                 JOIN set_claims s2 ON s2.id = c2.id
                  JOIN claim_targets t2 ON t2.claim = c2.id
                  WHERE p.prev = (SELECT key FROM claim_keys WHERE claim = c.id) AND t2.target = t.target AND {live2}
              ) AND NOT EXISTS (
@@ -316,6 +415,9 @@ pub struct ClaimStore {
     /// The multihash of the user the catalog acts as, which SQL reads as
     /// `acting_user()`: None for everyone.
     acting: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    /// The multihash of the user whose views of anchors are looked at,
+    /// which SQL reads as `viewing_owner()`: None for the acting user's.
+    viewing: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
 }
 
 /// One of the host's users, as this repo knows them.
@@ -380,6 +482,11 @@ impl ClaimStore {
         db.conn().create_scalar_function("acting_user", 0, rusqlite::functions::FunctionFlags::SQLITE_UTF8, move |_| {
             Ok(state.lock().ok().and_then(|acting| acting.clone()))
         })?;
+        let viewing = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let state = std::sync::Arc::clone(&viewing);
+        db.conn().create_scalar_function("viewing_owner", 0, rusqlite::functions::FunctionFlags::SQLITE_UTF8, move |_| {
+            Ok(state.lock().ok().and_then(|viewing| viewing.clone()))
+        })?;
         db.conn().execute_batch(SCHEMA)?;
         // From when a repo had one user, in a table, and authorized keys
         // weren't anyone's in particular
@@ -405,6 +512,10 @@ impl ClaimStore {
             // older build's, replacing every set before it
             db.conn().execute_batch("ALTER TABLE set_claims ADD COLUMN after INTEGER NOT NULL DEFAULT 0")?;
         }
+        if !db.conn().prepare("SELECT 1 FROM pragma_table_info('set_claims') WHERE name = 'owner'")?.exists([])? {
+            // Whose view of its anchors a set's for, if not its signer's
+            db.conn().execute_batch("ALTER TABLE set_claims ADD COLUMN owner INTEGER REFERENCES multihashes (id)")?;
+        }
         let views = views();
         if !views_current(&db, &views)? {
             db.conn().execute_batch(&views)?;
@@ -415,7 +526,7 @@ impl ClaimStore {
         }
         db.conn().execute_batch("CREATE INDEX IF NOT EXISTS sign_claims_prev ON sign_claims (prev)")?;
         widen_kinds(&db)?;
-        let store = Self { db, acting };
+        let store = Self { db, acting, viewing };
         store.key_claims()?;
         if !store.authorized_current()? {
             store.authorize()?;
@@ -829,16 +940,20 @@ impl ClaimStore {
     }
 
     fn set(&self, id: Id) -> Result<Set> {
-        let (prefix, value, at, after): (Vec<u8>, Vec<u8>, i64, bool) = self.db.conn()
-            .prepare_cached("SELECT s.value_prefix, v.multihash, s.at, s.after FROM set_claims s JOIN multihashes v ON v.id = s.value WHERE s.id = ?1")?
-            .query_row([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
+        let (prefix, value, at, after, owner): (Vec<u8>, Vec<u8>, i64, bool, Option<Vec<u8>>) = self.db.conn()
+            .prepare_cached(
+                "SELECT s.value_prefix, v.multihash, s.at, s.after, o.multihash FROM set_claims s JOIN multihashes v ON v.id = s.value
+                 LEFT JOIN multihashes o ON o.id = s.owner WHERE s.id = ?1",
+            )?
+            .query_row([id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?;
+        let owner = owner.map(|owner| link(&KEY_PREFIX, &owner)).transpose()?;
         let prev = if after { Some(self.set_prev(id)?) } else { None };
         let wrote: Vec<Vec<u8>> = self.db.conn()
             .prepare_cached("SELECT path FROM set_wrote WHERE claim = ?1")?
             .query_map([id], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         Set::new(self.targets(id)?, link(&prefix, &value)?, u64::try_from(at).unwrap_or_default())
-            .map(|set| set.after(prev).wrote(wrote))
+            .map(|set| set.after(prev).wrote(wrote).for_view(owner))
             .ok_or_else(|| Error::Invalid { store: NAME, reason: "a set with no targets".into() })
     }
 
@@ -849,10 +964,157 @@ impl ClaimStore {
         links(stmt.query_map([id], pair)?)
     }
 
+    /// Look at a user's view of an anchor, if `anchor` is one (see
+    /// `claim::view`), while `f` does, with the anchor it's of; or else at
+    /// the acting user's, with the anchor itself.
+    fn viewing<T>(&self, anchor: Key<'_>, f: impl FnOnce(Key<'_>) -> Result<T>) -> Result<T> {
+        let cid = Link::V1(Cidv1::new(DAG_CBOR_CODEC, super::owned(anchor)?));
+        let Some((of, owner)) = crate::claim::viewed(&cid) else {
+            return f(anchor);
+        };
+        let before = self.viewing.lock().ok().and_then(|mut viewing| viewing.replace(owner.multihash().to_bytes()));
+        let result = f(of.multihash());
+        if let Ok(mut viewing) = self.viewing.lock() {
+            *viewing = before;
+        }
+        result
+    }
+
+    /// An anchor's heads, in the view looked at: the sets that count which
+    /// no other replaces, as (set, value, at), by `at`, the value's
+    /// multihash, and the set's. More than one is a fork, to be merged. A
+    /// user's view of an anchor (see `claim::view`) is theirs, if the acting
+    /// user may read it, and nothing otherwise.
+    pub fn heads(&self, anchor: Key<'_>) -> Result<Vec<(Link, Link, u64)>> {
+        self.viewing(anchor, |anchor| self.heads_here(anchor))
+    }
+
+    /// Every set of an anchor that counts, as `heads` looks: see `sets_here`.
+    pub fn sets(&self, anchor: Key<'_>) -> Result<Vec<super::SetOf>> {
+        self.viewing(anchor, |anchor| self.sets_here(anchor))
+    }
+
+    /// What each set of an anchor that counts wrote, as `heads` looks.
+    pub fn wrote(&self, anchor: Key<'_>) -> Result<Vec<(Link, Vec<u8>)>> {
+        self.viewing(anchor, |anchor| self.wrote_here(anchor))
+    }
+
+    /// What an anchor is now, as `heads` looks: see `value_of_here`.
+    pub fn value_of(&self, anchor: Key<'_>) -> Result<Option<Link>> {
+        self.viewing(anchor, |anchor| self.value_of_here(anchor))
+    }
+
+    /// Every set of an anchor that counts, as `heads` looks, as (at, value).
+    pub fn history(&self, anchor: Key<'_>) -> Result<Vec<(u64, Link)>> {
+        self.viewing(anchor, |anchor| self.history_here(anchor))
+    }
+
+    /// Whether the acting user may set a user's view of an anchor, if
+    /// `anchor` is one: it's theirs, or they've been given `/anchor/write`
+    /// on it. Their own view of any anchor, they may.
+    pub fn may_write(&self, anchor: &Link) -> Result<bool> {
+        let Some((of, owner)) = crate::claim::viewed(anchor) else {
+            return Ok(true);
+        };
+        if self.acting().as_deref().is_none_or(|acting| acting == owner.multihash().to_bytes()) {
+            return Ok(true);
+        }
+        Ok(self.db.conn()
+            .prepare_cached(
+                "SELECT 1 FROM anchor_access a JOIN multihashes o ON o.id = a.owner JOIN multihashes n ON n.id = a.anchor
+                 JOIN multihashes u ON u.id = a.user
+                 WHERE o.multihash = ?1 AND n.multihash = ?2 AND u.multihash = acting_user() AND a.command = 'write'",
+            )?
+            .exists(params![owner.multihash().to_bytes(), of.multihash().to_bytes()])?)
+    }
+
+    /// The multihash of the user this acts for, if it acts for one.
+    pub fn acting(&self) -> Option<Vec<u8>> {
+        self.acting.lock().ok().and_then(|acting| acting.clone())
+    }
+
+    /// Whether the acting user may see a user's view of an anchor, if
+    /// `anchor` is one: it's theirs, or they've been given `/anchor/read`.
+    pub fn may_read(&self, anchor: &Link) -> Result<bool> {
+        let Some((of, owner)) = crate::claim::viewed(anchor) else {
+            return Ok(true);
+        };
+        if self.acting().as_deref().is_none_or(|acting| acting == owner.multihash().to_bytes()) {
+            return Ok(true);
+        }
+        Ok(self.db.conn()
+            .prepare_cached(
+                "SELECT 1 FROM anchor_access a JOIN multihashes o ON o.id = a.owner JOIN multihashes n ON n.id = a.anchor
+                 JOIN multihashes u ON u.id = a.user
+                 WHERE o.multihash = ?1 AND n.multihash = ?2 AND u.multihash = acting_user() AND a.command = 'read'",
+            )?
+            .exists(params![owner.multihash().to_bytes(), of.multihash().to_bytes()])?)
+    }
+
+    /// Whether a key the user authorized signed a claim.
+    pub fn signed_by_user(&self, claim: &Link, user: &Link) -> Result<bool> {
+        Ok(self.db.conn()
+            .prepare_cached(
+                "SELECT 1 FROM multihashes m JOIN claim_targets st ON st.target = m.id JOIN sign_claims sg ON sg.id = st.claim
+                 JOIN authorized au ON au.key = sg.by JOIN multihashes u ON u.id = au.user
+                 WHERE m.multihash = ?1 AND u.multihash = ?2",
+            )?
+            .exists(params![claim.multihash().to_bytes(), user.multihash().to_bytes()])?)
+    }
+
+    /// Note a view of an anchor linked to here (see `claim::view`), so what
+    /// links to it reaches what it is.
+    pub fn note_view(&self, view: &Link) -> Result<()> {
+        let Some((anchor, owner)) = crate::claim::viewed(view) else {
+            return Ok(());
+        };
+        self.db.conn()
+            .prepare_cached("INSERT OR IGNORE INTO anchor_views (view, anchor, owner) VALUES (?1, ?2, ?3)")?
+            .execute(params![self.db.intern(view.multihash())?, self.db.intern(anchor.multihash())?, self.db.intern(owner.multihash())?])?;
+        Ok(())
+    }
+
+    /// Put who may read and write users' views of anchors, as the grants
+    /// worked out say, in place of what was: with, for those write's been
+    /// taken from, the sets of theirs that stand, and before them.
+    pub fn set_access(&self, shares: &[crate::grants::Share]) -> Result<()> {
+        use crate::claim::covers;
+        let conn = self.db.conn();
+        conn.execute_batch("DELETE FROM anchor_access; DELETE FROM anchor_stood;")?;
+        for share in shares {
+            let (owner, anchor, user) = (self.db.intern(share.owner.multihash())?, self.db.intern(share.anchor.multihash())?, self.db.intern(share.user.multihash())?);
+            for (command, name) in [(crate::grants::READ, "read"), (crate::grants::WRITE, "write")] {
+                if share.held.iter().any(|held| covers(held, command)) {
+                    conn.prepare_cached("INSERT OR IGNORE INTO anchor_access (owner, anchor, user, command) VALUES (?1, ?2, ?3, ?4)")?
+                        .execute(params![owner, anchor, user, name])?;
+                }
+            }
+            // What stands, and every set before it
+            let mut pending: Vec<Id> = Vec::new();
+            for set in &share.stands {
+                pending.push(self.db.intern(set.multihash())?);
+            }
+            let mut seen = std::collections::HashSet::new();
+            while let Some(set) = pending.pop() {
+                if !seen.insert(set) {
+                    continue;
+                }
+                conn.prepare_cached("INSERT OR IGNORE INTO anchor_stood (owner, anchor, user, claim) VALUES (?1, ?2, ?3, ?4)")?
+                    .execute(params![owner, anchor, user, set])?;
+                let before: Vec<Id> = conn
+                    .prepare_cached("SELECT p.prev FROM claim_keys k JOIN set_prev p ON p.claim = k.claim WHERE k.key = ?1")?
+                    .query_map([set], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                pending.extend(before);
+            }
+        }
+        Ok(())
+    }
+
     /// An anchor's heads: the sets that count which no other replaces, as
     /// (set, value, at), by `at`, the value's multihash, and the set's. More than
     /// one is a fork, to be merged.
-    pub fn heads(&self, anchor: Key<'_>) -> Result<Vec<(Link, Link, u64)>> {
+    fn heads_here(&self, anchor: Key<'_>) -> Result<Vec<(Link, Link, u64)>> {
         let mut stmt = self.db.conn().prepare_cached(
             "SELECT k.multihash, a.prefix, v.multihash, a.at FROM multihashes m
              JOIN anchor_values a ON a.anchor = m.id
@@ -873,7 +1135,7 @@ impl ClaimStore {
     /// Every set of an anchor that counts, as (set, value, at, prev), by
     /// `at`, the value's multihash, and the set's: its history, as a graph,
     /// in the same order wherever it is.
-    pub fn sets(&self, anchor: Key<'_>) -> Result<Vec<super::SetOf>> {
+    fn sets_here(&self, anchor: Key<'_>) -> Result<Vec<super::SetOf>> {
         let ids: Vec<(Id, Vec<u8>)> = self.db.conn()
             .prepare_cached(&format!(
                 "SELECT c.id, k.multihash FROM multihashes m
@@ -883,8 +1145,9 @@ impl ClaimStore {
                  JOIN multihashes v ON v.id = s.value
                  JOIN claim_keys ck ON ck.claim = c.id
                  JOIN multihashes k ON k.id = ck.key
-                 WHERE m.multihash = ?1 AND {LIVE}
-                 ORDER BY s.at, v.multihash, k.multihash"
+                 WHERE m.multihash = ?1 AND {}
+                 ORDER BY s.at, v.multihash, k.multihash",
+                here("c", "s", "t"),
             ))?
             .query_map([anchor.to_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -898,16 +1161,18 @@ impl ClaimStore {
 
     /// The paths each set of an anchor that counts says it wrote, by the
     /// set's CID, for those that say any.
-    pub fn wrote(&self, anchor: Key<'_>) -> Result<Vec<(Link, Vec<u8>)>> {
+    fn wrote_here(&self, anchor: Key<'_>) -> Result<Vec<(Link, Vec<u8>)>> {
         let rows: Vec<(Vec<u8>, Vec<u8>)> = self.db.conn()
             .prepare_cached(&format!(
                 "SELECT k.multihash, w.path FROM multihashes m
                  JOIN claim_targets t ON t.target = m.id
                  JOIN claims c ON c.id = t.claim
+                 JOIN set_claims s ON s.id = c.id
                  JOIN set_wrote w ON w.claim = c.id
                  JOIN claim_keys ck ON ck.claim = c.id
                  JOIN multihashes k ON k.id = ck.key
-                 WHERE m.multihash = ?1 AND {LIVE}"
+                 WHERE m.multihash = ?1 AND {}",
+                here("c", "s", "t"),
             ))?
             .query_map([anchor.to_bytes()], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -916,7 +1181,7 @@ impl ClaimStore {
 
     /// What an anchor is now, if any set says: its latest head. Where it's
     /// forked, the catalog merges its heads.
-    pub fn value_of(&self, anchor: Key<'_>) -> Result<Option<Link>> {
+    fn value_of_here(&self, anchor: Key<'_>) -> Result<Option<Link>> {
         let row: Option<(Vec<u8>, Vec<u8>)> = self.db.conn()
             .prepare_cached(
                 "SELECT a.prefix, v.multihash FROM multihashes m
@@ -951,15 +1216,16 @@ impl ClaimStore {
     }
 
     /// Every set of an anchor that counts, as (at, value), oldest first.
-    pub fn history(&self, anchor: Key<'_>) -> Result<Vec<(u64, Link)>> {
+    fn history_here(&self, anchor: Key<'_>) -> Result<Vec<(u64, Link)>> {
         let mut stmt = self.db.conn().prepare_cached(&format!(
             "SELECT s.at, s.value_prefix, v.multihash FROM multihashes m
              JOIN claim_targets t ON t.target = m.id
              JOIN claims c ON c.id = t.claim
              JOIN set_claims s ON s.id = c.id
              JOIN multihashes v ON v.id = s.value
-             WHERE m.multihash = ?1 AND {LIVE}
-             ORDER BY s.at, v.multihash"
+             WHERE m.multihash = ?1 AND {}
+             ORDER BY s.at, v.multihash",
+            here("c", "s", "t"),
         ))?;
         let rows = stmt.query_map([anchor.to_bytes()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?)))?;
         rows.map(|row| {
@@ -1014,13 +1280,20 @@ impl ClaimStore {
                 let Some(value) = self.db.lookup(value.as_ref())? else {
                     return Ok(None);
                 };
+                let owner = match set.owner() {
+                    Some(owner) => match self.db.lookup(owner.multihash())? {
+                        Some(owner) => Some(owner),
+                        None => return Ok(None),
+                    },
+                    None => None,
+                };
                 let ids: Vec<Id> = self.db.conn()
                     .prepare_cached(
                         "SELECT c.id FROM claims c JOIN set_claims s ON s.id = c.id JOIN claim_targets t ON t.claim = c.id
                          WHERE c.claim IS NULL AND s.value = ?1 AND s.value_prefix = ?2 AND s.at = ?3 AND t.target = ?4 AND t.prefix = ?5
-                             AND s.after = ?6",
+                             AND s.after = ?6 AND s.owner IS ?7",
                     )?
-                    .query_map(params![value, value_prefix, i64::try_from(set.at()).unwrap_or(i64::MAX), target, prefix, set.prev().is_some()], |r| r.get(0))?
+                    .query_map(params![value, value_prefix, i64::try_from(set.at()).unwrap_or(i64::MAX), target, prefix, set.prev().is_some(), owner], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
                 // The same sets replaced, too
                 let mut same = None;
@@ -1168,8 +1441,9 @@ impl ClaimStore {
         }
         if let Claim::Set(set) = claim {
             let (value_prefix, value) = split(set.value())?;
-            conn.prepare_cached("INSERT INTO set_claims (id, value, value_prefix, at, after) VALUES (?1, ?2, ?3, ?4, ?5)")?
-                .execute(params![row, self.db.intern(value.as_ref())?, value_prefix, i64::try_from(set.at()).unwrap_or(i64::MAX), set.prev().is_some()])?;
+            let owner = set.owner().map(|owner| self.db.intern(owner.multihash())).transpose()?;
+            conn.prepare_cached("INSERT INTO set_claims (id, value, value_prefix, at, after, owner) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?
+                .execute(params![row, self.db.intern(value.as_ref())?, value_prefix, i64::try_from(set.at()).unwrap_or(i64::MAX), set.prev().is_some(), owner])?;
             let mut stmt = conn.prepare_cached("INSERT OR IGNORE INTO set_prev (claim, prev, prefix) VALUES (?1, ?2, ?3)")?;
             for prev in set.prev().unwrap_or_default() {
                 let (prefix, multihash) = split(prev)?;

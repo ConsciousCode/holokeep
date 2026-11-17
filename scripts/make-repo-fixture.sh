@@ -58,6 +58,12 @@ peer() { "$hk" --repo "$tmp/$1" node id; }
 HK_PASSPHRASE=fixture h node invite "$(peer other)" --account 4000000000 >/dev/null 2>&1
 HK_PASSPHRASE=fixture h node invite "$(peer third)" >/dev/null 2>&1
 root=$(h anchor root | head -1)
+# The owner lets the other account's user read and write their view of
+# the anchor, which is an anchor of its own, the owner's view of it
+founder=$(h node grant ls | head -1 | cut -f1)
+other=$(h node grant ls | awk -F'\t' '$2 == "/mesh/user" { print $1 }')
+h anchor share "$anchor" "$other" read write >/dev/null 2>&1
+viewed=$(h anchor view "$anchor" "$founder")
 
 mkdir -p "$out"
 cp -a "$repo/." "$out/"
@@ -72,6 +78,7 @@ top $top
 copied $big
 git $git
 lost $lost
+viewed $viewed
 EXPECT
 echo "made $out"
 du -sh "$out"

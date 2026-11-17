@@ -472,6 +472,11 @@ impl Node {
             None => None,
         };
         let after = cids(self.grant_evidence()?);
+        // Who may read and write whose views of anchors, for counting sets:
+        // only a mesh with grants says, so another mesh's daemon leaves it
+        if before != after && let Some((_, state)) = &self.granted {
+            self.catalog.set_access(&state.shares())?;
+        }
         let Some(machines) = self.machines() else {
             return Ok(before != after);
         };

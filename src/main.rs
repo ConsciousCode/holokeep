@@ -484,6 +484,35 @@ enum AnchorCommand {
     /// Print this account's root anchor, the top of `hk mount`, and what
     /// it is now
     Root,
+    /// Let a user of the mesh, by peer ID, read or write your view of an
+    /// anchor, or one you've been let pass on (a view, as `view` prints
+    /// it): `read`, `write`, `grant` (to pass on what they hold), or `all`.
+    /// What they set counts in your view; their own view of it is apart
+    #[cfg(feature = "net")]
+    Share {
+        anchor: Link,
+        who: String,
+        #[arg(required = true)]
+        commands: Vec<String>,
+    },
+    /// Take back what a user may do with your view of an anchor; and from
+    /// those they passed it on to, unless someone else did too. Taking
+    /// write away, what they set before still counts, and nothing after
+    #[cfg(feature = "net")]
+    Unshare {
+        anchor: Link,
+        who: String,
+        #[arg(required = true)]
+        commands: Vec<String>,
+    },
+    /// List who may read and write views of anchors, yours and those
+    /// shared with you, or one anchor's
+    #[cfg(feature = "net")]
+    Shared { anchor: Option<Link> },
+    /// Print a user's view of an anchor, by their peer ID, as an anchor of
+    /// its own: what to show or mount (`ln -s /anchors/<view>` in the
+    /// mount) to see what they've shared, or set it if they let you
+    View { anchor: Link, owner: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1323,7 +1352,6 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
 }
 
 /// A user's or machine's key, by peer ID or CID.
-#[cfg(feature = "net")]
 fn key_named(text: &str) -> anyhow::Result<Link> {
     holokeep::keys::from_peer_id(text)
         .or_else(|| text.parse::<Link>().ok().filter(holokeep::keys::is_key))
@@ -1621,6 +1649,42 @@ fn revoke_device(dir: &Path, repo: &Catalog, peer: &str, until: &[String], dry_r
     Ok(())
 }
 
+/// Give or take away what a user may do with a view of an anchor: the
+/// acting user's own, or one they may pass on. Taking write away, the
+/// user's latest sets in the view stand.
+#[cfg(feature = "net")]
+fn share(dir: Option<&PathBuf>, repo: &Catalog, anchor: &Link, who: &str, commands: &[String], give: bool) -> anyhow::Result<()> {
+    use holokeep::grants::{ANCHOR, ANCHOR_GRANT, READ, WRITE};
+    anyhow::ensure!(holokeep::claim::is_anchor(anchor), "{anchor} isn't an anchor");
+    let place = holokeep::net::mesh::Place::main(&repo_dir(dir.cloned())?);
+    let genesis = holokeep::net::daemon::members(&place)?.genesis()?.context("the mesh has no grants: `hk node grant init` first")?;
+    let commands: Vec<String> = commands
+        .iter()
+        .map(|command| match command.as_str() {
+            "read" => Ok(READ.to_owned()),
+            "write" => Ok(WRITE.to_owned()),
+            "grant" => Ok(ANCHOR_GRANT.to_owned()),
+            "all" => Ok(ANCHOR.to_owned()),
+            other if claim::is_command(other) && claim::covers(ANCHOR, other) => Ok(other.to_owned()),
+            other => Err(anyhow::anyhow!("not a command on an anchor: {other} (read, write, grant, all, or one under /anchor)")),
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let who = key_named(who)?;
+    let cid = if give {
+        repo.grant_on(&genesis, anchor, std::slice::from_ref(&who), &commands, &[], &[])?
+    } else {
+        let stands = if commands.iter().any(|command| claim::covers(command, WRITE)) {
+            let view = holokeep::claim::viewed(anchor).map_or_else(|| repo.user().ok().flatten().and_then(|me| holokeep::claim::view(anchor, &me)), |_| Some(anchor.clone()));
+            view.map(|view| repo.latest_sets_by(&view, &who)).transpose()?.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        repo.grant_on(&genesis, anchor, std::slice::from_ref(&who), &[], &commands, &stands)?
+    };
+    out!("{cid}");
+    reload(&place)
+}
+
 /// Add a file or directory, returning its root.
 fn add(importer: &Importer, path: &Path, quiet: bool, sink: &mut impl BlockSink) -> anyhow::Result<Link> {
     if path == Path::new("-") {
@@ -1858,6 +1922,30 @@ fn hold_all(dir: Option<&PathBuf>, repo: &Catalog, cids: &[Link], shallow: bool)
 fn anchor(dir: Option<&PathBuf>, mut repo: Catalog, command: AnchorCommand) -> anyhow::Result<()> {
     match command {
         AnchorCommand::New => out!("{}", repo.new_anchor()?),
+        AnchorCommand::View { anchor, owner } => {
+            let view = holokeep::claim::view(&anchor, &key_named(&owner)?).with_context(|| format!("{anchor} isn't an anchor, or is a view already"))?;
+            out!("{view}");
+        },
+        #[cfg(feature = "net")]
+        AnchorCommand::Share { anchor, who, commands } => share(dir, &repo, &anchor, &who, &commands, true)?,
+        #[cfg(feature = "net")]
+        AnchorCommand::Unshare { anchor, who, commands } => share(dir, &repo, &anchor, &who, &commands, false)?,
+        #[cfg(feature = "net")]
+        AnchorCommand::Shared { anchor } => {
+            let place = holokeep::net::mesh::Place::main(&repo_dir(dir.cloned())?);
+            let genesis = holokeep::net::daemon::members(&place)?.genesis()?.context("the mesh has no grants, so nothing's shared")?;
+            let state = repo.grant_state(&genesis)?.context("the mesh's first grant isn't here")?;
+            let me = repo.user()?;
+            let only = anchor.map(|anchor| holokeep::claim::viewed(&anchor).map_or(anchor, |(of, _)| of));
+            for share in state.shares() {
+                let mine = me.as_ref().is_some_and(|me| *me == share.owner || *me == share.user);
+                if !mine || only.as_ref().is_some_and(|only| *only != share.anchor) {
+                    continue;
+                }
+                let stands = if share.stands.is_empty() { String::new() } else { format!("\t{} sets of theirs stand", share.stands.len()) };
+                out!("{}\t{}\t{}\t{}{stands}", holokeep::keys::peer_id(&share.owner), share.anchor, holokeep::keys::peer_id(&share.user), share.held.join(" "));
+            }
+        },
         AnchorCommand::Set { anchor, cid, lazy } => {
             anyhow::ensure!(holokeep::claim::is_anchor(&anchor), "{anchor} isn't an anchor");
             if !lazy {

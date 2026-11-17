@@ -3037,6 +3037,9 @@ fn repos_earlier_builds_made_still_open() {
             assert!(repo.claims().expect("claims").kept(git.multihash()).expect("kept"), "{name}: what the refs name");
         }
 
+        if let Some(viewed) = expect.get("viewed") {
+            assert_eq!(repo.anchor_value(viewed).expect("value").as_ref(), Some(&expect["tree"]), "{name}: the owner's view of their own anchor is it");
+        }
         if let Some(lost) = expect.get("lost") {
             assert!(repo.lost_at(lost).expect("lost").is_some(), "{name}: reported lost");
             assert_eq!(repo.lost_blocks().expect("list").len(), 1, "{name}");
@@ -3328,4 +3331,81 @@ fn revoking_a_device_keeps_the_grants_it_made_before_the_cutoff() {
     take(&after);
     let state = there.grant_state(&genesis).expect("state").expect("a mesh");
     assert!(state.holds(&ezra.id(), USER) && !state.holds(&machine.id(), MACHINE));
+}
+
+/// Two users sharing a repo, one letting the other see, then set, their
+/// view of an anchor: what's set for them counts in their view, the
+/// other's own view of the anchor is apart, and taking write away keeps
+/// what stands, and nothing after.
+#[test]
+fn a_user_lets_another_read_then_write_their_view_of_an_anchor() {
+    use crate::grants::{READ, USER, WRITE};
+    let scratch = Scratch::new("anchor-shared");
+    let mut repo = Catalog::open_repo(&scratch.path().join("repo")).expect("open");
+    let root = repo.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let genesis = repo.found_grants(&root).expect("found");
+    let (owner, me) = (repo.signer().expect("signer").clone(), repo.uid());
+    let bob = me.wrapping_add(1);
+    let (bobs, bob_root) = (crate::keys::Key::generate().expect("key"), crate::keys::Key::generate().expect("key"));
+    repo.certify(&bob_root, &bobs.id()).expect("certify");
+    repo.grant(&genesis, &[bob_root.id()], &[USER.to_owned()], &[]).expect("grant");
+    let as_bob = |repo: &mut Catalog| {
+        repo.act_for(bob, bobs.clone()).expect("act");
+        repo.set_user(&bob_root.id()).expect("user");
+    };
+    let as_owner = |repo: &mut Catalog| repo.act_for(me, owner.clone()).expect("act");
+
+    let (one, two, three) = (raw(b"one"), raw(b"two"), raw(b"three"));
+    for block in [&one, &two, &three] {
+        repo.put_block(block, CidVersion::V1).expect("put");
+    }
+    let anchor = repo.new_anchor().expect("anchor");
+    repo.set_anchor(&anchor, &link(&one)).expect("set");
+    let view = crate::claim::view(&anchor, &root.id()).expect("view");
+    assert_eq!(repo.anchor_value(&view).expect("value"), Some(link(&one)), "a user's view of their own anchor is it");
+
+    as_bob(&mut repo);
+    assert_eq!(repo.anchor_value(&view).expect("value"), None, "not shared yet");
+    assert!(!repo.may_read(&view).expect("may"));
+    as_owner(&mut repo);
+    repo.grant_on(&genesis, &anchor, &[bob_root.id()], &[READ.to_owned()], &[], &[]).expect("grant");
+    as_bob(&mut repo);
+    assert_eq!(repo.anchor_value(&view).expect("value"), Some(link(&one)));
+    assert_eq!(repo.anchor_value(&anchor).expect("value"), None, "bob's own view of the anchor is apart");
+    assert!(!repo.may_write(&view).expect("may") && repo.set_anchor(&view, &link(&two)).is_err(), "read, not write");
+
+    // What a mount point of bob's to the view reaches is bob's, kept
+    let t = scratch.path().join("t");
+    std::fs::create_dir_all(&t).expect("mkdir");
+    std::os::unix::fs::symlink(format!("/anchors/{view}"), t.join("shared")).expect("symlink");
+    let top = AnyCid::V1(Importer::default().add_path(&t, &mut repo, &mut |_, _| {}).expect("import").expect("top").cid);
+    repo.keep(&top).expect("keep");
+    repo.db.conn().execute("UPDATE holdings SET since = 0", []).expect("age");
+    assert!(repo.visible(one.cid().multihash()).expect("visible"), "through the view");
+    assert!(repo.kept_under(one.cid().multihash()).expect("kept"));
+
+    as_owner(&mut repo);
+    repo.grant_on(&genesis, &anchor, &[bob_root.id()], &[WRITE.to_owned()], &[], &[]).expect("grant");
+    as_bob(&mut repo);
+    let set = repo.set_anchor(&view, &link(&two)).expect("set");
+    assert_eq!(repo.anchor_value(&view).expect("value"), Some(link(&two)));
+    assert_eq!(repo.anchor_value(&anchor).expect("value"), None, "a set for the owner's view isn't bob's own");
+    as_owner(&mut repo);
+    assert_eq!(repo.anchor_value(&anchor).expect("value"), Some(link(&two)), "bob's set counts in the owner's view");
+    assert_eq!(repo.latest_sets_by(&anchor, &bob_root.id()).expect("latest"), std::slice::from_ref(&set));
+
+    // Write taken away: bob's set stands, and nothing after
+    repo.grant_on(&genesis, &anchor, &[bob_root.id()], &[], &[WRITE.to_owned()], std::slice::from_ref(&set)).expect("grant");
+    as_bob(&mut repo);
+    assert!(repo.set_anchor(&view, &link(&three)).is_err());
+    let late = crate::claim::Set::new([anchor.clone()], link(&three), 4_000_000_000).expect("set").after(Some(vec![set])).for_view(Some(root.id()));
+    repo.put_claim(&Claim::Set(late)).expect("put");
+    assert_eq!(repo.anchor_value(&view).expect("value"), Some(link(&two)));
+    as_owner(&mut repo);
+    assert_eq!(repo.anchor_value(&anchor).expect("value"), Some(link(&two)));
+
+    // Read taken away: bob sees nothing of it
+    repo.grant_on(&genesis, &anchor, &[bob_root.id()], &[], &[READ.to_owned()], &[]).expect("grant");
+    as_bob(&mut repo);
+    assert_eq!(repo.anchor_value(&view).expect("value"), None);
 }

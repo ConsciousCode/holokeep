@@ -51,6 +51,16 @@ other side enforces anything.
   `/mesh`. Taking away undoes what was concurrent with it, the senior
   operator winning, and what's given goes with the giver's power to give
   it. Machines share grants as they connect.
+- **Grants on anchors.** A user lets others read or write their view of
+  an anchor, or pass those on (see [[Grants#Grants on anchors]]): a
+  grant on an anchor is about the view of whoever it's judged from. A
+  view is an anchor of its own, `{"anchor": <nonce>, "of": <user>}`
+  (see [[Anchors and Names#Views]]), which a reader shows and mounts as
+  any anchor, read-only unless they may write it; mount points within it
+  are to the owner's views too. A set for another's view says so, in
+  `for`; taking write away names what `stands`. This works between
+  accounts sharing a repo; a reader on a machine not hosting the owner
+  can't yet fetch what's shared (phase 3b).
 - **Local clients.** With `hk node run --shared`, the host's other users
   ask the daemon over its socket, as their own accounts.
 - **Block access tokens** are computed and checked (see
@@ -72,8 +82,8 @@ Not yet implemented, beyond what's above.
 
 ## Roles and grants
 
-Grants on the mesh are implemented (see [[Grants]]); roles, grants on
-anchors, and `stands` are not yet. Modelled on SQL's, since a SQL
+Grants on the mesh and on anchors, and `stands`, are implemented (see
+[[Grants]]); roles are not yet. Modelled on SQL's, since a SQL
 server, like a member machine, is trusted to enforce them.
 
 | SQL | Here |
@@ -81,7 +91,7 @@ server, like a member machine, is trusted to enforce them.
 | role | A user, or a named role granted to users and other roles. |
 | superuser, `CREATEROLE` | Mesh commands: `/mesh/machine`, `/mesh/user`, `/mesh/grant`. The **operator** holds `/mesh`. |
 | database owner | The user whose first grant made the mesh: the first operator. |
-| table owner | The user who made an anchor, with `/anchor` on it. |
+| table owner | Every user, of their own view of every anchor, with `/anchor` on it. |
 | `SELECT` | `/anchor/read`: see what an anchor's value reaches. |
 | `INSERT`, `UPDATE` | `/anchor/write`: sets on an anchor count for its owner too. |
 | `WITH GRANT OPTION` | `/anchor/grant`, `/mesh/grant`: pass on what one has. |
@@ -101,9 +111,14 @@ server, like a member machine, is trusted to enforce them.
   do, so one user's stolen device can't admit a machine that would then
   hold everyone's data. (Implemented; a mesh without grants still merges
   any member's roster into every other's.)
-- **Writers share an anchor** as devices of one user do now: each name is
-  a multi-value register, and concurrent writes show as conflicts (see
-  [[Anchors and Names#Conflicts]]).
+- **Writers share an anchor** as devices of one user do: each name is a
+  multi-value register, and concurrent writes show as conflicts (see
+  [[Anchors and Names#Conflicts]]). (Implemented.)
+- **Permissions are of the owner's view.** What's granted on an anchor
+  isn't a permission on the anchor everywhere, but the owner's: "I'll
+  take your sets on this as mine". So an anchor imported from another
+  user, or one with a well-known nonce, is still each user's own.
+  (Implemented.)
 
 ### Commands
 
@@ -121,9 +136,9 @@ aren't yet.
 | `/mesh/machine` | the mesh | Being a machine of the mesh. |
 | `/mesh/user` | the mesh | Being a user of the mesh. |
 | `/mesh/grant` | the mesh | Giving and taking away mesh commands one holds. |
-| `/anchor/read` | an anchor | Seeing what its value reaches. |
-| `/anchor/write` | an anchor | Sets on it, which count for its owner. |
-| `/anchor/grant` | an anchor | Granting commands one holds on it. |
+| `/anchor/read` | a view of an anchor | Seeing what its value reaches. |
+| `/anchor/write` | a view of an anchor | Sets for its owner's view, which count there. |
+| `/anchor/grant` | a view of an anchor | Granting commands one holds on it. |
 | `/role/member` | a role | Holding whatever the role holds. |
 
 ### The `grant` claim
@@ -246,15 +261,18 @@ Not yet implemented, beyond protected meshes.
    and a roster of grants. Done, but for devices apart from machines and
    named roles.
 3. Grants on anchors, `/anchor/read` and `/anchor/write`, and taking
-   them away.
+   them away. Done between accounts sharing a repo (3a); serving what's
+   shared to readers on machines that don't host the owner is next (3b).
 4. Remote clients.
 5. Capabilities for sharing outside the mesh.
 
 ## Open questions
 
-- How a grant's `del` of `/anchor/write` names `stands` when the grantee
-  wrote on several branches, and what happens to a set made after one of
-  `stands` concurrently with another.
+- Whether giving write back should leave out the sets made while it was
+  taken away, which needs sets to say what they'd seen of the grants.
+- Whether to make every user's root anchor one well-known anchor, each
+  user's being their view of it, so applications can name "the root"
+  without knowing whose (see `IDEAS.md`).
 - The format of a mesh's setting for machines users add themselves.
 - How grants are fetched and checked by a machine joining late: the whole
   history, as now, or a snapshot of the state with its heads, once there

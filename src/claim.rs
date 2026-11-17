@@ -94,6 +94,9 @@ pub struct Set {
     /// when a conflict's resolved to its latest version: names joined by
     /// `/`, sorted and distinct.
     wrote: Vec<Vec<u8>>,
+    /// The user whose view of the anchors it's for, if not its signer's
+    /// own: it counts there if they've given its signer `/anchor/write`.
+    for_: Option<Link>,
 }
 
 /// "`by` vouches for the targets, claims, as of `at`": `sig` is the key's
@@ -237,8 +240,19 @@ impl Set {
     /// A set of the anchors, if there are any.
     pub fn new(target: impl IntoIterator<Item = Link>, value: Link, at: u64) -> Option<Self> {
         let target = set(target);
-        (!target.is_empty()).then_some(Self { target, value, at, prev: None, wrote: Vec::new() })
+        (!target.is_empty()).then_some(Self { target, value, at, prev: None, wrote: Vec::new(), for_: None })
     }
+
+    /// The same set, for this user's view of its anchors, or with none,
+    /// its signer's own.
+    #[must_use]
+    pub fn for_view(mut self, owner: Option<Link>) -> Self {
+        self.for_ = owner;
+        self
+    }
+
+    /// Whose view of its anchors it's for, if not its signer's own.
+    pub const fn owner(&self) -> Option<&Link> { self.for_.as_ref() }
 
     /// The same set, replacing the sets `prev`, empty for none, or, if
     /// none, every set before it, as an older build's.
@@ -471,6 +485,9 @@ impl Claim {
                 if !set.wrote.is_empty() {
                     map.insert("wrote".to_owned(), Ipld::List(set.wrote.iter().cloned().map(Ipld::Bytes).collect()));
                 }
+                if let Some(owner) = &set.for_ {
+                    map.insert("for".to_owned(), Ipld::Link(owner.clone()));
+                }
                 ("set", map)
             },
             Self::Tomb(_) => ("tomb", BTreeMap::new()),
@@ -586,7 +603,12 @@ impl Claim {
                     Some(_) => return None,
                     None => Vec::new(),
                 };
-                Self::Set(Set::new(target.clone(), value, u64::try_from(at).ok()?)?.after(prev).wrote(wrote))
+                let owner = match map.remove("for") {
+                    Some(Ipld::Link(owner)) => Some(owner),
+                    Some(_) => return None,
+                    None => None,
+                };
+                Self::Set(Set::new(target.clone(), value, u64::try_from(at).ok()?)?.after(prev).wrote(wrote).for_view(owner))
             },
             "tomb" => Self::Tomb(Tomb::new(target.clone())?),
             "lost" => {
@@ -676,12 +698,49 @@ fn anchor_of(nonce: [u8; 16]) -> std::io::Result<Link> {
         .ok_or_else(|| std::io::Error::other("an anchor too large to be an identity"))
 }
 
-/// Whether a CID is an anchor.
+/// Whether a CID is an anchor, or a user's view of one (see `view`).
 pub fn is_anchor(cid: &Link) -> bool {
-    if cid.codec() != DAG_CBOR_CODEC || cid.hashcode() != IDENTITY {
-        return false;
+    parse_anchor(cid).is_some()
+}
+
+/// An anchor's nonce, and whose view of it the CID is, if it's a view.
+fn parse_anchor(cid: &Link) -> Option<([u8; 16], Option<Link>)> {
+    (cid.codec() == DAG_CBOR_CODEC && cid.hashcode() == IDENTITY).then_some(())?;
+    let Ok(Ipld::Map(mut map)) = dagcbor::from_slice(cid.digest_ref()) else {
+        return None;
+    };
+    let Some(Ipld::Bytes(nonce)) = map.remove("anchor") else {
+        return None;
+    };
+    let nonce: [u8; 16] = nonce.try_into().ok()?;
+    match (map.remove("of"), map.is_empty()) {
+        (None, true) => Some((nonce, None)),
+        (Some(Ipld::Link(owner)), true) if owner.codec() == 0x72 => Some((nonce, Some(owner))),
+        _ => None,
     }
-    matches!(dagcbor::from_slice(cid.digest_ref()), Ok(Ipld::Map(map)) if map.len() == 1 && matches!(map.get("anchor"), Some(Ipld::Bytes(nonce)) if nonce.len() == 16))
+}
+
+/// A user's view of an anchor, as a CID of its own, an anchor too.
+///
+/// It's the identity CID of `{"anchor": <its nonce>, "of": <user>}`. What
+/// it is is what counts in their view of the anchor, which whoever they've
+/// given `/anchor/read` may see, and whoever they've given `/anchor/write`
+/// may set. None if the anchor's already a view, or isn't an anchor.
+pub fn view(anchor: &Link, owner: &Link) -> Option<Link> {
+    let (nonce, None) = parse_anchor(anchor)? else {
+        return None;
+    };
+    let value = Ipld::Map(BTreeMap::from([("anchor".to_owned(), Ipld::Bytes(nonce.to_vec())), ("of".to_owned(), Ipld::Link(owner.clone()))]));
+    let data = dagcbor::to_vec(&value).ok()?;
+    Block::identity(DAG_CBOR_CODEC, data.into()).map(|block| AnyCid::V1(block.cid().clone()))
+}
+
+/// The anchor a view is of, and whose view it is, if the CID is a view.
+pub fn viewed(cid: &Link) -> Option<(Link, Link)> {
+    let (nonce, Some(owner)) = parse_anchor(cid)? else {
+        return None;
+    };
+    Some((anchor_of(nonce).ok()?, owner))
 }
 
 /// The anchor a symlink's target is, if it's `/anchors/<anchor>`: one
@@ -900,6 +959,29 @@ mod tests {
         assert_eq!(dissolved(&set.cid()), Some(set.clone()));
         assert_eq!(Claim::parse(set.block().data()), Some(set));
         assert!(Set::new([], cid(b"v"), 0).is_none());
+    }
+
+    #[test]
+    fn a_set_for_another_users_view_says_so() {
+        let anchor = super::anchor().expect("anchor");
+        let owner = crate::keys::Key::generate().expect("key").id();
+        let set = Claim::Set(Set::new([anchor.clone()], cid(b"v"), 1).expect("set").after(Some(Vec::new())).for_view(Some(owner.clone())));
+        let Claim::Set(parsed) = Claim::parse(set.block().data()).expect("parses") else { panic!("a set") };
+        assert_eq!(parsed.owner(), Some(&owner));
+        assert_ne!(set.cid(), Claim::Set(Set::new([anchor], cid(b"v"), 1).expect("set").after(Some(Vec::new()))).cid());
+    }
+
+    #[test]
+    fn a_view_of_an_anchor_is_an_anchor_naming_both() {
+        let anchor = super::anchor().expect("anchor");
+        let owner = crate::keys::Key::generate().expect("key").id();
+        let view = super::view(&anchor, &owner).expect("a view");
+        assert!(super::is_anchor(&view) && view != anchor);
+        assert_eq!(super::viewed(&view), Some((anchor.clone(), owner.clone())));
+        assert_eq!(super::viewed(&anchor), None);
+        assert_eq!(super::view(&view, &owner), None, "not a view of a view");
+        assert_eq!(super::view(&anchor, &owner), Some(view), "the same every time");
+        assert!(super::view(&cid(b"x"), &owner).is_none());
     }
 
     #[test]

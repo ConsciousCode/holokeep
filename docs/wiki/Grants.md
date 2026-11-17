@@ -1,7 +1,9 @@
 What users and machines may do in a [[Mesh|mesh]]: grants, a history of
 claims giving and taking away commands. Once a mesh has grants, its
 machines are those given `/mesh/machine`, and its users those given
-`/mesh/user`. Why, and what's planned beyond this, is on [[Sharing]].
+`/mesh/user`; and a user may let others read or write their view of an
+anchor (see [[#Grants on anchors]]). Why, and what's planned beyond
+this, is on [[Sharing]].
 
 ## Commands
 
@@ -17,6 +19,10 @@ them. A command **covers** itself and the longer ones under it:
 | `/mesh/grant` | To give and take away the mesh commands it holds. |
 | `/mesh` | All of these: an **operator**. |
 | `/` | Everything: the founder. |
+| `/anchor/read` | On a user's view of an anchor: to see it, and what it reaches. |
+| `/anchor/write` | On a user's view of an anchor: sets on it for them count there. |
+| `/anchor/grant` | On a user's view of an anchor: to give and take away the commands on it one holds. |
+| `/anchor` | All of these: a user holds it on their own view of every anchor. |
 
 A machine is one given `/mesh/machine` itself; an operator holding it
 by `/mesh` isn't taken for a machine.
@@ -31,10 +37,10 @@ the user making it: its root key, or a device it certified (see
 |---|---|---|
 | `claim` | `"grant"` | |
 | `target` | `[Link]` | Who it's for: users' root keys, machines' keys. |
-| `on` | `Link` | An anchor or role it's about; omitted for the mesh. Grants with `on` are kept, but not yet worked out. |
+| `on` | `Link` | An anchor it's about (see [[#Grants on anchors]]), or a role (planned, kept but not worked out); omitted for the mesh. |
 | `add` | `[string]` | Commands given, sorted and distinct; omitted when empty. |
 | `del` | `[string]` | Commands taken away, sorted and distinct; omitted when empty. |
-| `stands` | `[Link]` | Only with a `del` covering `/anchor/write`: the targets' last sets on `on` that count. Not yet worked out. |
+| `stands` | `[Link]` | Only with a `del` covering `/anchor/write`: the targets' latest sets on `on` that still count (see [[#Taking write away]]). |
 | `prev` | `[Link]` | The grants its signer had seen last, sorted by CID bytes; empty for the first. |
 
 At least one of `add` and `del`, and nothing in one overlapping
@@ -97,6 +103,63 @@ A device's revocation is the boundary for what it signed, not a time:
 grants it signed up to the sign trusted are signed again and count,
 those after don't (see [[Keys and Users#Revocation]]).
 
+## Grants on anchors
+
+Every user holds `/anchor` on **their own view** of every anchor: what
+the sets that count for them say it is. A grant `on` an anchor is about
+the view of whoever it's judged from, not anything of the anchor's
+everywhere: "I'll take your sets on this as mine". So grants on anchors
+are worked out separately for each user who signed one on that anchor,
+as the **owner** of a view, by the rules above, with the owner in the
+founder's place, `/anchor/grant` in `/mesh/grant`'s, and being a user
+still a matter for the mesh: the signer must hold `/mesh/user` in the
+mesh's state at the grant's `prev` (and with what's taken away
+concurrently heeded), and a giver must hold it still for what they gave
+to be held. A mesh's operators and founder hold nothing on a user's
+view, and no one does once the owner isn't a user.
+
+If B holds `/anchor/grant` on U's view of A and passes `/anchor/read` to
+C, that grant is judged in U's view (where B may give it), and in B's
+own (where B holds everything). Taking B's `/anchor/grant` away in U's
+view takes C's read there too, not in B's.
+
+### Views
+
+A user's view of an anchor is named by a CID of its own, an anchor
+too (see [[Anchors and Names#Views]]): the identity CID of
+`{"anchor": <its nonce>, "of": <user>}`. What a catalog shows of a view
+is what counts in that user's view of the anchor, if the acting user
+may read it (it's theirs, or they hold `/anchor/read`), and nothing
+otherwise.
+
+A set counts in owner O's view of anchor A if:
+
+- it's for its signer's own view (no `for`), and O signed it; or
+- it's for O's view (`for: O`; see [[Claims]]), and O, a user O has
+  given `/anchor/write` on A, or one whose set stands (below) signed it;
+- and no tomb O signed retracts it.
+
+So the owner and every writer who may read see the same history, and
+concurrent writes merge and conflict as one user's devices' do (see
+[[Anchors and Names#Forks and merges]]). A writer's own view of the
+anchor is apart: a set for O's view doesn't count in theirs.
+
+A reader sees the blocks the view reaches, whatever it is and was, and
+what that mounts, as though they were their own (see [[Keys and
+Users#Accounts]]), without a keep of their own.
+
+### Taking write away
+
+Sets don't name the grants their signer had seen, or a writer whose
+write was taken away could claim to have seen an old state forever.
+Instead, a grant taking `/anchor/write` away names, in `stands`, the
+writer's latest sets in the view that still count: `hk anchor unshare`
+names those that none of theirs came after, one for each branch they
+wrote on. A set of theirs that's one of those, or before one by `prev`,
+still counts; any other doesn't, though it stays in history. Giving
+write back makes all of theirs count again, the ones in between too,
+since sets don't say when they were made.
+
 ## Using them
 
 - The first invite of the main mesh's owner (see [[Mesh#Joining]]) makes
@@ -117,6 +180,17 @@ those after don't (see [[Keys and Users#Revocation]]).
   longer counted as holding copies. Rosters from other members are
   heeded only for machines the grants say are in.
 - `hk node forget` refuses a machine the grants say is in.
+- `hk anchor share <anchor> <who> read|write|grant|all…` gives a user
+  commands on the acting user's view of an anchor, or on another's they
+  may pass on, if `<anchor>` is a view of one; `hk anchor unshare` takes
+  them away, naming what `stands` of theirs taking write; `hk anchor
+  shared [<anchor>]` lists who holds what on views of anchors the acting
+  user owns or holds something on; `hk anchor view <anchor> <owner>`
+  prints a view's CID, to show, mount or set.
+- Who may read and write each view is worked out from the grants into
+  `anchor_access`, and the sets that stand into `anchor_stood`, when a
+  grant's made here and whenever the daemon's grants change, for the
+  SQL that counts sets.
 - An account's user who doesn't hold `/mesh/user` is served to no one:
   no machine is taken to host them.
 

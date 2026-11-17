@@ -350,6 +350,15 @@ scenario_shared() {
     ! on ezra hk dag fetch "$ours" >/dev/null 2>&1 || fail "ezra fetched one's note"
     ! on one hk block get "$theirs" >/dev/null 2>&1 || fail "one's owner reads ezra's note"
     on two hk dag fetch "$ours" >/dev/null || fail "two can't fetch one's note"
+    # One's owner lets ezra's user read their view of an anchor: the grant
+    # reaches ezra's machine, which lists it
+    local anchor ezra_user
+    anchor=$(on one hk anchor new)
+    on one hk anchor set "$anchor" "$ours" >/dev/null
+    ezra_user=$(on one hk node grant ls | awk -F'\t' '$2 == "/mesh/user" { print $1 }')
+    on one hk anchor share "$anchor" "$ezra_user" read >/dev/null || fail "one can't share an anchor with ezra's user"
+    on one hk anchor shared | grep -q "	$anchor	$ezra_user	/anchor/read$" || fail "one doesn't list the share"
+    wait_for "ezra to have the share" sh_on ezra "hk anchor shared | grep -q '$anchor'"
 }
 
 # --- Main ----------------------------------------------------------------
