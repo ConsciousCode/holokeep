@@ -2108,6 +2108,23 @@ fn opening_a_repo_puts_right_what_has_changed() {
     assert!(catalog.new_anchor().is_ok());
 }
 
+/// A repo a newer build has opened isn't made over by an older one, whose
+/// views would break the newer's reading them, if it's still running.
+#[test]
+fn a_repo_a_newer_build_opened_is_left_alone() {
+    let scratch = Scratch::new("open-newer");
+    let repo = scratch.path().join("repo");
+    drop(Catalog::open_repo(&repo).expect("open"));
+    let db = rusqlite::Connection::open(repo.join("blocks.db")).expect("db");
+    let schema = |db: &rusqlite::Connection| db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).expect("version");
+    assert_eq!(schema(&db), crate::store::SCHEMA, "it says what made it");
+    db.pragma_update(None, "user_version", crate::store::SCHEMA + 1).expect("newer");
+    let views = |db: &rusqlite::Connection| db.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0)).expect("version");
+    let before = views(&db);
+    assert!(matches!(Catalog::open_repo(&repo), Err(crate::store::Error::Newer(n)) if n == crate::store::SCHEMA + 1));
+    assert_eq!(views(&db), before, "nothing's made over");
+}
+
 //-------------//
 //-[ Volumes ]-//
 //-------------//

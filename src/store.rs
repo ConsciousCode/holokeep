@@ -109,6 +109,10 @@ pub enum Error {
     /// Data in a store which can't be right.
     #[error("invalid data in store {store}: {reason}")]
     Invalid { store: &'static str, reason: String },
+
+    /// The database was made over by a newer build, as [`SCHEMA`] says.
+    #[error("a newer hk has opened this repo, with schema {0}, and this one knows up to {SCHEMA}: use that one, or upgrade")]
+    Newer(i64),
 }
 
 impl Error {
@@ -230,6 +234,15 @@ pub trait Store: BlockIndex + BlockSource + BlockStore {
 
 /// How long a write waits for another writer, by default, before failing
 /// as busy.
+/// Which tables and views a repo's database has, as this build makes
+/// them, kept in its `user_version`.
+///
+/// Each change to them raises it. A build finding it higher won't open the database, since
+/// making it over as it knows it, its views say, would break what the newer
+/// build reads them with, where that's still running. Raise it with any
+/// change to them (and make a repo fixture, `scripts/make-repo-fixture.sh`).
+pub const SCHEMA: i64 = 1;
+
 pub const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long a big import holds the write lock before letting others have it.
@@ -283,6 +296,13 @@ impl Db {
              );",
         )?;
         conn.busy_timeout(WRITER_WAIT)?;
+        let schema: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if schema > SCHEMA {
+            return Err(Error::Newer(schema));
+        }
+        if schema < SCHEMA {
+            conn.pragma_update(None, "user_version", SCHEMA)?;
+        }
         Ok(Self(Rc::new(conn)))
     }
 
