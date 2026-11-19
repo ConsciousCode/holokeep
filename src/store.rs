@@ -241,7 +241,7 @@ pub trait Store: BlockIndex + BlockSource + BlockStore {
 /// making it over as it knows it, its views say, would break what the newer
 /// build reads them with, where that's still running. Raise it with any
 /// change to them (and make a repo fixture, `scripts/make-repo-fixture.sh`).
-pub const SCHEMA: i64 = 1;
+pub const SCHEMA: i64 = 2;
 
 pub const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -501,6 +501,9 @@ pub struct Catalog {
     /// Git commits new here, to keep what their parents have as deltas on
     /// what they have; see `git_deltas`.
     commits: std::cell::RefCell<git::Commits>,
+    /// While serving a user of the mesh this doesn't host, as a guest: who,
+    /// and the claims shared with them, by multihash (see `as_guest`).
+    guest: Option<(Link, std::collections::HashSet<Vec<u8>>)>,
 }
 
 /// Asks a running node to fetch blocks, just them, saying whether it
@@ -710,6 +713,43 @@ impl Catalog {
     /// what it puts is held for it. Nothing's signed meanwhile, the key
     /// being this account's, nor is its quota the other's; then it acts
     /// for this account again.
+    /// See as a user of the mesh this doesn't host would be let see, for a
+    /// while, as a guest: the sets of views of anchors they may read, those
+    /// made for their own views, the signatures and tombs of those, and
+    /// what the sets reach; nothing else. What they're let see is shared
+    /// with them wherever it is, so a machine hosting them may have it.
+    /// Nothing's held or signed meanwhile.
+    pub fn as_guest<R>(&mut self, user: &Link, f: impl FnOnce(&Self) -> R) -> Result<R> {
+        let claims = self.claims.clone().ok_or(Error::NoClaims)?;
+        let shared = claims.guest_claims(user)?.iter().map(Multihash::to_bytes).collect();
+        let (signer, quota) = (self.signer.take(), self.quota.take());
+        self.guest = Some((user.clone(), shared));
+        claims.act_as(Some(user));
+        let seen = f(self);
+        self.guest = None;
+        self.signer = signer;
+        self.quota = quota;
+        self.refresh_acting()?;
+        Ok(seen)
+    }
+
+    /// The claims shared with a user of the mesh, as `as_guest` sees them,
+    /// by CID.
+    pub fn guest_claims(&self, user: &Link) -> Result<Vec<Link>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let mut cids = Vec::new();
+        for key in claims.guest_claims(user)? {
+            cids.extend(self.cid_of(key.as_ref())?);
+        }
+        Ok(cids)
+    }
+
+    /// The users who share a view of an anchor with this one, either way:
+    /// whose this may read or write, or who may read or write this one's.
+    pub fn related(&self, user: &Link) -> Result<Vec<Link>> {
+        self.claims.as_ref().ok_or(Error::NoClaims)?.related(user)
+    }
+
     pub fn viewing<R>(&mut self, uid: u32, f: impl FnOnce(&Self) -> R) -> Result<R> {
         if uid == self.uid {
             return Ok(f(self));
@@ -1063,14 +1103,16 @@ impl Catalog {
     /// grants say, for counting sets: as no one may but their owners, if
     /// its grants aren't here.
     pub fn refresh_access(&self, genesis: &Link) -> Result<()> {
-        let shares = self.grant_state(genesis)?.map(|state| state.shares()).unwrap_or_default();
-        self.set_access(&shares)
+        match self.grant_state(genesis)? {
+            Some(state) => self.set_access(&state),
+            None => self.claims.as_ref().ok_or(Error::NoClaims)?.set_access(&[], &[]),
+        }
     }
 
-    /// Put who may read and write users' views of anchors, as grants worked
-    /// out say, in place of what was.
-    pub fn set_access(&self, shares: &[crate::grants::Share]) -> Result<()> {
-        self.claims.as_ref().ok_or(Error::NoClaims)?.set_access(shares)
+    /// Put who the mesh's users are, and who may read and write their views
+    /// of anchors, as grants worked out say, in place of what was.
+    pub fn set_access(&self, state: &crate::grants::State) -> Result<()> {
+        self.claims.as_ref().ok_or(Error::NoClaims)?.set_access(&state.shares(), &state.users())
     }
 
     /// Give or take away commands on a view of an anchor, as the user this
@@ -1127,9 +1169,16 @@ impl Catalog {
 
     /// Every grant here, with what makes each count elsewhere: the signs
     /// of it, and the certificates and revocations of the keys that
-    /// signed them, as (CID, bytes), for another machine of the mesh.
-    pub fn grant_blocks(&self, grants: &[Link]) -> Result<Vec<(Link, Vec<u8>)>> {
-        let pending = grants.iter().map(|cid| owned(cid.multihash())).collect::<Result<Vec<_>>>()?;
+    /// signed them, and of every key `users` certified, so what they sign
+    /// can be told to be theirs, as (CID, bytes), for another machine of
+    /// the mesh.
+    pub fn grant_blocks(&self, grants: &[Link], users: &[Link]) -> Result<Vec<(Link, Vec<u8>)>> {
+        let mut pending = grants.iter().map(|cid| owned(cid.multihash())).collect::<Result<Vec<_>>>()?;
+        if let Some(claims) = &self.claims {
+            for key in claims.certified_by(users)? {
+                pending.push(owned(key.multihash())?);
+            }
+        }
         let mut seen = std::collections::HashSet::new();
         let (precipitated, dissolved) = self.claims_following(&mut seen, pending, true)?;
         let mut blocks: Vec<(Link, Vec<u8>)> = dissolved.iter().map(|claim| (claim.cid(), claim.block().data().to_vec())).collect();
@@ -1357,7 +1406,7 @@ impl Catalog {
         if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
             return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
         }
-        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, breathing: std::cell::Cell::new(None), lost_asked: std::cell::RefCell::default(), states: std::cell::RefCell::default(), views: std::cell::RefCell::default(), fetcher: None, missed: std::cell::RefCell::default(), commits: std::cell::RefCell::default() };
+        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, breathing: std::cell::Cell::new(None), lost_asked: std::cell::RefCell::default(), states: std::cell::RefCell::default(), views: std::cell::RefCell::default(), fetcher: None, missed: std::cell::RefCell::default(), commits: std::cell::RefCell::default(), guest: None };
         for volume in volumes {
             catalog.attach(volume)?;
         }
@@ -2783,6 +2832,15 @@ impl Catalog {
         let Some(claims) = &self.claims else {
             return Ok(true);
         };
+        if let Some((guest, shared)) = &self.guest {
+            if shared.contains(&key.to_bytes()) {
+                return Ok(true);
+            }
+            if key.code() == IDENTITY || claims.has(key)? {
+                return Ok(false);
+            }
+            return self.reached_by_guest(key, guest);
+        }
         // An identity block is its CID, so it hides nothing, but a
         // dissolved claim is still someone's to tell
         if key.code() == IDENTITY {
@@ -2825,6 +2883,28 @@ impl Catalog {
                 claims::in_view("c", "s", "t", "ar.owner"),
             ))?
             .exists([key.to_bytes()])?)
+    }
+
+    /// Whether a block's here and is what a set shared with a guest
+    /// reaches, as `as_guest` says: a set of a view they may read, or one
+    /// made for their own view.
+    fn reached_by_guest(&self, key: Key<'_>, guest: &Link) -> Result<bool> {
+        if !self.has(key)? {
+            return Ok(false);
+        }
+        Ok(self.db.conn()
+            .prepare_cached(&format!(
+                "WITH RECURSIVE up (id) AS (
+                     SELECT id FROM multihashes WHERE multihash = ?1
+                     UNION SELECT l.source FROM links l JOIN up ON l.target = up.id
+                     UNION SELECT a.anchor FROM anchor_history a JOIN up ON a.value = up.id
+                 )
+                 SELECT 1 FROM up
+                 JOIN set_claims s ON s.value = up.id JOIN claims c ON c.id = s.id JOIN claim_targets t ON t.claim = c.id
+                 WHERE {} LIMIT 1",
+                claims::shared_with("c", "s", "t", "(SELECT id FROM multihashes WHERE multihash = ?2)"),
+            ))?
+            .exists(params![key.to_bytes(), guest.multihash().to_bytes()])?)
     }
 
     /// Whether a block is in any other account's repo: put here by it

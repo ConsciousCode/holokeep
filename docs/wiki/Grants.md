@@ -200,7 +200,9 @@ since sets don't say when they were made.
 connecting, and whenever its grants change, a machine sends each member
 `{mesh: CID, have: [CID]}`: the mesh's first grant, and every grant it
 has with what makes each count: the signs of it, and the certificates
-and revocations of the keys that signed them. The member answers
+and revocations of the keys that signed them, and of every key each of
+the mesh's users has certified, so any machine can tell a user's devices,
+whether or not it hosts them. The member answers
 `{blocks: [[CID, bytes]]}`: those of these it has that the asker
 doesn't. If the asker has some it doesn't, it asks back. So a
 revocation, or a signing again, travels as a new grant does. Only claims arriving under their own CIDs are

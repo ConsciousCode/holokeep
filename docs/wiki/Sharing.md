@@ -58,12 +58,13 @@ other side enforces anything.
   (see [[Anchors and Names#Views]]), which a reader shows and mounts as
   any anchor, read-only unless they may write it; mount points within it
   are to the owner's views too. A set for another's view says so, in
-  `for`; taking write away names what `stands`. This works between
-  accounts sharing a repo. Across machines it doesn't yet (phase 3b): a
-  reader on a machine not hosting the owner can't fetch what's shared,
-  and a writer's sets for the owner's view, signed by another account's
-  keys, are withheld from the owner's mesh like anything else of that
-  account's, so the owner's other machines don't hear of them.
+  `for`; taking write away names what `stands`. Across machines, a user
+  sharing a view with one a member hosts is a **guest** of it (see
+  [[Mesh#Users sharing a mesh]]): what's shared with them goes to and
+  from it, and nothing else, so a reader sees a view on a machine that
+  doesn't host its owner, and what a writer sets for it reaches all the
+  owner's machines. Every user's certificates go with the grants, so any
+  machine can tell who signed what.
 - **Local clients.** With `hk node run --shared`, the host's other users
   ask the daemon over its socket, as their own accounts.
 - **Block access tokens** are computed and checked (see
@@ -264,8 +265,8 @@ Not yet implemented, beyond protected meshes.
    and a roster of grants. Done, but for devices apart from machines and
    named roles.
 3. Grants on anchors, `/anchor/read` and `/anchor/write`, and taking
-   them away. Done between accounts sharing a repo (3a); serving what's
-   shared to readers on machines that don't host the owner is next (3b).
+   them away. Done: between accounts sharing a repo (3a), and across
+   machines, guests' (3b).
 4. Remote clients.
 5. Capabilities for sharing outside the mesh.
 

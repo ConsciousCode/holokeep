@@ -48,11 +48,31 @@ pub struct Notice {
     /// Whose structure this is, as `Want`'s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     user: Option<ByteBuf>,
+    /// Whether it's from a machine that doesn't host the user, of the
+    /// claims shared with them: all wanted that aren't here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    guest: bool,
 }
 
 super::hosts::for_user!(Notice);
 
 impl Notice {
+    /// As noticed to a machine hosting a guest.
+    #[must_use]
+    pub const fn guest(mut self) -> Self {
+        self.guest = true;
+        self
+    }
+
+    pub const fn is_guest(&self) -> bool {
+        self.guest
+    }
+
+    /// The CIDs it notices.
+    pub fn cids(&self) -> Vec<Vec<u8>> {
+        self.blocks.iter().map(|(cid, _)| cid.to_vec()).collect()
+    }
+
     pub const fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
@@ -191,6 +211,34 @@ fn held(catalog: &Catalog, key: &Multihash<Vec<u8>>) -> Result<bool> {
         };
     }
     Ok(catalog.has(key.as_ref())?)
+}
+
+/// Want what a guest's notice says that isn't here: it's what's shared with
+/// them, so there's nothing here for it to link to.
+pub fn answer_guest(catalog: &Catalog, notice: &Notice) -> Result<Wants> {
+    let mut want = Vec::new();
+    for (cid, _) in &notice.blocks {
+        if let Ok(link) = Link::decode(cid)
+            && !catalog.holds(&link)?
+        {
+            want.push(cid.clone());
+        }
+    }
+    Ok(Wants { want })
+}
+
+/// Pushes of what a guest's machine wants, of what they may see here.
+pub fn guest_pushes(catalog: &Catalog, wants: &Wants) -> Result<Vec<Push>> {
+    let mut blocks: Vec<Block> = Vec::new();
+    for cid in &wants.want {
+        if let Ok(link) = Link::decode(cid)
+            && catalog.visible(link.multihash())?
+            && let Ok(Some(block)) = catalog.get_block(&link)
+        {
+            blocks.push(block);
+        }
+    }
+    Ok(Push::batches(catalog, blocks)?.into_iter().map(Push::guest).collect())
 }
 
 /// Pushes of what a member wants, of what's here.

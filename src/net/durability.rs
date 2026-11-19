@@ -92,11 +92,28 @@ pub struct Push {
     /// Whose blocks these are, as `Want`'s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     user: Option<ByteBuf>,
+    /// Whether it's from a machine that doesn't host the user, of what's
+    /// shared with them: claims alone, which aren't copies.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    guest: bool,
 }
 
 super::hosts::for_user!(Push);
 
 impl Push {
+    /// As pushed to a machine hosting a guest: what's shared with them,
+    /// whose copies here are no concern of theirs.
+    #[must_use]
+    pub fn guest(mut self) -> Self {
+        self.copies.clear();
+        self.guest = true;
+        self
+    }
+
+    pub const fn is_guest(&self) -> bool {
+        self.guest
+    }
+
     /// Pushes of these blocks, each about a few megabytes at most, with
     /// the copies held here.
     pub fn batches(catalog: &Catalog, blocks: impl IntoIterator<Item = Block>) -> Result<Vec<Self>> {
@@ -436,6 +453,29 @@ pub fn answer_push(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, push
         kept.push((ByteBuf::from(link.multihash().to_bytes()), catalog.replicas(link.multihash())?));
     }
     Ok(Kept { kept })
+}
+
+/// Take in a push from a machine that doesn't host the account's user, of
+/// what's shared with them: claims, which count as the claims here say,
+/// and nothing else. Returns them, kept.
+pub fn answer_guest_push(catalog: &Catalog, push: Push) -> Result<(Kept, Vec<crate::claim::Claim>)> {
+    let mut kept = Vec::new();
+    let mut claims = Vec::new();
+    for (cid, data) in push.blocks {
+        let Ok(link) = Link::decode(&cid) else {
+            continue;
+        };
+        let Ok(block) = Block::verify(link.clone().into(), data.into_vec().into_boxed_slice()) else {
+            continue;
+        };
+        let Some(claim) = crate::claim::Claim::parse(block.data()) else {
+            continue;
+        };
+        catalog.put_block(&block, link.version())?;
+        kept.push((ByteBuf::from(link.multihash().to_bytes()), Vec::new()));
+        claims.push(claim);
+    }
+    Ok((Kept { kept }, claims))
 }
 
 /// What an audit did.
@@ -898,6 +938,7 @@ mod tests {
             blocks: vec![(ByteBuf::from(block.cid().to_bytes()), ByteBuf::from(block.data().to_vec()))],
             copies: Vec::new(),
             user: None,
+            guest: false,
         };
         catalog.set_quota(Some(100));
         let small = block(&[1; 60]);

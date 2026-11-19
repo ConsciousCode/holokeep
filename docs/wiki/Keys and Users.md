@@ -124,4 +124,9 @@ certified, since a lost one can't say it's lost: `hk device revoke` them.
 The `authorized` table holds what certificates and their tombs say, and is
 worked out again when a claim that might change it arrives: a certificate,
 a tomb of one, or a signature by a user's root key. A device's signature
-can't change it, so doesn't cost anything.
+can't change it, so doesn't cost anything. It's of the users with an
+account here and the main mesh's users, as its grants say (`mesh_users`),
+whose certificates go with the grants: so a machine can tell a user's
+devices whether or not it hosts them, to know who signed what's shared
+(see [[Mesh#Users sharing a mesh]]). Which keys a claim counts for is
+still only the accounts' users'.

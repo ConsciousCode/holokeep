@@ -88,11 +88,14 @@ ID:
 sig = ed25519(device, "holokeep hosts\x00" || peer ID bytes)
 ```
 
-A machine takes another to host a user only if it serves that user too,
-the signature checks, the device is certified by the user here and
-not revoked, and, if the mesh has grants, the user holds `/mesh/user`. So a machine can't claim to host a user without one of the
-user's device keys, and learns nothing from what it's told of users it
-doesn't serve.
+A machine takes another to host a user only if the signature checks, the
+device is certified by the user here and not revoked, and, if the mesh
+has grants, the user holds `/mesh/user`; it can tell for a user it
+doesn't serve as for one it does, since every user's certificates and
+revocations go with the grants (see [[Grants#Sharing grants]]). So a
+machine can't claim to host a user without one of the user's device
+keys. Of a user it doesn't serve, only what's shared with them is the
+other's (see **Guests**).
 
 **Serving.** Every request about blocks names, as `user`, the user's key
 CID whose blocks it's about. The answering machine works it out as its
@@ -106,6 +109,39 @@ and its blocks go to any member, as before there were users. A machine of
 an older build, which doesn't answer `hosts`, is taken to host the user
 of the answering daemon's own account, and its requests, which name no
 user, are for that account.
+
+**Guests.** A user hosted by a member, who shares a view of an anchor with
+another user this machine serves (one may read or write the other's, by
+[[Grants#Grants on anchors|grants on anchors]]), is a **guest** of this
+machine's: what's shared between them goes to and from the member,
+whether or not the member hosts this machine's user. That's so even
+where both users are served here, as what one user has for another is
+withheld from the other's account. A guest is served nothing else.
+
+- **What's shared with a guest:** the sets that count in views of anchors
+  they may read, and what those sets are and reach; the sets made for
+  their own views, and what those reach; tombs of sets on anchors they
+  may read; and the signs of all these.
+- **Asking as a guest.** A request naming a user this machine doesn't
+  serve, from a member hosting them, is answered with what's shared with
+  them, and no copies (`copies` empty), so a guest's machine is never
+  counted as holding a user's blocks.
+- **Noticing a guest.** Each machine notices every member of the claims
+  shared with each guest it hosts, those it's not yet noticed and been
+  answered, with `guest: true`; noticed again only once the grants change
+  or it reconnects. The member wants everything noticed that it lacks,
+  there being nothing there for it to link to, and takes only claims from
+  a push marked `guest`. Whether they count is for the claims there to
+  say, as anywhere.
+- **Fetching as a guest.** A fetch for an account asks the members
+  hosting its user first, then those hosting its guests. A set pushed by
+  a guest's machine for the view of a user served here is what that user's
+  view is, so what it's set to is fetched for them at once, from the
+  guest's machine if need be, and kept as theirs.
+
+So a reader sees a view of an anchor on a machine that doesn't host its
+owner, fetching from the owner's machines as the mount reads, and what a
+writer sets for it reaches every machine of the owner's.
 
 `hk node peers` lists, for each connected member, the accounts here whose
 users it hosts.
@@ -132,7 +168,9 @@ one copy of a block: the volume it's on, by its random label, and what
 that volume risks (see [[Replication and Retention]]).
 An **offer** is `{risks: [string], free: uint | null}`. `user?` is
 `user: CID`, the key of the user whose blocks a request is about, omitted
-by older builds (see [[#Users sharing a mesh]]).
+by older builds (see [[#Users sharing a mesh]]). `guest?` is `guest:
+true`, from a machine that doesn't host the user, of what's shared with
+them; omitted otherwise.
 
 | Protocol | Request | Response | Purpose |
 |---|---|---|---|
@@ -141,8 +179,8 @@ by older builds (see [[#Users sharing a mesh]]).
 | `/holokeep/grants/1.0.0` | `{mesh: CID, have: [CID]}` | `{blocks: [[CID, data]]}` | Share grants (see [[Grants#Sharing grants]]). |
 | `/holokeep/blocks/1.0.0` | `{want: [key], user?}` | `{blocks: [[CID, data]], missing: [key], copies: [[replica]]}` | Fetch blocks. |
 | `/holokeep/adverts/1.0.0` | `{blocks: [[key, [replica]]], user?}` | `{held: [[key, [replica]]], offer: offer \| null}` | "These may be under-replicated." |
-| `/holokeep/push/1.0.0` | `{blocks: [[CID, data]], copies: [[replica]], user?}` | `{kept: [[key, [replica]]]}` | Send copies to keep. |
-| `/holokeep/notices/1.0.0` | `{blocks: [[CID, [key]]], user?}` | `{want: [CID]}` | Notice structure and what it links to. |
+| `/holokeep/push/1.0.0` | `{blocks: [[CID, data]], copies: [[replica]], user?, guest?}` | `{kept: [[key, [replica]]]}` | Send copies to keep, or claims shared with a guest. |
+| `/holokeep/notices/1.0.0` | `{blocks: [[CID, [key]]], user?, guest?}` | `{want: [CID]}` | Notice structure and what it links to, or claims shared with a guest. |
 | `/holokeep/trim/1.0.0` | `{keys: [key], user?}` | `{held: [[key, [replica]]], refused: [key]}` | "I mean to let go of these." |
 | `/holokeep/dropped/1.0.0` | `{keys: [key]}` | `{}` | "I let go of these." |
 | `/holokeep/condemn/1.0.0` | `{blocks: [key]}` | `{kept: [key]}` | "Does a keep of yours reach these?" |

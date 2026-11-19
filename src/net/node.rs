@@ -48,7 +48,7 @@ use crate::store::BlockIndex;
 use super::mesh::{Error, Members, Result, unless_busy};
 use super::structure::{self, Cursors, Notice, Wants};
 use super::trim::{self, Ack, Dropped, Grant, Intent, Trim, Watermarks};
-use crate::cid::CidRef;
+use crate::cid::{Cid as _, CidRef};
 use crate::model::Link;
 use crate::store::{Catalog, ExternalFile};
 
@@ -258,6 +258,16 @@ pub struct Node {
     /// The mesh's first grant and its grants, worked out, once it has
     /// them: who's in it is what they say.
     granted: Option<(Link, crate::grants::State)>,
+    /// The claims shared with each guest a member hosts that it's been
+    /// noticed of and answered, by (member, guest's key CID's bytes): what's
+    /// noticed again is only what's new, until the grants change.
+    guests_noticed: HashMap<(PeerId, Vec<u8>), HashSet<Vec<u8>>>,
+    /// Notices of what's shared with guests, unanswered: to whom, for
+    /// which guest, and what they notice.
+    guest_notices: HashMap<request_response::OutboundRequestId, (PeerId, Link, Vec<Vec<u8>>)>,
+    /// Pushes of what's shared with guests, unanswered: what's kept of
+    /// them isn't a copy.
+    guest_pushes: HashSet<request_response::OutboundRequestId>,
     /// Events which happened outside `next`, for it to return first.
     ready: VecDeque<Event>,
 }
@@ -356,6 +366,9 @@ impl Node {
             changed: Vec::new(),
             condemning: HashMap::new(),
             granted: None,
+            guests_noticed: HashMap::new(),
+            guest_notices: HashMap::new(),
+            guest_pushes: HashSet::new(),
             ready: VecDeque::new(),
         };
         node.reload()?;
@@ -451,7 +464,7 @@ impl Node {
             return Ok(Vec::new());
         };
         let grants: Vec<Link> = state.grants().chain(state.waiting()).cloned().collect();
-        Ok(self.catalog.grant_blocks(&grants)?)
+        Ok(self.catalog.grant_blocks(&grants, &state.users())?)
     }
 
     /// Work out the mesh's grants afresh, if it has them, and list as
@@ -459,8 +472,14 @@ impl Node {
     /// out any other. Returns whether any grants, or anything bearing on
     /// whether they count, arrived since: a revocation, or a signing again.
     fn refresh_grants(&mut self) -> Result<bool> {
-        let cids = |blocks: Vec<(Link, Vec<u8>)>| blocks.into_iter().map(|(cid, _)| cid).collect::<Vec<_>>();
-        let before = cids(self.grant_evidence()?);
+        // The grants worked out, and what's sent of them: evidence alone
+        // may hold a grant before it's worked out, as what's about a key
+        // whose certificate goes with them
+        let cids = |node: &Self| -> Result<(Vec<Link>, Vec<Link>)> {
+            let grants = node.granted.as_ref().map(|(_, state)| state.grants().chain(state.waiting()).cloned().collect()).unwrap_or_default();
+            Ok((grants, node.grant_evidence()?.into_iter().map(|(cid, _)| cid).collect()))
+        };
+        let before = cids(self)?;
         self.granted = match self.members.genesis()? {
             Some(genesis) => {
                 let state = self.catalog.grant_state(&genesis)?;
@@ -471,11 +490,13 @@ impl Node {
             },
             None => None,
         };
-        let after = cids(self.grant_evidence()?);
+        let after = cids(self)?;
         // Who may read and write whose views of anchors, for counting sets:
         // only a mesh with grants says, so another mesh's daemon leaves it
         if before != after && let Some((_, state)) = &self.granted {
-            self.catalog.set_access(&state.shares())?;
+            self.catalog.set_access(state)?;
+            // What's shared with whom may have changed
+            self.guests_noticed.clear();
         }
         let Some(machines) = self.machines() else {
             return Ok(before != after);
@@ -526,6 +547,7 @@ impl Node {
             for peer in self.connected() {
                 self.ask_grants(peer)?;
             }
+            unless_busy(self.announce(), "noticing guests of what's shared with them")?;
         }
         Ok(())
     }
@@ -554,6 +576,94 @@ impl Node {
             },
             request_response::Event::Message { message: request_response::Message::Response { response, .. }, .. } => self.took_grants(&response)?,
             _ => {},
+        }
+        Ok(())
+    }
+
+    /// The users a member hosts who share a view of an anchor with another
+    /// user this node hosts: their guests here, and this node's users
+    /// theirs there. What's shared between them goes to and from it, as
+    /// what one user has for another is withheld from the other's account,
+    /// even where it's hosted too.
+    fn guests_of(&self, peer: &PeerId) -> Result<Vec<Link>> {
+        let (true, Some(Hosting::Users(users))) = (self.heard.contains(peer), self.hosting.get(peer)) else {
+            return Ok(Vec::new());
+        };
+        let mut related = HashSet::new();
+        for local in self.locals()? {
+            if let (Some(user), true) = (&local.user, local.rooted) {
+                related.extend(self.catalog.related(user)?.iter().map(CidRef::to_bytes));
+            }
+        }
+        Ok(users.iter().filter(|user| related.contains(*user)).filter_map(|user| Link::decode(user).ok()).collect())
+    }
+
+    /// The guest a member asks as, by the user it names, if it's one.
+    fn guest_of(&self, peer: &PeerId, user: Option<&[u8]>) -> Result<Option<Link>> {
+        let Some(user) = user else {
+            return Ok(None);
+        };
+        Ok(self.guests_of(peer)?.into_iter().find(|guest| guest.to_bytes() == user))
+    }
+
+    /// The account a member notices or pushes what's shared with its user
+    /// for, as a guest of theirs: by the user it names, if one served here
+    /// shares a view of an anchor with one the member hosts.
+    fn hosting_guest(&self, peer: &PeerId, user: Option<&[u8]>) -> Result<Option<Local>> {
+        let Some(user) = user else {
+            return Ok(None);
+        };
+        let Some(local) = self.locals()?.into_iter().find(|local| local.rooted && local.user_bytes().as_deref() == Some(user)) else {
+            return Ok(None);
+        };
+        let Some(ours) = &local.user else {
+            return Ok(None);
+        };
+        let related: HashSet<Vec<u8>> = self.catalog.related(ours)?.iter().map(CidRef::to_bytes).collect();
+        let theirs = self.guests_of(peer)?;
+        Ok(theirs.iter().any(|guest| related.contains(&guest.to_bytes())).then_some(local))
+    }
+
+    /// The connected members a fetch for an account asks: those hosting its
+    /// user, then those hosting users who share views of anchors with it,
+    /// of whom it's a guest.
+    fn fetch_peers(&self, local: &Local) -> Result<Vec<PeerId>> {
+        let mut peers = self.peers_for(local);
+        if let (Some(user), true) = (&local.user, local.rooted) {
+            let related: HashSet<Vec<u8>> = self.catalog.related(user)?.iter().map(CidRef::to_bytes).collect();
+            let mut guests = Vec::new();
+            for peer in self.connected() {
+                if !peers.contains(&peer) && self.guests_of(&peer)?.iter().any(|guest| related.contains(&guest.to_bytes())) {
+                    guests.push(peer);
+                }
+            }
+            guests.sort();
+            peers.extend(guests);
+        }
+        Ok(peers)
+    }
+
+    /// Notice a member of the claims shared with each guest of this node's
+    /// users it hosts, those it's not been noticed of.
+    fn announce_guests(&mut self, peer: PeerId) -> Result<()> {
+        for guest in self.guests_of(&peer)? {
+            let key = (peer, guest.to_bytes());
+            if self.guest_notices.values().any(|(to, of, _)| *to == peer && of == &guest) {
+                continue;
+            }
+            let noticed = self.guests_noticed.get(&key);
+            let new: Vec<Link> = self.catalog.guest_claims(&guest)?.into_iter()
+                .filter(|cid| noticed.is_none_or(|noticed| !noticed.contains(&cid.to_bytes())))
+                .collect();
+            if new.is_empty() {
+                continue;
+            }
+            let batches = self.catalog.as_guest(&guest, |catalog| structure::notices(catalog, &new))??;
+            for notice in batches {
+                let cids = notice.cids();
+                let request = self.swarm.behaviour_mut().notices.send_request(&peer, notice.for_user(Some(&key.1)).guest());
+                self.guest_notices.insert(request, (peer, guest.clone(), cids));
+            }
         }
         Ok(())
     }
@@ -615,8 +725,9 @@ impl Node {
         self.telling.insert(request, (peer, hosts));
     }
 
-    /// Take in what a member says it hosts: those of the users served here
-    /// whose devices, as certified here, signed for it.
+    /// Take in what a member says it hosts: those of the users served here,
+    /// and of the mesh's other users, whose devices, as certified here,
+    /// signed for it. Of the others, only what's shared with them is its.
     fn heard_hosts(&mut self, peer: PeerId, hosts: &Hosts) -> Result<()> {
         let locals = self.locals()?;
         let mut users = std::collections::BTreeSet::new();
@@ -624,10 +735,12 @@ impl Node {
             let Some((user, device)) = host.verify(&peer) else {
                 continue;
             };
-            let Some(local) = locals.iter().find(|local| local.user.as_ref() == Some(&user)) else {
-                continue;
+            let certified = if let Some(local) = locals.iter().find(|local| local.user.as_ref() == Some(&user)) {
+                self.catalog.viewing(local.uid, |catalog| catalog.claims().map_or(Ok(false), |claims| claims.authorized(&device)))??
+            } else {
+                let recognized = self.granted.as_ref().is_some_and(|(_, state)| state.holds(&user, crate::grants::USER));
+                recognized && self.catalog.claims().map_or(Ok(false), |claims| claims.authorizes(&user, &device))?
             };
-            let certified = self.catalog.viewing(local.uid, |catalog| catalog.claims().map_or(Ok(false), |claims| claims.authorized(&device)))??;
             if certified {
                 users.insert(user.to_bytes());
             }
@@ -706,7 +819,7 @@ impl Node {
                 self.announce_as(peer, &local)?;
             }
         }
-        Ok(())
+        self.announce_guests(peer)
     }
 
     /// The cursor a member's noticed from for an account: the catalog's
@@ -757,14 +870,29 @@ impl Node {
     fn on_notice(&mut self, event: request_response::Event<Notice, Wants>) -> Result<()> {
         match event {
             request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
-                let wants = match self.serving(&peer, request.user())? {
-                    Some(local) => self.catalog.viewing(local.uid, |catalog| structure::answer(catalog, &request))??,
-                    None => Wants::default(),
+                let wants = if request.is_guest() {
+                    match self.hosting_guest(&peer, request.user())? {
+                        Some(local) => self.catalog.viewing(local.uid, |catalog| structure::answer_guest(catalog, &request))??,
+                        None => Wants::default(),
+                    }
+                } else {
+                    match self.serving(&peer, request.user())? {
+                        Some(local) => self.catalog.viewing(local.uid, |catalog| structure::answer(catalog, &request))??,
+                        None => Wants::default(),
+                    }
                 };
                 // The noticer may be gone already
                 let _ = self.swarm.behaviour_mut().notices.send_response(channel, wants);
             },
             request_response::Event::Message { message: request_response::Message::Response { request_id, response }, .. } => {
+                if let Some((peer, guest, cids)) = self.guest_notices.remove(&request_id) {
+                    for push in self.catalog.as_guest(&guest, |catalog| structure::guest_pushes(catalog, &response))?? {
+                        let request = self.swarm.behaviour_mut().push.send_request(&peer, push.for_user(Some(&guest.to_bytes())));
+                        self.guest_pushes.insert(request);
+                    }
+                    self.guests_noticed.entry((peer, guest.to_bytes())).or_default().extend(cids);
+                    return Ok(());
+                }
                 let Some((peer, uid, cursor)) = self.notices.remove(&request_id) else {
                     return Ok(());
                 };
@@ -780,7 +908,8 @@ impl Node {
                 }
             },
             request_response::Event::OutboundFailure { request_id, .. } => {
-                // Noticed again from its cursor, later
+                // Noticed again, later
+                self.guest_notices.remove(&request_id);
                 if let Some((peer, uid, Some(_))) = self.notices.remove(&request_id) {
                     self.noticing.remove(&(peer, uid));
                 }
@@ -1354,6 +1483,15 @@ impl Node {
     fn on_push(&mut self, event: request_response::Event<Push, Kept>) -> Result<()> {
         match event {
             request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
+                if request.is_guest() {
+                    let Some(local) = self.hosting_guest(&peer, request.user())? else {
+                        let _ = self.swarm.behaviour_mut().push.send_response(channel, Kept::default());
+                        return Ok(());
+                    };
+                    let (kept, claims) = self.catalog.viewing(local.uid, |catalog| durability::answer_guest_push(catalog, request))??;
+                    let _ = self.swarm.behaviour_mut().push.send_response(channel, kept);
+                    return self.took_guest_claims(&local, &claims);
+                }
                 let kept = match self.serving(&peer, request.user())? {
                     Some(local) => self.catalog.viewing(local.uid, |catalog| durability::answer_push(catalog, &self.sightings, &peer, request, &self.marks))??,
                     None => Kept::default(),
@@ -1365,6 +1503,9 @@ impl Node {
                 // What links to what's pushed goes after it, copies or
                 // not: claims about it may have been noticed before it
                 // was there to want them for
+                if self.guest_pushes.remove(&request_id) {
+                    return Ok(());
+                }
                 let kept = response.keys();
                 let uid = self.pushed.remove(&request_id);
                 if let Some((_, audit)) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
@@ -1379,6 +1520,7 @@ impl Node {
             },
             request_response::Event::OutboundFailure { request_id, .. } => {
                 self.pushed.remove(&request_id);
+                self.guest_pushes.remove(&request_id);
                 if let Some((_, audit)) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
                     audit.push_failed(request_id);
                 }
@@ -1425,6 +1567,24 @@ impl Node {
         self.start_fetch(uid, Fetch::blocks(blocks))
     }
 
+    /// Claims a guest's machine pushed: what a set of theirs for an
+    /// account's user's own view is, is fetched, from them if need be, as
+    /// it counts in the user's view, and so is theirs to keep.
+    fn took_guest_claims(&mut self, local: &Local, claims: &[crate::claim::Claim]) -> Result<()> {
+        let Some(user) = &local.user else {
+            return Ok(());
+        };
+        for claim in claims {
+            if let crate::claim::Claim::Set(set) = claim
+                && set.owner() == Some(user)
+                && !self.catalog.has(set.value().multihash())?
+            {
+                self.fetch_for(local.uid, set.value().clone())?;
+            }
+        }
+        Ok(())
+    }
+
     fn start_fetch(&mut self, uid: u32, fetch: Fetch) -> Result<FetchId> {
         self.tell_hosts()?;
         let uid = if self.accounts().contains(&uid) { uid } else { self.catalog.uid() };
@@ -1445,7 +1605,7 @@ impl Node {
             return Ok(());
         };
         let local = self.local(uid)?;
-        let peers = self.peers_for(&local);
+        let peers = self.fetch_peers(&local)?;
         let user = local.user_bytes();
         let Some((_, fetch)) = self.fetches.get_mut(&id) else {
             return Ok(());
@@ -1484,6 +1644,7 @@ impl Node {
             for peer in self.connected() {
                 self.ask_grants(peer)?;
             }
+            unless_busy(self.announce(), "noticing guests of what's shared with them")?;
         }
         self.reload_allowed()
     }
@@ -1635,6 +1796,7 @@ impl Node {
 
     fn on_disconnected(&mut self, peer: &PeerId) {
         self.noticing.retain(|(noticed, _)| noticed != peer);
+        self.guests_noticed.retain(|(noticed, _), _| noticed != peer);
         self.hosting.remove(peer);
         self.heard.remove(peer);
         self.sightings.disconnected(peer);
@@ -1647,8 +1809,13 @@ impl Node {
         match event {
             request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
                 let Some(local) = self.serving(&peer, request.user())? else {
-                    // Another account's is as good as not here
-                    let _ = self.swarm.behaviour_mut().blocks.send_response(channel, blocks::refuse(&request));
+                    // A guest sees what's shared with them; another account's
+                    // is otherwise as good as not here
+                    let answer = match self.guest_of(&peer, request.user())? {
+                        Some(guest) => self.catalog.as_guest(&guest, |catalog| blocks::answer(catalog, &request))?.without_copies(),
+                        None => blocks::refuse(&request),
+                    };
+                    let _ = self.swarm.behaviour_mut().blocks.send_response(channel, answer);
                     return Ok(());
                 };
                 let answer = self.catalog.viewing(local.uid, |catalog| blocks::answer(catalog, &request))?;

@@ -8,9 +8,9 @@
 //! one of a user's device keys can say it hosts them. A user's blocks are
 //! served, noticed and pushed only to machines hosting the user.
 //!
-//! A machine checks what it's told only of the users it hosts itself,
-//! against their certificates here: of anyone else's, it has nothing to
-//! serve.
+//! A machine checks what it's told against the users' certificates here,
+//! which go with the grants for every user of the mesh: of a user it
+//! doesn't host, it serves only what's shared with them, as a guest's.
 //!
 //! A machine of an older build doesn't speak this, and is taken to host
 //! the user the mesh was for, as it did.

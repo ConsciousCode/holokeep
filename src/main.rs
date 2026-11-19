@@ -1403,7 +1403,7 @@ fn found_grants(place: &holokeep::net::mesh::Place, repo: &mut Catalog, root: &h
 fn grant_blocks(repo: &Catalog, genesis: &Link) -> anyhow::Result<(Link, Vec<Vec<u8>>)> {
     let state = repo.grant_state(genesis)?.context("the mesh's grants aren't here")?;
     let grants: Vec<Link> = state.grants().cloned().collect();
-    Ok((genesis.clone(), repo.grant_blocks(&grants)?.into_iter().map(|(_, data)| data).collect()))
+    Ok((genesis.clone(), repo.grant_blocks(&grants, &[])?.into_iter().map(|(_, data)| data).collect()))
 }
 
 /// What an invite gives, on a mesh with grants, or the first invite of

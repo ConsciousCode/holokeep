@@ -359,6 +359,31 @@ scenario_shared() {
     on one hk anchor share "$anchor" "$ezra_user" read >/dev/null || fail "one can't share an anchor with ezra's user"
     on one hk anchor shared | grep -q "	$anchor	$ezra_user	/anchor/read$" || fail "one doesn't list the share"
     wait_for "ezra to have the share" sh_on ezra "hk anchor shared | grep -q '$anchor'"
+    # Ezra's machine reads one's owner's view of it
+    local owner view later
+    owner=$(on one hk anchor shared | awk -F'\t' -v a="$anchor" '$2 == a { print $1; exit }')
+    view=$(on ezra hk anchor view "$anchor" "$owner")
+    wait_for "ezra to see one's view" sh_on ezra "hk anchor show '$view' | head -1 | grep -q '$ours'"
+    on ezra hk dag fetch "$ours" >/dev/null || fail "ezra can't fetch what's shared"
+    # With one cut off, two alone hosts the owner: what's set next reaches
+    # ezra from two, which doesn't host ezra's user, as a guest's
+    later=$(sh_on one 'echo "a later note of one'"'"'s" | hk add -q -')
+    on one hk anchor set "$anchor" "$later" >/dev/null
+    wait_for "two to fetch the later note" on two hk dag fetch "$later"
+    wait_for "two to have the later set" sh_on two "hk anchor show '$anchor' | head -1 | grep -q '$later'"
+    cut_off one
+    wait_for "ezra to see the later set" sh_on ezra "hk anchor show '$view' | head -1 | grep -q '$later'"
+    wait_for "ezra to fetch the later note from two" on ezra hk dag fetch "$later"
+    # Let write, by the owner's other machine: what ezra sets for the
+    # owner's view reaches two, which fetches what it is from ezra
+    on two hk anchor share "$anchor" "$ezra_user" write >/dev/null || fail "two can't let ezra's user write"
+    wait_for "ezra to have write" sh_on ezra "hk anchor shared | grep '	$anchor	$ezra_user	' | grep -q /anchor/write"
+    on ezra hk anchor set "$view" "$theirs" >/dev/null || fail "ezra can't set one's owner's view"
+    ! on ezra hk anchor show "$anchor" 2>/dev/null | head -1 | grep -q "$theirs" || fail "ezra's own view of the anchor was set"
+    wait_for "two to see ezra's set" sh_on two "hk anchor show '$anchor' | head -1 | grep -q '$theirs'"
+    wait_for "two to fetch what ezra set" on two hk block get "$theirs"
+    put_back one
+    wait_for "one to see ezra's set" sh_on one "hk anchor show '$anchor' | head -1 | grep -q '$theirs'"
 }
 
 # --- Main ----------------------------------------------------------------

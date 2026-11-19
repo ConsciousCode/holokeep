@@ -553,6 +553,17 @@ impl State {
         &self.waiting
     }
 
+    /// The mesh's users: who holds `/mesh/user`, the founder among them.
+    pub fn users(&self) -> Vec<Link> {
+        let mut users: Vec<Link> = std::iter::once(self.founder.clone())
+            .chain(self.holders().into_iter().map(|(who, _)| who))
+            .filter(|who| self.holds(who, USER))
+            .collect();
+        users.sort_by_key(crate::cid::CidRef::to_bytes);
+        users.dedup();
+        users
+    }
+
     /// Everyone given anything on the mesh, with which of the commands
     /// they were given they hold now.
     pub fn holders(&self) -> Vec<(Link, Vec<String>)> {

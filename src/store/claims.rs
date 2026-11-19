@@ -88,10 +88,11 @@ pub(super) const LIVE_OTHERS: &str = live!("u.key IS NOT (SELECT id FROM multiha
 /// certified and not revoked.
 const AUTHORIZED: &str = "
     SELECT key AS user, key FROM users
+    UNION SELECT key, key FROM mesh_users
     UNION
         SELECT rs.by, t.target FROM claims d JOIN claim_targets t ON t.claim = d.id JOIN claim_keys dk ON dk.claim = d.id
         JOIN claim_targets rt ON rt.target = dk.key JOIN sign_claims rs ON rs.id = rt.claim
-        WHERE d.kind = 'device' AND rs.by IN (SELECT key FROM users) AND NOT EXISTS (
+        WHERE d.kind = 'device' AND (rs.by IN (SELECT key FROM users) OR rs.by IN (SELECT key FROM mesh_users)) AND NOT EXISTS (
             SELECT 1 FROM claim_targets tt JOIN claims tb ON tb.id = tt.claim JOIN claim_keys tbk ON tbk.claim = tb.id
             JOIN claim_targets rt2 ON rt2.target = tbk.key JOIN sign_claims rs2 ON rs2.id = rt2.claim
             WHERE tt.target = dk.key AND tb.kind = 'tomb' AND rs2.by = rs.by
@@ -127,6 +128,18 @@ pub(super) fn in_view(c: &str, s: &str, t: &str, owner: &str) -> String {
                  JOIN claim_keys kk ON kk.claim = k.id JOIN claim_targets kt ON kt.target = kk.key
                  JOIN sign_claims ks ON ks.id = kt.claim JOIN authorized ka ON ka.key = ks.by AND ka.user = {owner}
                  WHERE tk.claim = {c}.id AND k.kind = 'tomb') END)"
+    )
+}
+
+/// Whether the set `s`, the claims row `c`, on `t.target`, is shared with
+/// the user with id `guest`: it counts in a view of the anchor they may
+/// read, or it's for their own view.
+pub(super) fn shared_with(c: &str, s: &str, t: &str, guest: &str) -> String {
+    format!(
+        "({s}.owner = {guest} OR EXISTS (
+             SELECT 1 FROM anchor_access ar WHERE ar.anchor = {t}.target AND ar.user = {guest} AND ar.command = 'read'
+             AND {counts}))",
+        counts = in_view(c, s, t, "ar.owner"),
     )
 }
 
@@ -215,6 +228,13 @@ const AUTH_TABLES: &str = "
              PRIMARY KEY (owner, anchor, user, command)
          ) WITHOUT ROWID;
          CREATE INDEX IF NOT EXISTS anchor_access_user ON anchor_access (user, anchor);
+         -- The main mesh's users, as its grants say, whether or not they've
+         -- an account here: whose devices are worked out too, so what they
+         -- sign for others' views, and others' views they're let read, can
+         -- be told to be theirs.
+         CREATE TABLE IF NOT EXISTS mesh_users (
+             key INTEGER PRIMARY KEY
+         );
          -- Sets, by multihash, that count in `owner`'s view of an anchor
          -- though `user`, who made them, may no longer write it: what a
          -- grant taking write away said stands, and before it.
@@ -561,7 +581,10 @@ impl ClaimStore {
         Ok(match claim {
             Claim::Device(_) => true,
             Claim::Sign(sign) => self.db.conn()
-                .prepare_cached("SELECT 1 FROM users u JOIN multihashes m ON m.id = u.key WHERE m.multihash = ?1")?
+                .prepare_cached(
+                    "SELECT 1 FROM multihashes m WHERE m.multihash = ?1
+                     AND (m.id IN (SELECT key FROM users) OR m.id IN (SELECT key FROM mesh_users))",
+                )?
                 .exists([sign.by().multihash().to_bytes()])?,
             Claim::Tomb(tomb) => {
                 let mut certificate = self.db.conn().prepare_cached(
@@ -725,6 +748,85 @@ impl ClaimStore {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
         rows.into_iter().map(|(prefix, multihash, ok)| Ok((link(&prefix, &multihash)?, ok))).collect()
+    }
+
+    /// The claims shared with a user, as `Catalog::as_guest` says, by
+    /// multihash: sets that count in views of anchors they may read, and
+    /// sets for their own views; tombs of sets on anchors they may read;
+    /// and the signs of all those.
+    pub fn guest_claims(&self, guest: &Link) -> Result<Vec<Multihash>> {
+        let sql = format!(
+            "WITH g (id) AS (SELECT id FROM multihashes WHERE multihash = ?1),
+             sets (key) AS (
+                 SELECT ck.key FROM set_claims s JOIN claims c ON c.id = s.id JOIN claim_targets t ON t.claim = c.id
+                 JOIN claim_keys ck ON ck.claim = c.id
+                 WHERE {shared}
+             ),
+             tombs (key) AS (
+                 SELECT kk.key FROM claims k JOIN claim_keys kk ON kk.claim = k.id JOIN claim_targets x ON x.claim = k.id
+                 JOIN claim_keys tk ON tk.key = x.target JOIN set_claims s ON s.id = tk.claim JOIN claim_targets t ON t.claim = s.id
+                 WHERE k.kind = 'tomb' AND EXISTS (
+                     SELECT 1 FROM anchor_access ar WHERE ar.anchor = t.target AND ar.user = (SELECT id FROM g) AND ar.command = 'read')
+             ),
+             claimed (key) AS (SELECT key FROM sets UNION SELECT key FROM tombs)
+             SELECT DISTINCT m.multihash FROM (
+                 SELECT key FROM claimed
+                 UNION SELECT sk.key FROM claimed JOIN claim_targets st ON st.target = claimed.key
+                     JOIN sign_claims sg ON sg.id = st.claim JOIN claim_keys sk ON sk.claim = sg.id
+             ) x JOIN multihashes m ON m.id = x.key ORDER BY m.multihash",
+            shared = shared_with("c", "s", "t", "(SELECT id FROM g)"),
+        );
+        let rows: Vec<Vec<u8>> = self.db.conn()
+            .prepare_cached(&sql)?
+            .query_map([guest.multihash().to_bytes()], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.iter().map(|multihash| decode_key(NAME, multihash)).collect()
+    }
+
+    /// The users who share a view of an anchor with this one, either way.
+    pub fn related(&self, user: &Link) -> Result<Vec<Link>> {
+        let rows: Vec<Vec<u8>> = self.db.conn()
+            .prepare_cached(
+                "WITH u (id) AS (SELECT id FROM multihashes WHERE multihash = ?1)
+                 SELECT DISTINCT m.multihash FROM (
+                     SELECT user AS who FROM anchor_access WHERE owner = (SELECT id FROM u)
+                     UNION SELECT owner FROM anchor_access WHERE user = (SELECT id FROM u)
+                 ) r JOIN multihashes m ON m.id = r.who WHERE r.who != (SELECT id FROM u) ORDER BY m.multihash",
+            )?
+            .query_map([user.multihash().to_bytes()], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter().map(|multihash| link(&KEY_PREFIX, &multihash)).collect()
+    }
+
+    /// Whether a user has authorized a key: its own, or one it certified
+    /// and hasn't revoked, if it's one of the users here or the mesh's.
+    pub fn authorizes(&self, user: &Link, key: &Link) -> Result<bool> {
+        Ok(self.db.conn()
+            .prepare_cached(
+                "SELECT 1 FROM authorized a JOIN multihashes k ON k.id = a.key JOIN multihashes u ON u.id = a.user
+                 WHERE k.multihash = ?1 AND u.multihash = ?2",
+            )?
+            .exists(params![key.multihash().to_bytes(), user.multihash().to_bytes()])?)
+    }
+
+    /// Every key these users have certified, revoked or not.
+    pub fn certified_by(&self, users: &[Link]) -> Result<Vec<Link>> {
+        let mut stmt = self.db.conn().prepare_cached(
+            "SELECT DISTINCT t.prefix, m.multihash FROM claims d
+             JOIN claim_targets t ON t.claim = d.id JOIN multihashes m ON m.id = t.target JOIN claim_keys dk ON dk.claim = d.id
+             WHERE d.kind = 'device' AND EXISTS (
+                 SELECT 1 FROM claim_targets rt JOIN sign_claims rs ON rs.id = rt.claim JOIN multihashes b ON b.id = rs.by
+                 WHERE rt.target = dk.key AND b.multihash = ?1
+             ) ORDER BY m.multihash",
+        )?;
+        let mut keys = Vec::new();
+        for user in users {
+            let rows: Vec<(Vec<u8>, Vec<u8>)> = stmt.query_map([user.multihash().to_bytes()], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            for (prefix, multihash) in rows {
+                keys.push(link(&prefix, &multihash)?);
+            }
+        }
+        Ok(keys)
     }
 
     /// The CIDs of claims, other than signs and certificates, which a key
@@ -1077,9 +1179,20 @@ impl ClaimStore {
     /// Put who may read and write users' views of anchors, as the grants
     /// worked out say, in place of what was: with, for those write's been
     /// taken from, the sets of theirs that stand, and before them.
-    pub fn set_access(&self, shares: &[crate::grants::Share]) -> Result<()> {
+    pub fn set_access(&self, shares: &[crate::grants::Share], users: &[Link]) -> Result<()> {
         use crate::claim::covers;
         let conn = self.db.conn();
+        let before: Vec<Id> = conn.prepare_cached("SELECT key FROM mesh_users ORDER BY key")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut after = users.iter().map(|user| self.db.intern(user.multihash())).collect::<Result<Vec<Id>>>()?;
+        after.sort_unstable();
+        after.dedup();
+        if before != after {
+            conn.execute_batch("DELETE FROM mesh_users")?;
+            for user in &after {
+                conn.prepare_cached("INSERT INTO mesh_users (key) VALUES (?1)")?.execute([user])?;
+            }
+            self.authorize()?;
+        }
         conn.execute_batch("DELETE FROM anchor_access; DELETE FROM anchor_stood;")?;
         for share in shares {
             let (owner, anchor, user) = (self.db.intern(share.owner.multihash())?, self.db.intern(share.anchor.multihash())?, self.db.intern(share.user.multihash())?);

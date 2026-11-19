@@ -3272,7 +3272,7 @@ fn grants_count_where_theyre_sent_with_their_certificates() {
 
     // Elsewhere, by what's sent: grants, signs, and certificates
     let grants: Vec<Link> = state.grants().cloned().collect();
-    let blocks = here.grant_blocks(&grants).expect("blocks");
+    let blocks = here.grant_blocks(&grants, &[]).expect("blocks");
     let there = Catalog::open_repo(&scratch.path().join("there")).expect("catalog");
     for (cid, data) in &blocks {
         let claim = crate::claim::Claim::parse(data).expect("a claim");
@@ -3325,7 +3325,7 @@ fn revoking_a_device_keeps_the_grants_it_made_before_the_cutoff() {
     let [(recognized, first), (admitted, _)] = made.as_slice() else { panic!("two grants made") };
     let state = here.grant_state(&genesis).expect("state").expect("a mesh");
     assert!(state.counts(recognized) && state.counts(admitted));
-    let sent = |grants: &[Link]| here.grant_blocks(grants).expect("blocks");
+    let sent = |grants: &[Link]| here.grant_blocks(grants, &[]).expect("blocks");
     let grants: Vec<Link> = state.grants().cloned().collect();
     let before = sent(&grants);
     let there = Catalog::open_repo(&scratch.path().join("there")).expect("catalog");
@@ -3348,6 +3348,40 @@ fn revoking_a_device_keeps_the_grants_it_made_before_the_cutoff() {
     take(&after);
     let state = there.grant_state(&genesis).expect("state").expect("a mesh");
     assert!(state.holds(&ezra.id(), USER) && !state.holds(&machine.id(), MACHINE));
+}
+
+/// Every user of the mesh has their devices worked out on every machine,
+/// whether it hosts them or not, by their certificates and revocations
+/// going with the grants: so what they sign for another's view can be
+/// told to be theirs anywhere.
+#[test]
+fn a_mesh_users_devices_are_known_where_they_have_no_account() {
+    use crate::grants::USER;
+    let scratch = Scratch::new("grants-devices");
+    let here = Catalog::open_repo(&scratch.path().join("here")).expect("catalog");
+    let root = here.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let genesis = here.found_grants(&root).expect("found");
+    let [ezra, phone, lost] = [(); 3].map(|()| crate::keys::Key::generate().expect("key"));
+    here.grant(&genesis, &[ezra.id()], &[USER.to_owned()], &[]).expect("grant");
+    here.certify(&ezra, &phone.id()).expect("certify");
+    here.certify(&ezra, &lost.id()).expect("certify");
+    here.revoke(&ezra, &lost.id(), None).expect("revoke");
+    let state = here.grant_state(&genesis).expect("state").expect("a mesh");
+    assert!(state.users().contains(&ezra.id()) && state.users().contains(&root.id()));
+    let grants: Vec<Link> = state.grants().cloned().collect();
+
+    let there = |name: &str, users: &[Link]| {
+        let there = Catalog::open_repo(&scratch.path().join(name)).expect("catalog");
+        for (_, data) in here.grant_blocks(&grants, users).expect("blocks") {
+            there.put_block(&Claim::parse(&data).expect("a claim").block(), CidVersion::V1).expect("put");
+        }
+        there.refresh_access(&genesis).expect("access");
+        let claims = there.claims().expect("claims");
+        claims.act_as(None);
+        (claims.authorized(&phone.id()).expect("authorized"), claims.authorized(&lost.id()).expect("authorized"))
+    };
+    assert_eq!(there("told", &state.users()), (true, false), "the phone's ezra's, the lost one revoked");
+    assert_eq!(there("untold", &[]), (false, false), "nothing says whose the phone is");
 }
 
 /// Two users sharing a repo, one letting the other see, then set, their
@@ -3425,4 +3459,53 @@ fn a_user_lets_another_read_then_write_their_view_of_an_anchor() {
     repo.grant_on(&genesis, &anchor, &[bob_root.id()], &[], &[READ.to_owned()], &[]).expect("grant");
     as_bob(&mut repo);
     assert_eq!(repo.anchor_value(&view).expect("value"), None);
+}
+
+/// A machine serving a user of the mesh it doesn't host, as a guest, lets
+/// them see what's shared with them and nothing else: the sets of a view
+/// they may read and what those reach, with the sets' signatures, and the
+/// sets made for their own views.
+#[test]
+fn a_guest_sees_only_whats_shared_with_them() {
+    use crate::grants::{READ, USER};
+    let scratch = Scratch::new("guest");
+    let mut repo = Catalog::open_repo(&scratch.path().join("repo")).expect("open");
+    let root = repo.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let genesis = repo.found_grants(&root).expect("found");
+    let ezra = crate::keys::Key::generate().expect("key");
+    repo.grant(&genesis, &[ezra.id()], &[USER.to_owned()], &[]).expect("grant");
+    repo.refresh_access(&genesis).expect("access");
+
+    let dir = scratch.path().join("shared");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("note"), b"a note to share").expect("write");
+    let shared = AnyCid::V1(Importer::default().add_path(&dir, &mut repo, &mut |_, _| {}).expect("import").expect("top").cid);
+    let note = AnyCid::V1(Importer::default().add_path(&dir.join("note"), &mut repo, &mut |_, _| {}).expect("import").expect("top").cid);
+    let (private, theirs) = (raw(b"not shared"), raw(b"for ezra"));
+    repo.put_block(&private, CidVersion::V1).expect("put");
+    repo.put_block(&theirs, CidVersion::V1).expect("put");
+    let anchor = repo.new_anchor().expect("anchor");
+    let set = repo.set_anchor(&anchor, &shared).expect("set");
+    let other = repo.new_anchor().expect("anchor");
+    let unshared = repo.set_anchor(&other, &link(&private)).expect("set");
+    // What the owner set for ezra's own view of an anchor, as if let
+    let for_ezra = crate::claim::Set::new([other], link(&theirs), 4_000_000_000).expect("set").for_view(Some(ezra.id()));
+    let for_ezra = repo.put_claim(&Claim::Set(for_ezra)).expect("put");
+
+    let sees = |repo: &mut Catalog, cid: &Link| repo.as_guest(&ezra.id(), |repo| repo.visible(cid.multihash()).expect("visible")).expect("guest");
+    assert!(!sees(&mut repo, &set), "not shared yet");
+    assert!(sees(&mut repo, &for_ezra) && sees(&mut repo, &link(&theirs)), "what's for ezra's own view");
+    repo.grant_on(&genesis, &anchor, &[ezra.id()], &[READ.to_owned()], &[], &[]).expect("grant");
+    for cid in [&set, &shared, &note] {
+        assert!(sees(&mut repo, cid), "{cid} is shared");
+    }
+    for cid in [&unshared, &link(&private)] {
+        assert!(!sees(&mut repo, cid), "{cid} isn't");
+    }
+    let listed = repo.guest_claims(&ezra.id()).expect("claims");
+    assert!(listed.contains(&set) && listed.contains(&for_ezra) && !listed.contains(&unshared));
+    let signs: Vec<&Link> = listed.iter().filter(|cid| matches!(repo.claim_at(cid.multihash()), Ok(Some(Claim::Sign(_))))).collect();
+    assert!(!signs.is_empty(), "with their signatures");
+    assert!(signs.iter().all(|sign| sees(&mut repo, sign)));
+    assert!(repo.visible(private.cid().multihash()).expect("visible"), "the owner's as before");
 }

@@ -71,6 +71,14 @@ impl Blocks {
     pub fn served(&self) -> Vec<Vec<u8>> {
         self.found.iter().filter_map(|(cid, _)| Some(Link::decode(cid).ok()?.multihash().to_bytes())).collect()
     }
+
+    /// As served to a guest: the copies held here are no concern of a
+    /// machine that doesn't host whose they are.
+    #[must_use]
+    pub fn without_copies(mut self) -> Self {
+        self.copies.clear();
+        self
+    }
 }
 
 /// Answer a want from what the catalog can read.
