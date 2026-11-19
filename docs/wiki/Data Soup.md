@@ -52,7 +52,7 @@ the holokeep repository; this wiki is the reference.
 | mesh | Machines serving one or more users, each user's blocks only on machines hosting them (private), or a vault's holders (protected). |
 | vault | An account's internal account for what it encrypts for friends to hold. |
 | machine | A mesh member, named by `node.key`; trusted by every user of the mesh. In a mesh with grants, one given `/mesh/machine`. Planned to be distinct from devices, see [[Sharing]]. |
-| grant | A claim giving or taking away commands in a mesh, after the grants before it; see [[Grants]]. |
+| grant | A claim giving or taking away commands in a mesh, or on a user's view of an anchor, after the grants before it; see [[Grants]]. |
 | command | What a grant gives, as a path from `/`: `/mesh/user`, `/mesh/machine`, `/mesh/grant`, and on a view of an anchor `/anchor/read`, `/anchor/write`, `/anchor/grant`. |
 | operator | A user holding `/mesh`; the **founder**, whose first grant names the mesh, holds `/`. |
 | client | A device acting for its user through a member machine, not a member itself (planned; local clients exist). |

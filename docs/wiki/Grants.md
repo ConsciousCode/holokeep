@@ -208,4 +208,4 @@ kept. A machine of another mesh, or without grants, answers with
 nothing; one that knows the first grant but hasn't any grants yet asks
 for them.
 
-Source: `src/claim.rs`, `src/grants.rs`, `src/store.rs`, `src/store/claims.rs`, `src/net/grants.rs`, `src/net/node.rs`, `src/net/mesh.rs`, `src/main.rs`.
+Source: `src/claim.rs`, `src/grants.rs`, `src/store.rs`, `src/store/claims.rs`, `src/net/grants.rs`, `src/net/node.rs`, `src/net/mesh.rs`, `src/main.rs`, `src/mount.rs`.

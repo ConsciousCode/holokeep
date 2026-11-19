@@ -59,8 +59,11 @@ other side enforces anything.
   any anchor, read-only unless they may write it; mount points within it
   are to the owner's views too. A set for another's view says so, in
   `for`; taking write away names what `stands`. This works between
-  accounts sharing a repo; a reader on a machine not hosting the owner
-  can't yet fetch what's shared (phase 3b).
+  accounts sharing a repo. Across machines it doesn't yet (phase 3b): a
+  reader on a machine not hosting the owner can't fetch what's shared,
+  and a writer's sets for the owner's view, signed by another account's
+  keys, are withheld from the owner's mesh like anything else of that
+  account's, so the owner's other machines don't hear of them.
 - **Local clients.** With `hk node run --shared`, the host's other users
   ask the daemon over its socket, as their own accounts.
 - **Block access tokens** are computed and checked (see
