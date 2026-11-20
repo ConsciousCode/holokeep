@@ -257,8 +257,9 @@ passing on what's shared with them through a member (see
 - **Friends** hold ciphertext in a protected mesh, as now. A paid storage
   node is the same: a member of its company's mesh, where its customers
   are users, and a friend to each customer's mesh.
-- **Capabilities.** Sharing with someone outside the mesh means giving
-  them keys, not permissions. A block access token only lets a holder
+- **Capabilities** (designed in [[Capabilities]], not yet implemented).
+  Sharing with someone outside the mesh means giving them keys, not
+  permissions. A block access token only lets a holder
   that can't read a block decide whether to hand it over; read access is
   holding the decryption key. Scoped sharing (a folder, not everything)
   needs keys derived down the tree, as Peergos's cryptree does, whereas a

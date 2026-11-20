@@ -23,6 +23,7 @@ the holokeep repository; this wiki is the reference.
 - [[Protected Meshes]]: vaults, encryption, recovery.
 - [[Grants]]: who may do what in a mesh, as a history of claims.
 - [[Sharing]]: users sharing machines and data (partly planned).
+- [[Capabilities]]: sharing by key, from ciphertext no member guards (a design, not yet implemented).
 - [[Mount]]: the FUSE filesystem and writing through it.
 - [[Rules]]: `.souprules`, what's made through the mount becomes.
 - [[Git]]: git objects as `git-raw` blocks, and importing repositories.
