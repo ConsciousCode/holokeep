@@ -92,6 +92,22 @@ impl Roster {
     }
 }
 
+/// The most a request or answer may be. An answer to a want, or a push,
+/// carries a few megabytes of blocks, and at least one however large,
+/// where libp2p's codec allows a megabyte.
+const MESSAGE: u64 = 64 << 20;
+
+/// A request and response protocol in CBOR, its messages as large as
+/// blocks need.
+pub(crate) fn exchange<Req, Resp>(protocol: StreamProtocol, config: request_response::Config) -> request_response::cbor::Behaviour<Req, Resp>
+where
+    Req: Send + Serialize + serde::de::DeserializeOwned,
+    Resp: Send + Serialize + serde::de::DeserializeOwned,
+{
+    let codec = request_response::cbor::codec::Codec::default().set_request_size_maximum(MESSAGE).set_response_size_maximum(MESSAGE);
+    request_response::Behaviour::with_codec(codec, [(protocol, ProtocolSupport::Full)], config)
+}
+
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
     allowed: allow_block_list::Behaviour<AllowedPeers>,
@@ -309,43 +325,16 @@ impl Node {
             ping: ping::Behaviour::new(ping::Config::new().with_interval(PING).with_timeout(PING)),
             mdns: mdns.into(),
             kad,
-            members: request_response::cbor::Behaviour::new([(MEMBERS, ProtocolSupport::Full)], request_response::Config::default()),
-            blocks: request_response::cbor::Behaviour::new(
-                [(blocks::PROTOCOL, ProtocolSupport::Full)],
-                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
-            ),
-            adverts: request_response::cbor::Behaviour::new(
-                [(durability::ADVERTS, ProtocolSupport::Full)],
-                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
-            ),
-            push: request_response::cbor::Behaviour::new(
-                [(durability::PUSH, ProtocolSupport::Full)],
-                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
-            ),
-            notices: request_response::cbor::Behaviour::new(
-                [(structure::PROTOCOL, ProtocolSupport::Full)],
-                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
-            ),
-            trim: request_response::cbor::Behaviour::new(
-                [(trim::PROTOCOL, ProtocolSupport::Full)],
-                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
-            ),
-            dropped: request_response::cbor::Behaviour::new(
-                [(trim::DROPPED, ProtocolSupport::Full)],
-                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
-            ),
-            condemn: request_response::cbor::Behaviour::new(
-                [(collect::PROTOCOL, ProtocolSupport::Full)],
-                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
-            ),
-            hosts: request_response::cbor::Behaviour::new(
-                [(hosts::PROTOCOL, ProtocolSupport::Full)],
-                request_response::Config::default().with_request_timeout(Duration::from_secs(20)),
-            ),
-            grants: request_response::cbor::Behaviour::new(
-                [(super::grants::PROTOCOL, ProtocolSupport::Full)],
-                request_response::Config::default().with_request_timeout(Duration::from_mins(1)),
-            ),
+            members: exchange(MEMBERS, request_response::Config::default()),
+            blocks: exchange(blocks::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
+            adverts: exchange(durability::ADVERTS, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
+            push: exchange(durability::PUSH, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
+            notices: exchange(structure::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
+            trim: exchange(trim::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
+            dropped: exchange(trim::DROPPED, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
+            condemn: exchange(collect::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
+            hosts: exchange(hosts::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_secs(20)),),
+            grants: exchange(super::grants::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
         };
         let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(IDLE);
         let swarm = Swarm::new(transport, behaviour, peer, config);

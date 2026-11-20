@@ -401,6 +401,23 @@ async fn short_blocks_are_copied_to_a_member() {
 }
 
 #[tokio::test]
+async fn whole_chunks_are_copied_and_fetched() {
+    // A megabyte apiece, as `hk add` chunks files: more than one message
+    // of libp2p's would carry
+    let (mut a, mut b, _) = Box::pin(holding()).await;
+    let chunks: Vec<Block> = (0..3u8).map(|i| raw(&vec![i; 1 << 20])).collect();
+    for chunk in &chunks {
+        a.catalog().put_block(chunk, CidVersion::V1).expect("put");
+    }
+    let id = a.audit(2).expect("audit");
+    audited(&mut [&mut a, &mut b], &[(0, id)]).await;
+    assert!(chunks.iter().all(|chunk| has(&b, chunk)));
+    let big = raw(&vec![9; 3 << 20]);
+    b.catalog().put_block(&big, CidVersion::V1).expect("put");
+    assert_eq!(fetch(&mut b, &mut a, link(&big)).await, (1, vec![]));
+}
+
+#[tokio::test]
 async fn a_copy_a_member_has_is_sighted_not_sent() {
     let (mut a, mut b, blocks) = Box::pin(holding()).await;
     let branch = blocks.get(1).expect("branch");
