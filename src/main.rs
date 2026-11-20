@@ -181,10 +181,11 @@ enum NodeCommand {
         #[arg(long, value_parser = holokeep::net::daemon::parse_size)]
         quota: Option<u64>,
         /// Let in a client instead: a device of the user, by its peer ID
-        /// (`hk node id` in its repo), which is no member, connecting to
-        /// this node alone where it listens for clients (`hk node run
-        /// --clients`), seeing and saying only what the user may. Its
-        /// ticket holds no mesh key
+        /// (`hk node id` in its repo), which is no member, connecting where
+        /// members listen for clients (`hk node run --clients`), seeing and
+        /// saying only what the user may. With grants, it's given
+        /// /mesh/client, which every member serving the user lets in;
+        /// without, this node alone. Its ticket holds no mesh key
         #[arg(long, conflicts_with_all = ["device", "protected", "quota"])]
         client: bool,
     },
@@ -1229,17 +1230,35 @@ fn invite_client(place: &holokeep::net::mesh::Place, peer: &str, account: Option
     let root = root_key(&repo, dir)?;
     repo.batch(|repo| repo.certify(&root, &device))?;
     members.add_client(&peer, uid)?;
+    // With grants, every member serving the user lets it in, as they say
     let grants = match members.genesis()? {
-        Some(genesis) => Some(grant_blocks(&Catalog::open_repo(dir)?, &genesis)?),
+        Some(genesis) => {
+            let mut owner = Catalog::open_repo(dir)?;
+            let state = owner.grant_state(&genesis)?.context("the mesh's grants aren't here")?;
+            if !state.holders().iter().any(|(who, held)| *who == device && held.iter().any(|command| command == holokeep::grants::CLIENT)) {
+                owner.batch(|owner| owner.grant(&genesis, std::slice::from_ref(&device), &[holokeep::grants::CLIENT.to_owned()], &[]))?;
+            }
+            Some(grant_blocks(&owner, &genesis)?)
+        },
         None => None,
     };
     let blocks = client_blocks(&repo)?;
     reload(place)?;
-    let listening: Vec<libp2p::Multiaddr> = daemon::ask(place, "client-listeners")?.unwrap_or_default().iter().filter_map(|addr| addr.parse().ok()).collect();
-    if listening.is_empty() {
+    // Where it may connect: this node, and others serving the user that
+    // listen for clients too
+    let mut listening: std::collections::BTreeMap<libp2p::PeerId, Vec<libp2p::Multiaddr>> = std::collections::BTreeMap::new();
+    for line in daemon::ask(place, &format!("clients-at {uid}"))?.unwrap_or_default() {
+        if let Some((member, addr)) = line.split_once('\t')
+            && let (Ok(member), Ok(addr)) = (member.parse(), addr.parse())
+        {
+            listening.entry(member).or_default().push(addr);
+        }
+    }
+    if !listening.contains_key(&me) {
         eprintln!("note: this node isn't listening for clients, so the ticket says nowhere to find it: start `hk node run --clients` and invite again");
     }
-    let members = std::collections::BTreeMap::from([(me, listening)]);
+    listening.entry(me).or_default();
+    let members = listening;
     out!("{}", mesh::Ticket { swarm_key: None, client: true, inviter: me, members, user: Some((user, blocks)), protected: false, sealed: Vec::new(), held: Vec::new(), grants }.encode());
     Ok(())
 }

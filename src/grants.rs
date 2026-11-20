@@ -49,6 +49,10 @@ use crate::model::Link;
 pub const USER: &str = "/mesh/user";
 /// Being a machine of the mesh: in its roster, holding its plaintext.
 pub const MACHINE: &str = "/mesh/machine";
+/// Being a client of the mesh: a device of one of its users that's no
+/// machine, let in by every member serving its user where it listens for
+/// clients, and counted on for nothing.
+pub const CLIENT: &str = "/mesh/client";
 /// Giving and taking away the mesh commands one holds.
 pub const GRANT: &str = "/mesh/grant";
 /// Every mesh command: an operator's.

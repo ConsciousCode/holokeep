@@ -77,7 +77,9 @@ other side enforces anything.
   keeps no repo, just its key and ticket, for a sandbox without a disk:
   each `hk` command reads, adds, keeps, tags or sets anchors through the
   member, which says what it's asked as the client's account (see
-  [[Mesh#Thin clients]]).
+  [[Mesh#Thin clients]]). In a mesh with grants a client is the mesh's,
+  given `/mesh/client`: every member serving its user lets it in, so
+  it's cut off only once they're all away.
 - **Block access tokens** are computed and checked (see
   [[Protected Meshes#Block access tokens]]), but nothing asks for them.
 
@@ -90,8 +92,6 @@ Not yet implemented, beyond what's above.
   This waits for machines to be admitted by grants of their own, since
   until then an invite certifies the joining machine as a device, and
   one ID is all it needs.
-- **Clients of several members**, so a client isn't cut off while its one
-  member is away.
 
 ## Roles and grants
 

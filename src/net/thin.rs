@@ -4,8 +4,9 @@
 //!
 //! - A thin client is a directory holding a key, its peer ID the device
 //!   key a user certified, and the ticket it joined with (`hk node join
-//!   --thin`), which says where its member listens for clients. Its member
-//!   lets it in as it does any client.
+//!   --thin`), which says where its members listen for clients: its
+//!   inviter, and others serving its user. Each command connects to
+//!   whichever answers first, which lets it in as it does any client.
 //! - It reads blocks as any client does, asking its member, which fetches
 //!   what it lacks of the user's from the user's other machines. A thin
 //!   client asks again a while, rather than waiting on a fetch of its own.
@@ -114,19 +115,21 @@ pub struct Behaviour {
     asks: request_response::cbor::Behaviour<Ask, Answer>,
 }
 
-/// A thin client, connecting to its member.
+/// A thin client, connecting to whichever of its members answers first.
 pub struct Thin {
     swarm: Swarm<Behaviour>,
+    /// The member it's connected to, once it is.
     member: PeerId,
-    addrs: Vec<Multiaddr>,
+    /// Where each member it may connect to listens for clients.
+    members: Vec<(PeerId, Vec<Multiaddr>)>,
     /// Whose blocks it reads and writes, by the user's key CID's bytes.
     user: Vec<u8>,
 }
 
 impl Thin {
-    /// A thin client over a transport, of a member listening at `addrs`,
-    /// for a user.
-    pub fn new(transport: Boxed<(PeerId, StreamMuxerBox)>, key: &Keypair, member: PeerId, addrs: Vec<Multiaddr>, user: &Link) -> Self {
+    /// A thin client over a transport, of members listening for clients
+    /// where they say, the first preferred, for a user.
+    pub fn new(transport: Boxed<(PeerId, StreamMuxerBox)>, key: &Keypair, members: Vec<(PeerId, Vec<Multiaddr>)>, user: &Link) -> Self {
         let config = || request_response::Config::default().with_request_timeout(ANSWER);
         let behaviour = Behaviour {
             ping: ping::Behaviour::default(),
@@ -135,7 +138,8 @@ impl Thin {
             asks: exchange(PROTOCOL, config()),
         };
         let swarm = Swarm::new(transport, behaviour, key.public().to_peer_id(), libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(Duration::from_mins(1)));
-        Self { swarm, member, addrs, user: user.to_bytes() }
+        let member = members.first().map_or_else(PeerId::random, |(member, _)| *member);
+        Self { swarm, member, members, user: user.to_bytes() }
     }
 
     /// The thin client a directory is, over TCP.
@@ -143,11 +147,14 @@ impl Thin {
         let ticket = Ticket::decode(&std::fs::read_to_string(dir.join(TICKET))?)?;
         let key = mesh::node_key(dir)?;
         let (user, _) = ticket.user.as_ref().ok_or_else(|| Error::Invalid("the ticket says whose device this is not".into()))?;
-        let addrs = ticket.members.get(&ticket.inviter).cloned().unwrap_or_default();
+        // Its inviter first, then whoever else serves its user
+        let mut members: Vec<(PeerId, Vec<Multiaddr>)> = ticket.members.iter().map(|(peer, addrs)| (*peer, addrs.clone())).collect();
+        members.sort_by_key(|(peer, _)| *peer != ticket.inviter);
         let base = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
-        Ok(Self::new(super::clients::client_transport(base, &key)?, &key, ticket.inviter, addrs, user))
+        Ok(Self::new(super::clients::client_transport(base, &key)?, &key, members, user))
     }
 
+    /// The member it's connected to, or will try first.
     pub const fn member(&self) -> PeerId {
         self.member
     }
@@ -156,28 +163,44 @@ impl Thin {
         *self.swarm.local_peer_id()
     }
 
-    /// Connect to the member.
+    /// Connect to a member: every one at once, keeping whichever answers
+    /// first, its inviter if they come together.
     pub async fn connect(&mut self) -> Result<()> {
         if self.swarm.is_connected(&self.member) {
             return Ok(());
         }
-        if self.addrs.is_empty() {
-            return Err(Error::Invalid(format!("the ticket says nowhere to find {}: invite this client again once it listens for clients", self.member)));
+        let mut trying = HashSet::new();
+        for (member, addrs) in self.members.iter().filter(|(_, addrs)| !addrs.is_empty()) {
+            if self.swarm.dial(DialOpts::peer_id(*member).addresses(addrs.clone()).build()).is_ok() {
+                trying.insert(*member);
+            }
         }
-        let member = self.member;
-        self.swarm.dial(DialOpts::peer_id(member).addresses(self.addrs.clone()).build()).map_err(|e| Error::Invalid(format!("dialing {member}: {e}")))?;
+        if trying.is_empty() {
+            return Err(Error::Invalid("the ticket says nowhere to find a member: invite this client again once its member listens for clients".into()));
+        }
+        let mut errors = Vec::new();
         let connected = async {
             loop {
                 match self.swarm.select_next_some().await {
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == member => return Ok(()),
-                    SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } if peer_id == member => {
-                        return Err(Error::Invalid(format!("couldn't connect to {member}: {error}")));
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } if trying.contains(&peer_id) => return Ok(peer_id),
+                    SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } if trying.remove(&peer_id) => {
+                        errors.push(format!("{peer_id}: {error}"));
+                        if trying.is_empty() {
+                            return Err(Error::Invalid(format!("couldn't connect to a member: {}", errors.join("; "))));
+                        }
                     },
                     _ => {},
                 }
             }
         };
-        tokio::time::timeout(CONNECT, connected).await.map_err(|_| Error::Invalid(format!("{member} didn't answer: is it running `hk node run --clients`?")))?
+        let member = tokio::time::timeout(CONNECT, connected).await.map_err(|_| Error::Invalid("no member answered: is one running `hk node run --clients`?".into()))??;
+        self.member = member;
+        // One connection's all it needs
+        let others: Vec<PeerId> = self.members.iter().map(|(peer, _)| *peer).filter(|peer| *peer != member).collect();
+        for peer in others {
+            let _ = self.swarm.disconnect_peer_id(peer);
+        }
+        Ok(())
     }
 
     /// Drive the swarm until `pick` takes an event, or the member's gone.

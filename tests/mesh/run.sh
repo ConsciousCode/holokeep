@@ -81,6 +81,12 @@ node_up() {
     wait_for "$name's node to run" on "$name" hk node status
 }
 
+# Stop a node's daemon, and wait till it's stopped
+node_down() {
+    sh_on "$1" 'for p in /proc/[0-9]*; do tr "\0" " " < "$p/cmdline" 2>/dev/null | grep -q "^hk node run" && kill -INT "${p#/proc/}"; done; true'
+    wait_for "$1's node to stop" sh_on "$1" '! hk node status'
+}
+
 # Mount a node's soup at /soup, and wait till it's there
 mount_up() {
     podman exec -d "$run-$1" sh -c 'exec hk mount /soup >>/tmp/mount.log 2>&1'
@@ -400,7 +406,7 @@ scenario_client() {
     node_up laptop
     wait_for "the client to connect" sh_on one "hk node peers | grep -q '^$peer	connected	client	4000000001$'"
     on laptop hk node status | grep -q "^client of	$one_peer$" || fail "the laptop doesn't say it's one's client"
-    ! on one hk node grant ls | grep -q "^$peer	" || fail "the client was given commands"
+    [ "$(on one hk node grant ls | grep "^$peer	")" = "$peer	/mesh/client" ] || fail "the client wasn't given /mesh/client, and that alone"
     [ "$(on laptop hk node peers | cut -f1)" = "$one_peer" ] || fail "the client was told of members"
     ! on two hk node peers | grep -q "$peer" || fail "two was told of the client"
     # It reads what ezra's user has, through one, and nothing else
@@ -420,8 +426,9 @@ scenario_client() {
     sh_on ezra 'echo "and ezra replies" > /soup/notes/ezra.md'
     wait_for "the laptop to read ezra's page" holds laptop /soup/notes/ezra.md "and ezra replies"
     # Forgotten, it's shut out at once
-    on one hk node forget "$peer"
-    ! on one hk node peers | grep -q "$peer" || fail "one still lists the client"
+    ! on one hk node forget "$peer" 2>/dev/null || fail "forgot a client the grants say is one"
+    on one hk node grant rm "$peer" /mesh/client >/dev/null
+    wait_for "one to stop listing the client" sh_on one "! hk node peers | grep -q '$peer'"
     wait_for "the laptop to be cut off" sh_on laptop "hk node status | grep -q '^connected	0$'"
 }
 
@@ -453,9 +460,35 @@ scenario_thin() {
     on sandbox hk anchor set "$anchor" "$mine" >/dev/null
     [ "$(on sandbox hk anchor show "$anchor" | head -1)" = "$mine" ] || fail "the sandbox's anchor isn't set"
     wait_for "ezra to see the sandbox's anchor" sh_on ezra "hk anchor show $anchor 2>/dev/null | head -1 | grep -q $mine"
-    # Forgotten, it's shut out
-    on one hk node forget "$peer"
-    ! on sandbox hk whoami >/dev/null 2>&1 || fail "the forgotten sandbox still got in"
+    # Its grant taken away, it's shut out
+    on one hk node grant rm "$peer" /mesh/client >/dev/null
+    wait_for "one to shut the sandbox out" sh_on one "! hk node peers | grep -q '$peer'"
+    ! on sandbox hk whoami >/dev/null 2>&1 || fail "the sandbox still got in"
+}
+
+# A client of the mesh, not just of one member: ezra's machine listens for
+# clients too, and a thin client invited by one reads through it while
+# one's away
+scenario_several() {
+    local peer ticket theirs
+    node_down ezra
+    node_up ezra --clients
+    wait_for "one to hear where ezra listens for clients" sh_on one "hk node status | grep -q '^members listening for clients	1$'"
+    machine roamer
+    peer=$(on roamer hk node id)
+    ticket=$(on one hk node invite "$peer" --client --account 4000000001 2>/dev/null)
+    on roamer hk node join --thin "$ticket" 2>/dev/null
+    wait_for "ezra to let the roamer in" sh_on ezra "hk node peers | grep -q '^$peer	.*client'"
+    theirs=$(sh_on ezra 'echo "read through ezra" | hk add -q -')
+    cut_off one
+    if [ "$(on roamer hk cat "$theirs" 2>&1)" != "read through ezra" ]; then
+        put_back one
+        fail "the roamer couldn't read through ezra with one away"
+    fi
+    put_back one
+    # Its grant taken away on one, ezra shuts it out too
+    on one hk node grant rm "$peer" /mesh/client >/dev/null
+    wait_for "ezra to shut the roamer out" sh_on ezra "! hk node peers | grep -q '^$peer	'"
 }
 
 # --- Main ----------------------------------------------------------------
@@ -475,7 +508,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke shared client thin)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke shared client thin several)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

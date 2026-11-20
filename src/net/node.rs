@@ -74,12 +74,28 @@ const PING: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Roster {
     members: Vec<(String, Vec<String>)>,
+    /// Where members listen for clients, as far as the sender knows:
+    /// omitted by older builds. A client's member tells it only of those
+    /// serving its user, and of no members otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    clients: Vec<(String, Vec<String>)>,
 }
 
 impl Roster {
     fn from_members(members: &BTreeMap<PeerId, Vec<Multiaddr>>) -> Self {
         let members = members.iter().map(|(peer, addrs)| (peer.to_string(), addrs.iter().map(ToString::to_string).collect()));
-        Self { members: members.collect() }
+        Self { members: members.collect(), clients: Vec::new() }
+    }
+
+    /// The same, saying too where members listen for clients.
+    fn with_clients(mut self, clients: &BTreeMap<PeerId, Vec<Multiaddr>>) -> Self {
+        self.clients = Self::from_members(clients).members;
+        self
+    }
+
+    /// Where it says members listen for clients.
+    fn to_clients(&self) -> BTreeMap<PeerId, Vec<Multiaddr>> {
+        Self { members: self.clients.clone(), clients: Vec::new() }.to_members()
     }
 
     /// The members named, skipping anything malformed: it came from a
@@ -295,7 +311,9 @@ pub struct Node {
     /// The member this node's a client of, if it's a client, and the port
     /// it listens for clients on, as last connected to.
     client_of: Option<PeerId>,
-    member_port: Option<u64>,
+    member_ports: HashMap<PeerId, u64>,
+    /// Where other members say they listen for clients.
+    client_addrs: BTreeMap<PeerId, Vec<Multiaddr>>,
     /// Events which happened outside `next`, for it to return first.
     ready: VecDeque<Event>,
 }
@@ -385,7 +403,8 @@ impl Node {
             clients: HashMap::new(),
             asked: Vec::new(),
             client_of,
-            member_port: None,
+            member_ports: HashMap::new(),
+            client_addrs: BTreeMap::new(),
             ready: VecDeque::new(),
         };
         node.reload()?;
@@ -441,19 +460,29 @@ impl Node {
             let me = self.peer_id();
             let served = self.accounts();
             let members = self.members.list()?;
-            for (peer, uid) in self.members.clients()? {
-                if peer == me || members.contains_key(&peer) || !served.contains(&uid) {
+            // With grants, they say who's a client, of whichever account's
+            // user certified it; the clients this node was told of only
+            // where they don't
+            let candidates: Vec<(PeerId, Vec<u32>)> = match self.granted_clients() {
+                Some(granted) => granted.into_iter().map(|peer| (peer, served.clone())).collect(),
+                None => self.members.clients()?.into_iter().map(|(peer, uid)| (peer, vec![uid])).collect(),
+            };
+            for (peer, uids) in candidates {
+                if peer == me || members.contains_key(&peer) {
                     continue;
                 }
-                let local = self.local(uid)?;
                 let Some(device) = crate::keys::from_peer_id(&peer.to_string()) else {
                     continue;
                 };
-                if !local.rooted || !self.recognizes(&local) {
-                    continue;
-                }
-                if self.catalog.viewing(uid, |catalog| catalog.claims().map_or(Ok(false), |claims| claims.authorized(&device)))?? {
-                    clients.insert(peer, uid);
+                for uid in uids.into_iter().filter(|uid| served.contains(uid)) {
+                    let local = self.local(uid)?;
+                    if !local.rooted || !self.recognizes(&local) {
+                        continue;
+                    }
+                    if self.catalog.viewing(uid, |catalog| catalog.claims().map_or(Ok(false), |claims| claims.authorized(&device)))?? {
+                        clients.insert(peer, uid);
+                        break;
+                    }
                 }
             }
         }
@@ -529,6 +558,53 @@ impl Node {
             .filter(|(_, held)| held.iter().any(|command| command == crate::grants::MACHINE))
             .filter_map(|(who, _)| PeerId::from_bytes(&who.multihash().to_bytes()).ok())
             .collect())
+    }
+
+    /// The clients the mesh's grants say there are, if it has grants.
+    fn granted_clients(&self) -> Option<std::collections::BTreeSet<PeerId>> {
+        let (_, state) = self.granted.as_ref()?;
+        Some(state.holders().into_iter()
+            .filter(|(_, held)| held.iter().any(|command| command == crate::grants::CLIENT))
+            .filter_map(|(who, _)| PeerId::from_bytes(&who.multihash().to_bytes()).ok())
+            .collect())
+    }
+
+    /// Where other members say they listen for clients.
+    pub const fn client_addrs(&self) -> &BTreeMap<PeerId, Vec<Multiaddr>> {
+        &self.client_addrs
+    }
+
+    /// Where the members serving an account's user listen for clients,
+    /// this one among them: where a client of it may connect.
+    pub fn client_roster(&self, uid: u32) -> Result<BTreeMap<PeerId, Vec<Multiaddr>>> {
+        let local = self.local(uid)?;
+        let mut roster: BTreeMap<PeerId, Vec<Multiaddr>> = self.client_addrs.iter()
+            .filter(|(peer, addrs)| !addrs.is_empty() && self.hosts(peer, &local))
+            .map(|(peer, addrs)| (*peer, addrs.clone()))
+            .collect();
+        if !self.client_listeners().is_empty() {
+            roster.insert(self.peer_id(), self.client_listeners());
+        }
+        Ok(roster)
+    }
+
+    /// A client's member says where members serving its user listen for
+    /// clients: connect to them too.
+    fn learn_members(&mut self, from: &PeerId, roster: &Roster) -> Result<()> {
+        if self.client_of.is_none() || !self.members.contains(from)? {
+            return Ok(());
+        }
+        let mut theirs = roster.to_clients();
+        theirs.remove(&self.peer_id());
+        theirs.retain(|_, addrs| !addrs.is_empty());
+        self.members.merge(&theirs)?;
+        for (peer, addrs) in theirs {
+            self.swarm.behaviour_mut().allowed.allow_peer(peer);
+            if !self.swarm.is_connected(&peer) {
+                self.dial(peer, addrs);
+            }
+        }
+        Ok(())
     }
 
     /// Every grant of the mesh here, and what makes each count, as sent
@@ -1047,6 +1123,9 @@ impl Node {
     /// holds up nothing now, and isn't believed to hold anything. One that's
     /// connected is plainly there. A client is no longer let in.
     pub fn forget_member(&mut self, peer: &PeerId) -> Result<()> {
+        if self.granted_clients().is_some_and(|clients| clients.contains(peer)) {
+            return Err(Error::Invalid(format!("the mesh's grants say {peer} is a client: take that away with `hk node grant rm {peer} /mesh/client`")));
+        }
         // A client's shut out at once, connected or not
         if self.members.remove_client(peer)? {
             return self.reload_clients();
@@ -1822,7 +1901,11 @@ impl Node {
     fn roster(&self) -> Result<Roster> {
         let mut members = self.members.list()?;
         members.insert(self.peer_id(), self.listeners());
-        Ok(Roster::from_members(&members))
+        let mut clients: BTreeMap<PeerId, Vec<Multiaddr>> = self.client_addrs.iter().filter(|(peer, _)| members.contains_key(*peer)).map(|(peer, addrs)| (*peer, addrs.clone())).collect();
+        if !self.client_listeners().is_empty() {
+            clients.insert(self.peer_id(), self.client_listeners());
+        }
+        Ok(Roster::from_members(&members).with_clients(&clients))
     }
 
     /// Take in another member's roster, letting in and dialing whoever's
@@ -1835,6 +1918,11 @@ impl Node {
             theirs.retain(|peer, _| machines.contains(peer));
         }
         let new = self.members.merge(&theirs)?;
+        for (peer, addrs) in roster.to_clients() {
+            if peer != self.peer_id() && self.members.contains(&peer)? {
+                self.client_addrs.insert(peer, addrs);
+            }
+        }
         self.reload()?;
         for peer in &new {
             if let Some(addrs) = theirs.get(peer).filter(|addrs| !addrs.is_empty()) {
@@ -1886,6 +1974,11 @@ impl Node {
         // A client's told of no members, and tells its member of none
         if !self.is_client(&peer) && self.client_of.is_none() {
             let roster = self.roster()?;
+            self.swarm.behaviour_mut().members.send_request(&peer, roster);
+        }
+        // A client's told where else it may connect, and of nothing more
+        if let Some(&uid) = self.clients.get(&peer) {
+            let roster = Roster::default().with_clients(&self.client_roster(uid)?);
             self.swarm.behaviour_mut().members.send_request(&peer, roster);
         }
         self.ask_grants(peer)?;
@@ -1987,7 +2080,8 @@ impl Node {
             return Ok(());
         }
         if self.client_of.is_some() {
-            for addr in addrs.iter().filter(|addr| self.member_port.is_some() && super::clients::port(addr) == self.member_port) {
+            let port = self.member_ports.get(&peer).copied();
+            for addr in addrs.iter().filter(|addr| port.is_some() && super::clients::port(addr) == port) {
                 self.members.add_addr(&peer, addr)?;
             }
             return Ok(());
@@ -2003,11 +2097,16 @@ impl Node {
     /// no members, and can't make any.
     fn on_roster(&mut self, peer: PeerId, message: request_response::Message<Roster, Roster>) -> Result<Option<Event>> {
         Ok(match message {
-            request_response::Message::Request { channel, .. } if self.is_client(&peer) || self.client_of.is_some() => {
+            request_response::Message::Request { request, channel, .. } if self.client_of.is_some() => {
+                let _ = self.swarm.behaviour_mut().members.send_response(channel, Roster::default());
+                self.learn_members(&peer, &request)?;
+                None
+            },
+            request_response::Message::Request { channel, .. } if self.is_client(&peer) => {
                 let _ = self.swarm.behaviour_mut().members.send_response(channel, Roster::default());
                 None
             },
-            request_response::Message::Response { .. } if self.client_of.is_some() => None,
+            request_response::Message::Response { .. } if self.client_of.is_some() || self.is_client(&peer) => None,
             request_response::Message::Request { request, channel, .. } => {
                 let new = self.learn(&request)?;
                 let roster = self.roster()?;
@@ -2033,8 +2132,8 @@ impl Node {
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                 if endpoint.is_dialer() {
                     unless_busy(self.members.add_addr(&peer_id, endpoint.get_remote_address()), "noting a member's address")?;
-                    if self.client_of == Some(peer_id) {
-                        self.member_port = super::clients::port(endpoint.get_remote_address());
+                    if let (Some(_), Some(port)) = (self.client_of, super::clients::port(endpoint.get_remote_address())) {
+                        self.member_ports.insert(peer_id, port);
                     }
                 }
                 if num_established.get() > 1 {

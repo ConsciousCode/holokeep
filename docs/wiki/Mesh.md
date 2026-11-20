@@ -47,7 +47,7 @@ A **ticket** is dag-cbor, multibase base32-lower encoded:
 | `inviter` | bytes: the inviter's peer ID |
 | `key` | string: the swarm key in `swarm.key` text form (never in a client's) |
 | `client` | `true` for a [[#Clients|client]]'s (omitted otherwise) |
-| `members` | list of `[peer ID bytes, [multiaddr bytes…]]`: for a client's, the inviter alone, where it listens for clients |
+| `members` | list of `[peer ID bytes, [multiaddr bytes…]]`: for a client's, the inviter and the others serving the user, where each listens for clients |
 | `user` | link: the user's root key (when the mesh has one) |
 | `blocks` | list of bytes: every certificate and revocation, the joiner's included, and the sealed root with what keeps it (not for a client) |
 | `protected` | `true` for a protected mesh (omitted otherwise) |
@@ -168,15 +168,29 @@ user's, and is counted on for nothing.
 4. `hk node run --clients [<addr>]` on the member listens for clients
    (port 4012 by default); `hk node run` on the client connects.
 
+**Several members.** In a mesh with [[Grants|grants]], the invite also
+gives the client's device `/mesh/client`, and every member serving the
+client's user lets it in, as the grants say, whichever member invited
+it; the clients a member was told of count only in a mesh without
+grants. Members tell each other where they listen for clients in their
+rosters (`clients`), so the ticket lists every member serving the user
+that does, and a member tells a client that connects where the others
+serving its user listen, and nothing else: a client keeping a repo
+connects to all of them, and a thin client to whichever answers first.
+A client is cut off only once every one of them is away.
+
 **The gate.** A member listens for clients apart, without pnet, so that
 port is open to anyone who can reach it, but only clients' keys get in:
 noise authenticates the client by its device key, its peer ID, and the
 member lets in only the clients it was told to whose devices are still
 certified and not revoked, whose user the mesh recognizes. Each is let
 in only where clients connect, and members only where members do, so
-neither passes for the other. A client forgotten (`hk node forget <id>`)
-is shut out at once, and one whose device is revoked as soon as the
-revocation reaches the member.
+neither passes for the other. A client given `/mesh/client` is shut out
+by every member once that's taken away (`hk node grant rm <id>
+/mesh/client`), which `hk node forget` refuses to do for it, as for a
+machine; one let in without grants is forgotten (`hk node forget <id>`)
+and shut out at once. One whose device is revoked is shut out as soon as
+the revocation reaches each member.
 
 **Once in**, a client is as a machine hosting its user alone: it says so
 over `hosts`, signing the member's peer ID with its device key, and
@@ -199,8 +213,8 @@ member is:
 - collection doesn't ask it, nor wait for it.
 
 A client looks for nothing lost, its copies being a cache. It finds its
-member where its ticket said, and again wherever the member says it
-listens on the port it connected to.
+members where its ticket and their rosters said, and again wherever each
+says it listens on the port it connected to it on.
 
 `hk node peers` on the member lists each client, whether it's connected,
 `client`, and the account it acts for; `hk node status` on a client says
@@ -270,7 +284,7 @@ them; omitted otherwise.
 
 | Protocol | Request | Response | Purpose |
 |---|---|---|---|
-| `/holokeep/members/1.0.0` | `{members: [[peer, [addr]]]}` | same | Exchange rosters. |
+| `/holokeep/members/1.0.0` | `{members: [[peer, [addr]]], clients?: [[peer, [addr]]]}` | same | Exchange rosters, and where members listen for clients. |
 | `/holokeep/hosts/1.0.0` | `{hosts: [{user: CID, device: CID, sig: bytes}]}` | same | Say which users each hosts. |
 | `/holokeep/grants/1.0.0` | `{mesh: CID, have: [CID]}` | `{blocks: [[CID, data]]}` | Share grants (see [[Grants#Sharing grants]]). |
 | `/holokeep/blocks/1.0.0` | `{want: [key], user?}` | `{blocks: [[CID, data]], missing: [key], copies: [[replica]]}` | Fetch blocks. |

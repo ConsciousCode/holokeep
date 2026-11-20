@@ -16,6 +16,7 @@ them. A command **covers** itself and the longer ones under it:
 |---|---|
 | `/mesh/user` | To be a user of the mesh: its accounts are served, and grants need it. |
 | `/mesh/machine` | To be a machine of the mesh: let in, listed, and given plaintext. |
+| `/mesh/client` | To be a [[Mesh#Clients\|client]] of the mesh: a user's device that's no machine, let in by every member serving its user where they listen for clients, and counted on for nothing. `hk node invite --client` gives it. |
 | `/mesh/grant` | To give and take away the mesh commands it holds. |
 | `/mesh` | All of these: an **operator**. |
 | `/` | Everything: the founder. |
@@ -24,8 +25,9 @@ them. A command **covers** itself and the longer ones under it:
 | `/anchor/grant` | On a user's view of an anchor: to give and take away the commands on it one holds. |
 | `/anchor` | All of these: a user holds it on their own view of every anchor. |
 
-A machine is one given `/mesh/machine` itself; an operator holding it
-by `/mesh` isn't taken for a machine.
+A machine is one given `/mesh/machine` itself, and a client one given
+`/mesh/client` itself; an operator holding either by `/mesh` isn't taken
+for one.
 
 ## The `grant` claim
 

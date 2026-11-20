@@ -337,6 +337,12 @@ pub fn trim(place: &Place) -> Result<Option<super::trim::Report>> {
 pub fn forget(place: &Place, peer: &libp2p::PeerId) -> Result<()> {
     let Some(lines) = ask(place, &format!("forget {peer}"))? else {
         let members = members(place)?;
+        if let Some(genesis) = members.genesis()?
+            && let Some(state) = crate::store::Catalog::open_repo(&place.repo)?.grant_state(&genesis)?
+            && crate::keys::from_peer_id(&peer.to_string()).is_some_and(|key| state.holders().iter().any(|(who, held)| *who == key && held.iter().any(|c| c == crate::grants::CLIENT)))
+        {
+            return Err(Error::Invalid(format!("the mesh's grants say {peer} is a client: take that away with `hk node grant rm {peer} /mesh/client`")));
+        }
         if members.remove_client(peer)? {
             return Ok(());
         }
@@ -787,6 +793,22 @@ fn as_account(node: &mut Node, dir: &Path, uid: u32, command: &str) -> Result<Ve
     Ok(lines)
 }
 
+/// Where the members serving an account's user, by uid, listen for
+/// clients, a line per address.
+fn clients_at(node: &Node, uid: &str) -> Result<String> {
+    use std::fmt::Write as _;
+    let Ok(uid) = uid.trim().parse::<u32>() else {
+        return Ok(format!("error: not a uid: {uid}\n"));
+    };
+    let mut out = String::new();
+    for (peer, addrs) in node.client_roster(uid)? {
+        for addr in addrs {
+            let _ = writeln!(out, "{peer}\t{addr}");
+        }
+    }
+    Ok(out)
+}
+
 /// What `status` says of a node.
 fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<String> {
     use std::fmt::Write as _;
@@ -802,6 +824,9 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
     if !node.clients().is_empty() {
         let connected = node.connected().iter().filter(|peer| node.is_client(peer)).count();
         let _ = writeln!(out, "clients\t{} of {} connected", connected, node.clients().len());
+    }
+    if !node.client_addrs().is_empty() {
+        let _ = writeln!(out, "members listening for clients\t{}", node.client_addrs().len());
     }
     let _ = writeln!(out, "blocks\t{}", node.catalog().block_count()?);
     let _ = writeln!(out, "copies\t{copies}");
@@ -906,6 +931,7 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
                 node.dial_members()?;
             }
         },
+        command if command.starts_with("clients-at ") => out.push_str(&clients_at(node, command.trim_start_matches("clients-at "))?),
         command if command.starts_with("forget ") => {
             match command.trim_start_matches("forget ").trim().parse().map_err(|e| Error::Invalid(format!("not a peer: {e}"))).and_then(|peer| node.forget_member(&peer)) {
                 Ok(()) => out.push_str("forgotten\n"),

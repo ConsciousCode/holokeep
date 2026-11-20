@@ -1538,7 +1538,7 @@ async fn serving<T>(nodes: &mut [&mut Node], work: impl Future<Output = T>) -> T
 fn thin_of(member: &Node, device: &crate::keys::Key, user: &Link) -> Thin {
     let key = Keypair::from_protobuf_encoding(&device.to_protobuf()).expect("keypair");
     let transport = crate::net::clients::client_transport(MemoryTransport::default(), &key).expect("transport");
-    Thin::new(transport, &key, member.peer_id(), member.client_listeners(), user)
+    Thin::new(transport, &key, vec![(member.peer_id(), member.client_listeners())], user)
 }
 
 /// A member listening for clients, and a thin client of it let in,
@@ -1641,4 +1641,78 @@ async fn only_thin_clients_let_in_get_in() {
         stranger.ask(vec!["whoami".to_owned()]).await
     }).await;
     assert!(refused.is_err());
+}
+
+//----------------------------//
+//-[ Clients of the mesh's ]-//
+//----------------------------//
+
+/// Two members serving one user, both listening for clients, with grants;
+/// and a device of the user's the first gives /mesh/client, which both
+/// have heard of. Returns the device.
+async fn granted_client() -> (Node, Node, crate::keys::Key, crate::keys::Key, Link) {
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let (mut a, mut b) = (node(swarm_key).await, node(swarm_key).await);
+    for node in [&mut a, &mut b] {
+        node.listen_for_clients(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
+    }
+    assert!(until(&mut [&mut a, &mut b], |n| n.iter().all(|node| !node.client_listeners().is_empty())).await);
+    invite(&a, &b, swarm_key);
+    a.reload().expect("reload");
+    b.reload().expect("reload");
+    b.dial_members().expect("dial");
+    assert!(until(&mut [&mut a, &mut b], |n| connected(n[0], n[1])).await);
+    let root = one_user(&mut [&mut a, &mut b]);
+    let device = crate::keys::Key::generate().expect("key");
+    for node in [&a, &b] {
+        node.catalog().certify(&root, &device.id()).expect("certify");
+    }
+    let genesis = found(&mut [&mut a, &mut b], &root);
+    a.catalog().grant(&genesis, &[device.id()], &[crate::grants::CLIENT.to_owned()], &[]).expect("grant");
+    a.reload().expect("reload");
+    assert!(until(&mut [&mut a, &mut b], |n| says(n[1], &device.id(), crate::grants::CLIENT) && n[1].granted_clients().is_some_and(|clients| !clients.is_empty())).await);
+    (a, b, root, device, genesis)
+}
+
+#[tokio::test]
+async fn a_client_of_the_mesh_connects_to_every_member_serving_its_user() {
+    let (mut a, mut b, root, device, genesis) = Box::pin(granted_client()).await;
+    let mut client = client_of(&a, &device, None);
+    client.catalog().set_user(&root.id()).expect("user");
+    for key in [a.catalog().signer().expect("signer").id(), b.catalog().signer().expect("signer").id(), device.id()] {
+        client.catalog().certify(&root, &key).expect("certify");
+    }
+    let peer = client.peer_id();
+    assert!(a.is_client(&peer) && b.is_client(&peer), "each lets it in, as the grants say");
+    client.reload().expect("reload");
+    client.dial_members().expect("dial");
+    // Told by the one it was invited by where the other listens, it
+    // connects to both
+    assert!(until(&mut [&mut a, &mut b, &mut client], |n| n[2].connected().contains(&n[0].peer_id()) && n[2].connected().contains(&n[1].peer_id())).await);
+    assert!(!a.members().contains(&peer).expect("contains") && !b.members().contains(&peer).expect("contains"));
+    // What only the other has, it reads from it
+    let theirs = raw(b"only on b");
+    b.catalog().put_block(&theirs, CidVersion::V1).expect("put");
+    assert_eq!(fetch(&mut b, &mut client, link(&theirs)).await, (1, vec![]));
+    // Forgetting it isn't enough; taking the grant away shuts it out of both
+    assert!(a.forget_member(&peer).is_err());
+    a.catalog().grant(&genesis, &[device.id()], &[], &[crate::grants::CLIENT.to_owned()]).expect("grant");
+    a.reload().expect("reload");
+    assert!(until(&mut [&mut a, &mut b, &mut client], |n| n[2].connected().is_empty() && !n[0].is_client(&peer) && !n[1].is_client(&peer)).await);
+}
+
+#[tokio::test]
+async fn a_thin_client_reaches_whichever_member_is_there() {
+    let (a, mut b, root, device, _) = Box::pin(granted_client()).await;
+    let key = Keypair::from_protobuf_encoding(&device.to_protobuf()).expect("keypair");
+    let transport = crate::net::clients::client_transport(MemoryTransport::default(), &key).expect("transport");
+    let mut thin = Thin::new(transport, &key, vec![(a.peer_id(), a.client_listeners()), (b.peer_id(), b.client_listeners())], &root.id());
+    // Its first member's gone
+    let gone = a.peer_id();
+    drop(a);
+    let held = raw(b"on b");
+    b.catalog().put_block(&held, CidVersion::V1).expect("put");
+    let got = serving(&mut [&mut b], thin.get(&[link(&held)])).await.expect("get");
+    assert_eq!(got.len(), 1);
+    assert_ne!(thin.member(), gone);
 }
