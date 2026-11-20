@@ -535,7 +535,8 @@ impl Node {
     }
 
     /// Whether a visitor sent something it's not to: anything but asking
-    /// for blocks and asking over `ask`. Dropped unanswered.
+    /// for blocks, asking over `ask`, and pushing what it writes. Dropped
+    /// unanswered.
     fn trespasses(&self, event: &BehaviourEvent) -> bool {
         const fn from<Req, Resp>(event: &request_response::Event<Req, Resp>) -> Option<PeerId> {
             match event {
@@ -547,7 +548,6 @@ impl Node {
             BehaviourEvent::Identify(identify::Event::Received { peer_id, .. }) => Some(*peer_id),
             BehaviourEvent::Members(event) => from(event),
             BehaviourEvent::Adverts(event) => from(event),
-            BehaviourEvent::Push(event) => from(event),
             BehaviourEvent::Notices(event) => from(event),
             BehaviourEvent::Trim(event) => from(event),
             BehaviourEvent::Dropped(event) => from(event),
@@ -1733,6 +1733,9 @@ impl Node {
     fn on_push(&mut self, event: request_response::Event<Push, Kept>) -> Result<()> {
         match event {
             request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
+                if let Some(key) = self.visitors.get(&peer).cloned() {
+                    return self.on_visitor_push(&key, request, channel);
+                }
                 if request.is_guest() {
                     let Some(local) = self.hosting_guest(&peer, request.user())? else {
                         let _ = self.swarm.behaviour_mut().push.send_response(channel, Kept::default());

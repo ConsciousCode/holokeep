@@ -107,14 +107,20 @@ const OWNER: &str = "(SELECT id FROM multihashes WHERE multihash = coalesce(view
 /// counts in the view of the user with id `owner`: a set for its signer's
 /// own view, signed by them, or one for theirs (`s.owner`), signed by
 /// them, a user they've given `/anchor/write` on it, or one whose set they
-/// said stands on taking it away; not tombed by them. With no users,
+/// said stands on taking it away; not tombed by them. A visitor, no user
+/// of the mesh, signs with its own key, which is itself. With no users,
 /// every set counts that no tomb targets.
 pub(super) fn in_view(c: &str, s: &str, t: &str, owner: &str) -> String {
     format!(
         "(CASE WHEN NOT EXISTS (SELECT 1 FROM users) THEN NOT EXISTS (
              SELECT 1 FROM claim_keys tk JOIN claim_targets x ON x.target = tk.key JOIN claims k ON k.id = x.claim
              WHERE tk.claim = {c}.id AND k.kind = 'tomb')
-         ELSE EXISTS (
+         ELSE (EXISTS (
+             SELECT 1 FROM claim_keys sk JOIN claim_targets st ON st.target = sk.key JOIN sign_claims sg ON sg.id = st.claim
+             WHERE sk.claim = {c}.id AND {s}.owner = {owner} AND (
+                 EXISTS (SELECT 1 FROM anchor_access aw WHERE aw.owner = {owner} AND aw.anchor = {t}.target AND aw.user = sg.by AND aw.command = 'write')
+                 OR EXISTS (SELECT 1 FROM anchor_stood ao WHERE ao.owner = {owner} AND ao.anchor = {t}.target AND ao.user = sg.by AND ao.claim = sk.key)))
+         OR EXISTS (
              SELECT 1 FROM claim_keys sk JOIN claim_targets st ON st.target = sk.key
              JOIN sign_claims sg ON sg.id = st.claim JOIN authorized au ON au.key = sg.by
              WHERE sk.claim = {c}.id AND (
@@ -122,7 +128,7 @@ pub(super) fn in_view(c: &str, s: &str, t: &str, owner: &str) -> String {
                  OR ({s}.owner = {owner} AND (
                      au.user = {owner}
                      OR EXISTS (SELECT 1 FROM anchor_access aw WHERE aw.owner = {owner} AND aw.anchor = {t}.target AND aw.user = au.user AND aw.command = 'write')
-                     OR EXISTS (SELECT 1 FROM anchor_stood ao WHERE ao.owner = {owner} AND ao.anchor = {t}.target AND ao.user = au.user AND ao.claim = sk.key)))))
+                     OR EXISTS (SELECT 1 FROM anchor_stood ao WHERE ao.owner = {owner} AND ao.anchor = {t}.target AND ao.user = au.user AND ao.claim = sk.key))))))
              AND NOT EXISTS (
                  SELECT 1 FROM claim_keys tk JOIN claim_targets x ON x.target = tk.key JOIN claims k ON k.id = x.claim
                  JOIN claim_keys kk ON kk.claim = k.id JOIN claim_targets kt ON kt.target = kk.key
@@ -1158,8 +1164,8 @@ impl ClaimStore {
         Ok(self.db.conn()
             .prepare_cached(
                 "SELECT 1 FROM multihashes m JOIN claim_targets st ON st.target = m.id JOIN sign_claims sg ON sg.id = st.claim
-                 JOIN authorized au ON au.key = sg.by JOIN multihashes u ON u.id = au.user
-                 WHERE m.multihash = ?1 AND u.multihash = ?2",
+                 JOIN multihashes u ON u.multihash = ?2
+                 WHERE m.multihash = ?1 AND (sg.by = u.id OR EXISTS (SELECT 1 FROM authorized au WHERE au.key = sg.by AND au.user = u.id))",
             )?
             .exists(params![claim.multihash().to_bytes(), user.multihash().to_bytes()])?)
     }

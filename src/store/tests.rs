@@ -3509,3 +3509,44 @@ fn a_guest_sees_only_whats_shared_with_them() {
     assert!(signs.iter().all(|sign| sees(&mut repo, sign)));
     assert!(repo.visible(private.cid().multihash()).expect("visible"), "the owner's as before");
 }
+
+/// A visitor, a key no grant of the mesh names, writing an owner's view of
+/// an anchor: its sets, signed by its own key, count there while it holds
+/// write, and once that's taken away, those that stood do and no later.
+#[test]
+fn a_visitors_own_sets_count_while_it_may_write() {
+    use crate::grants::{READ, WRITE};
+    let scratch = Scratch::new("visitor-writes");
+    let repo = Catalog::open_repo(&scratch.path().join("repo")).expect("open");
+    let root = repo.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let genesis = repo.found_grants(&root).expect("found");
+    let visitor = crate::keys::Key::generate().expect("key");
+    let (one, two, three) = (raw(b"one"), raw(b"two"), raw(b"three"));
+    for block in [&one, &two, &three] {
+        repo.put_block(block, CidVersion::V1).expect("put");
+    }
+    let anchor = repo.new_anchor().expect("anchor");
+    let first = repo.set_anchor(&anchor, &link(&one)).expect("set");
+    let mut last_sign = None;
+    let mut visitor_sets = |value: &Block, prev: Vec<Link>, at: u64| {
+        let set = Claim::Set(crate::claim::Set::new([anchor.clone()], link(value), at).expect("set").after(Some(prev)).for_view(Some(root.id())));
+        let sign = Claim::Sign(crate::claim::Sign::new(&visitor, [set.cid()], last_sign.clone(), at).expect("sign"));
+        repo.put_block(&set.block(), CidVersion::V1).expect("put");
+        repo.put_block(&sign.block(), CidVersion::V1).expect("put");
+        last_sign = Some(sign.cid());
+        set.cid()
+    };
+
+    let read_only = visitor_sets(&two, vec![first], 4_000_000_000);
+    assert_eq!(repo.anchor_value(&anchor).expect("value"), Some(link(&one)), "not let write");
+    repo.grant_on(&genesis, &anchor, &[visitor.id()], &[READ.to_owned()], &[], &[]).expect("grant");
+    assert_eq!(repo.anchor_value(&anchor).expect("value"), Some(link(&one)), "let read, not write");
+    repo.grant_on(&genesis, &anchor, &[visitor.id()], &[WRITE.to_owned()], &[], &[]).expect("grant");
+    assert_eq!(repo.anchor_value(&anchor).expect("value"), Some(link(&two)), "let write, what it set counts");
+    assert_eq!(repo.latest_sets_by(&anchor, &visitor.id()).expect("latest"), std::slice::from_ref(&read_only));
+
+    // Write taken away: what stood stands, and nothing after
+    repo.grant_on(&genesis, &anchor, &[visitor.id()], &[], &[WRITE.to_owned()], std::slice::from_ref(&read_only)).expect("grant");
+    visitor_sets(&three, vec![read_only], 4_000_000_001);
+    assert_eq!(repo.anchor_value(&anchor).expect("value"), Some(link(&two)));
+}

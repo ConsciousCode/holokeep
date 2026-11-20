@@ -8,6 +8,9 @@ use libp2p::request_response::{self, ResponseChannel};
 
 use super::{FetchId, Node};
 use crate::cid::CidRef as _;
+use crate::claim::covers;
+use crate::grants::WRITE;
+use crate::net::durability::{self, Kept, Push};
 use crate::model::Link;
 use crate::net::mesh::Result;
 use crate::net::thin::{Answer, Ask};
@@ -32,6 +35,10 @@ fn needs(words: &[String]) -> (Vec<Link>, Vec<Link>) {
         ["anchor", "set", _, cid] => (parse(&[cid]), Vec::new()),
         _ => (Vec::new(), Vec::new()),
     }
+}
+
+fn parse(cid: &str) -> Result<Link> {
+    cid.parse().map_err(|_| crate::net::mesh::Error::Invalid(format!("not a CID: {cid}")))
 }
 
 fn error(message: &str) -> Answer {
@@ -77,7 +84,8 @@ impl Node {
     }
 
     /// Answer a visitor, which may ask only about what's shared with it:
-    /// which views, and what each is now, as it may read them.
+    /// which views, what each is now, as it may read them, and what a set
+    /// of its own would follow.
     fn answer_visitor(&mut self, peer: &PeerId, key: &Link, words: &[String]) -> Result<Answer> {
         let words: Vec<&str> = words.iter().map(String::as_str).collect();
         let mut lines = Vec::new();
@@ -94,13 +102,49 @@ impl Node {
                 }
             },
             ["anchor", "show", view] => {
-                let view: Link = view.parse().map_err(|_| crate::net::mesh::Error::Invalid(format!("not a CID: {view}")))?;
+                let view = parse(view)?;
                 let value = self.catalog.as_guest(key, |catalog| catalog.anchor_value(&view))??;
                 lines.push(value.map_or_else(|| "unset".to_owned(), |value| value.to_string()));
             },
-            _ => return Ok(error("a visitor may only read what's shared with it: whoami, shared, anchor show, and blocks")),
+            // What a set of its own would follow: the view's heads, and
+            // when each was set
+            ["anchor", "heads", view] => {
+                let view = parse(view)?;
+                for (set, _, at) in self.catalog.as_guest(key, |catalog| catalog.anchor_heads(&view))?? {
+                    lines.push(format!("{set}\t{at}"));
+                }
+            },
+            // What a sign of its own would follow: its last here
+            ["signed"] => {
+                if let Some(sign) = self.catalog.claims().map(|claims| claims.head(key)).transpose()?.flatten() {
+                    lines.push(sign.to_string());
+                }
+            },
+            _ => return Ok(error("a visitor may only read and write what's shared with it: whoami, shared, anchor show, anchor heads, signed, blocks, and pushes")),
         }
         Ok(Answer { lines })
+    }
+
+    /// Hold what a visitor pushed, for the user it's pushed for, if this
+    /// serves them and the visitor may write a view of theirs: what it
+    /// sets, and what that reaches. What a set of its reaches that isn't
+    /// here is fetched, as it is for a guest's.
+    pub(super) fn on_visitor_push(&mut self, key: &Link, push: Push, channel: ResponseChannel<Kept>) -> Result<()> {
+        let local = match (&self.granted, push.user()) {
+            (Some((_, state)), Some(user)) => self.locals()?.into_iter().find(|local| {
+                local.rooted
+                    && local.user_bytes().as_deref() == Some(user)
+                    && local.user.as_ref().is_some_and(|owner| state.shares().iter().any(|share| share.owner == *owner && share.user == *key && share.held.iter().any(|held| covers(held, WRITE))))
+            }),
+            _ => None,
+        };
+        let Some(local) = local.filter(|local| self.recognizes(local)) else {
+            let _ = self.swarm.behaviour_mut().push.send_response(channel, Kept::default());
+            return Ok(());
+        };
+        let (kept, sets) = self.catalog.viewing(local.uid, |catalog| durability::answer_visitor_push(catalog, push))??;
+        let _ = self.swarm.behaviour_mut().push.send_response(channel, kept);
+        self.took_guest_claims(&local, &sets)
     }
 
     /// A fetch finished: answer what a client asked, if that's what it

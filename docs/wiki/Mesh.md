@@ -266,7 +266,8 @@ so it's given, passed on by those holding `/anchor/grant`, and taken
 away as any share is, and every machine works out the same answer.
 
 1. `hk node id` in a directory of the visitor's prints its key.
-2. `hk anchor share <anchor> <peer> read` on a machine of the owner's.
+2. `hk anchor share <anchor> <peer> read` on a machine of the owner's,
+   and `write` too, if it's to set it.
 3. `hk node invite <peer> --visitor [--account <uid>]` prints a ticket
    saying where the members serving the owner listen for clients;
    nothing's certified.
@@ -278,9 +279,22 @@ port each key the owner's shares say may read, unless it's a member or
 client. A visitor reads as a guest of what's shared with its key, and
 nothing else: `blocks` answers only for blocks those views reach
 (`hk cat`, `hk get`), and `ask` only `whoami`, `shared` (the views shared
-with it, `hk anchor shared`, as `<view> <owner> <commands>`), and
-`anchor show <view>`. Anything else it sends is dropped unanswered:
-pushes, notices, adverts, rosters, hosts, grants, and identify. It's told
+with it, `hk anchor shared`, as `<view> <owner> <commands>`),
+`anchor show <view>`, and what a set of its own needs: `anchor heads
+<view>` (each head's CID and time) and `signed` (its last sign there).
+
+A visitor let write a view writes as itself, since no member may sign for
+it. `hk add` pushes the blocks, keeping nothing, and `hk anchor set
+<view> <cid>` signs a set with its own key, after the view's heads and
+its last sign, and pushes both. The member holds what a visitor pushes
+for the owner it's pushed for, if it serves them and the visitor may
+write a view of theirs; of claims, it takes only sets and their signs,
+which count in the owner's view as the grants say, there and on every
+machine they reach. It refuses anything pushed otherwise, and `hk anchor
+set` checks the set counts before it says so.
+
+Anything else it sends is dropped unanswered: notices, adverts, rosters,
+hosts, grants, and identify. It's told
 nothing unasked: no roster, hosts or grants, no notices, and it's no
 part of audits, trims or collection. Unshared, it's shut out as soon as
 the grant reaches each member. Kademlia and identify still answer it as

@@ -17,6 +17,11 @@
 //!   as for a host's users sharing a repo (`hk node run --shared`). What
 //!   that needs of a DAG, the member fetches first.
 //!
+//! - A visitor's thin client, a key outside the mesh, can't ask its member
+//!   to say anything: it signs its sets itself, and pushes them with what
+//!   they reach, which the member holds for the user whose view it is, if
+//!   they let the visitor write it.
+//!
 //! Each command connects anew: a thin client keeps nothing between them
 //! but its key and ticket.
 
@@ -126,6 +131,9 @@ pub struct Thin {
     user: Vec<u8>,
     /// How long to keep asking for blocks the member hasn't.
     patience: Duration,
+    /// Its own key, to sign with, if it's a visitor: a key outside the
+    /// mesh, which nothing's certified as a device of anyone's.
+    visitor: Option<crate::keys::Key>,
 }
 
 impl Thin {
@@ -141,7 +149,19 @@ impl Thin {
         };
         let swarm = Swarm::new(transport, behaviour, key.public().to_peer_id(), libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(Duration::from_mins(1)));
         let member = members.first().map_or_else(PeerId::random, |(member, _)| *member);
-        Self { swarm, member, members, user: user.to_bytes(), patience: PATIENCE }
+        Self { swarm, member, members, user: user.to_bytes(), patience: PATIENCE, visitor: None }
+    }
+
+    /// A visitor's, signing its own sets with its key.
+    #[must_use]
+    pub fn as_visitor(mut self, key: crate::keys::Key) -> Self {
+        self.visitor = Some(key);
+        self
+    }
+
+    /// Whether it's a visitor's.
+    pub const fn is_visitor(&self) -> bool {
+        self.visitor.is_some()
     }
 
     /// The thin client a directory is, over TCP.
@@ -153,7 +173,15 @@ impl Thin {
         let mut members: Vec<(PeerId, Vec<Multiaddr>)> = ticket.members.iter().map(|(peer, addrs)| (*peer, addrs.clone())).collect();
         members.sort_by_key(|(peer, _)| *peer != ticket.inviter);
         let base = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
-        Ok(Self::new(super::clients::client_transport(base, &key)?, &key, members, user))
+        let thin = Self::new(super::clients::client_transport(base, &key)?, &key, members, user);
+        // A visitor's ticket certifies nothing: its key's its own
+        let certified = ticket.user.as_ref().is_some_and(|(_, certificates)| !certificates.is_empty());
+        if certified {
+            return Ok(thin);
+        }
+        let bytes = key.to_protobuf_encoding().map_err(|e| Error::Invalid(e.to_string()))?;
+        let key = crate::keys::Key::from_protobuf(&bytes).ok_or_else(|| Error::Invalid("this client's key isn't ed25519".into()))?;
+        Ok(thin.as_visitor(key))
     }
 
     /// Ask for blocks the member hasn't for this long, not the usual 30 s.
@@ -312,11 +340,56 @@ impl Thin {
                 BehaviourEvent::Push(request_response::Event::OutboundFailure { request_id, error, .. }) if request_id == sent => Some(Err(failed(member, &error))),
                 _ => None,
             }).await?;
+            if kept.keys().is_empty() && self.visitor.is_some() {
+                return Err(Error::Invalid(format!("{member} took none of it: a visitor writes only where it's been let write a view (`hk anchor shared`)")));
+            }
             if kept.keys().len() < count {
                 return Err(Error::Invalid(format!("{member} kept {} of {count} blocks: short of space, or of the account's quota", kept.keys().len())));
             }
         }
         Ok(())
+    }
+}
+
+impl Thin {
+    /// Set a view of an anchor shared with this visitor to a value, as
+    /// itself: a set signed with its own key, after the view's heads,
+    /// pushed to the member, which counts it in the owner's view if the
+    /// visitor may write it. What it reaches must be pushed first, or be
+    /// the owner's already. Returns the set's CID.
+    pub async fn set_own(&mut self, view: &Link, value: &Link) -> Result<Link> {
+        let key = self.visitor.clone().ok_or_else(|| Error::Invalid("a client of the mesh sets anchors through its account".into()))?;
+        let (anchor, owner) = crate::claim::viewed(view).ok_or_else(|| Error::Invalid(format!("{view} isn't a view of an anchor: `hk anchor shared` lists those shared with this key")))?;
+        let shared = self.ask(vec!["shared".to_owned()]).await?;
+        let writable = shared.iter().any(|line| {
+            let mut fields = line.split('\t');
+            fields.next() == Some(&view.to_string()) && fields.nth(1).is_some_and(|held| held.split(' ').any(|held| crate::claim::covers(held, crate::grants::WRITE)))
+        });
+        if !writable {
+            return Err(Error::Invalid(format!("{} hasn't let this key write {view}", crate::keys::peer_id(&owner))));
+        }
+        let mut prev = Vec::new();
+        let mut latest = 0;
+        for line in self.ask(vec!["anchor".to_owned(), "heads".to_owned(), view.to_string()]).await? {
+            let (set, at) = line.split_once('\t').ok_or_else(|| Error::Invalid(format!("the member said {line:?} of a head")))?;
+            prev.push(set.parse::<Link>().map_err(|_| Error::Invalid(format!("not a CID: {set}")))?);
+            latest = latest.max(at.parse::<u64>().map_err(|_| Error::Invalid(format!("not a time: {at}")))?.saturating_add(1));
+        }
+        let signed = match self.ask(vec!["signed".to_owned()]).await?.first() {
+            Some(sign) => Some(sign.parse::<Link>().map_err(|_| Error::Invalid(format!("not a CID: {sign}")))?),
+            None => None,
+        };
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+        let at = now.max(latest);
+        let set = crate::claim::Set::new([anchor], value.clone(), at).ok_or_else(|| Error::Invalid("a set names an anchor".into()))?.after(Some(prev)).for_view(Some(owner));
+        let set = crate::claim::Claim::Set(set);
+        let sign = crate::claim::Sign::new(&key, [set.cid()], signed, at).ok_or_else(|| Error::Invalid("nothing to sign".into()))?;
+        self.push(vec![set.block(), crate::claim::Claim::Sign(sign).block()]).await?;
+        let heads = self.ask(vec!["anchor".to_owned(), "heads".to_owned(), view.to_string()]).await?;
+        if !heads.iter().any(|line| line.split('\t').next() == Some(&set.cid().to_string())) {
+            return Err(Error::Invalid(format!("{} took the set, but it doesn't count in {view}: was write taken away?", self.member)));
+        }
+        Ok(set.cid())
     }
 }
 
@@ -358,6 +431,14 @@ impl Blocking {
 
     pub fn push(&self, blocks: Vec<Block>) -> Result<()> {
         self.runtime.block_on(self.thin.borrow_mut().push(blocks))
+    }
+
+    pub fn is_visitor(&self) -> bool {
+        self.thin.borrow().is_visitor()
+    }
+
+    pub fn set_own(&self, view: &Link, value: &Link) -> Result<Link> {
+        self.runtime.block_on(self.thin.borrow_mut().set_own(view, value))
     }
 }
 

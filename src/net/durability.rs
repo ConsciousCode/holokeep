@@ -521,6 +521,30 @@ pub fn answer_guest_push(catalog: &Catalog, push: Push) -> Result<(Kept, Vec<cra
     Ok((Kept { kept }, claims))
 }
 
+/// Hold what a visitor pushed for a user it may write a view of: blocks,
+/// and of claims, only sets and their signs, which count as the user's
+/// view says. Returns what was kept, and the sets.
+pub fn answer_visitor_push(catalog: &Catalog, push: Push) -> Result<(Kept, Vec<crate::claim::Claim>)> {
+    let mut kept = Vec::new();
+    let mut sets = Vec::new();
+    for (cid, data) in push.blocks {
+        let Ok(link) = Link::decode(&cid) else {
+            continue;
+        };
+        let Ok(block) = Block::verify(link.clone().into(), data.into_vec().into_boxed_slice()) else {
+            continue;
+        };
+        match crate::claim::Claim::parse(block.data()) {
+            Some(claim @ crate::claim::Claim::Set(_)) => sets.push(claim),
+            Some(crate::claim::Claim::Sign(_)) | None => {},
+            Some(_) => continue,
+        }
+        catalog.put_block(&block, link.version())?;
+        kept.push((ByteBuf::from(link.multihash().to_bytes()), Vec::new()));
+    }
+    Ok((Kept { kept }, sets))
+}
+
 /// What an audit did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {

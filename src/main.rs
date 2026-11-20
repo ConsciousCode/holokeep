@@ -191,8 +191,9 @@ enum NodeCommand {
         /// Let in a visitor instead: a key that's no user of the mesh, by
         /// its peer ID (`hk node id` in its directory), which a user here
         /// shares views of anchors with (`hk anchor share <anchor> <peer>
-        /// read`), reading those and nothing else, as a thin client (`hk
-        /// node join --thin`) where members listen for clients. Nothing's
+        /// read`, or `write`), reading and setting those and nothing else,
+        /// as a thin client (`hk node join --thin`) where members listen
+        /// for clients, signing its sets with its own key. Nothing's
         /// certified: what's shared with it is all it's let in for, till
         /// it's unshared
         #[arg(long, conflicts_with_all = ["device", "protected", "quota", "client"])]
@@ -926,7 +927,8 @@ fn thin(dir: &Path, command: Command) -> anyhow::Result<()> {
             let mut sink = Sink::new(&client);
             let root = add(&importer, &path, quiet, &mut sink)?;
             sink.finish()?;
-            if !no_keep {
+            // A visitor keeps nothing: what it sets is the owner's to keep
+            if !no_keep && !client.is_visitor() {
                 client.ask(vec!["keep".to_owned(), "add".to_owned(), root.to_string()])?;
             }
         },
@@ -951,8 +953,13 @@ fn thin(dir: &Path, command: Command) -> anyhow::Result<()> {
         Command::Anchor(AnchorCommand::Root) => ask(&connect()?, &["anchor", "root"])?,
         Command::Anchor(AnchorCommand::Show { anchor }) => ask(&connect()?, &["anchor", "show", &anchor.to_string()])?,
         Command::Anchor(AnchorCommand::Set { anchor, cid, lazy }) => {
+            let client = connect()?;
+            if client.is_visitor() {
+                out!("{}", client.set_own(&anchor, &cid)?);
+                return Ok(());
+            }
             let (anchor, cid) = (anchor.to_string(), cid.to_string());
-            ask(&connect()?, &if lazy { vec!["anchor", "set", "--lazy", &anchor, &cid] } else { vec!["anchor", "set", &anchor, &cid] })?;
+            ask(&client, &if lazy { vec!["anchor", "set", "--lazy", &anchor, &cid] } else { vec!["anchor", "set", &anchor, &cid] })?;
         },
         _ => anyhow::bail!("this is a thin client, with no repo: it reads, adds, keeps, tags and sets anchors through its member, and no more"),
     }
@@ -1944,10 +1951,10 @@ fn share(dir: Option<&PathBuf>, repo: &Catalog, anchor: &Link, who: &str, comman
         .collect::<anyhow::Result<_>>()?;
     let who = key_named(who)?;
     if give
-        && commands.iter().any(|command| !claim::covers(READ, command))
+        && commands.iter().any(|command| !claim::covers(READ, command) && !claim::covers(WRITE, command))
         && repo.grant_state(&genesis)?.is_some_and(|state| !state.holds(&who, holokeep::grants::USER))
     {
-        eprintln!("note: {} is no user of the mesh, so only reads, as a visitor: what it sets or gives doesn't count", holokeep::keys::peer_id(&who));
+        eprintln!("note: {} is no user of the mesh, so only reads and writes, as a visitor: what it gives doesn't count", holokeep::keys::peer_id(&who));
     }
     let cid = if give {
         repo.grant_on(&genesis, anchor, std::slice::from_ref(&who), &commands, &[], &[])?

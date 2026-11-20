@@ -489,7 +489,8 @@ impl State {
     /// the owner, everything while they're a user of the mesh; anyone
     /// else, as the owner's grants on it, and those they let others make,
     /// say. One the mesh's grants have never named, a visitor, holds only
-    /// what lets it read: what it sets, or gives, no one's said counts.
+    /// what lets it read and write, its sets signed by its own key: what it
+    /// gives, no one's said counts.
     pub fn holds_on(&self, owner: &Link, anchor: &Link, who: &Link, command: &str) -> bool {
         if !self.holds(owner, USER) {
             return false;
@@ -497,7 +498,7 @@ impl State {
         if who == owner {
             return true;
         }
-        if !self.holds(who, USER) && (self.named(who) || !covers(READ, command)) {
+        if !self.holds(who, USER) && (self.named(who) || !(covers(READ, command) || covers(WRITE, command))) {
             return false;
         }
         self.view(owner, anchor).is_some_and(|view| self.holds_in(view, &view.judged, who, command))
@@ -829,17 +830,17 @@ mod tests {
     }
 
     #[test]
-    fn a_visitor_only_reads() {
+    fn a_visitor_reads_and_writes_but_gives_nothing() {
         let (mut history, _, u, b, _, last) = users();
         let anchor = crate::claim::anchor().expect("anchor");
         let visitor = crate::keys::Key::generate().expect("key").id();
         history.grant_on(&u, &visitor, &anchor, &[ANCHOR_GRANT, READ, WRITE], &[], &[&last]);
         let state = history.state();
-        assert!(state.holds_on(&u, &anchor, &visitor, READ));
-        assert!(!state.holds_on(&u, &anchor, &visitor, WRITE) && !state.holds_on(&u, &anchor, &visitor, ANCHOR_GRANT));
+        assert!(state.holds_on(&u, &anchor, &visitor, READ) && state.holds_on(&u, &anchor, &visitor, WRITE));
+        assert!(!state.holds_on(&u, &anchor, &visitor, ANCHOR_GRANT) && !state.holds_on(&u, &anchor, &visitor, ANCHOR));
         assert!(!state.holds_on(&b, &anchor, &visitor, READ), "only on the view shared");
         let share = state.shares().into_iter().find(|share| share.user == visitor).expect("shared");
-        assert_eq!(share.held, [READ]);
+        assert_eq!(share.held, [READ, WRITE]);
     }
 
     #[test]

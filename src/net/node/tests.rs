@@ -1769,3 +1769,45 @@ async fn a_visitor_reads_only_what_is_shared_with_it() {
     assert!(!member.is_visitor(&thin.peer_id()));
     assert!(serving(&mut [&mut member], thin.ask(words(&["shared"]))).await.is_err());
 }
+
+/// A visitor let write a view sets it as itself: what it pushes is held
+/// for the owner, its set, signed with its own key, counts in the owner's
+/// view, and claims of other kinds aren't taken. Write taken away, it's
+/// refused, and what stood stands.
+#[tokio::test]
+async fn a_visitor_let_write_sets_a_view_as_itself() {
+    use crate::grants::{READ, WRITE};
+    let mut member = node(mesh::fresh_swarm_key().expect("key")).await;
+    member.listen_for_clients(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
+    assert!(until(&mut [&mut member], |n| !n[0].client_listeners().is_empty()).await);
+    let root = one_user(&mut [&mut member]);
+    let genesis = found(&mut [&mut member], &root);
+    let (before, written, later) = (raw(b"before"), raw(b"from a visitor"), raw(b"too late"));
+    member.catalog().put_block(&before, CidVersion::V1).expect("put");
+    let anchor = member.catalog().new_anchor().expect("anchor");
+    member.catalog().set_anchor(&anchor, &link(&before)).expect("set");
+    let visitor = crate::keys::Key::generate().expect("key");
+    member.catalog().grant_on(&genesis, &anchor, &[visitor.id()], &[READ.to_owned(), WRITE.to_owned()], &[], &[]).expect("share");
+    member.reload().expect("reload");
+    let mut thin = thin_of(&member, &visitor, &root.id()).with_patience(Duration::from_millis(300)).as_visitor(visitor.clone());
+    let view = crate::claim::view(&anchor, &root.id()).expect("view");
+
+    serving(&mut [&mut member], thin.push(vec![written.clone()])).await.expect("push");
+    let set = serving(&mut [&mut member], thin.set_own(&view, &link(&written))).await.expect("set");
+    assert_eq!(member.catalog().anchor_value(&anchor).expect("value"), Some(link(&written)), "it counts in the owner's view");
+    assert!(member.catalog().has(written.cid().multihash()).expect("has"));
+    assert_eq!(member.catalog().latest_sets_by(&anchor, &visitor.id()).expect("latest"), std::slice::from_ref(&set));
+    // A keep of its own isn't taken (of two, so it's no inline CID)
+    let keep = crate::claim::Claim::Keep(crate::claim::Keep::new([link(&written), link(&before)]).expect("keep"));
+    let _ = serving(&mut [&mut member], thin.push(vec![keep.block()])).await;
+    assert!(!member.catalog().has(keep.cid().multihash()).expect("has"));
+
+    // Write taken away: refused, and what it set stands
+    member.catalog().grant_on(&genesis, &anchor, &[visitor.id()], &[], &[WRITE.to_owned()], std::slice::from_ref(&set)).expect("unshare");
+    member.reload().expect("reload");
+    assert!(member.is_visitor(&thin.peer_id()), "it still reads");
+    assert!(serving(&mut [&mut member], thin.set_own(&view, &link(&before))).await.is_err());
+    assert!(serving(&mut [&mut member], thin.push(vec![later.clone()])).await.is_err());
+    assert!(!member.catalog().has(later.cid().multihash()).expect("has"));
+    assert_eq!(member.catalog().anchor_value(&anchor).expect("value"), Some(link(&written)));
+}
