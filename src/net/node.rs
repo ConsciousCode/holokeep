@@ -19,6 +19,9 @@
 //! - A node serves several accounts, users sharing its machine, and
 //!   members tell each other which users they host; a user's blocks go
 //!   only to machines hosting the user. See `hosts`.
+//! - A member lets in clients, its users' devices which are no members,
+//!   where it listens for them; a client connects to that member alone.
+//!   See `clients`.
 
 use std::path::PathBuf;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -29,16 +32,17 @@ use futures::{AsyncRead, AsyncWrite, StreamExt};
 use libp2p::allow_block_list::{self, AllowedPeers};
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::Boxed;
-use libp2p::core::upgrade::Version;
 use libp2p::identity::Keypair;
-use libp2p::pnet::{PnetConfig, PreSharedKey};
+use libp2p::pnet::PreSharedKey;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::behaviour::toggle::Toggle;
+use libp2p::core::transport::ListenerId;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport, identify, kad, mdns, noise, ping, tcp, yamux};
+use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport, identify, kad, mdns, ping, tcp};
 use serde::{Deserialize, Serialize};
 
 use super::blocks::{self, Blocks, Fetch, Want};
+use super::clients::{Gate, Ports};
 use super::collect::{self, Condemn, Condemned, Verdict};
 use super::durability::{self, Advert, Audit, Haves, Kept, Push, Report, Sightings, Trickle};
 use super::grants::{Have, Sent};
@@ -91,6 +95,7 @@ impl Roster {
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
     allowed: allow_block_list::Behaviour<AllowedPeers>,
+    gate: Gate,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     mdns: Toggle<mdns::tokio::Behaviour>,
@@ -138,8 +143,9 @@ pub enum Event {
 }
 
 /// A transport for the mesh, over some base transport: the private
-/// network, then noise, then yamux.
-pub fn transport<T>(base: T, key: &Keypair, swarm_key: PreSharedKey) -> Result<Boxed<(PeerId, StreamMuxerBox)>>
+/// network, then noise, then yamux; where clients connect, as `clients`
+/// says, no private network.
+pub fn transport<T>(base: T, key: &Keypair, swarm_key: PreSharedKey, clients: Ports) -> Result<Boxed<(PeerId, StreamMuxerBox)>>
 where
     T: Transport + Send + Unpin + 'static,
     T::Error: Send + Sync + 'static,
@@ -147,15 +153,7 @@ where
     T::ListenerUpgrade: Send,
     T::Dial: Send,
 {
-    let pnet = PnetConfig::new(swarm_key);
-    let noise = noise::Config::new(key).map_err(|e| Error::Invalid(format!("noise: {e}")))?;
-    Ok(base
-        .and_then(move |socket, _| pnet.handshake(socket))
-        .upgrade(Version::V1)
-        .authenticate(noise)
-        .multiplex(yamux::Config::default())
-        .timeout(Duration::from_secs(20))
-        .boxed())
+    super::clients::transport(base, key, swarm_key, clients)
 }
 
 /// One of the accounts a node serves, by uid, and who it acts for: its
@@ -268,25 +266,45 @@ pub struct Node {
     /// Pushes of what's shared with guests, unanswered: what's kept of
     /// them isn't a copy.
     guest_pushes: HashSet<request_response::OutboundRequestId>,
+    /// Where this listens for clients, by port, as its transport and gate
+    /// know it, and its listeners for them.
+    ports: Ports,
+    client_listeners: HashSet<ListenerId>,
+    /// The clients let in, by their device's peer ID, and the account each
+    /// acts for: certified by its user, and still so.
+    clients: HashMap<PeerId, u32>,
+    /// The member this node's a client of, if it's a client, and the port
+    /// it listens for clients on, as last connected to.
+    client_of: Option<PeerId>,
+    member_port: Option<u64>,
     /// Events which happened outside `next`, for it to return first.
     ready: VecDeque<Event>,
 }
 
 impl Node {
-    /// A node over TCP, finding members on the LAN by mDNS.
+    /// A node over TCP, finding members on the LAN by mDNS; or a client's,
+    /// with no private network, finding its member where it was told.
     pub fn tcp(key: &Keypair, swarm_key: PreSharedKey, catalog: Catalog, members: Members) -> Result<Self> {
         let base = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
-        Self::new(transport(base, key, swarm_key)?, key, catalog, members, true)
+        if members.client_of()?.is_some() {
+            return Self::new(super::clients::client_transport(base, key)?, key, catalog, members, false, Ports::default());
+        }
+        let ports = Ports::default();
+        Self::new(transport(base, key, swarm_key, ports.clone())?, key, catalog, members, true, ports)
     }
 
-    /// A node over a transport, with or without mDNS.
-    pub fn new(transport: Boxed<(PeerId, StreamMuxerBox)>, key: &Keypair, catalog: Catalog, members: Members, lan: bool) -> Result<Self> {
+    /// A node over a transport, with or without mDNS, its transport
+    /// leaving the private network out on `ports`, where clients connect.
+    pub fn new(transport: Boxed<(PeerId, StreamMuxerBox)>, key: &Keypair, catalog: Catalog, members: Members, lan: bool, ports: Ports) -> Result<Self> {
         let peer = key.public().to_peer_id();
-        let mdns = if lan { Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer)?) } else { None };
+        let client_of = members.client_of()?;
+        let mdns = if lan && client_of.is_none() { Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer)?) } else { None };
         let mut kad = kad::Behaviour::with_config(peer, kad::store::MemoryStore::new(peer), kad::Config::new(KAD));
-        kad.set_mode(Some(kad::Mode::Server));
+        // A client's no member for others to find
+        kad.set_mode(Some(if client_of.is_some() { kad::Mode::Client } else { kad::Mode::Server }));
         let behaviour = Behaviour {
             allowed: allow_block_list::Behaviour::default(),
+            gate: Gate::new(ports.clone()),
             identify: identify::Behaviour::new(identify::Config::new(IDENTIFY.into(), key.public())),
             ping: ping::Behaviour::new(ping::Config::new().with_interval(PING).with_timeout(PING)),
             mdns: mdns.into(),
@@ -369,6 +387,11 @@ impl Node {
             guests_noticed: HashMap::new(),
             guest_notices: HashMap::new(),
             guest_pushes: HashSet::new(),
+            ports,
+            client_listeners: HashSet::new(),
+            clients: HashMap::new(),
+            client_of,
+            member_port: None,
             ready: VecDeque::new(),
         };
         node.reload()?;
@@ -399,7 +422,59 @@ impl Node {
     /// each with its key here: users sharing this machine.
     pub fn serve(&mut self, others: Vec<(u32, crate::keys::Key)>) -> Result<()> {
         self.others = others;
+        self.reload_clients()?;
         self.tell_hosts()
+    }
+
+    /// Whether a peer's a client, not a member: asked nothing a member is,
+    /// and counted on for nothing.
+    pub fn is_client(&self, peer: &PeerId) -> bool {
+        self.clients.contains_key(peer)
+    }
+
+    /// The clients let in, and the account each acts for.
+    pub const fn clients(&self) -> &HashMap<PeerId, u32> {
+        &self.clients
+    }
+
+    /// Let in the clients this node was told to, each still a device of
+    /// an account's user here, whom the mesh recognizes; and no others,
+    /// shutting out any whose device was revoked. A client never has
+    /// clients.
+    fn reload_clients(&mut self) -> Result<()> {
+        let mut clients = HashMap::new();
+        if self.client_of.is_none() {
+            let me = self.peer_id();
+            let served = self.accounts();
+            let members = self.members.list()?;
+            for (peer, uid) in self.members.clients()? {
+                if peer == me || members.contains_key(&peer) || !served.contains(&uid) {
+                    continue;
+                }
+                let local = self.local(uid)?;
+                let Some(device) = crate::keys::from_peer_id(&peer.to_string()) else {
+                    continue;
+                };
+                if !local.rooted || !self.recognizes(&local) {
+                    continue;
+                }
+                if self.catalog.viewing(uid, |catalog| catalog.claims().map_or(Ok(false), |claims| claims.authorized(&device)))?? {
+                    clients.insert(peer, uid);
+                }
+            }
+        }
+        let gone: Vec<PeerId> = self.clients.keys().filter(|peer| !clients.contains_key(*peer)).copied().collect();
+        for peer in gone {
+            self.swarm.behaviour_mut().allowed.disallow_peer(peer);
+        }
+        for peer in clients.keys() {
+            self.swarm.behaviour_mut().allowed.allow_peer(*peer);
+        }
+        let peers: HashSet<PeerId> = clients.keys().copied().collect();
+        self.swarm.behaviour_mut().gate.set_clients(peers.clone());
+        self.sightings.uncount(peers)?;
+        self.clients = clients;
+        Ok(())
     }
 
     /// The uids of the accounts served, the catalog's own first.
@@ -498,7 +573,8 @@ impl Node {
             // What's shared with whom may have changed
             self.guests_noticed.clear();
         }
-        let Some(machines) = self.machines() else {
+        // A client's member is the one it was told, whoever the machines are
+        let (Some(machines), None) = (self.machines(), self.client_of) else {
             return Ok(before != after);
         };
         let me = self.peer_id();
@@ -668,10 +744,19 @@ impl Node {
         Ok(())
     }
 
-    /// The connected members which may be asked of an account's blocks.
+    /// The connected members which may be asked of an account's blocks,
+    /// and its clients.
     fn peers_for(&self, local: &Local) -> Vec<PeerId> {
         let mut peers: Vec<PeerId> = self.connected().into_iter().filter(|peer| self.heard.contains(peer) && self.hosts(peer, local)).collect();
         peers.sort();
+        peers
+    }
+
+    /// The connected members which may keep an account's blocks, and be
+    /// counted on to: not its clients, whose copies are no one's.
+    fn machines_for(&self, local: &Local) -> Vec<PeerId> {
+        let mut peers = self.peers_for(local);
+        peers.retain(|peer| !self.is_client(peer));
         peers
     }
 
@@ -741,7 +826,9 @@ impl Node {
                 let recognized = self.granted.as_ref().is_some_and(|(_, state)| state.holds(&user, crate::grants::USER));
                 recognized && self.catalog.claims().map_or(Ok(false), |claims| claims.authorizes(&user, &device))?
             };
-            if certified {
+            // A client acts for its account's user alone
+            let client = self.clients.get(&peer).map(|&uid| locals.iter().any(|local| local.uid == uid && local.user.as_ref() == Some(&user)));
+            if certified && client.is_none_or(|ok| ok) {
                 users.insert(user.to_bytes());
             }
         }
@@ -796,6 +883,8 @@ impl Node {
     /// Notice each connected member of structure which arrived since it
     /// was last noticed, unless it's still to answer the last.
     pub fn announce(&mut self) -> Result<()> {
+        // A device revoked since is a client no more
+        self.reload_clients()?;
         self.tell_hosts()?;
         let telling: HashSet<PeerId> = self.telling.values().map(|(peer, _)| *peer).collect();
         for peer in self.connected() {
@@ -957,8 +1046,12 @@ impl Node {
 
     /// No longer take a peer for a member, as one that won't be back: it
     /// holds up nothing now, and isn't believed to hold anything. One that's
-    /// connected is plainly there.
+    /// connected is plainly there. A client is no longer let in.
     pub fn forget_member(&mut self, peer: &PeerId) -> Result<()> {
+        // A client's shut out at once, connected or not
+        if self.members.remove_client(peer)? {
+            return self.reload_clients();
+        }
         if self.connected().contains(peer) {
             return Err(Error::Invalid(format!("{peer} is connected")));
         }
@@ -1096,7 +1189,7 @@ impl Node {
         for local in self.locals()? {
             let id = self.next_trim;
             self.next_trim = id.wrapping_add(1);
-            let peers = self.peers_for(&local);
+            let peers = self.machines_for(&local);
             let (mut trim, intents) = self.catalog.viewing(local.uid, |catalog| Trim::start(catalog, &self.sightings, &peers, copies, keys.iter().cloned()))??;
             for intent in intents {
                 let intent = intent.for_user(local.user_bytes().as_deref());
@@ -1308,7 +1401,7 @@ impl Node {
     fn ask_condemned(&mut self) -> Result<()> {
         let asking: HashSet<PeerId> = self.condemning.values().map(|&(peer, _)| peer).collect();
         for peer in self.connected() {
-            if asking.contains(&peer) {
+            if asking.contains(&peer) || self.is_client(&peer) {
                 continue;
             }
             for (batch, keys) in self.condemned.unasked(&peer, 8)? {
@@ -1375,8 +1468,8 @@ impl Node {
             let theirs: Vec<Multihash> = self.catalog.viewing(local.uid, |catalog| keys.iter().filter(|key| catalog.visible(key.as_ref()).unwrap_or(false)).cloned().collect())?;
             let id = self.next_audit;
             self.next_audit = id.wrapping_add(1);
-            let peers = self.peers_for(&local);
-            let (mut audit, adverts) = self.catalog.viewing(local.uid, |catalog| Audit::start(catalog, &self.sightings, me, &peers, copies, theirs))??;
+            let peers = self.machines_for(&local);
+            let (mut audit, adverts) = self.catalog.viewing(local.uid, |catalog| Audit::start(catalog, &self.sightings, (me, self.client_of.is_none()), &peers, copies, theirs))??;
             for advert in adverts {
                 let advert = advert.for_user(local.user_bytes().as_deref());
                 for &peer in &peers {
@@ -1657,15 +1750,37 @@ impl Node {
                 self.swarm.behaviour_mut().kad.add_address(&peer, addr);
             }
         }
-        Ok(())
+        self.reload_clients()
     }
 
     pub fn listen(&mut self, addr: Multiaddr) -> Result<()> {
         self.swarm.listen_on(addr).map(drop).map_err(|e| Error::Invalid(format!("listen: {e}")))
     }
 
+    /// Listen for clients too, apart from members: see `clients`.
+    pub fn listen_for_clients(&mut self, addr: Multiaddr) -> Result<()> {
+        if self.client_of.is_some() {
+            return Err(Error::Invalid("a client has no clients".into()));
+        }
+        self.ports.add(&addr);
+        let id = self.swarm.listen_on(addr).map_err(|e| Error::Invalid(format!("listen: {e}")))?;
+        self.client_listeners.insert(id);
+        Ok(())
+    }
+
+    /// Where this listens for members.
     pub fn listeners(&self) -> Vec<Multiaddr> {
-        self.swarm.listeners().cloned().collect()
+        self.swarm.listeners().filter(|addr| !self.ports.contains(addr)).cloned().collect()
+    }
+
+    /// Where this listens for clients.
+    pub fn client_listeners(&self) -> Vec<Multiaddr> {
+        self.swarm.listeners().filter(|addr| self.ports.contains(addr)).cloned().collect()
+    }
+
+    /// The member this is a client of, if it's a client.
+    pub const fn client_of(&self) -> Option<PeerId> {
+        self.client_of
     }
 
     pub fn connected(&self) -> Vec<PeerId> {
@@ -1766,8 +1881,11 @@ impl Node {
     /// A member's newly connected: tell it of the members, notice it of
     /// what it's missed, and vouch for its sightings from now on.
     fn on_connected(&mut self, peer: PeerId) -> Result<()> {
-        let roster = self.roster()?;
-        self.swarm.behaviour_mut().members.send_request(&peer, roster);
+        // A client's told of no members, and tells its member of none
+        if !self.is_client(&peer) && self.client_of.is_none() {
+            let roster = self.roster()?;
+            self.swarm.behaviour_mut().members.send_request(&peer, roster);
+        }
         self.ask_grants(peer)?;
         // What's here is noticed once it knows what this node hosts
         self.tell_hosts()?;
@@ -1820,9 +1938,16 @@ impl Node {
                 };
                 let answer = self.catalog.viewing(local.uid, |catalog| blocks::answer(catalog, &request))?;
                 let served = answer.served();
+                // A client reads through this node alone: what of its user's
+                // isn't here is fetched from the user's other machines, to
+                // be here when it asks again
+                let missing = if self.is_client(&peer) { answer.missing() } else { Vec::new() };
                 // The asker may be gone already
                 let _ = self.swarm.behaviour_mut().blocks.send_response(channel, answer);
                 self.notice_backrefs(peer, &served, &local)?;
+                if !missing.is_empty() {
+                    self.fetch_blocks_for(local.uid, missing)?;
+                }
             },
             request_response::Event::Message { peer, message: request_response::Message::Response { request_id, response }, .. } => {
                 if let Some(id) = self.fetch_of(request_id) {
@@ -1852,12 +1977,63 @@ impl Node {
         Ok(())
     }
 
+    /// Where a member says it listens: where to find it again. A client
+    /// listens nowhere, and is found nowhere; a client's member listens
+    /// for clients on one port, where it's found again wherever it moves.
+    fn on_identified(&mut self, peer: PeerId, addrs: &[Multiaddr]) -> Result<()> {
+        if self.is_client(&peer) {
+            return Ok(());
+        }
+        if self.client_of.is_some() {
+            for addr in addrs.iter().filter(|addr| self.member_port.is_some() && super::clients::port(addr) == self.member_port) {
+                self.members.add_addr(&peer, addr)?;
+            }
+            return Ok(());
+        }
+        for addr in addrs {
+            self.members.add_addr(&peer, addr)?;
+            self.swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
+        }
+        Ok(())
+    }
+
+    /// A member's roster, or its answer to this one's. A client's told of
+    /// no members, and can't make any.
+    fn on_roster(&mut self, peer: PeerId, message: request_response::Message<Roster, Roster>) -> Result<Option<Event>> {
+        Ok(match message {
+            request_response::Message::Request { channel, .. } if self.is_client(&peer) || self.client_of.is_some() => {
+                let _ = self.swarm.behaviour_mut().members.send_response(channel, Roster::default());
+                None
+            },
+            request_response::Message::Response { .. } if self.client_of.is_some() => None,
+            request_response::Message::Request { request, channel, .. } => {
+                let new = self.learn(&request)?;
+                let roster = self.roster()?;
+                // The asker may be gone already
+                let _ = self.swarm.behaviour_mut().members.send_response(channel, roster);
+                (!new.is_empty()).then_some(Event::Learned(new))
+            },
+            request_response::Message::Response { response, .. } => {
+                let new = self.learn(&response)?;
+                (!new.is_empty()).then_some(Event::Learned(new))
+            },
+        })
+    }
+
     fn handle(&mut self, event: SwarmEvent<BehaviourEvent>) -> Result<Option<Event>> {
         Ok(match event {
-            SwarmEvent::NewListenAddr { address, .. } => Some(Event::Listening(address)),
+            SwarmEvent::NewListenAddr { listener_id, address } => {
+                if self.client_listeners.contains(&listener_id) {
+                    self.ports.add(&address);
+                }
+                Some(Event::Listening(address))
+            },
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                 if endpoint.is_dialer() {
                     unless_busy(self.members.add_addr(&peer_id, endpoint.get_remote_address()), "noting a member's address")?;
+                    if self.client_of == Some(peer_id) {
+                        self.member_port = super::clients::port(endpoint.get_remote_address());
+                    }
                 }
                 if num_established.get() > 1 {
                     return Ok(None);
@@ -1872,10 +2048,7 @@ impl Node {
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => Some(Event::Failed(peer_id, error.to_string())),
             SwarmEvent::IncomingConnectionError { error, .. } => Some(Event::Failed(None, error.to_string())),
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
-                for addr in info.listen_addrs {
-                    self.members.add_addr(&peer_id, &addr)?;
-                    self.swarm.behaviour_mut().kad.add_address(&peer_id, addr);
-                }
+                self.on_identified(peer_id, &info.listen_addrs)?;
                 None
             },
             SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { connection, result: Err(_), .. })) => {
@@ -1886,19 +2059,7 @@ impl Node {
                 self.on_discovered(found)?;
                 None
             },
-            SwarmEvent::Behaviour(BehaviourEvent::Members(request_response::Event::Message { message, .. })) => match message {
-                request_response::Message::Request { request, channel, .. } => {
-                    let new = self.learn(&request)?;
-                    let roster = self.roster()?;
-                    // The asker may be gone already
-                    let _ = self.swarm.behaviour_mut().members.send_response(channel, roster);
-                    (!new.is_empty()).then_some(Event::Learned(new))
-                },
-                request_response::Message::Response { response, .. } => {
-                    let new = self.learn(&response)?;
-                    (!new.is_empty()).then_some(Event::Learned(new))
-                },
-            },
+            SwarmEvent::Behaviour(BehaviourEvent::Members(request_response::Event::Message { peer, message, .. })) => self.on_roster(peer, message)?,
             SwarmEvent::Behaviour(BehaviourEvent::Blocks(event)) => {
                 self.on_blocks(event)?;
                 None

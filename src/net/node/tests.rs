@@ -8,9 +8,10 @@ use libp2p::multiaddr::Protocol;
 async fn node(swarm_key: PreSharedKey) -> Node {
     let key = Keypair::generate_ed25519();
     let members = Members::open(Db::memory().expect("db"), crate::net::mesh::MAIN).expect("members");
-    let transport = transport(MemoryTransport::default(), &key, swarm_key).expect("transport");
+    let ports = Ports::default();
+    let transport = transport(MemoryTransport::default(), &key, swarm_key, ports.clone()).expect("transport");
     let catalog = Catalog::standard(Db::memory().expect("db")).expect("catalog");
-    let mut node = Node::new(transport, &key, catalog, members, false).expect("node");
+    let mut node = Node::new(transport, &key, catalog, members, false, ports).expect("node");
     node.listen(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
     loop {
         if let Event::Listening(_) = node.next().await.expect("event") {
@@ -24,7 +25,7 @@ fn invite(inviter: &Node, joiner: &Node, swarm_key: PreSharedKey) {
     inviter.members().add(&joiner.peer_id()).expect("add");
     let mut members = inviter.members().list().expect("list");
     members.insert(inviter.peer_id(), inviter.listeners());
-    let ticket = Ticket { swarm_key, inviter: inviter.peer_id(), members, user: None, protected: false, sealed: Vec::new(), held: Vec::new(), grants: None };
+    let ticket = Ticket { swarm_key: Some(swarm_key), client: false, inviter: inviter.peer_id(), members, user: None, protected: false, sealed: Vec::new(), held: Vec::new(), grants: None };
     let ticket = Ticket::decode(&ticket.encode()).expect("round trip");
     joiner.members().merge(&ticket.members).expect("join");
 }
@@ -1034,10 +1035,10 @@ async fn what_a_keep_asks_one_copy_of_isnt_copied() {
 async fn node_in_file(swarm_key: PreSharedKey, path: &std::path::Path) -> (Node, rusqlite::Connection) {
     let key = Keypair::generate_ed25519();
     let members = Members::open(Db::memory().expect("db"), crate::net::mesh::MAIN).expect("members");
-    let transport = transport(MemoryTransport::default(), &key, swarm_key).expect("transport");
+    let transport = transport(MemoryTransport::default(), &key, swarm_key, Ports::default()).expect("transport");
     let catalog = Catalog::standard(Db::open(path).expect("db")).expect("catalog");
     catalog.wait_for_writers(Duration::from_millis(20)).expect("wait");
-    let mut node = Node::new(transport, &key, catalog, members, false).expect("node");
+    let mut node = Node::new(transport, &key, catalog, members, false, Ports::default()).expect("node");
     node.listen(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
     loop {
         if let Event::Listening(_) = node.next().await.expect("event") {
@@ -1291,4 +1292,207 @@ async fn only_users_the_grants_recognize_are_hosted() {
     server.reload().expect("reload");
     assert!(until(&mut [&mut server, &mut mine, &mut theirs], |n| says(n[2], &them.id(), USER)).await);
     assert_eq!(fetch(&mut server, &mut theirs, link(&yours)).await.0, 1);
+}
+
+//-------------//
+//-[ Clients ]-//
+//-------------//
+
+/// A client of a member, its device key its peer ID, told where the
+/// member listens for clients, or `at`.
+fn client_of(member: &Node, device: &crate::keys::Key, at: Option<Vec<Multiaddr>>) -> Node {
+    let key = Keypair::from_protobuf_encoding(&device.to_protobuf()).expect("keypair");
+    let members = Members::open(Db::memory().expect("db"), mesh::MAIN).expect("members");
+    let at = at.unwrap_or_else(|| member.client_listeners());
+    members.merge(&BTreeMap::from([(member.peer_id(), at)])).expect("merge");
+    members.set_client_of(&member.peer_id()).expect("client of");
+    let transport = crate::net::clients::client_transport(MemoryTransport::default(), &key).expect("transport");
+    let catalog = Catalog::standard(Db::memory().expect("db")).expect("catalog");
+    let mut client = Node::new(transport, &key, catalog, members, false, Ports::default()).expect("node");
+    client.catalog_mut().set_signer(device.clone()).expect("signer");
+    client
+}
+
+/// A member listening for clients too, and a client of it, devices of
+/// one user, connected. Returns the user's root key.
+async fn with_client() -> (Node, Node, crate::keys::Key) {
+    use crate::keys::Key;
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let mut member = node(swarm_key).await;
+    member.listen_for_clients(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
+    assert!(until(&mut [&mut member], |n| !n[0].client_listeners().is_empty()).await);
+    assert!(member.listeners().iter().all(|addr| !member.client_listeners().contains(addr)));
+    let (root, laptop, device) = (Key::generate().expect("key"), Key::generate().expect("key"), Key::generate().expect("key"));
+    let mut client = client_of(&member, &device, None);
+    for node in [&member, &client] {
+        node.catalog().set_user(&root.id()).expect("user");
+        for key in [&laptop, &device] {
+            node.catalog().certify(&root, &key.id()).expect("certify");
+        }
+    }
+    member.catalog_mut().set_signer(laptop).expect("signer");
+    member.members().add_client(&client.peer_id(), member.catalog().uid()).expect("client");
+    member.reload().expect("reload");
+    client.reload().expect("reload");
+    client.dial_members().expect("dial");
+    assert!(until(&mut [&mut member, &mut client], |n| connected(n[0], n[1])).await);
+    (member, client, root)
+}
+
+#[tokio::test]
+async fn a_client_reads_and_writes_through_its_member() {
+    let (mut member, mut client, _) = Box::pin(with_client()).await;
+    assert!(member.is_client(&client.peer_id()) && client.client_of() == Some(member.peer_id()));
+    assert!(!client.is_client(&member.peer_id()));
+    // What the member holds, the client fetches
+    let held = raw(b"on the member");
+    member.catalog().put_block(&held, CidVersion::V1).expect("put");
+    assert_eq!(fetch(&mut member, &mut client, link(&held)).await, (1, vec![]));
+    // What the client says reaches the member, and counts there
+    let tag = raw(b"from the client");
+    client.catalog().put_block(&tag, CidVersion::V1).expect("put");
+    client.catalog().tag(&link(&held), &link(&tag)).expect("tag");
+    client.announce().expect("announce");
+    assert!(until(&mut [&mut member, &mut client], |n| tags(n[0], &held) == [link(&tag)]).await);
+    // What the client makes, its audit copies to the member
+    let made = raw(b"made on the client");
+    client.catalog().put_block(&made, CidVersion::V1).expect("put");
+    let id = client.audit(2).expect("audit");
+    let reports = audited(&mut [&mut member, &mut client], &[(1, id)]).await;
+    assert_eq!(reports.first().map(|report| report.short), Some(0), "{reports:?}");
+    assert!(has(&member, &made));
+    // The member's roster isn't the client's to know, nor the client's
+    // the member's
+    assert!(!member.members().contains(&client.peer_id()).expect("contains"));
+    assert_eq!(client.members().list().expect("list").len(), 1);
+}
+
+#[tokio::test]
+async fn a_clients_copies_count_for_nothing() {
+    let (mut member, mut client, _) = Box::pin(with_client()).await;
+    let held = raw(b"on the member");
+    member.catalog().put_block(&held, CidVersion::V1).expect("put");
+    assert_eq!(fetch(&mut member, &mut client, link(&held)).await.0, 1);
+    // The client says it holds a copy, which the member doesn't believe in
+    let id = client.audit(3).expect("audit");
+    audited(&mut [&mut member, &mut client], &[(1, id)]).await;
+    assert!(member.sightings().of(held.cid().multihash()).expect("sightings").is_empty());
+    // Nor copies anything to it
+    let id = member.audit(2).expect("audit");
+    let reports = audited(&mut [&mut member, &mut client], &[(0, id)]).await;
+    assert!(reports.iter().all(|report| report.copied == 0 && report.short > 0), "{reports:?}");
+}
+
+#[tokio::test]
+async fn only_clients_let_in_get_in_and_only_where_clients_do() {
+    let (mut member, mut client, root) = Box::pin(with_client()).await;
+    // A device of the user's, but never let in as a client
+    let device = crate::keys::Key::generate().expect("key");
+    member.catalog().certify(&root, &device.id()).expect("certify");
+    let mut stranger = client_of(&member, &device, None);
+    stranger.reload().expect("reload");
+    stranger.dial_members().expect("dial");
+    assert!(!within(Duration::from_secs(2), &mut [&mut member, &mut stranger], |n| connected(n[0], n[1])).await);
+
+    // One let in, dialing where members connect, without the mesh's key
+    let device = crate::keys::Key::generate().expect("key");
+    member.catalog().certify(&root, &device.id()).expect("certify");
+    let mut astray = client_of(&member, &device, Some(member.listeners()));
+    member.members().add_client(&astray.peer_id(), member.catalog().uid()).expect("client");
+    member.reload().expect("reload");
+    assert!(member.is_client(&astray.peer_id()));
+    astray.reload().expect("reload");
+    astray.dial_members().expect("dial");
+    assert!(!within(Duration::from_secs(2), &mut [&mut member, &mut astray], |n| connected(n[0], n[1])).await);
+
+    // A member, with the key, dialing where clients connect
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let mut other = node(swarm_key).await;
+    other.members().merge(&BTreeMap::from([(member.peer_id(), member.client_listeners())])).expect("merge");
+    member.members().add(&other.peer_id()).expect("add");
+    member.reload().expect("reload");
+    other.reload().expect("reload");
+    other.dial_members().expect("dial");
+    assert!(!within(Duration::from_secs(2), &mut [&mut member, &mut other], |n| connected(n[0], n[1])).await);
+
+    // And a client forgotten is shut out at once
+    member.forget_member(&client.peer_id()).expect("forget");
+    assert!(until(&mut [&mut member, &mut client], |n| !n[0].connected().contains(&n[1].peer_id())).await);
+    assert!(!member.is_client(&client.peer_id()));
+}
+
+#[tokio::test]
+async fn what_a_client_makes_goes_to_its_member_whatever_they_share() {
+    let (mut member, mut client, _) = Box::pin(with_client()).await;
+    // On one disk, as a sandbox on its member's machine: a copy there
+    // raises nothing, but the client's own counts for nothing
+    for node in [&member, &client] {
+        for volume in node.catalog().volume_list().expect("volumes") {
+            node.catalog().add_risk(&volume.name, "disk:shared").expect("risk");
+        }
+    }
+    let made = raw(b"made on a shared disk");
+    client.catalog().put_block(&made, CidVersion::V1).expect("put");
+    let id = client.audit(2).expect("audit");
+    let reports = audited(&mut [&mut member, &mut client], &[(1, id)]).await;
+    assert!(has(&member, &made), "{reports:?}");
+    // And once it's there, nothing's short
+    let id = client.audit(2).expect("audit");
+    assert_eq!(audited(&mut [&mut member, &mut client], &[(1, id)]).await.first().map(|report| report.advertised), Some(0));
+}
+
+#[tokio::test]
+async fn what_its_member_lacks_a_client_has_next_time() {
+    use crate::keys::Key;
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let (mut member, mut other) = (node(swarm_key).await, node(swarm_key).await);
+    invite(&member, &other, swarm_key);
+    member.listen_for_clients(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
+    assert!(until(&mut [&mut member], |n| !n[0].client_listeners().is_empty()).await);
+    let (root, mine, theirs, device) = (Key::generate().expect("key"), Key::generate().expect("key"), Key::generate().expect("key"), Key::generate().expect("key"));
+    let mut client = client_of(&member, &device, None);
+    for node in [&member, &other, &client] {
+        node.catalog().set_user(&root.id()).expect("user");
+        for key in [&mine, &theirs, &device] {
+            node.catalog().certify(&root, &key.id()).expect("certify");
+        }
+    }
+    member.catalog_mut().set_signer(mine).expect("signer");
+    other.catalog_mut().set_signer(theirs).expect("signer");
+    member.members().add_client(&client.peer_id(), member.catalog().uid()).expect("client");
+    for node in [&mut member, &mut other, &mut client] {
+        node.reload().expect("reload");
+        node.dial_members().expect("dial");
+    }
+    assert!(until(&mut [&mut member, &mut other, &mut client], |n| connected(n[0], n[1]) && connected(n[0], n[2])).await);
+    assert!(!other.connected().contains(&client.peer_id()));
+    // Only the other member has it: the first ask finds it missing, and
+    // has the member fetch it
+    let elsewhere = raw(b"on the other member");
+    other.catalog().put_block(&elsewhere, CidVersion::V1).expect("put");
+    let id = client.fetch_blocks(vec![link(&elsewhere)]).expect("fetch");
+    let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(10)).expect("deadline");
+    loop {
+        let events = futures::future::select_all([&mut member, &mut other, &mut client].map(|node| Box::pin(node.next())));
+        let (event, from, _) = tokio::time::timeout_at(deadline, events).await.expect("in time");
+        if let Event::Fetched { id: done, missing, .. } = event.expect("event")
+            && (from, done) == (2, id)
+        {
+            assert_eq!(missing, [link(&elsewhere)]);
+            break;
+        }
+    }
+    assert!(until(&mut [&mut member, &mut other, &mut client], |n| has(n[0], &elsewhere)).await);
+    let id = client.fetch_blocks(vec![link(&elsewhere)]).expect("fetch");
+    let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(10)).expect("deadline");
+    loop {
+        let events = futures::future::select_all([&mut member, &mut other, &mut client].map(|node| Box::pin(node.next())));
+        let (event, from, _) = tokio::time::timeout_at(deadline, events).await.expect("in time");
+        if let Event::Fetched { id: done, fetched, .. } = event.expect("event")
+            && (from, done) == (2, id)
+        {
+            assert_eq!(fetched, 1);
+            break;
+        }
+    }
 }

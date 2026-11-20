@@ -74,10 +74,11 @@ machine() {
     on "$name" mkdir -p /soup
 }
 
-# Start a node's daemon, and wait till it answers
+# Start a node's daemon, with any more arguments, and wait till it answers
 node_up() {
-    podman exec -d "$run-$1" sh -c 'exec hk node run >>/tmp/node.log 2>&1'
-    wait_for "$1's node to run" on "$1" hk node status
+    local name=$1; shift
+    podman exec -d "$run-$name" sh -c "exec hk node run $* >>/tmp/node.log 2>&1"
+    wait_for "$name's node to run" on "$name" hk node status
 }
 
 # Mount a node's soup at /soup, and wait till it's there
@@ -386,6 +387,44 @@ scenario_shared() {
     wait_for "one to see ezra's set" sh_on one "hk anchor show '$anchor' | head -1 | grep -q '$theirs'"
 }
 
+# A client of one: a device of ezra's user which is no member, connecting
+# to one alone, where it listens for clients, and seeing what ezra's user
+# may, and only that
+scenario_client() {
+    local peer one_peer ticket theirs ours mine
+    machine laptop
+    peer=$(on laptop hk node id)
+    one_peer=$(on one hk node id)
+    ticket=$(on one hk node invite "$peer" --client --account 4000000001 2>/dev/null)
+    on laptop hk node join "$ticket" >/dev/null
+    node_up laptop
+    wait_for "the client to connect" sh_on one "hk node peers | grep -q '^$peer	connected	client	4000000001$'"
+    on laptop hk node status | grep -q "^client of	$one_peer$" || fail "the laptop doesn't say it's one's client"
+    ! on one hk node grant ls | grep -q "^$peer	" || fail "the client was given commands"
+    [ "$(on laptop hk node peers | cut -f1)" = "$one_peer" ] || fail "the client was told of members"
+    ! on two hk node peers | grep -q "$peer" || fail "two was told of the client"
+    # It reads what ezra's user has, through one, and nothing else
+    theirs=$(sh_on ezra 'echo "a note for the laptop" | hk add -q -')
+    ours=$(sh_on one 'echo "a note of one'"'"'s alone" | hk add -q -')
+    wait_for "the laptop to fetch ezra's note" on laptop hk dag fetch "$theirs"
+    ! on laptop hk dag fetch "$ours" >/dev/null 2>&1 || fail "the laptop fetched one's owner's note"
+    # What it adds goes to one, and on to ezra's machine, not to two
+    mine=$(sh_on laptop 'echo "a note from the laptop" | hk add -q -')
+    wait_for "ezra to fetch the laptop's note" on ezra hk dag fetch "$mine"
+    ! on two hk dag fetch "$mine" >/dev/null 2>&1 || fail "two fetched the laptop's note"
+    # Its mount is ezra's user's soup, read and written both ways
+    mount_up laptop
+    mount_up ezra
+    sh_on laptop 'mkdir /soup/notes && echo "written on the laptop" > /soup/notes/laptop.md'
+    wait_for "ezra to read the laptop's page" holds ezra /soup/notes/laptop.md "written on the laptop"
+    sh_on ezra 'echo "and ezra replies" > /soup/notes/ezra.md'
+    wait_for "the laptop to read ezra's page" holds laptop /soup/notes/ezra.md "and ezra replies"
+    # Forgotten, it's shut out at once
+    on one hk node forget "$peer"
+    ! on one hk node peers | grep -q "$peer" || fail "one still lists the client"
+    wait_for "the laptop to be cut off" sh_on laptop "hk node status | grep -q '^connected	0$'"
+}
+
 # --- Main ----------------------------------------------------------------
 
 say "building hk and the machine image"
@@ -396,14 +435,14 @@ podman network create "$net" >/dev/null
 say "a mesh of two"
 machine one
 machine two
-node_up one
+node_up one --clients
 invite one two
 node_up two
 mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke shared)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke shared client)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

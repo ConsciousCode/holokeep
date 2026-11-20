@@ -68,6 +68,12 @@ pub struct Blocks {
 
 impl Blocks {
     /// The multihashes of the blocks it carries.
+    /// What wasn't here to serve, by CIDs of no codec in particular, as
+    /// fetching blocks alone needs none: theirs come with them.
+    pub fn missing(&self) -> Vec<Link> {
+        self.missing.iter().filter_map(|key| Some(AnyCid::V1(Cidv1::new(RAW_CODEC, Multihash::decode(key).ok()?)))).collect()
+    }
+
     pub fn served(&self) -> Vec<Vec<u8>> {
         self.found.iter().filter_map(|(cid, _)| Some(Link::decode(cid).ok()?.multihash().to_bytes())).collect()
     }

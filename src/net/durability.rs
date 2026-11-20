@@ -189,6 +189,8 @@ pub struct Sightings {
     ttl: Duration,
     /// Peers connected, and since when.
     live: std::cell::RefCell<HashMap<PeerId, i64>>,
+    /// Peers whose copies don't count, as they're no members: clients.
+    uncounted: std::cell::RefCell<std::collections::HashSet<PeerId>>,
 }
 
 impl Sightings {
@@ -210,7 +212,7 @@ impl Sightings {
                  value INTEGER NOT NULL
              );",
         )?;
-        Ok(Self { db, ttl: TTL, live: std::cell::RefCell::default() })
+        Ok(Self { db, ttl: TTL, live: std::cell::RefCell::default(), uncounted: std::cell::RefCell::default() })
     }
 
     /// Believe in sightings for this long instead.
@@ -239,8 +241,21 @@ impl Sightings {
         seen >= cutoff || self.live.borrow().get(peer).is_some_and(|&since| since <= seen)
     }
 
-    /// Note that a peer holds a copy of a block.
+    /// Count no copies these peers hold, whatever they say: clients, whose
+    /// copies are a cache, not the mesh's.
+    pub fn uncount(&self, peers: std::collections::HashSet<PeerId>) -> Result<()> {
+        for peer in &peers {
+            self.forget_peer(peer)?;
+        }
+        *self.uncounted.borrow_mut() = peers;
+        Ok(())
+    }
+
+    /// Note that a peer holds a copy of a block, if its copies count.
     pub fn see(&self, key: Key<'_>, peer: &PeerId, replica: &Replica) -> Result<()> {
+        if self.uncounted.borrow().contains(peer) {
+            return Ok(());
+        }
         let block = self.db.intern(key)?;
         self.db.conn()
             .prepare_cached("INSERT OR REPLACE INTO sightings (block, label, peer, risks, seen) VALUES (?1, ?2, ?3, ?4, ?5)")?
@@ -522,11 +537,14 @@ impl Audit {
     /// or whose copies elsewhere are due to be sighted again, and which
     /// this node is responsible for among the holders it knows of,
     /// connected or itself. Returns the audit and the adverts to send
-    /// every peer.
+    /// every peer. Unless `own` counts, what's here counts for nothing, as
+    /// a client's copies, a cache, count for nothing to the mesh: what it
+    /// holds is short till a member holds it, whatever risks they share,
+    /// and no longer, as the member's audits see to the rest.
     pub fn start(
         catalog: &Catalog,
         sightings: &Sightings,
-        me: PeerId,
+        (me, own): (PeerId, bool),
         peers: &[PeerId],
         copies: usize,
         keys: impl IntoIterator<Item = Multihash>,
@@ -547,8 +565,10 @@ impl Audit {
             if key.code() == IDENTITY || audit.blocks.contains_key(&key.to_bytes()) {
                 continue;
             }
-            let ours = catalog.replicas(key.as_ref())?;
-            let copies = catalog.copies_wanted(key.as_ref(), copies)?.unwrap_or(copies);
+            let ours = if own { catalog.replicas(key.as_ref())? } else { Vec::new() };
+            // A client's done once a member holds it, whose audits see to
+            // the rest
+            let copies = if own { catalog.copies_wanted(key.as_ref(), copies)?.unwrap_or(copies) } else { 1 };
             let mut holding = Holding { copies, ..Holding::default() };
             for (peer, replica) in sightings.of(key.as_ref())? {
                 if peers.contains(&peer) {
@@ -985,7 +1005,7 @@ mod tests {
         sightings.see(key.as_ref(), &peer, &replica(1, &["volume:01", "disk:elsewhere"])).expect("see");
         // Enough copies, freshly sighted: nothing to say
         let advertised = |sightings: &Sightings| {
-            Audit::start(&catalog, sightings, me, &[peer], 2, [key.clone()]).expect("start").0.report.advertised
+            Audit::start(&catalog, sightings, (me, true), &[peer], 2, [key.clone()]).expect("start").0.report.advertised
         };
         assert_eq!(advertised(&sightings), 0);
         // Four days on, it's due

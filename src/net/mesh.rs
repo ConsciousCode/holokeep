@@ -239,6 +239,19 @@ impl Members {
              CREATE TABLE IF NOT EXISTS mesh_grants (
                  mesh TEXT PRIMARY KEY,
                  genesis BLOB NOT NULL
+             );
+             -- Of a member: the clients it lets connect, by their device's
+             -- peer ID, and the account, by uid, each acts for.
+             CREATE TABLE IF NOT EXISTS mesh_clients (
+                 mesh TEXT NOT NULL,
+                 peer TEXT NOT NULL,
+                 uid INTEGER NOT NULL,
+                 PRIMARY KEY (mesh, peer)
+             ) WITHOUT ROWID;
+             -- Of a client: the member it connects to, its only member.
+             CREATE TABLE IF NOT EXISTS mesh_client_of (
+                 mesh TEXT PRIMARY KEY,
+                 peer TEXT NOT NULL
              );",
         )?;
         if !db.conn().prepare("SELECT 1 FROM pragma_table_info('meshes') WHERE name = 'protected'")?.exists([])? {
@@ -412,6 +425,46 @@ impl Members {
             .exists([&self.mesh, &peer.to_string()])?)
     }
 
+    /// Let a client connect, acting for an account: one of its user's
+    /// devices, which is no member.
+    pub fn add_client(&self, peer: &PeerId, uid: u32) -> Result<()> {
+        self.db.conn()
+            .prepare_cached("INSERT INTO mesh_clients (mesh, peer, uid) VALUES (?1, ?2, ?3) ON CONFLICT (mesh, peer) DO UPDATE SET uid = excluded.uid")?
+            .execute(params![self.mesh, peer.to_string(), uid])?;
+        Ok(())
+    }
+
+    /// No longer let a client connect. Returns whether it was one.
+    pub fn remove_client(&self, peer: &PeerId) -> Result<bool> {
+        Ok(self.db.conn().prepare_cached("DELETE FROM mesh_clients WHERE mesh = ?1 AND peer = ?2")?.execute([&self.mesh, &peer.to_string()])? > 0)
+    }
+
+    /// The clients let connect, and the account each acts for.
+    pub fn clients(&self) -> Result<BTreeMap<PeerId, u32>> {
+        let rows: Vec<(String, u32)> = self.db.conn()
+            .prepare_cached("SELECT peer, uid FROM mesh_clients WHERE mesh = ?1 ORDER BY peer")?
+            .query_map([&self.mesh], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows.into_iter().filter_map(|(peer, uid)| Some((PeerId::from_str(&peer).ok()?, uid))).collect())
+    }
+
+    /// The member this node is a client of, if it's a client.
+    pub fn client_of(&self) -> Result<Option<PeerId>> {
+        let peer: Option<String> = self.db.conn()
+            .prepare_cached("SELECT peer FROM mesh_client_of WHERE mesh = ?1")?
+            .query_row([&self.mesh], |row| row.get(0))
+            .optional()?;
+        peer.map(|peer| PeerId::from_str(&peer).map_err(|e| Error::Invalid(format!("the member this is a client of, {peer}: {e}")))).transpose()
+    }
+
+    /// Be a client of a member, and of no other.
+    pub fn set_client_of(&self, peer: &PeerId) -> Result<()> {
+        self.db.conn()
+            .prepare_cached("INSERT INTO mesh_client_of (mesh, peer) VALUES (?1, ?2) ON CONFLICT (mesh) DO UPDATE SET peer = excluded.peer")?
+            .execute([&self.mesh, &peer.to_string()])?;
+        Ok(())
+    }
+
     /// Take in members another member knows of, but those forgotten here.
     /// Returns those new here.
     pub fn merge(&self, other: &BTreeMap<PeerId, Vec<Multiaddr>>) -> Result<Vec<PeerId>> {
@@ -434,7 +487,13 @@ impl Members {
 /// What a machine needs to join a mesh.
 #[derive(Debug, Clone)]
 pub struct Ticket {
-    pub swarm_key: PreSharedKey,
+    /// The mesh's key, which a client's ticket leaves out: a client is no
+    /// member.
+    pub swarm_key: Option<PreSharedKey>,
+    /// Whether it's for a client of the inviter: one of its user's
+    /// devices, connecting to the inviter alone, where it listens for
+    /// clients, and seeing only what its user may.
+    pub client: bool,
     /// The node which made it, and where it listens.
     pub inviter: PeerId,
     /// Every member the inviter knows of, itself included, and where each
@@ -471,9 +530,14 @@ impl Ticket {
         });
         let mut ticket = BTreeMap::from([
             ("inviter".to_owned(), Ipld::Bytes(self.inviter.to_bytes())),
-            ("key".to_owned(), Ipld::String(self.swarm_key.to_string())),
             ("members".to_owned(), Ipld::List(members.collect())),
         ]);
+        if let Some(swarm_key) = &self.swarm_key {
+            ticket.insert("key".to_owned(), Ipld::String(swarm_key.to_string()));
+        }
+        if self.client {
+            ticket.insert("client".to_owned(), Ipld::Bool(true));
+        }
         if let Some((user, certificate)) = &self.user {
             ticket.insert("user".to_owned(), Ipld::Link(user.clone()));
             ticket.insert("blocks".to_owned(), Ipld::List(certificate.iter().cloned().map(Ipld::Bytes).collect()));
@@ -506,10 +570,16 @@ impl Ticket {
             _ => Err(invalid("peer id")),
         };
         let inviter = peer(map.remove("inviter"))?;
-        let Some(Ipld::String(key)) = map.remove("key") else {
-            return Err(invalid("key"));
+        let client = match map.remove("client") {
+            None => false,
+            Some(Ipld::Bool(client)) => client,
+            Some(_) => return Err(invalid("client")),
         };
-        let swarm_key = PreSharedKey::from_str(&key).map_err(|_| invalid("key"))?;
+        let swarm_key = match map.remove("key") {
+            Some(Ipld::String(key)) if !client => Some(PreSharedKey::from_str(&key).map_err(|_| invalid("key"))?),
+            None if client => None,
+            _ => return Err(invalid("key")),
+        };
         let Some(Ipld::List(list)) = map.remove("members") else {
             return Err(invalid("members"));
         };
@@ -569,7 +639,7 @@ impl Ticket {
             }).collect::<Result<_>>()?)),
             _ => return Err(invalid("grants")),
         };
-        Ok(Self { swarm_key, inviter, members, user, protected, sealed, held, grants })
+        Ok(Self { swarm_key, client, inviter, members, user, protected, sealed, held, grants })
     }
 }
 
@@ -615,5 +685,40 @@ mod tests {
         assert!(Place::valid("friends-2") && !Place::valid("../up") && !Place::valid(""));
         assert_eq!(Place::new(Path::new("/r"), "x").dir(), Path::new("/r/meshes/x"));
         assert_eq!(Place::main(Path::new("/r")).dir(), Path::new("/r"));
+
+        // A member's clients, and a client's member
+        let (client, member) = (peer(), peer());
+        main.add_client(&client, 60002).expect("client");
+        assert_eq!(main.clients().expect("clients").into_iter().collect::<Vec<_>>(), [(client, 60002)]);
+        assert!(other.clients().expect("clients").is_empty() && !main.contains(&client).expect("contains"));
+        assert!(main.remove_client(&client).expect("remove") && !main.remove_client(&client).expect("remove"));
+        assert_eq!(main.client_of().expect("client of"), None);
+        main.set_client_of(&member).expect("client of");
+        assert_eq!(main.client_of().expect("client of"), Some(member));
+        assert_eq!(other.client_of().expect("client of"), None);
+    }
+
+    #[test]
+    fn a_clients_ticket_holds_no_mesh_key() {
+        let inviter = peer();
+        let ticket = Ticket {
+            swarm_key: None,
+            client: true,
+            inviter,
+            members: BTreeMap::from([(inviter, vec!["/ip4/127.0.0.1/tcp/4012".parse().expect("addr")])]),
+            user: None,
+            protected: false,
+            sealed: Vec::new(),
+            held: Vec::new(),
+            grants: None,
+        };
+        let decoded = Ticket::decode(&ticket.encode()).expect("decode");
+        assert!(decoded.client && decoded.swarm_key.is_none());
+        assert_eq!(decoded.members, ticket.members);
+        // A member's needs the key, and a client's mustn't have it
+        let member = Ticket::decode(&Ticket { client: false, ..ticket.clone() }.encode());
+        assert!(member.is_err());
+        let leaky = Ticket { swarm_key: Some(fresh_swarm_key().expect("key")), ..ticket };
+        assert!(Ticket::decode(&leaky.encode()).is_err());
     }
 }

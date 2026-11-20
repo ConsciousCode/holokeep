@@ -67,6 +67,13 @@ other side enforces anything.
   machine can tell who signed what.
 - **Local clients.** With `hk node run --shared`, the host's other users
   ask the daemon over its socket, as their own accounts.
+- **Remote clients.** A device needn't be a machine: a client keeps a
+  repo of its own, as a cache, and connects to one member, without the
+  swarm key, where the member listens for clients, acting as its user and
+  seeing only what that user may (see [[Mesh#Clients]]). It's no member,
+  so its copies count for nothing and it's told of no members. An agent
+  running on a machine outside the mesh (a hosted assistant) is a client,
+  never a member, or it would hold everyone's plaintext.
 - **Block access tokens** are computed and checked (see
   [[Protected Meshes#Block access tokens]]), but nothing asks for them.
 
@@ -79,10 +86,11 @@ Not yet implemented, beyond what's above.
   This waits for machines to be admitted by grants of their own, since
   until then an invite certifies the joining machine as a device, and
   one ID is all it needs.
-- **Remote clients.** A device needn't be a machine. A client connects to
-  a member machine and acts as its user, seeing only what that user may.
-  An agent running on a machine outside the mesh (a hosted assistant) is
-  a client, never a member, or it would hold everyone's plaintext.
+- **Thin clients.** A client with no repo of its own, for a sandbox
+  without a disk to keep one on, asking its member for what it reads and
+  sending what it writes, as `hk` commands ask the daemon.
+- **Clients of several members**, so a client isn't cut off while its one
+  member is away.
 
 ## Roles and grants
 
@@ -267,7 +275,8 @@ Not yet implemented, beyond protected meshes.
 3. Grants on anchors, `/anchor/read` and `/anchor/write`, and taking
    them away. Done: between accounts sharing a repo (3a), and across
    machines, guests' (3b).
-4. Remote clients.
+4. Remote clients. Done, as clients keeping a repo of their own; thin
+   clients are to come.
 5. Capabilities for sharing outside the mesh.
 
 ## Open questions
@@ -282,4 +291,4 @@ Not yet implemented, beyond protected meshes.
   history, as now, or a snapshot of the state with its heads, once there
   are too many to send each time or to work out quadratically.
 
-Source: `src/account.rs`, `src/grants.rs`, `src/keys.rs`, `src/net/daemon.rs`, `src/net/grants.rs`, `src/net/hosts.rs`, `src/net/mesh.rs`, `src/net/node.rs`, `src/vault.rs`.
+Source: `src/account.rs`, `src/grants.rs`, `src/keys.rs`, `src/net/clients.rs`, `src/net/daemon.rs`, `src/net/grants.rs`, `src/net/hosts.rs`, `src/net/mesh.rs`, `src/net/node.rs`, `src/vault.rs`.

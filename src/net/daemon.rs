@@ -39,6 +39,16 @@ const SOCKET: &str = "node.sock";
 /// Where a node listens unless told otherwise.
 pub const LISTEN: &str = "/ip4/0.0.0.0/tcp/4011";
 
+/// Where a node listens for clients, if it's to, unless told otherwise.
+pub const LISTEN_CLIENTS: &str = "/ip4/0.0.0.0/tcp/4012";
+
+/// Where a node listens: for members, and for clients, if it's to.
+#[derive(Debug, Clone)]
+pub struct Listen {
+    pub members: Multiaddr,
+    pub clients: Option<Multiaddr>,
+}
+
 /// How often to dial members which aren't connected.
 const REDIAL: Duration = Duration::from_mins(1);
 
@@ -327,6 +337,9 @@ pub fn trim(place: &Place) -> Result<Option<super::trim::Report>> {
 pub fn forget(place: &Place, peer: &libp2p::PeerId) -> Result<()> {
     let Some(lines) = ask(place, &format!("forget {peer}"))? else {
         let members = members(place)?;
+        if members.remove_client(peer)? {
+            return Ok(());
+        }
         if let Some(genesis) = members.genesis()?
             && let Some(state) = crate::store::Catalog::open_repo(&place.repo)?.grant_state(&genesis)?
             && crate::keys::from_peer_id(&peer.to_string()).is_some_and(|key| state.holders().iter().any(|(who, held)| *who == key && held.iter().any(|c| c == crate::grants::MACHINE)))
@@ -388,16 +401,18 @@ fn ask_within(place: &Place, command: &str, time: Option<Duration>) -> Result<Op
 fn open_node(place: &Place) -> Result<(Node, bool)> {
     let dir = place.repo.as_path();
     let key = mesh::node_key(dir)?;
+    let db = Db::open(&dir.join("blocks.db"))?;
+    db.conn().busy_timeout(WRITER_WAIT)?;
+    let members = Members::open(db, &place.mesh)?;
+    // A client has no swarm key, and needs none
     let (swarm_key, alone) = match mesh::swarm_key(&place.dir())? {
         Some(swarm_key) => (swarm_key, false),
+        None if members.client_of()?.is_some() => (mesh::fresh_swarm_key()?, false),
         None if place.is_main() => (mesh::fresh_swarm_key()?, true),
         None => return Err(Error::Invalid("this node isn't in that mesh: invite another, or join one".into())),
     };
     let mut catalog = crate::store::Catalog::open_repo(dir)?;
     catalog.wait_for_writers(WRITER_WAIT)?;
-    let db = Db::open(&dir.join("blocks.db"))?;
-    db.conn().busy_timeout(WRITER_WAIT)?;
-    let members = Members::open(db, &place.mesh)?;
     // A mesh for another of the host's accounts holds and hears of its repo
     if let Some(uid) = members.account()? {
         catalog.act_for(uid, crate::keys::account_key(dir, uid)?)?;
@@ -419,13 +434,25 @@ fn serve_accounts(node: &mut Node, dir: &Path) -> Result<()> {
     node.serve(keys)
 }
 
-/// Listen and connect to members, and say so, unless alone.
-fn start(node: &mut Node, place: &Place, listen: Multiaddr, alone: bool) -> Result<()> {
+/// Listen and connect to members, and say so, unless alone; or as a
+/// client, listening nowhere, connect to its member.
+fn start(node: &mut Node, place: &Place, listen: &Listen, alone: bool) -> Result<()> {
     if alone {
         eprintln!("node {} in no mesh yet, alone: watching files imported in place, and collecting what nothing keeps", node.peer_id());
         return Ok(());
     }
-    node.listen(listen)?;
+    if let Some(member) = node.client_of() {
+        if listen.clients.is_some() {
+            return Err(Error::Invalid("this node is a client, which has no clients".into()));
+        }
+        node.dial_members()?;
+        eprintln!("node {} a client of {member}", node.peer_id());
+        return Ok(());
+    }
+    node.listen(listen.members.clone())?;
+    if let Some(clients) = &listen.clients {
+        node.listen_for_clients(clients.clone())?;
+    }
     node.dial_members()?;
     eprintln!("node {} in mesh {}", node.peer_id(), place.mesh);
     Ok(())
@@ -452,13 +479,13 @@ fn control_socket(place: &Place, shared: bool) -> Result<UnixListener> {
 
 /// A node alone, its swarm's key no member's, made a member of a mesh:
 /// started again, as that mesh's node, if it's in one now.
-fn join_mesh(place: &Place, listen: &Multiaddr, (low, high): (u64, u64)) -> Result<Option<Node>> {
+fn join_mesh(place: &Place, listen: &Listen, (low, high): (u64, u64)) -> Result<Option<Node>> {
     let (mut joined, alone) = open_node(place)?;
     if alone {
         return Ok(None);
     }
     joined.set_watermarks(low, high);
-    start(&mut joined, place, listen.clone(), false)?;
+    start(&mut joined, place, listen, false)?;
     Ok(Some(joined))
 }
 
@@ -500,7 +527,7 @@ fn notice_change(node: &mut Node, remounts: &mut Remounts, path: PathBuf, again:
 
 /// Join the mesh this node's been made a member of, if it can now. Returns
 /// whether that's been dealt with.
-fn join_now(node: &mut Node, alone: &mut bool, place: &Place, listen: &Multiaddr, marks: (u64, u64)) -> Result<bool> {
+fn join_now(node: &mut Node, alone: &mut bool, place: &Place, listen: &Listen, marks: (u64, u64)) -> Result<bool> {
     match join_mesh(place, listen, marks) {
         Ok(joined) => {
             if let Some(joined) = joined {
@@ -523,10 +550,12 @@ fn join_now(node: &mut Node, alone: &mut bool, place: &Place, listen: &Multiaddr
 /// Free space is kept between watermarks, `(low, high)`: below the low,
 /// the node lets go of copies the mesh can spare until it's above the
 /// high. If `collecting`, garbage is collected too, a sample at a time.
-pub async fn run(place: &Place, listen: Multiaddr, copies: usize, (low, high): (u64, u64), collecting: bool, scanning: bool, shared: bool) -> Result<()> {
+pub async fn run(place: &Place, listen: Listen, copies: usize, (low, high): (u64, u64), collecting: bool, scanning: bool, shared: bool) -> Result<()> {
     let (mut node, mut alone) = open_node(place)?;
     node.set_watermarks(low, high);
-    start(&mut node, place, listen.clone(), alone)?;
+    start(&mut node, place, &listen, alone)?;
+    // What a client holds is a cache: what's lost is its member's to say
+    let scanning = scanning && node.client_of().is_none();
     let control = control_socket(place, shared)?;
     let mut redial = tokio::time::interval(REDIAL);
     let later = |delay| tokio::time::Instant::now().checked_add(delay).unwrap_or_else(tokio::time::Instant::now);
@@ -766,7 +795,14 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
     if alone {
         let _ = writeln!(out, "mesh\tnone yet, alone");
     }
+    if let Some(member) = node.client_of() {
+        let _ = writeln!(out, "client of\t{member}");
+    }
     let _ = writeln!(out, "connected\t{}", node.connected().len());
+    if !node.clients().is_empty() {
+        let connected = node.connected().iter().filter(|peer| node.is_client(peer)).count();
+        let _ = writeln!(out, "clients\t{} of {} connected", connected, node.clients().len());
+    }
     let _ = writeln!(out, "blocks\t{}", node.catalog().block_count()?);
     let _ = writeln!(out, "copies\t{copies}");
     let _ = writeln!(out, "trickle\t{:.1}s", node.trickle_interval().as_secs_f64());
@@ -796,6 +832,29 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
     Ok(out)
 }
 
+/// What `peers` says: each member, whether it's connected, where it
+/// listens, and which accounts here its users are; then each client.
+fn peers(node: &Node) -> Result<String> {
+    let mut out = String::new();
+    let connected = node.connected();
+    // A ticket's list includes whoever it let in
+    for (peer, addrs) in node.members().list()?.into_iter().filter(|(peer, _)| *peer != node.peer_id()) {
+        let state = if connected.contains(&peer) { "connected" } else { "-" };
+        let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
+        // Which accounts here its users are, once it's said
+        let hosts: Vec<String> = if connected.contains(&peer) { node.hosted_by(&peer)?.iter().map(ToString::to_string).collect() } else { Vec::new() };
+        let hosts = if hosts.is_empty() { "-".to_owned() } else { hosts.join(" ") };
+        let _ = writeln!(out, "{peer}\t{state}\t{}\t{hosts}", addrs.join(" "));
+    }
+    let mut clients: Vec<(&libp2p::PeerId, &u32)> = node.clients().iter().collect();
+    clients.sort();
+    for (peer, uid) in clients {
+        let state = if connected.contains(peer) { "connected" } else { "-" };
+        let _ = writeln!(out, "{peer}\t{state}\tclient\t{uid}");
+    }
+    Ok(out)
+}
+
 /// Answer one command on the control socket, or say which fetch it waits
 /// on, to be answered when that finishes.
 async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, copies: usize, collecting: bool, alone: bool, join: &mut bool) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
@@ -819,18 +878,7 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
         return Ok(None);
     }
     match line.trim() {
-        "peers" => {
-            let connected = node.connected();
-            // A ticket's list includes whoever it let in
-            for (peer, addrs) in node.members().list()?.into_iter().filter(|(peer, _)| *peer != node.peer_id()) {
-                let state = if connected.contains(&peer) { "connected" } else { "-" };
-                let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
-                // Which accounts here its users are, once it's said
-                let hosts: Vec<String> = if connected.contains(&peer) { node.hosted_by(&peer)?.iter().map(ToString::to_string).collect() } else { Vec::new() };
-                let hosts = if hosts.is_empty() { "-".to_owned() } else { hosts.join(" ") };
-                let _ = writeln!(out, "{peer}\t{state}\t{}\t{hosts}", addrs.join(" "));
-            }
-        },
+        "peers" => out.push_str(&peers(node)?),
         "status" => out.push_str(&status(node, copies, collecting, alone)?),
         "scan-lost" => {
             node.scan_lost()?;
@@ -841,11 +889,16 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
                 let _ = writeln!(out, "{addr}");
             }
         },
+        "client-listeners" => {
+            for addr in node.client_listeners() {
+                let _ = writeln!(out, "{addr}");
+            }
+        },
         "reload" => {
             // Alone, it has a swarm key no member has, so once it's in a
             // mesh, it starts again as that mesh's node
             if alone {
-                *join = mesh::swarm_key(&place.dir())?.is_some();
+                *join = mesh::swarm_key(&place.dir())?.is_some() || node.members().client_of()?.is_some();
                 let _ = writeln!(out, "{}", if *join { "joined" } else { "alone" });
             } else {
                 node.reload()?;

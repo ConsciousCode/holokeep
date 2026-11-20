@@ -241,7 +241,7 @@ pub trait Store: BlockIndex + BlockSource + BlockStore {
 /// making it over as it knows it, its views say, would break what the newer
 /// build reads them with, where that's still running. Raise it with any
 /// change to them (and make a repo fixture, `scripts/make-repo-fixture.sh`).
-pub const SCHEMA: i64 = 2;
+pub const SCHEMA: i64 = 3;
 
 pub const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 

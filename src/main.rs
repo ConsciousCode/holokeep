@@ -180,6 +180,13 @@ enum NodeCommand {
         /// G, T) [default: no limit]
         #[arg(long, value_parser = holokeep::net::daemon::parse_size)]
         quota: Option<u64>,
+        /// Let in a client instead: a device of the user, by its peer ID
+        /// (`hk node id` in its repo), which is no member, connecting to
+        /// this node alone where it listens for clients (`hk node run
+        /// --clients`), seeing and saying only what the user may. Its
+        /// ticket holds no mesh key
+        #[arg(long, conflicts_with_all = ["device", "protected", "quota"])]
+        client: bool,
     },
     /// Join a mesh with a ticket from a node already in it
     Join {
@@ -223,6 +230,12 @@ enum NodeCommand {
         /// their own (the repo's directory must let them reach the socket)
         #[arg(long)]
         shared: bool,
+        /// Listen for clients too, those `hk node invite --client` let in,
+        /// here [default: port 4012]. Clients connect without the mesh's
+        /// key, so this is open to anyone who can reach it, though only
+        /// the clients' keys get in
+        #[arg(long, num_args = 0..=1, default_missing_value = holokeep::net::daemon::LISTEN_CLIENTS)]
+        clients: Option<String>,
     },
     /// Let go now of every copy here the mesh can spare, short of space or
     /// not
@@ -1084,10 +1097,86 @@ fn invite(place: &holokeep::net::mesh::Place, peer: &str, device: Option<&str>, 
     reload(place)?;
     let listening = daemon::ask(place, "listeners")?.unwrap_or_default();
     list.insert(me, listening.iter().filter_map(|addr| addr.parse().ok()).collect());
-    out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: Some((user, blocks)), protected: false, sealed: Vec::new(), held: Vec::new(), grants }.encode());
+    out!("{}", mesh::Ticket { swarm_key: Some(swarm_key), client: false, inviter: me, members: list, user: Some((user, blocks)), protected: false, sealed: Vec::new(), held: Vec::new(), grants }.encode());
     if listening.is_empty() {
         eprintln!("note: this node isn't running, so the ticket says nowhere to find it; it'll be found on the LAN, or start `hk node run` and invite again");
     }
+    Ok(())
+}
+
+/// The blocks a client's ticket brings it: every certificate and
+/// revocation of its user, signed. Not the user's root key, even sealed: a
+/// client only signs.
+#[cfg(feature = "net")]
+fn client_blocks(repo: &Catalog) -> anyhow::Result<Vec<Vec<u8>>> {
+    let keys: Vec<Vec<u8>> = repo.devices()?.iter().map(|(device, _)| device.multihash().to_bytes()).collect();
+    let about = holokeep::net::structure::backrefs(repo, keys.iter().map(Vec::as_slice))?;
+    about.iter()
+        .map(|cid| Ok(repo.get_block(cid)?.with_context(|| format!("{cid} went missing"))?.into_data().into_vec()))
+        .collect()
+}
+
+/// Let a client in: certify its key as a device of an account's user, and
+/// print its ticket, which says where this node listens for clients.
+#[cfg(feature = "net")]
+fn invite_client(place: &holokeep::net::mesh::Place, peer: &str, account: Option<u32>) -> anyhow::Result<()> {
+    use holokeep::net::{daemon, mesh};
+    anyhow::ensure!(place.is_main(), "clients are of the main mesh");
+    let dir = place.repo.as_path();
+    let peer: libp2p::PeerId = peer.parse().context("not a peer id")?;
+    let me = mesh::node_key(dir)?.public().to_peer_id();
+    anyhow::ensure!(peer != me, "that's this node");
+    let members = daemon::members(place)?;
+    anyhow::ensure!(members.client_of()?.is_none(), "this node is a client, which has no clients");
+    anyhow::ensure!(!members.contains(&peer)?, "{peer} is a member of the mesh, not a client");
+    let home = rustix::process::getuid().as_raw();
+    let uid = account.unwrap_or(home);
+    anyhow::ensure!(uid == home || members.others()?.contains(&uid), "uid {uid} isn't an account this node serves");
+    let device = holokeep::keys::from_peer_id(&peer.to_string()).context("not an ed25519 peer")?;
+    let mut repo = Catalog::open_repo(dir)?;
+    repo.act_for(uid, holokeep::keys::account_key(dir, uid)?)?;
+    let user = repo.user()?.context("the account has no user yet, so is in no mesh: invite a machine first")?;
+    let root = root_key(&repo, dir)?;
+    repo.batch(|repo| repo.certify(&root, &device))?;
+    members.add_client(&peer, uid)?;
+    let grants = match members.genesis()? {
+        Some(genesis) => Some(grant_blocks(&Catalog::open_repo(dir)?, &genesis)?),
+        None => None,
+    };
+    let blocks = client_blocks(&repo)?;
+    reload(place)?;
+    let listening: Vec<libp2p::Multiaddr> = daemon::ask(place, "client-listeners")?.unwrap_or_default().iter().filter_map(|addr| addr.parse().ok()).collect();
+    if listening.is_empty() {
+        eprintln!("note: this node isn't listening for clients, so the ticket says nowhere to find it: start `hk node run --clients` and invite again");
+    }
+    let members = std::collections::BTreeMap::from([(me, listening)]);
+    out!("{}", mesh::Ticket { swarm_key: None, client: true, inviter: me, members, user: Some((user, blocks)), protected: false, sealed: Vec::new(), held: Vec::new(), grants }.encode());
+    Ok(())
+}
+
+/// Become a client of the member a ticket's from: a device of its user,
+/// connecting to it alone.
+#[cfg(feature = "net")]
+fn join_client(place: &holokeep::net::mesh::Place, ticket: &holokeep::net::mesh::Ticket) -> anyhow::Result<()> {
+    use holokeep::net::{daemon, mesh};
+    anyhow::ensure!(place.is_main(), "clients are of the main mesh");
+    let dir = place.repo.as_path();
+    anyhow::ensure!(mesh::swarm_key(dir)?.is_none(), "this node is a machine of a mesh: a client is a repo of its own, with --repo");
+    let (user, blocks) = ticket.user.as_ref().context("not a ticket: a client's says whose device it is")?;
+    let uid = rustix::process::getuid().as_raw();
+    may_join(dir, uid, user)?;
+    let members = daemon::members(place)?;
+    if let Some(had) = members.client_of()? {
+        anyhow::ensure!(had == ticket.inviter, "this node is a client of {had}");
+    }
+    if let Some((genesis, blocks)) = &ticket.grants {
+        join_grants(place, genesis, blocks)?;
+    }
+    join_user(dir, uid, user, blocks)?;
+    members.merge(&ticket.members)?;
+    members.set_client_of(&ticket.inviter)?;
+    reload(place)?;
+    eprintln!("a client of {} now, as a device of user {}; `hk node run` to connect", ticket.inviter, holokeep::keys::peer_id(user));
     Ok(())
 }
 
@@ -1175,7 +1264,7 @@ fn invite_friend(place: &holokeep::net::mesh::Place, peer: &str, vault: &str, qu
     reload(place)?;
     let listening = daemon::ask(place, "listeners")?.unwrap_or_default();
     list.insert(me, listening.iter().filter_map(|addr| addr.parse().ok()).collect());
-    out!("{}", mesh::Ticket { swarm_key, inviter: me, members: list, user: None, protected: true, sealed, held, grants: None }.encode());
+    out!("{}", mesh::Ticket { swarm_key: Some(swarm_key), client: false, inviter: me, members: list, user: None, protected: true, sealed, held, grants: None }.encode());
     Ok(())
 }
 
@@ -1251,6 +1340,59 @@ fn peers(place: &holokeep::net::mesh::Place) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Join a mesh with a ticket, as a machine of it, or as a client of the
+/// member that made it.
+#[cfg(feature = "net")]
+fn join(place: &holokeep::net::mesh::Place, ticket: &str, account: Option<u32>) -> anyhow::Result<()> {
+    use holokeep::net::{daemon, mesh};
+    let dir = place.repo.as_path();
+    let mut ticket = mesh::Ticket::decode(ticket)?;
+    if ticket.client {
+        anyhow::ensure!(account.is_none(), "a client acts for its repo's owner: make it a repo of its own, with --repo");
+        return join_client(place, &ticket);
+    }
+    let swarm_key = ticket.swarm_key.context("not a ticket: a member's has the mesh's key")?;
+    let me = mesh::node_key(dir)?.public().to_peer_id();
+    anyhow::ensure!(ticket.members.remove(&me).is_some(), "the ticket isn't for this node, {me}");
+    let members = daemon::members(place)?;
+    anyhow::ensure!(members.client_of()?.is_none(), "this node is a client: a machine of a mesh is a repo of its own, with --repo");
+    // A protected mesh holds this account's vault, and nothing else
+    let account = if ticket.protected {
+        anyhow::ensure!(!place.is_main() && account.is_none(), "a protected mesh holds your vault: join it with a --mesh of its own");
+        let me = rustix::process::getuid().as_raw();
+        let uid = holokeep::vault::vault_of(me);
+        if !ticket.sealed.is_empty() && !dir.join("accounts").join(format!("{uid}.key")).exists() {
+            recover(dir, me, &ticket.sealed)?;
+        }
+        Some(holokeep::vault::Vault::open(dir, me)?.uid())
+    } else {
+        account
+    };
+    let (uid, _) = mesh_uid(&members, account)?;
+    if let Some((user, _)) = &ticket.user {
+        may_join(dir, uid, user)?;
+    }
+    mesh::set_swarm_key(&place.dir(), swarm_key)?;
+    let uid = mesh_account(&members, account)?;
+    members.merge(&ticket.members)?;
+    if let Some((genesis, blocks)) = &ticket.grants {
+        join_grants(place, genesis, blocks)?;
+    }
+    if let Some((user, blocks)) = &ticket.user {
+        join_user(dir, uid, user, blocks)?;
+    }
+    reload(place)?;
+    let mesh = if place.is_main() { String::new() } else { format!(" --mesh {}", place.mesh) };
+    eprintln!("joined the mesh of {}; `hk node run{mesh}` to connect", ticket.inviter);
+    if !ticket.held.is_empty() {
+        eprintln!("it holds {} of your vault's manifests; once it's running, restore each with `hk protect restore`:", ticket.held.len());
+        for cid in &ticket.held {
+            out!("{cid}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "net")]
 fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Result<()> {
     use holokeep::net::{daemon, mesh};
@@ -1268,54 +1410,20 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
                 out!("{name}\t{uid}");
             }
         },
-        NodeCommand::Invite { peer, device, account, protected: false, quota: None } => invite(place, &peer, device.as_deref(), account)?,
-        NodeCommand::Invite { peer, device, account: None, protected: true, quota } => {
+        NodeCommand::Invite { peer, account, client: true, .. } => invite_client(place, &peer, account)?,
+        NodeCommand::Invite { peer, device, account, protected: false, quota: None, .. } => invite(place, &peer, device.as_deref(), account)?,
+        NodeCommand::Invite { peer, device, account: None, protected: true, quota, .. } => {
             invite_friend(place, &peer, device.as_deref().context("a protected mesh holds a friend's vault: name it with --device")?, quota)?;
         },
         NodeCommand::Invite { .. } => anyhow::bail!("--quota is for a protected mesh, which is a friend's, not an account's"),
-        NodeCommand::Join { ticket, account } => {
-            let mut ticket = mesh::Ticket::decode(&ticket)?;
-            let me = mesh::node_key(dir)?.public().to_peer_id();
-            anyhow::ensure!(ticket.members.remove(&me).is_some(), "the ticket isn't for this node, {me}");
-            let members = daemon::members(place)?;
-            // A protected mesh holds this account's vault, and nothing else
-            let account = if ticket.protected {
-                anyhow::ensure!(!place.is_main() && account.is_none(), "a protected mesh holds your vault: join it with a --mesh of its own");
-                let me = rustix::process::getuid().as_raw();
-                let uid = holokeep::vault::vault_of(me);
-                if !ticket.sealed.is_empty() && !dir.join("accounts").join(format!("{uid}.key")).exists() {
-                    recover(dir, me, &ticket.sealed)?;
-                }
-                Some(holokeep::vault::Vault::open(dir, me)?.uid())
-            } else {
-                account
-            };
-            let (uid, _) = mesh_uid(&members, account)?;
-            if let Some((user, _)) = &ticket.user {
-                may_join(dir, uid, user)?;
-            }
-            mesh::set_swarm_key(&place.dir(), ticket.swarm_key)?;
-            let uid = mesh_account(&members, account)?;
-            members.merge(&ticket.members)?;
-            if let Some((genesis, blocks)) = &ticket.grants {
-                join_grants(place, genesis, blocks)?;
-            }
-            if let Some((user, blocks)) = &ticket.user {
-                join_user(dir, uid, user, blocks)?;
-            }
-            reload(place)?;
-            let mesh = if place.is_main() { String::new() } else { format!(" --mesh {}", place.mesh) };
-            eprintln!("joined the mesh of {}; `hk node run{mesh}` to connect", ticket.inviter);
-            if !ticket.held.is_empty() {
-                eprintln!("it holds {} of your vault's manifests; once it's running, restore each with `hk protect restore`:", ticket.held.len());
-                for cid in &ticket.held {
-                    out!("{cid}");
-                }
-            }
-        },
-        NodeCommand::Run { listen, copies, low_water, high_water, no_collect, no_lost_scan, shared } => {
+        NodeCommand::Join { ticket, account } => join(place, &ticket, account)?,
+        NodeCommand::Run { listen, copies, low_water, high_water, no_collect, no_lost_scan, shared, clients } => {
             let listen = listen.as_deref().unwrap_or_else(|| if place.is_main() { daemon::LISTEN } else { "/ip4/0.0.0.0/tcp/0" });
-            let listen = listen.parse().context("not a multiaddr")?;
+            anyhow::ensure!(clients.is_none() || place.is_main(), "clients are of the main mesh");
+            let listen = daemon::Listen {
+                members: listen.parse().context("not a multiaddr")?,
+                clients: clients.map(|addr| addr.parse()).transpose().context("not a multiaddr")?,
+            };
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
             runtime.block_on(daemon::run(place, listen, copies, (low_water, high_water), !no_collect, !no_lost_scan, shared))?;
         },

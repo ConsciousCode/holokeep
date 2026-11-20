@@ -16,6 +16,9 @@ libp2p over TCP, stacked as:
 2. **noise** for authentication, with the node's ed25519 key.
 3. **yamux** for multiplexing.
 
+Where a member listens for [[#Clients|clients]], on a port of its own,
+connections skip pnet, since clients haven't the key.
+
 Behaviours: identify, ping, mDNS (LAN discovery), Kademlia under
 `/holokeep/kad/1.0.0` (kept apart from Amino), and the request-response
 protocols below.
@@ -42,10 +45,11 @@ A **ticket** is dag-cbor, multibase base32-lower encoded:
 | Key | Value |
 |---|---|
 | `inviter` | bytes: the inviter's peer ID |
-| `key` | string: the swarm key in `swarm.key` text form |
-| `members` | list of `[peer ID bytes, [multiaddr bytes…]]` |
+| `key` | string: the swarm key in `swarm.key` text form (never in a client's) |
+| `client` | `true` for a [[#Clients|client]]'s (omitted otherwise) |
+| `members` | list of `[peer ID bytes, [multiaddr bytes…]]`: for a client's, the inviter alone, where it listens for clients |
 | `user` | link: the user's root key (when the mesh has one) |
-| `blocks` | list of bytes: every certificate and revocation, the joiner's included, and the sealed root with what keeps it |
+| `blocks` | list of bytes: every certificate and revocation, the joiner's included, and the sealed root with what keeps it (not for a client) |
 | `protected` | `true` for a protected mesh (omitted otherwise) |
 | `sealed` | list of bytes: a vault's sealed blocks, for recovery |
 | `held` | list of links: the vault's manifests, for recovery |
@@ -146,6 +150,62 @@ writer sets for it reaches every machine of the owner's.
 `hk node peers` lists, for each connected member, the accounts here whose
 users it hosts.
 
+## Clients
+
+A **client** is a device of a user that isn't a machine of the mesh: a
+laptop that only visits, or an agent running somewhere the mesh doesn't
+trust with everyone's plaintext. It keeps a repo of its own, as a cache,
+and connects to one member, which serves it as its user, and no one else.
+It isn't a member: it hasn't the swarm key, holds nothing but what's its
+user's, and is counted on for nothing.
+
+1. `hk node id` in the client's repo prints its peer ID, its device key.
+2. `hk node invite <id> --client [--account <uid>]` on the member certifies
+   it as a device of the account's user (asking the user's passphrase),
+   lets it in, in `mesh_clients`, and prints its ticket.
+3. `hk node join <ticket>` in the client's repo makes it a device of the
+   user, a client of the member alone, in `mesh_client_of`.
+4. `hk node run --clients [<addr>]` on the member listens for clients
+   (port 4012 by default); `hk node run` on the client connects.
+
+**The gate.** A member listens for clients apart, without pnet, so that
+port is open to anyone who can reach it, but only clients' keys get in:
+noise authenticates the client by its device key, its peer ID, and the
+member lets in only the clients it was told to whose devices are still
+certified and not revoked, whose user the mesh recognizes. Each is let
+in only where clients connect, and members only where members do, so
+neither passes for the other. A client forgotten (`hk node forget <id>`)
+is shut out at once, and one whose device is revoked as soon as the
+revocation reaches the member.
+
+**Once in**, a client is as a machine hosting its user alone: it says so
+over `hosts`, signing the member's peer ID with its device key, and
+everything about blocks then goes as for a member hosting that user. Its
+reads are fetches from the member, and what the member lacks of the
+user's, it fetches from the user's other machines, to have when the
+client asks again. What the client says, the member takes in as its
+user's. What it adds, its audits copy to the member, counting its own
+copy for nothing, so a block is short till a member holds it whatever
+risks they share (a sandbox on the member's own disk still hands its work
+over), and no longer: the member's audits see to the rest. It's a guest's machine as any is, so
+what other users share with its user reaches it. But it's asked nothing a
+member is:
+
+- no copies go to it to make blocks durable, and none it holds count, so
+  its member's audits and trims leave it out, and its sightings aren't
+  believed;
+- it's told of no members, its roster isn't heeded, and it's no part of
+  mDNS or Kademlia;
+- collection doesn't ask it, nor wait for it.
+
+A client looks for nothing lost, its copies being a cache. It finds its
+member where its ticket said, and again wherever the member says it
+listens on the port it connected to.
+
+`hk node peers` on the member lists each client, whether it's connected,
+`client`, and the account it acts for; `hk node status` on a client says
+whose client it is.
+
 ## Connections
 
 Members are dialled on start and once a minute after, and a member is
@@ -220,7 +280,7 @@ Durability (`adverts`, `push`), trimming (`trim`, `dropped`) and garbage
 collection (`condemn`) are described in
 [[Replication and Retention]].
 
-Source: `src/net/node.rs`, `src/net/hosts.rs`, `src/net/grants.rs`, `src/net/mesh.rs`, `src/net/blocks.rs`, `src/net/structure.rs`, `src/net/daemon.rs`.
+Source: `src/net/node.rs`, `src/net/clients.rs`, `src/net/hosts.rs`, `src/net/grants.rs`, `src/net/mesh.rs`, `src/net/blocks.rs`, `src/net/structure.rs`, `src/net/daemon.rs`.
 
 ## Forgetting members
 
@@ -237,3 +297,6 @@ counted. Others telling of it aren't heeded, in `mesh_forgotten`, so each
 node has to say so itself. It's refused while the peer's connected.
 Inviting it lets it back in. Its key can still sign, which `hk device
 revoke` stops.
+
+A client is forgotten by the member it connects to, at once, connected or
+not, and is no longer let in.
