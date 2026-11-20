@@ -133,6 +133,34 @@ impl Push {
         Ok(pushes)
     }
 
+    /// Pushes of these blocks, each about a few megabytes at most, from a
+    /// thin client, which holds no copies.
+    pub fn bare(blocks: impl IntoIterator<Item = Block>) -> Vec<Self> {
+        let mut pushes = Vec::new();
+        let (mut push, mut size) = (Self::default(), 0usize);
+        for block in blocks {
+            if !push.blocks.is_empty() && size.saturating_add(block.data().len()) > BUDGET {
+                pushes.push(std::mem::take(&mut push));
+                size = 0;
+            }
+            size = size.saturating_add(block.data().len());
+            push.blocks.push((ByteBuf::from(block.cid().to_bytes()), ByteBuf::from(block.data().to_vec())));
+        }
+        if !push.blocks.is_empty() {
+            pushes.push(push);
+        }
+        pushes
+    }
+
+    /// How many blocks it carries.
+    pub const fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
     fn add(&mut self, catalog: &Catalog, block: &Block) -> Result<()> {
         self.copies.push(catalog.replicas(block.cid().multihash())?);
         self.blocks.push((ByteBuf::from(block.cid().to_bytes()), ByteBuf::from(block.data().to_vec())));

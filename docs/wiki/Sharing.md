@@ -73,7 +73,11 @@ other side enforces anything.
   seeing only what that user may (see [[Mesh#Clients]]). It's no member,
   so its copies count for nothing and it's told of no members. An agent
   running on a machine outside the mesh (a hosted assistant) is a client,
-  never a member, or it would hold everyone's plaintext.
+  never a member, or it would hold everyone's plaintext. A **thin client**
+  keeps no repo, just its key and ticket, for a sandbox without a disk:
+  each `hk` command reads, adds, keeps, tags or sets anchors through the
+  member, which says what it's asked as the client's account (see
+  [[Mesh#Thin clients]]).
 - **Block access tokens** are computed and checked (see
   [[Protected Meshes#Block access tokens]]), but nothing asks for them.
 
@@ -86,9 +90,6 @@ Not yet implemented, beyond what's above.
   This waits for machines to be admitted by grants of their own, since
   until then an invite certifies the joining machine as a device, and
   one ID is all it needs.
-- **Thin clients.** A client with no repo of its own, for a sandbox
-  without a disk to keep one on, asking its member for what it reads and
-  sending what it writes, as `hk` commands ask the daemon.
 - **Clients of several members**, so a client isn't cut off while its one
   member is away.
 
@@ -275,8 +276,8 @@ Not yet implemented, beyond protected meshes.
 3. Grants on anchors, `/anchor/read` and `/anchor/write`, and taking
    them away. Done: between accounts sharing a repo (3a), and across
    machines, guests' (3b).
-4. Remote clients. Done, as clients keeping a repo of their own; thin
-   clients are to come.
+4. Remote clients. Done: clients keeping a repo of their own as a cache,
+   and thin clients keeping none.
 5. Capabilities for sharing outside the mesh.
 
 ## Open questions

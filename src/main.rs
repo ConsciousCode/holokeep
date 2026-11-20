@@ -196,6 +196,12 @@ enum NodeCommand {
         /// user the ticket's for
         #[arg(long)]
         account: Option<u32>,
+        /// Join as a thin client, with a client's ticket: this directory,
+        /// --repo, holds no repo, just this key and the ticket, and `hk`
+        /// commands here ask the member, reading, writing, keeping,
+        /// tagging and setting anchors through it
+        #[arg(long, conflicts_with = "account")]
+        thin: bool,
     },
     /// List the meshes this node is in, and whose each is
     Meshes,
@@ -849,21 +855,105 @@ fn open_repo(repo: Option<PathBuf>) -> anyhow::Result<Catalog> {
     Catalog::open_repo(&dir).with_context(|| format!("opening repo {}", dir.display()))
 }
 
+/// What `hk add` imports with.
+fn importer(chunker: &str, max_file_links: usize, hidden: bool) -> anyhow::Result<Importer> {
+    let Some(ChunkerType::Size(chunk_size)) = ChunkerType::parse(chunker) else {
+        anyhow::bail!("unsupported chunker {chunker:?}, expected size-[bytes]");
+    };
+    if chunk_size == 0 || max_file_links < 2 {
+        anyhow::bail!("chunk size must be positive and max-file-links at least 2");
+    }
+    Ok(Importer {
+        chunk_size,
+        layout: BalancedLayout { width: max_file_links },
+        hidden,
+        ..Importer::default()
+    })
+}
+
+/// Make a directory a thin client, of the member a client's ticket is from.
+#[cfg(feature = "net")]
+fn thin_join(place: &holokeep::net::mesh::Place, ticket: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(place.is_main(), "clients are of the main mesh");
+    let ticket = holokeep::net::thin::join(&place.repo, ticket)?;
+    let user = ticket.user.as_ref().map_or_else(String::new, |(user, _)| holokeep::keys::peer_id(user));
+    eprintln!("a thin client of {} now, as a device of user {user}: hk commands with --repo {} ask it", ticket.inviter, place.repo.display());
+    Ok(())
+}
+
+/// A thin client's commands, each asking its member: those which need no
+/// repo of their own.
+#[cfg(feature = "net")]
+fn thin(dir: &Path, command: Command) -> anyhow::Result<()> {
+    use holokeep::net::thin::{Blocking, Sink};
+    let connect = || Blocking::connect(dir).context("reaching the member");
+    let ask = |client: &Blocking, words: &[&str]| -> anyhow::Result<()> {
+        for line in client.ask(words.iter().map(|word| (*word).to_owned()).collect())? {
+            out!("{line}");
+        }
+        Ok(())
+    };
+    match command {
+        Command::Node(NodeArgs { mesh, command: NodeCommand::Id { account: None } }) if mesh == holokeep::net::mesh::MAIN => {
+            out!("{}", holokeep::net::mesh::node_key(dir)?.public().to_peer_id());
+        },
+        Command::Node(NodeArgs { mesh, command: NodeCommand::Join { ticket, thin: true, .. } }) => thin_join(&holokeep::net::mesh::Place::new(dir, &mesh), &ticket)?,
+        Command::Whoami => {
+            let client = connect()?;
+            out!("member\t{}", client.member());
+            ask(&client, &["whoami"])?;
+        },
+        Command::Add { path, only_hash, hidden, quiet, chunker, max_file_links, nocopy: false, no_keep } => {
+            let importer = importer(&chunker, max_file_links, hidden)?;
+            if only_hash {
+                return add(&importer, &path, quiet, &mut NullSink).map(drop);
+            }
+            let client = connect()?;
+            let mut sink = Sink::new(&client);
+            let root = add(&importer, &path, quiet, &mut sink)?;
+            sink.finish()?;
+            if !no_keep {
+                client.ask(vec!["keep".to_owned(), "add".to_owned(), root.to_string()])?;
+            }
+        },
+        Command::Cat { cid } => {
+            let mut out = io::BufWriter::new(io::stdout().lock());
+            export::cat(&connect()?, &cid, &mut out)?;
+            out.flush()?;
+        },
+        Command::Get { cid, output } => {
+            let dest = output.unwrap_or_else(|| PathBuf::from(cid.to_string()));
+            export::get(&connect()?, &cid, &dest).with_context(|| format!("writing {}", dest.display()))?;
+        },
+        Command::Block(BlockCommand::Get { cid }) => {
+            let block = connect()?.get(std::slice::from_ref(&cid))?.into_iter().next().with_context(|| format!("block {cid} not found"))?;
+            io::stdout().lock().write_all(block.data())?;
+        },
+        Command::Keep(KeepCommand::Add { copies: Some(_), .. }) => anyhow::bail!("how many copies to keep is the member's to say"),
+        Command::Keep(command) => ask(&connect()?, &keep_words(command).iter().map(String::as_str).collect::<Vec<_>>())?,
+        Command::Tag(command) => ask(&connect()?, &tag_words(command).iter().map(String::as_str).collect::<Vec<_>>())?,
+        Command::Anchor(AnchorCommand::New) => ask(&connect()?, &["anchor", "new"])?,
+        Command::Anchor(AnchorCommand::Root) => ask(&connect()?, &["anchor", "root"])?,
+        Command::Anchor(AnchorCommand::Show { anchor }) => ask(&connect()?, &["anchor", "show", &anchor.to_string()])?,
+        Command::Anchor(AnchorCommand::Set { anchor, cid, lazy }) => {
+            let (anchor, cid) = (anchor.to_string(), cid.to_string());
+            ask(&connect()?, &if lazy { vec!["anchor", "set", "--lazy", &anchor, &cid] } else { vec!["anchor", "set", &anchor, &cid] })?;
+        },
+        _ => anyhow::bail!("this is a thin client, with no repo: it reads, adds, keeps, tags and sets anchors through its member, and no more"),
+    }
+    Ok(())
+}
+
 fn run(args: Args) -> anyhow::Result<()> {
+    #[cfg(feature = "net")]
+    if let Ok(dir) = repo_dir(args.repo.clone())
+        && holokeep::net::thin::is_thin(&dir)
+    {
+        return thin(&dir, args.command);
+    }
     match args.command {
         Command::Add { path, only_hash, hidden, quiet, chunker, max_file_links, nocopy, no_keep } => {
-            let Some(ChunkerType::Size(chunk_size)) = ChunkerType::parse(&chunker) else {
-                anyhow::bail!("unsupported chunker {chunker:?}, expected size-[bytes]");
-            };
-            if chunk_size == 0 || max_file_links < 2 {
-                anyhow::bail!("chunk size must be positive and max-file-links at least 2");
-            }
-            let importer = Importer {
-                chunk_size,
-                layout: BalancedLayout { width: max_file_links },
-                hidden,
-                ..Importer::default()
-            };
+            let importer = importer(&chunker, max_file_links, hidden)?;
             if only_hash {
                 return add(&importer, &path, quiet, &mut NullSink).map(drop);
             }
@@ -1416,7 +1506,8 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
             invite_friend(place, &peer, device.as_deref().context("a protected mesh holds a friend's vault: name it with --device")?, quota)?;
         },
         NodeCommand::Invite { .. } => anyhow::bail!("--quota is for a protected mesh, which is a friend's, not an account's"),
-        NodeCommand::Join { ticket, account } => join(place, &ticket, account)?,
+        NodeCommand::Join { ticket, thin: true, .. } => thin_join(place, &ticket)?,
+        NodeCommand::Join { ticket, account, thin: false } => join(place, &ticket, account)?,
         NodeCommand::Run { listen, copies, low_water, high_water, no_collect, no_lost_scan, shared, clients } => {
             let listen = listen.as_deref().unwrap_or_else(|| if place.is_main() { daemon::LISTEN } else { "/ip4/0.0.0.0/tcp/0" });
             anyhow::ensure!(clients.is_none() || place.is_main(), "clients are of the main mesh");

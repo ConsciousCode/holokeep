@@ -425,6 +425,39 @@ scenario_client() {
     wait_for "the laptop to be cut off" sh_on laptop "hk node status | grep -q '^connected	0$'"
 }
 
+# A thin client of one, in a sandbox: no repo, just a key and a ticket,
+# every command asking one, as ezra's user
+scenario_thin() {
+    local peer one_peer ticket theirs ours mine anchor
+    machine sandbox
+    peer=$(on sandbox hk node id)
+    one_peer=$(on one hk node id)
+    ticket=$(on one hk node invite "$peer" --client --account 4000000001 2>/dev/null)
+    on sandbox hk node join --thin "$ticket" 2>/dev/null
+    ! sh_on sandbox 'test -e ~/.holokeep/blocks.db' || fail "the thin client made a repo"
+    [ "$(on sandbox hk whoami | head -1)" = "member	$one_peer" ] || fail "the thin client doesn't say whose it is"
+    # It reads what ezra's user has, which one fetches from ezra's machine
+    theirs=$(sh_on ezra 'echo "a note for the sandbox" | hk add -q -')
+    [ "$(on sandbox hk cat "$theirs")" = "a note for the sandbox" ] || fail "the sandbox couldn't read ezra's note"
+    ours=$(sh_on one 'echo "a note of one'"'"'s owner alone" | hk add -q -')
+    ! on sandbox hk cat "$ours" >/dev/null 2>&1 || fail "the sandbox read one's owner's note"
+    # What it adds, whole chunks among it, one keeps for ezra's user, and
+    # ezra's machine has
+    sh_on sandbox 'head -c 3000000 /dev/urandom > /tmp/big'
+    mine=$(on sandbox hk add -q /tmp/big)
+    [ "$(sh_on sandbox "hk cat $mine | sha256sum")" = "$(sh_on sandbox 'sha256sum < /tmp/big')" ] || fail "the sandbox's file came back changed"
+    on sandbox hk keep ls | grep -q "^$mine$" || fail "the sandbox's file isn't kept"
+    wait_for "ezra to fetch the sandbox's file" on ezra hk dag fetch "$mine"
+    # It sets anchors, as ezra's user
+    anchor=$(on sandbox hk anchor new)
+    on sandbox hk anchor set "$anchor" "$mine" >/dev/null
+    [ "$(on sandbox hk anchor show "$anchor" | head -1)" = "$mine" ] || fail "the sandbox's anchor isn't set"
+    wait_for "ezra to see the sandbox's anchor" sh_on ezra "hk anchor show $anchor 2>/dev/null | head -1 | grep -q $mine"
+    # Forgotten, it's shut out
+    on one hk node forget "$peer"
+    ! on sandbox hk whoami >/dev/null 2>&1 || fail "the forgotten sandbox still got in"
+}
+
 # --- Main ----------------------------------------------------------------
 
 say "building hk and the machine image"
@@ -442,7 +475,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke shared client)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke shared client thin)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

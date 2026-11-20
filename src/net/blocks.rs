@@ -54,6 +54,14 @@ pub struct Want {
 
 super::hosts::for_user!(Want);
 
+impl Want {
+    /// A want of these blocks, as a thin client asks: at most a batch's
+    /// worth, the rest left out.
+    pub fn of(blocks: &[Link]) -> Self {
+        Self { want: blocks.iter().take(BATCH).map(|cid| ByteBuf::from(cid.multihash().to_bytes())).collect(), user: None }
+    }
+}
+
 /// An answer to a want: blocks as (CID, bytes), and the multihashes of
 /// those the peer doesn't have; and the copies the peer holds of each
 /// block, so the asker knows where else it lives.
@@ -72,6 +80,11 @@ impl Blocks {
     /// fetching blocks alone needs none: theirs come with them.
     pub fn missing(&self) -> Vec<Link> {
         self.missing.iter().filter_map(|key| Some(AnyCid::V1(Cidv1::new(RAW_CODEC, Multihash::decode(key).ok()?)))).collect()
+    }
+
+    /// The blocks it carries, as (CID, bytes), unverified.
+    pub fn found(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.found.iter().map(|(cid, data)| (cid.as_slice(), data.as_slice()))
     }
 
     pub fn served(&self) -> Vec<Vec<u8>> {

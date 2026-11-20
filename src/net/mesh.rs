@@ -82,7 +82,7 @@ pub fn unless_busy(done: Result<()>, what: &str) -> Result<()> {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Write a secret, readable only by its owner.
-fn write_secret(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_secret(path: &Path, data: &[u8]) -> Result<()> {
     let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
     file.write_all(data)?;
     Ok(())

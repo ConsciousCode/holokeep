@@ -126,6 +126,7 @@ pub struct Behaviour {
     condemn: request_response::cbor::Behaviour<Condemn, Verdict>,
     hosts: request_response::cbor::Behaviour<Hosts, Hosts>,
     grants: request_response::cbor::Behaviour<Have, Sent>,
+    asks: request_response::cbor::Behaviour<super::thin::Ask, super::thin::Answer>,
 }
 
 /// A fetch, as the node knows it.
@@ -289,6 +290,8 @@ pub struct Node {
     /// The clients let in, by their device's peer ID, and the account each
     /// acts for: certified by its user, and still so.
     clients: HashMap<PeerId, u32>,
+    /// What clients asked which waits on fetches.
+    asked: Vec<asks::Asked>,
     /// The member this node's a client of, if it's a client, and the port
     /// it listens for clients on, as last connected to.
     client_of: Option<PeerId>,
@@ -326,15 +329,16 @@ impl Node {
             mdns: mdns.into(),
             kad,
             members: exchange(MEMBERS, request_response::Config::default()),
-            blocks: exchange(blocks::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
-            adverts: exchange(durability::ADVERTS, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
-            push: exchange(durability::PUSH, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
-            notices: exchange(structure::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
-            trim: exchange(trim::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
-            dropped: exchange(trim::DROPPED, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
-            condemn: exchange(collect::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
-            hosts: exchange(hosts::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_secs(20)),),
-            grants: exchange(super::grants::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1)),),
+            blocks: exchange(blocks::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1))),
+            adverts: exchange(durability::ADVERTS, request_response::Config::default().with_request_timeout(Duration::from_mins(1))),
+            push: exchange(durability::PUSH, request_response::Config::default().with_request_timeout(Duration::from_mins(1))),
+            notices: exchange(structure::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1))),
+            trim: exchange(trim::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1))),
+            dropped: exchange(trim::DROPPED, request_response::Config::default().with_request_timeout(Duration::from_mins(1))),
+            condemn: exchange(collect::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1))),
+            hosts: exchange(hosts::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_secs(20))),
+            grants: exchange(super::grants::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1))),
+            asks: exchange(super::thin::PROTOCOL, request_response::Config::default().with_request_timeout(super::thin::ANSWER)),
         };
         let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(IDLE);
         let swarm = Swarm::new(transport, behaviour, peer, config);
@@ -379,6 +383,7 @@ impl Node {
             ports,
             client_listeners: HashSet::new(),
             clients: HashMap::new(),
+            asked: Vec::new(),
             client_of,
             member_port: None,
             ready: VecDeque::new(),
@@ -493,6 +498,11 @@ impl Node {
         };
         if !self.recognizes(local) {
             return false;
+        }
+        // A client let in hosts its account's user, and no other, as a
+        // thin client can't say
+        if let Some(&uid) = self.clients.get(peer) {
+            return uid == local.uid;
         }
         match self.hosting.get(peer) {
             Some(Hosting::Users(users)) => users.contains(&user),
@@ -1708,7 +1718,10 @@ impl Node {
                     done => done?,
                 }
             }
-            self.ready.push_back(Event::Fetched { id, fetched, missing });
+            // What a client asked waits on it, which isn't the daemon's
+            if !self.fetched_for_ask(id)? {
+                self.ready.push_back(Event::Fetched { id, fetched, missing });
+            }
         }
         Ok(())
     }
@@ -2085,10 +2098,16 @@ impl Node {
                 self.on_grants(event)?;
                 None
             },
+            SwarmEvent::Behaviour(BehaviourEvent::Asks(event)) => {
+                self.on_ask(event)?;
+                None
+            },
             _ => None,
         })
     }
 }
+
+mod asks;
 
 #[cfg(test)]
 mod tests;

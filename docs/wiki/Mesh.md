@@ -206,6 +206,42 @@ listens on the port it connected to.
 `client`, and the account it acts for; `hk node status` on a client says
 whose client it is.
 
+### Thin clients
+
+A **thin client** has no repo of its own: a directory holding its key
+and the ticket it joined with, for a sandbox without a disk to keep a
+repo on. Every `hk` command run with that directory as `--repo` connects
+to its member, does what it's for there, and disconnects; nothing's kept
+between commands. It's let in as any client is: `hk node id` in the
+directory, `hk node invite <id> --client` on the member, then `hk node
+join --thin <ticket>` in the directory (again with a newer ticket from
+the same member, to find it where it listens now).
+
+- **Reading** (`hk cat`, `hk get`, `hk block get`) asks the member over
+  `blocks`, as any client's reads do, and each block is verified against
+  its CID. What the member lacks of the user's it fetches from the user's
+  other machines, and the thin client asks again a while (up to 30 s)
+  rather than failing at once. It reads up to 16 blocks ahead, so a file
+  comes a few at a time without a sandbox's memory filling.
+- **Writing** (`hk add`) imports on the client, as anywhere, and pushes
+  the blocks to the member over `push`, a few megabytes at a time, which
+  holds them for the client's account; then keeps the root, unless
+  `--no-keep`. What the member won't take, short of space or of the
+  account's quota, fails the command.
+- **Saying** (`hk keep`, `hk tag`, `hk anchor new/set/show/root`, `hk
+  whoami`) asks the member over `ask`, which answers as the client's
+  account, signing with the account's key there, as for the host's users
+  sharing a repo (`hk node run --shared`): the same commands, in
+  `src/account.rs`. A keep, or an anchor set, of a DAG that isn't all on
+  the member waits while the member fetches it, then answers.
+
+Only clients ask; a member asked by anyone else refuses. What a thin
+client says is signed by its account's key on the member, not by the
+client's device key, so revoking the device shuts it out but leaves what
+it said standing, as for any account. A thin client can't mount the
+soup, nor do anything else needing a repo: a client keeping a repo as a
+cache does that.
+
 ## Connections
 
 Members are dialled on start and once a minute after, and a member is
@@ -244,6 +280,12 @@ them; omitted otherwise.
 | `/holokeep/trim/1.0.0` | `{keys: [key], user?}` | `{held: [[key, [replica]]], refused: [key]}` | "I mean to let go of these." |
 | `/holokeep/dropped/1.0.0` | `{keys: [key]}` | `{}` | "I let go of these." |
 | `/holokeep/condemn/1.0.0` | `{blocks: [key]}` | `{kept: [key]}` | "Does a keep of yours reach these?" |
+| `/holokeep/ask/1.0.0` | `{words: [string]}` | `{lines: [string]}` | A [[#Thin clients\|thin client]]'s command, answered as its account. |
+
+A request or response may be up to 64 MiB. libp2p's CBOR codec allows a
+megabyte a request and ten a response by default, too little for a push
+of whole 1 MiB chunks, which no member could copy to another until it was
+raised.
 
 ### Access (`blocks`)
 
@@ -280,7 +322,7 @@ Durability (`adverts`, `push`), trimming (`trim`, `dropped`) and garbage
 collection (`condemn`) are described in
 [[Replication and Retention]].
 
-Source: `src/net/node.rs`, `src/net/clients.rs`, `src/net/hosts.rs`, `src/net/grants.rs`, `src/net/mesh.rs`, `src/net/blocks.rs`, `src/net/structure.rs`, `src/net/daemon.rs`.
+Source: `src/net/node.rs`, `src/net/clients.rs`, `src/net/thin.rs`, `src/net/node/asks.rs`, `src/net/hosts.rs`, `src/net/grants.rs`, `src/net/mesh.rs`, `src/net/blocks.rs`, `src/net/structure.rs`, `src/net/daemon.rs`.
 
 ## Forgetting members
 

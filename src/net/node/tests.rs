@@ -1513,3 +1513,132 @@ async fn what_its_member_lacks_a_client_has_next_time() {
         }
     }
 }
+
+//------------------//
+//-[ Thin clients ]-//
+//------------------//
+
+use crate::net::thin::Thin;
+
+/// Drive nodes while some work's done, or give up.
+async fn serving<T>(nodes: &mut [&mut Node], work: impl Future<Output = T>) -> T {
+    let mut work = std::pin::pin!(work);
+    let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(30)).expect("deadline");
+    loop {
+        assert!(tokio::time::Instant::now() < deadline, "out of time");
+        let events = futures::future::select_all(nodes.iter_mut().map(|node| Box::pin(node.next())));
+        tokio::select! {
+            out = &mut work => return out,
+            _ = tokio::time::timeout(Duration::from_millis(50), events) => {},
+        }
+    }
+}
+
+/// A thin client of a member, its device key its peer ID, for a user.
+fn thin_of(member: &Node, device: &crate::keys::Key, user: &Link) -> Thin {
+    let key = Keypair::from_protobuf_encoding(&device.to_protobuf()).expect("keypair");
+    let transport = crate::net::clients::client_transport(MemoryTransport::default(), &key).expect("transport");
+    Thin::new(transport, &key, member.peer_id(), member.client_listeners(), user)
+}
+
+/// A member listening for clients, and a thin client of it let in,
+/// devices of one user, whose root key it returns.
+async fn with_thin() -> (Node, Thin, crate::keys::Key) {
+    use crate::keys::Key;
+    let mut member = node(mesh::fresh_swarm_key().expect("key")).await;
+    member.listen_for_clients(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
+    assert!(until(&mut [&mut member], |n| !n[0].client_listeners().is_empty()).await);
+    let (root, laptop, device) = (Key::generate().expect("key"), Key::generate().expect("key"), Key::generate().expect("key"));
+    member.catalog().set_user(&root.id()).expect("user");
+    for key in [&laptop, &device] {
+        member.catalog().certify(&root, &key.id()).expect("certify");
+    }
+    member.catalog_mut().set_signer(laptop).expect("signer");
+    let thin = thin_of(&member, &device, &root.id());
+    member.members().add_client(&thin.peer_id(), member.catalog().uid()).expect("client");
+    member.reload().expect("reload");
+    (member, thin, root)
+}
+
+#[tokio::test]
+async fn a_thin_client_reads_writes_and_says_through_its_member() {
+    let (mut member, mut thin, _) = Box::pin(with_thin()).await;
+    serving(&mut [&mut member], thin.connect()).await.expect("connect");
+    // What the member holds, the thin client reads
+    let held = raw(b"on the member");
+    member.catalog().put_block(&held, CidVersion::V1).expect("put");
+    let got = serving(&mut [&mut member], thin.get(&[link(&held)])).await.expect("get");
+    assert_eq!(got.iter().map(|block| block.data().to_vec()).collect::<Vec<_>>(), [b"on the member".to_vec()]);
+    // What it writes, whole chunks among them, the member holds for it
+    let chunks: Vec<Block> = (0..3u8).map(|i| raw(&vec![i; 1 << 20])).collect();
+    let root = cbor(&Ipld::List(chunks.iter().map(|chunk| Ipld::Link(link(chunk))).collect()));
+    let written: Vec<Block> = chunks.iter().cloned().chain([root.clone()]).collect();
+    serving(&mut [&mut member], thin.push(written.clone())).await.expect("push");
+    assert!(written.iter().all(|block| has(&member, block)));
+    // And what it says, the member says as its account
+    let words = |words: &[&str]| words.iter().map(|word| (*word).to_owned()).collect::<Vec<_>>();
+    let kept = serving(&mut [&mut member], thin.ask(words(&["keep", "add", &link(&root).to_string()]))).await.expect("keep");
+    assert_eq!(kept.len(), 1);
+    assert!(member.catalog().claims().expect("claims").keeps().expect("keeps").contains(&link(&root)));
+    let tag = serving(&mut [&mut member], thin.ask(words(&["tag", "add", "from afar", &link(&held).to_string()]))).await.expect("tag");
+    assert_eq!(tag.len(), 1);
+    assert_eq!(serving(&mut [&mut member], thin.ask(words(&["tag", "ls", &link(&held).to_string()]))).await.expect("tags"), ["from afar"]);
+    let anchor = serving(&mut [&mut member], thin.ask(words(&["anchor", "new"]))).await.expect("anchor").remove(0);
+    serving(&mut [&mut member], thin.ask(words(&["anchor", "set", &anchor, &link(&root).to_string()]))).await.expect("set");
+    assert_eq!(member.catalog().anchor_value(&anchor.parse().expect("anchor")).expect("value"), Some(link(&root)));
+    // What it can't, it's told
+    let refused = serving(&mut [&mut member], thin.ask(words(&["collect"]))).await;
+    assert!(refused.is_err_and(|e| e.to_string().starts_with("not something an account can ask")));
+}
+
+#[tokio::test]
+async fn what_its_member_lacks_a_thin_client_reads_and_keeps_all_the_same() {
+    use crate::keys::Key;
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let (mut member, mut other) = (node(swarm_key).await, node(swarm_key).await);
+    invite(&member, &other, swarm_key);
+    member.listen_for_clients(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
+    assert!(until(&mut [&mut member], |n| !n[0].client_listeners().is_empty()).await);
+    let (root, mine, theirs, device) = (Key::generate().expect("key"), Key::generate().expect("key"), Key::generate().expect("key"), Key::generate().expect("key"));
+    for node in [&member, &other] {
+        node.catalog().set_user(&root.id()).expect("user");
+        for key in [&mine, &theirs, &device] {
+            node.catalog().certify(&root, &key.id()).expect("certify");
+        }
+    }
+    member.catalog_mut().set_signer(mine).expect("signer");
+    other.catalog_mut().set_signer(theirs).expect("signer");
+    let mut thin = thin_of(&member, &device, &root.id());
+    member.members().add_client(&thin.peer_id(), member.catalog().uid()).expect("client");
+    for node in [&mut member, &mut other] {
+        node.reload().expect("reload");
+        node.dial_members().expect("dial");
+    }
+    assert!(until(&mut [&mut member, &mut other], |n| connected(n[0], n[1])).await);
+    // Only the other member has these: the member fetches them as asked
+    let blocks = wide();
+    for block in &blocks {
+        other.catalog().put_block(block, CidVersion::V1).expect("put");
+    }
+    let (first, top) = (blocks.first().expect("leaf").clone(), blocks.last().expect("root").clone());
+    let got = serving(&mut [&mut member, &mut other], thin.get(&[link(&first)])).await.expect("get");
+    assert_eq!(got.len(), 1);
+    let words = vec!["keep".to_owned(), "add".to_owned(), link(&top).to_string()];
+    serving(&mut [&mut member, &mut other], thin.ask(words)).await.expect("keep");
+    assert!(blocks.iter().all(|block| has(&member, block)));
+    assert!(member.catalog().claims().expect("claims").keeps().expect("keeps").contains(&link(&top)));
+}
+
+#[tokio::test]
+async fn only_thin_clients_let_in_get_in() {
+    let (mut member, _, root) = Box::pin(with_thin()).await;
+    // A device of the user's, never let in
+    let device = crate::keys::Key::generate().expect("key");
+    member.catalog().certify(&root, &device.id()).expect("certify");
+    let mut stranger = thin_of(&member, &device, &root.id());
+    let refused = serving(&mut [&mut member], async {
+        stranger.connect().await?;
+        stranger.ask(vec!["whoami".to_owned()]).await
+    }).await;
+    assert!(refused.is_err());
+}

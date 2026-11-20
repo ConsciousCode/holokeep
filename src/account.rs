@@ -1,5 +1,6 @@
-//! What one of the host's users may ask of a repo another user owns,
-//! through its running node.
+//! What an account may ask of a repo it doesn't own: one of the host's
+//! users, of a repo another user owns, through its running node; or a
+//! thin client, of its member.
 //!
 //! It says and sees things as its own account, which the repo signs for
 //! with a key of the account's own. Its keeps hold blocks here like
@@ -30,6 +31,14 @@ fn tag(name: &str) -> Result<Link, String> {
     claim::tag(name)
         .filter(|_| name.len() <= claim::MAX_NAME)
         .ok_or_else(|| format!("a tag's name is 1 to {} bytes", claim::MAX_NAME))
+}
+
+fn an_anchor(word: &str) -> Result<Link, String> {
+    let anchor: Link = word.parse().map_err(|_| format!("not a CID: {word}"))?;
+    if !claim::is_anchor(&anchor) {
+        return Err(format!("{anchor} isn't an anchor"));
+    }
+    Ok(anchor)
 }
 
 fn respond(catalog: &mut Catalog, words: &[&str]) -> Result<Vec<String>, String> {
@@ -104,6 +113,32 @@ fn respond(catalog: &mut Catalog, words: &[&str]) -> Result<Vec<String>, String>
             let claims = catalog.claims().ok_or("this repo keeps no claims")?;
             out.extend(claims.tagged(tag(name)?.multihash()).map_err(failed)?.iter().map(ToString::to_string));
         },
+        ["anchor", "new"] => out.push(catalog.new_anchor().map_err(failed)?.to_string()),
+        ["anchor", "root"] => {
+            let root = catalog.root_anchor().map_err(failed)?.ok_or("this account has no key yet, so no root anchor")?;
+            out.push(root.to_string());
+            out.push(catalog.anchor_value(&root).map_err(failed)?.map_or_else(|| "unset".to_owned(), |value| value.to_string()));
+        },
+        ["anchor", "show", anchor] => {
+            let anchor = an_anchor(anchor)?;
+            out.push(catalog.anchor_value(&anchor).map_err(failed)?.map_or_else(|| "unset".to_owned(), |value| value.to_string()));
+            out.extend(catalog.anchor_history(&anchor).map_err(failed)?.iter().map(|(at, value)| format!("{at}\t{value}")));
+        },
+        ["anchor", "set", rest @ ..] => {
+            let (lazy, rest) = match rest {
+                ["--lazy", rest @ ..] => (true, rest),
+                rest => (false, rest),
+            };
+            let [anchor, cid] = rest else {
+                return Err("anchor set takes an anchor and a CID".into());
+            };
+            let (anchor, cid) = (an_anchor(anchor)?, cids(&[cid])?.remove(0));
+            let missing = if lazy { Vec::new() } else { catalog.missing_under(&cid).map_err(failed)? };
+            if !missing.is_empty() {
+                return Err(format!("{} blocks under {cid} aren't here; setting an anchor needs all of it (or set it --lazy)", missing.len()));
+            }
+            out.push(catalog.batch(|catalog| catalog.set_anchor(&anchor, &cid)).map_err(failed)?.to_string());
+        },
         _ => return Err(format!("not something an account can ask: {}", words.join(" "))),
     }
     Ok(out)
@@ -135,6 +170,18 @@ mod tests {
         assert_eq!(me.get(1), Some(&format!("device\t{}", crate::keys::peer_id(&other.id()))));
         assert!(answer(&mut repo, "keep\tadd\tnot a cid").first().is_some_and(|line| line.starts_with("error: ")));
         assert!(answer(&mut repo, "collect").first().is_some_and(|line| line.starts_with("error: ")));
+
+        let anchor = answer(&mut repo, "anchor\tnew").remove(0);
+        assert_eq!(answer(&mut repo, &format!("anchor\tset\t{anchor}\t{cid}")).len(), 1);
+        let shown = answer(&mut repo, &format!("anchor\tshow\t{anchor}"));
+        assert_eq!(shown.first(), Some(&cid));
+        assert!(shown.get(1).is_some_and(|line| line.ends_with(&cid)));
+        let elsewhere: Block = Block::hash(Cidv1Spec::default(), b"elsewhere"[..].into());
+        let missing = AnyCid::V1(elsewhere.cid().clone()).to_string();
+        assert!(answer(&mut repo, &format!("anchor\tset\t{anchor}\t{missing}")).first().is_some_and(|line| line.starts_with("error: ")));
+        assert_eq!(answer(&mut repo, &format!("anchor\tset\t--lazy\t{anchor}\t{missing}")).len(), 1);
+        assert!(answer(&mut repo, &format!("anchor\tset\t{cid}\t{cid}")).first().is_some_and(|line| line.starts_with("error: ")));
+        assert_eq!(answer(&mut repo, "anchor\troot").len(), 2);
 
         repo.act_for(owner.0, owner.1).expect("act");
         assert!(answer(&mut repo, &format!("tag\tls\t{cid}")).is_empty());
