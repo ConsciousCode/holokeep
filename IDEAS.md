@@ -13,5 +13,10 @@
   - Every user's root anchor one anchor with a well-known nonce, each user's root being their view of it, so applications can name and index "the root", or other well-known anchors ("inbox", "settings"), without knowing whose
   - Sound now views are per owner and sets say whose view they're for; needs a migration (a set carrying each user's current root, stored `/anchors/<old-root>` links), and rethinking the device-to-user change on making a mesh
 
+- Servers mounted on anchors, Plan 9 style (distant)
+  - A service provides part of the namespace live rather than as stored blocks: a machine's shell (SSH into any machine of the mesh through the soup), web 1/2 infrastructure, gateways to other systems
+  - Likely connects as a remote client, acting as a user and seeing what they may
+  - A step towards the mesh as one abstracted machine of machines: the lain cluster, then the "planetary filesystem"
+
 TODO:
 - Flood underreplicated blocks on peer join, intuitively the fluid finding its level
