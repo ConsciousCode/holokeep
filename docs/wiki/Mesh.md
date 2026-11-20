@@ -256,6 +256,40 @@ it said standing, as for any account. A thin client can't mount the
 soup, nor do anything else needing a repo: a client keeping a repo as a
 cache does that.
 
+### Visitors
+
+A **visitor** is a key outside the mesh, no user of it, that a user
+shares a view of an anchor with: a friend who doesn't run a mesh, or an
+agent trusted with one folder. What it may read is the owner's grants on
+their views, as for any user they share with (see [[Grants#Visitors]]),
+so it's given, passed on by those holding `/anchor/grant`, and taken
+away as any share is, and every machine works out the same answer.
+
+1. `hk node id` in a directory of the visitor's prints its key.
+2. `hk anchor share <anchor> <peer> read` on a machine of the owner's.
+3. `hk node invite <peer> --visitor [--account <uid>]` prints a ticket
+   saying where the members serving the owner listen for clients;
+   nothing's certified.
+4. `hk node join --thin <ticket>` in the visitor's directory, which is a
+   [[#Thin clients|thin client]] from then on.
+
+A member serving the owner, and recognizing them, lets in on its client
+port each key the owner's shares say may read, unless it's a member or
+client. A visitor reads as a guest of what's shared with its key, and
+nothing else: `blocks` answers only for blocks those views reach
+(`hk cat`, `hk get`), and `ask` only `whoami`, `shared` (the views shared
+with it, `hk anchor shared`, as `<view> <owner> <commands>`), and
+`anchor show <view>`. Anything else it sends is dropped unanswered:
+pushes, notices, adverts, rosters, hosts, grants, and identify. It's told
+nothing unasked: no roster, hosts or grants, no notices, and it's no
+part of audits, trims or collection. Unshared, it's shut out as soon as
+the grant reaches each member. Kademlia and identify still answer it as
+they would any connection, so it may learn where members listen, which
+the swarm key keeps closed to it.
+
+`hk node peers` lists visitors as `<peer> <state> visitor -`, and `hk
+node status` says how many are connected.
+
 ## Connections
 
 Members are dialled on start and once a minute after, and a member is

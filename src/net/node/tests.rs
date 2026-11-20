@@ -1716,3 +1716,56 @@ async fn a_thin_client_reaches_whichever_member_is_there() {
     assert_eq!(got.len(), 1);
     assert_ne!(thin.member(), gone);
 }
+
+//--------------//
+//-[ Visitors ]-//
+//--------------//
+
+#[tokio::test]
+async fn a_visitor_reads_only_what_is_shared_with_it() {
+    use crate::grants::READ;
+    let mut member = node(mesh::fresh_swarm_key().expect("key")).await;
+    member.listen_for_clients(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
+    assert!(until(&mut [&mut member], |n| !n[0].client_listeners().is_empty()).await);
+    let root = one_user(&mut [&mut member]);
+    let genesis = found(&mut [&mut member], &root);
+    // A folder on an anchor, shared; another not
+    let blocks = wide();
+    for block in &blocks {
+        member.catalog().put_block(block, CidVersion::V1).expect("put");
+    }
+    let top = link(blocks.last().expect("root"));
+    let (anchor, private) = (member.catalog().new_anchor().expect("anchor"), raw(b"not shared"));
+    member.catalog().put_block(&private, CidVersion::V1).expect("put");
+    let other = member.catalog().new_anchor().expect("anchor");
+    member.catalog_mut().batch(|catalog| {
+        catalog.set_anchor(&anchor, &top)?;
+        catalog.set_anchor(&other, &link(&private))
+    }).expect("set");
+    let visitor = crate::keys::Key::generate().expect("key");
+    member.catalog().grant_on(&genesis, &anchor, &[visitor.id()], &[READ.to_owned()], &[], &[]).expect("share");
+    member.reload().expect("reload");
+    let mut thin = thin_of(&member, &visitor, &root.id()).with_patience(Duration::from_millis(300));
+    assert!(member.is_visitor(&thin.peer_id()) && !member.is_client(&thin.peer_id()));
+    let words = |words: &[&str]| words.iter().map(|word| (*word).to_owned()).collect::<Vec<_>>();
+    // It's told what's shared with it, and reads it
+    let shared = serving(&mut [&mut member], thin.ask(words(&["shared"]))).await.expect("shared");
+    let view = crate::claim::view(&anchor, &root.id()).expect("view");
+    assert_eq!(shared.len(), 1);
+    assert!(shared.first().is_some_and(|line| line.starts_with(&format!("{view}\t")) && line.ends_with(READ)));
+    assert_eq!(serving(&mut [&mut member], thin.ask(words(&["anchor", "show", &view.to_string()]))).await.expect("show"), [top.to_string()]);
+    let got = serving(&mut [&mut member], thin.get(&blocks.iter().map(link).collect::<Vec<_>>())).await.expect("get");
+    assert_eq!(got.len(), blocks.len());
+    // And nothing else
+    assert!(serving(&mut [&mut member], thin.get(&[link(&private)])).await.is_err());
+    let theirs = crate::claim::view(&other, &root.id()).expect("view");
+    assert_eq!(serving(&mut [&mut member], thin.ask(words(&["anchor", "show", &theirs.to_string()]))).await.expect("show"), ["unset"]);
+    assert!(serving(&mut [&mut member], thin.ask(words(&["keep", "ls"]))).await.is_err());
+    assert!(serving(&mut [&mut member], thin.push(vec![raw(b"from a visitor")])).await.is_err());
+    assert!(!member.catalog().has(raw(b"from a visitor").cid().multihash()).expect("has"));
+    // Unshared, it's shut out
+    member.catalog().grant_on(&genesis, &anchor, &[visitor.id()], &[], &[READ.to_owned()], &[]).expect("unshare");
+    member.reload().expect("reload");
+    assert!(!member.is_visitor(&thin.peer_id()));
+    assert!(serving(&mut [&mut member], thin.ask(words(&["shared"]))).await.is_err());
+}

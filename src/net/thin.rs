@@ -124,6 +124,8 @@ pub struct Thin {
     members: Vec<(PeerId, Vec<Multiaddr>)>,
     /// Whose blocks it reads and writes, by the user's key CID's bytes.
     user: Vec<u8>,
+    /// How long to keep asking for blocks the member hasn't.
+    patience: Duration,
 }
 
 impl Thin {
@@ -139,7 +141,7 @@ impl Thin {
         };
         let swarm = Swarm::new(transport, behaviour, key.public().to_peer_id(), libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(Duration::from_mins(1)));
         let member = members.first().map_or_else(PeerId::random, |(member, _)| *member);
-        Self { swarm, member, members, user: user.to_bytes() }
+        Self { swarm, member, members, user: user.to_bytes(), patience: PATIENCE }
     }
 
     /// The thin client a directory is, over TCP.
@@ -152,6 +154,13 @@ impl Thin {
         members.sort_by_key(|(peer, _)| *peer != ticket.inviter);
         let base = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
         Ok(Self::new(super::clients::client_transport(base, &key)?, &key, members, user))
+    }
+
+    /// Ask for blocks the member hasn't for this long, not the usual 30 s.
+    #[must_use]
+    pub const fn with_patience(mut self, patience: Duration) -> Self {
+        self.patience = patience;
+        self
     }
 
     /// The member it's connected to, or will try first.
@@ -268,7 +277,7 @@ impl Thin {
     pub async fn get(&mut self, cids: &[Link]) -> Result<Vec<Block>> {
         let mut wanted: Vec<Link> = cids.to_vec();
         let mut found = Vec::new();
-        let deadline = tokio::time::Instant::now().checked_add(PATIENCE).unwrap_or_else(tokio::time::Instant::now);
+        let deadline = tokio::time::Instant::now().checked_add(self.patience).unwrap_or_else(tokio::time::Instant::now);
         let mut pause = Duration::from_millis(100);
         while !wanted.is_empty() {
             let (blocks, missing) = self.want(&wanted).await?;

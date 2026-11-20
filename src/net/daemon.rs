@@ -825,6 +825,9 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
         let connected = node.connected().iter().filter(|peer| node.is_client(peer)).count();
         let _ = writeln!(out, "clients\t{} of {} connected", connected, node.clients().len());
     }
+    if !node.visitors().is_empty() {
+        let _ = writeln!(out, "visitors\t{} of {} connected", node.visiting().len(), node.visitors().len());
+    }
     if !node.client_addrs().is_empty() {
         let _ = writeln!(out, "members listening for clients\t{}", node.client_addrs().len());
     }
@@ -876,6 +879,13 @@ fn peers(node: &Node) -> Result<String> {
     for (peer, uid) in clients {
         let state = if connected.contains(peer) { "connected" } else { "-" };
         let _ = writeln!(out, "{peer}\t{state}\tclient\t{uid}");
+    }
+    let visiting = node.visiting();
+    let mut visitors: Vec<&libp2p::PeerId> = node.visitors().keys().collect();
+    visitors.sort();
+    for peer in visitors {
+        let state = if visiting.contains(peer) { "connected" } else { "-" };
+        let _ = writeln!(out, "{peer}\t{state}\tvisitor\t-");
     }
     Ok(out)
 }

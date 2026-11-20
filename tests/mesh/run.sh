@@ -466,6 +466,36 @@ scenario_thin() {
     ! on sandbox hk whoami >/dev/null 2>&1 || fail "the sandbox still got in"
 }
 
+# A visitor: a key outside the mesh, no user of it, which one's owner
+# shares an anchor with, reading that and nothing else
+scenario_visitor() {
+    local peer ticket shared private anchor view
+    machine guest
+    peer=$(on guest hk node id)
+    shared=$(sh_on one 'echo "shared with a visitor" | hk add -q -')
+    private=$(sh_on one 'echo "not for visitors" | hk add -q -')
+    anchor=$(on one hk anchor new)
+    on one hk anchor set "$anchor" "$shared" >/dev/null
+    on one hk anchor share "$anchor" "$peer" read >/dev/null
+    ticket=$(on one hk node invite "$peer" --visitor 2>/dev/null)
+    on guest hk node join --thin "$ticket" 2>/dev/null
+    view=$(on guest hk anchor shared | cut -f1)
+    [ -n "$view" ] || fail "nothing's shared with the visitor"
+    [ "$(on guest hk anchor show "$view")" = "$shared" ] || fail "the visitor can't see the anchor"
+    [ "$(on guest hk cat "$shared")" = "shared with a visitor" ] || fail "the visitor can't read what's shared"
+    ! on guest hk cat "$private" >/dev/null 2>&1 || fail "the visitor read what isn't shared"
+    ! on guest hk keep ls >/dev/null 2>&1 || fail "the visitor asked what only a client may"
+    ! sh_on guest 'echo "from a visitor" | hk add -q -' >/dev/null 2>&1 || fail "the visitor wrote"
+    on one hk node peers | grep -q "^$peer	.*visitor" || fail "one doesn't list the visitor"
+    # two serves the owner too, so lets it in, but listens for no clients
+    wait_for "two to let the visitor in" sh_on two "hk node peers | grep -q '^$peer	-	visitor'"
+    # Unshared, it's shut out
+    on one hk anchor unshare "$anchor" "$peer" read >/dev/null
+    wait_for "one to shut the visitor out" sh_on one "! hk node peers | grep -q '^$peer	'"
+    wait_for "two to shut the visitor out" sh_on two "! hk node peers | grep -q '^$peer	'"
+    ! on guest hk anchor shared >/dev/null 2>&1 || fail "the visitor still got in, unshared"
+}
+
 # A client of the mesh, not just of one member: ezra's machine listens for
 # clients too, and a thin client invited by one reads through it while
 # one's away
@@ -508,7 +538,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke shared client thin several)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke shared client thin visitor several)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

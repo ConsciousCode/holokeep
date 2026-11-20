@@ -477,16 +477,28 @@ impl State {
         self.anchors.iter().find(|view| view.scope.founder == *owner && view.scope.on.as_ref() == Some(anchor))
     }
 
+    /// Whether the mesh's own grants name someone, given or taken anything
+    /// there: its founder, or one of its users, machines or clients, now or
+    /// before. Only one never named may be a visitor, so a user taken from
+    /// the mesh doesn't keep what was shared with them.
+    fn named(&self, who: &Link) -> bool {
+        *who == self.founder || self.nodes.iter().any(|node| node.in_scope(&self.mesh.scope) && node.targets(who))
+    }
+
     /// Whether someone holds a command on an owner's view of an anchor:
     /// the owner, everything while they're a user of the mesh; anyone
     /// else, as the owner's grants on it, and those they let others make,
-    /// say.
+    /// say. One the mesh's grants have never named, a visitor, holds only
+    /// what lets it read: what it sets, or gives, no one's said counts.
     pub fn holds_on(&self, owner: &Link, anchor: &Link, who: &Link, command: &str) -> bool {
-        if !self.holds(owner, USER) || !self.holds(who, USER) {
+        if !self.holds(owner, USER) {
             return false;
         }
         if who == owner {
             return true;
+        }
+        if !self.holds(who, USER) && (self.named(who) || !covers(READ, command)) {
+            return false;
         }
         self.view(owner, anchor).is_some_and(|view| self.holds_in(view, &view.judged, who, command))
     }
@@ -814,6 +826,20 @@ mod tests {
         let state = history.state();
         assert!(state.holds_on(&u, &anchor, &b, READ) && !state.holds_on(&u, &anchor, &c, READ));
         assert!(state.holds_on(&b, &anchor, &c, READ), "not on b's own view");
+    }
+
+    #[test]
+    fn a_visitor_only_reads() {
+        let (mut history, _, u, b, _, last) = users();
+        let anchor = crate::claim::anchor().expect("anchor");
+        let visitor = crate::keys::Key::generate().expect("key").id();
+        history.grant_on(&u, &visitor, &anchor, &[ANCHOR_GRANT, READ, WRITE], &[], &[&last]);
+        let state = history.state();
+        assert!(state.holds_on(&u, &anchor, &visitor, READ));
+        assert!(!state.holds_on(&u, &anchor, &visitor, WRITE) && !state.holds_on(&u, &anchor, &visitor, ANCHOR_GRANT));
+        assert!(!state.holds_on(&b, &anchor, &visitor, READ), "only on the view shared");
+        let share = state.shares().into_iter().find(|share| share.user == visitor).expect("shared");
+        assert_eq!(share.held, [READ]);
     }
 
     #[test]

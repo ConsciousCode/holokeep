@@ -306,6 +306,10 @@ pub struct Node {
     /// The clients let in, by their device's peer ID, and the account each
     /// acts for: certified by its user, and still so.
     clients: HashMap<PeerId, u32>,
+    /// Visitors let in, by peer ID, with the key each is: keys no user of
+    /// the mesh, nor ever named by its grants, that a user served here
+    /// shares a view of an anchor with, to read.
+    visitors: HashMap<PeerId, Link>,
     /// What clients asked which waits on fetches.
     asked: Vec<asks::Asked>,
     /// The member this node's a client of, if it's a client, and the port
@@ -402,6 +406,7 @@ impl Node {
             client_listeners: HashSet::new(),
             clients: HashMap::new(),
             asked: Vec::new(),
+            visitors: HashMap::new(),
             client_of,
             member_ports: HashMap::new(),
             client_addrs: BTreeMap::new(),
@@ -486,18 +491,88 @@ impl Node {
                 }
             }
         }
-        let gone: Vec<PeerId> = self.clients.keys().filter(|peer| !clients.contains_key(*peer)).copied().collect();
+        let visitors = self.find_visitors(&clients)?;
+        let gone: Vec<PeerId> = self.clients.keys().chain(self.visitors.keys()).filter(|peer| !clients.contains_key(*peer) && !visitors.contains_key(*peer)).copied().collect();
         for peer in gone {
             self.swarm.behaviour_mut().allowed.disallow_peer(peer);
         }
-        for peer in clients.keys() {
+        for peer in clients.keys().chain(visitors.keys()) {
             self.swarm.behaviour_mut().allowed.allow_peer(*peer);
         }
-        let peers: HashSet<PeerId> = clients.keys().copied().collect();
+        // Visitors connect where clients do
+        let peers: HashSet<PeerId> = clients.keys().chain(visitors.keys()).copied().collect();
         self.swarm.behaviour_mut().gate.set_clients(peers.clone());
         self.sightings.uncount(peers)?;
         self.clients = clients;
+        self.visitors = visitors;
         Ok(())
+    }
+
+    /// The visitors to let in: keys a user served here, whom the mesh
+    /// recognizes, shares a view of an anchor with, which the grants say
+    /// may read it, being neither users of the mesh nor named by its
+    /// grants; and neither members nor clients.
+    fn find_visitors(&self, clients: &HashMap<PeerId, u32>) -> Result<HashMap<PeerId, Link>> {
+        let mut visitors = HashMap::new();
+        let (None, Some((_, state))) = (self.client_of, &self.granted) else {
+            return Ok(visitors);
+        };
+        let owners: Vec<Link> = self.locals()?.into_iter().filter(|local| local.rooted && self.recognizes(local)).filter_map(|local| local.user).collect();
+        let members = self.members.list()?;
+        let me = self.peer_id();
+        for share in state.shares() {
+            if share.held.is_empty() || !owners.contains(&share.owner) || state.holds(&share.user, crate::grants::USER) {
+                continue;
+            }
+            let Ok(peer) = PeerId::from_bytes(&share.user.multihash().to_bytes()) else {
+                continue;
+            };
+            if peer != me && !members.contains_key(&peer) && !clients.contains_key(&peer) {
+                visitors.insert(peer, share.user);
+            }
+        }
+        Ok(visitors)
+    }
+
+    /// Whether a visitor sent something it's not to: anything but asking
+    /// for blocks and asking over `ask`. Dropped unanswered.
+    fn trespasses(&self, event: &BehaviourEvent) -> bool {
+        const fn from<Req, Resp>(event: &request_response::Event<Req, Resp>) -> Option<PeerId> {
+            match event {
+                request_response::Event::Message { peer, .. } => Some(*peer),
+                _ => None,
+            }
+        }
+        let peer = match event {
+            BehaviourEvent::Identify(identify::Event::Received { peer_id, .. }) => Some(*peer_id),
+            BehaviourEvent::Members(event) => from(event),
+            BehaviourEvent::Adverts(event) => from(event),
+            BehaviourEvent::Push(event) => from(event),
+            BehaviourEvent::Notices(event) => from(event),
+            BehaviourEvent::Trim(event) => from(event),
+            BehaviourEvent::Dropped(event) => from(event),
+            BehaviourEvent::Condemn(event) => from(event),
+            BehaviourEvent::Hosts(event) => from(event),
+            BehaviourEvent::Grants(event) => from(event),
+            _ => None,
+        };
+        peer.is_some_and(|peer| self.visitors.contains_key(&peer))
+    }
+
+    /// Whether a peer's a visitor: no member, no client, let in to read
+    /// what's shared with its key, and nothing else.
+    pub fn is_visitor(&self, peer: &PeerId) -> bool {
+        self.visitors.contains_key(peer)
+    }
+
+    /// The visitors let in, by peer ID, with their keys.
+    pub const fn visitors(&self) -> &HashMap<PeerId, Link> {
+        &self.visitors
+    }
+
+    /// The visitors connected now.
+    pub fn visiting(&self) -> Vec<PeerId> {
+        self.visitors.keys().filter(|peer| self.swarm.is_connected(peer)).copied().collect()
     }
 
     /// The uids of the accounts served, the catalog's own first.
@@ -526,6 +601,10 @@ impl Node {
             return true;
         };
         if !self.recognizes(local) {
+            return false;
+        }
+        // A visitor hosts no one, whatever it says
+        if self.visitors.contains_key(peer) {
             return false;
         }
         // A client let in hosts its account's user, and no other, as a
@@ -1864,8 +1943,10 @@ impl Node {
         self.client_of
     }
 
+    /// The members and clients connected: not visitors, who are told
+    /// nothing unasked.
     pub fn connected(&self) -> Vec<PeerId> {
-        self.swarm.connected_peers().copied().collect()
+        self.swarm.connected_peers().copied().filter(|peer| !self.visitors.contains_key(peer)).collect()
     }
 
     /// The accounts served here, by uid, whose users a member hosts, as
@@ -1971,6 +2052,10 @@ impl Node {
     /// A member's newly connected: tell it of the members, notice it of
     /// what it's missed, and vouch for its sightings from now on.
     fn on_connected(&mut self, peer: PeerId) -> Result<()> {
+        // A visitor's told nothing: it asks for what's shared with it
+        if self.visitors.contains_key(&peer) {
+            return Ok(());
+        }
         // A client's told of no members, and tells its member of none
         if !self.is_client(&peer) && self.client_of.is_none() {
             let roster = self.roster()?;
@@ -2020,6 +2105,12 @@ impl Node {
     /// names, or a fetch's answered.
     fn on_blocks(&mut self, event: request_response::Event<Want, Blocks>) -> Result<()> {
         match event {
+            request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } if self.visitors.contains_key(&peer) => {
+                // A visitor reads what's shared with its key, and nothing else
+                let key = self.visitors.get(&peer).cloned().ok_or_else(|| Error::Invalid("visitor gone".into()))?;
+                let answer = self.catalog.as_guest(&key, |catalog| blocks::answer(catalog, &request))?.without_copies();
+                let _ = self.swarm.behaviour_mut().blocks.send_response(channel, answer);
+            },
             request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
                 let Some(local) = self.serving(&peer, request.user())? else {
                     // A guest sees what's shared with them; another account's
@@ -2123,6 +2214,7 @@ impl Node {
 
     fn handle(&mut self, event: SwarmEvent<BehaviourEvent>) -> Result<Option<Event>> {
         Ok(match event {
+            SwarmEvent::Behaviour(event) if self.trespasses(&event) => None,
             SwarmEvent::NewListenAddr { listener_id, address } => {
                 if self.client_listeners.contains(&listener_id) {
                     self.ports.add(&address);

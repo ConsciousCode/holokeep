@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 
+use libp2p::PeerId;
 use libp2p::request_response::{self, ResponseChannel};
 
 use super::{FetchId, Node};
@@ -42,6 +43,11 @@ impl Node {
         let request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } = event else {
             return Ok(());
         };
+        if let Some(key) = self.visitors.get(&peer).cloned() {
+            let answer = self.answer_visitor(&peer, &key, &request.words).unwrap_or_else(|e| error(&e.to_string()));
+            let _ = self.swarm.behaviour_mut().asks.send_response(channel, answer);
+            return Ok(());
+        }
         let Some(&uid) = self.clients.get(&peer) else {
             let _ = self.swarm.behaviour_mut().asks.send_response(channel, error("only clients ask"));
             return Ok(());
@@ -68,6 +74,33 @@ impl Node {
         }
         self.asked.push(Asked { fetches, uid, words: request.words, channel });
         Ok(())
+    }
+
+    /// Answer a visitor, which may ask only about what's shared with it:
+    /// which views, and what each is now, as it may read them.
+    fn answer_visitor(&mut self, peer: &PeerId, key: &Link, words: &[String]) -> Result<Answer> {
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        let mut lines = Vec::new();
+        match words.as_slice() {
+            ["whoami"] => lines.push(format!("visitor\t{peer}")),
+            ["shared"] => {
+                let Some((_, state)) = &self.granted else {
+                    return Ok(Answer::default());
+                };
+                for share in state.shares().into_iter().filter(|share| share.user == *key && !share.held.is_empty()) {
+                    if let Some(view) = crate::claim::view(&share.anchor, &share.owner) {
+                        lines.push(format!("{view}\t{}\t{}", crate::keys::peer_id(&share.owner), share.held.join(" ")));
+                    }
+                }
+            },
+            ["anchor", "show", view] => {
+                let view: Link = view.parse().map_err(|_| crate::net::mesh::Error::Invalid(format!("not a CID: {view}")))?;
+                let value = self.catalog.as_guest(key, |catalog| catalog.anchor_value(&view))??;
+                lines.push(value.map_or_else(|| "unset".to_owned(), |value| value.to_string()));
+            },
+            _ => return Ok(error("a visitor may only read what's shared with it: whoami, shared, anchor show, and blocks")),
+        }
+        Ok(Answer { lines })
     }
 
     /// A fetch finished: answer what a client asked, if that's what it

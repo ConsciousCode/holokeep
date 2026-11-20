@@ -188,6 +188,15 @@ enum NodeCommand {
         /// without, this node alone. Its ticket holds no mesh key
         #[arg(long, conflicts_with_all = ["device", "protected", "quota"])]
         client: bool,
+        /// Let in a visitor instead: a key that's no user of the mesh, by
+        /// its peer ID (`hk node id` in its directory), which a user here
+        /// shares views of anchors with (`hk anchor share <anchor> <peer>
+        /// read`), reading those and nothing else, as a thin client (`hk
+        /// node join --thin`) where members listen for clients. Nothing's
+        /// certified: what's shared with it is all it's let in for, till
+        /// it's unshared
+        #[arg(long, conflicts_with_all = ["device", "protected", "quota", "client"])]
+        visitor: bool,
     },
     /// Join a mesh with a ticket from a node already in it
     Join {
@@ -877,8 +886,12 @@ fn importer(chunker: &str, max_file_links: usize, hidden: bool) -> anyhow::Resul
 fn thin_join(place: &holokeep::net::mesh::Place, ticket: &str) -> anyhow::Result<()> {
     anyhow::ensure!(place.is_main(), "clients are of the main mesh");
     let ticket = holokeep::net::thin::join(&place.repo, ticket)?;
-    let user = ticket.user.as_ref().map_or_else(String::new, |(user, _)| holokeep::keys::peer_id(user));
-    eprintln!("a thin client of {} now, as a device of user {user}: hk commands with --repo {} ask it", ticket.inviter, place.repo.display());
+    let (user, visiting) = ticket.user.as_ref().map_or_else(|| (String::new(), true), |(user, blocks)| (holokeep::keys::peer_id(user), blocks.is_empty()));
+    if visiting {
+        eprintln!("visiting {} now, to read what user {user} shares with this key: `hk anchor shared` with --repo {} lists it", ticket.inviter, place.repo.display());
+    } else {
+        eprintln!("a thin client of {} now, as a device of user {user}: hk commands with --repo {} ask it", ticket.inviter, place.repo.display());
+    }
     Ok(())
 }
 
@@ -933,6 +946,7 @@ fn thin(dir: &Path, command: Command) -> anyhow::Result<()> {
         Command::Keep(KeepCommand::Add { copies: Some(_), .. }) => anyhow::bail!("how many copies to keep is the member's to say"),
         Command::Keep(command) => ask(&connect()?, &keep_words(command).iter().map(String::as_str).collect::<Vec<_>>())?,
         Command::Tag(command) => ask(&connect()?, &tag_words(command).iter().map(String::as_str).collect::<Vec<_>>())?,
+        Command::Anchor(AnchorCommand::Shared { anchor: None }) => ask(&connect()?, &["shared"])?,
         Command::Anchor(AnchorCommand::New) => ask(&connect()?, &["anchor", "new"])?,
         Command::Anchor(AnchorCommand::Root) => ask(&connect()?, &["anchor", "root"])?,
         Command::Anchor(AnchorCommand::Show { anchor }) => ask(&connect()?, &["anchor", "show", &anchor.to_string()])?,
@@ -1263,6 +1277,46 @@ fn invite_client(place: &holokeep::net::mesh::Place, peer: &str, account: Option
     Ok(())
 }
 
+/// Print a ticket for a visitor: where members serving an account's user
+/// listen for clients. What it may read, the user's shares say.
+#[cfg(feature = "net")]
+fn invite_visitor(place: &holokeep::net::mesh::Place, peer: &str, account: Option<u32>) -> anyhow::Result<()> {
+    use holokeep::net::{daemon, mesh};
+    anyhow::ensure!(place.is_main(), "visitors are of the main mesh");
+    let dir = place.repo.as_path();
+    let peer: libp2p::PeerId = peer.parse().context("not a peer id")?;
+    let key = holokeep::keys::from_peer_id(&peer.to_string()).context("not an ed25519 peer")?;
+    let me = mesh::node_key(dir)?.public().to_peer_id();
+    let members = daemon::members(place)?;
+    anyhow::ensure!(members.client_of()?.is_none(), "this node is a client, which has no visitors");
+    let genesis = members.genesis()?.context("the mesh has no grants, so nothing's shared: `hk node grant init` first")?;
+    let home = rustix::process::getuid().as_raw();
+    let uid = account.unwrap_or(home);
+    anyhow::ensure!(uid == home || members.others()?.contains(&uid), "uid {uid} isn't an account this node serves");
+    let mut repo = Catalog::open_repo(dir)?;
+    repo.act_for(uid, holokeep::keys::account_key(dir, uid)?)?;
+    let user = repo.user()?.context("the account has no user yet, so shares nothing")?;
+    let state = repo.grant_state(&genesis)?.context("the mesh's grants aren't here")?;
+    anyhow::ensure!(!state.holds(&key, holokeep::grants::USER), "{peer} is a user of the mesh: share with it as one");
+    if !state.shares().iter().any(|share| share.user == key && share.owner == user && !share.held.is_empty()) {
+        eprintln!("note: nothing's shared with {peer} yet: `hk anchor share <anchor> {peer} read`, and it's let in");
+    }
+    let mut listening: std::collections::BTreeMap<libp2p::PeerId, Vec<libp2p::Multiaddr>> = std::collections::BTreeMap::new();
+    for line in daemon::ask(place, &format!("clients-at {uid}"))?.unwrap_or_default() {
+        if let Some((member, addr)) = line.split_once('\t')
+            && let (Ok(member), Ok(addr)) = (member.parse(), addr.parse())
+        {
+            listening.entry(member).or_default().push(addr);
+        }
+    }
+    if !listening.contains_key(&me) {
+        eprintln!("note: this node isn't listening for clients, so the ticket says nowhere to find it: start `hk node run --clients` and invite again");
+    }
+    listening.entry(me).or_default();
+    out!("{}", mesh::Ticket { swarm_key: None, client: true, inviter: me, members: listening, user: Some((user, Vec::new())), protected: false, sealed: Vec::new(), held: Vec::new(), grants: None }.encode());
+    Ok(())
+}
+
 /// Become a client of the member a ticket's from: a device of its user,
 /// connecting to it alone.
 #[cfg(feature = "net")]
@@ -1520,6 +1574,7 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
             }
         },
         NodeCommand::Invite { peer, account, client: true, .. } => invite_client(place, &peer, account)?,
+        NodeCommand::Invite { peer, account, visitor: true, .. } => invite_visitor(place, &peer, account)?,
         NodeCommand::Invite { peer, device, account, protected: false, quota: None, .. } => invite(place, &peer, device.as_deref(), account)?,
         NodeCommand::Invite { peer, device, account: None, protected: true, quota, .. } => {
             invite_friend(place, &peer, device.as_deref().context("a protected mesh holds a friend's vault: name it with --device")?, quota)?;
@@ -1888,6 +1943,12 @@ fn share(dir: Option<&PathBuf>, repo: &Catalog, anchor: &Link, who: &str, comman
         })
         .collect::<anyhow::Result<_>>()?;
     let who = key_named(who)?;
+    if give
+        && commands.iter().any(|command| !claim::covers(READ, command))
+        && repo.grant_state(&genesis)?.is_some_and(|state| !state.holds(&who, holokeep::grants::USER))
+    {
+        eprintln!("note: {} is no user of the mesh, so only reads, as a visitor: what it sets or gives doesn't count", holokeep::keys::peer_id(&who));
+    }
     let cid = if give {
         repo.grant_on(&genesis, anchor, std::slice::from_ref(&who), &commands, &[], &[])?
     } else {

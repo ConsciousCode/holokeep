@@ -80,6 +80,11 @@ other side enforces anything.
   [[Mesh#Thin clients]]). In a mesh with grants a client is the mesh's,
   given `/mesh/client`: every member serving its user lets it in, so
   it's cut off only once they're all away.
+- **Visitors.** A user shares a view of an anchor with a key outside the
+  mesh, as with anyone (`hk anchor share`): a key the mesh's grants never
+  named is a visitor, holding `/anchor/read` and nothing more. Members
+  serving the owner let it in where clients connect, as a thin client,
+  and serve it only what those views reach (see [[Mesh#Visitors]]).
 - **Block access tokens** are computed and checked (see
   [[Protected Meshes#Block access tokens]]), but nothing asks for them.
 
@@ -245,7 +250,8 @@ worth looking into for efficiency.
 
 ## Across the boundary
 
-Not yet implemented, beyond protected meshes.
+Implemented: protected meshes, and visitors reading what's shared with
+them through a member (see [[Mesh#Visitors]]). Not yet: the rest.
 
 - **Friends** hold ciphertext in a protected mesh, as now. A paid storage
   node is the same: a member of its company's mesh, where its customers
@@ -278,7 +284,12 @@ Not yet implemented, beyond protected meshes.
    machines, guests' (3b).
 4. Remote clients. Done: clients keeping a repo of their own as a cache,
    and thin clients keeping none.
-5. Capabilities for sharing outside the mesh.
+5. Capabilities for sharing outside the mesh. Begun: visitors, keys
+   outside the mesh that users share views with to read, through a
+   member that enforces it, as native grants. To come: visitors writing
+   and passing on (their sets and grants signed by their own keys, as
+   their own users), expiry, and capabilities no member need enforce,
+   encrypted down the tree.
 
 ## Open questions
 

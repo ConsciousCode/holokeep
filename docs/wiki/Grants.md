@@ -120,6 +120,14 @@ concurrently heeded), and a giver must hold it still for what they gave
 to be held. A mesh's operators and founder hold nothing on a user's
 view, and no one does once the owner isn't a user.
 
+**Visitors.** A key that's no user of the mesh, and that the mesh's own
+grants have never named (as founder, user, machine or client, given or
+taken anything), may still be given commands on a user's view: it's a
+**visitor**, and holds `/anchor/read` there if the grants say it does,
+and nothing else, whatever it's given; what it sets or gives counts for
+no one. A user taken from the mesh was named by its grants, so keeps
+nothing as a visitor. See [[Mesh#Visitors]] for how a visitor reads.
+
 If B holds `/anchor/grant` on U's view of A and passes `/anchor/read` to
 C, that grant is judged in U's view (where B may give it), and in B's
 own (where B holds everything). Taking B's `/anchor/grant` away in U's
