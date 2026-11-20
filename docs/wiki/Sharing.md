@@ -250,9 +250,9 @@ worth looking into for efficiency.
 
 ## Across the boundary
 
-Implemented: protected meshes, and visitors reading and writing what's
-shared with them through a member (see [[Mesh#Visitors]]). Not yet: the
-rest.
+Implemented: protected meshes, and visitors reading, writing and
+passing on what's shared with them through a member (see
+[[Mesh#Visitors]]). Not yet: the rest.
 
 - **Friends** hold ciphertext in a protected mesh, as now. A paid storage
   node is the same: a member of its company's mesh, where its customers
@@ -286,11 +286,10 @@ rest.
 4. Remote clients. Done: clients keeping a repo of their own as a cache,
    and thin clients keeping none.
 5. Capabilities for sharing outside the mesh. Begun: visitors, keys
-   outside the mesh that users share views with to read and write,
-   through a member that enforces it, as native grants, their sets
-   signed by their own keys. To come: visitors passing on (their grants
-   signed as their own), expiry, and capabilities no member need
-   enforce, encrypted down the tree.
+   outside the mesh that users share views with to read, write and pass
+   on, through a member that enforces it, as native grants, their sets
+   and grants signed by their own keys. To come: expiry, and
+   capabilities no member need enforce, encrypted down the tree.
 
 ## Open questions
 

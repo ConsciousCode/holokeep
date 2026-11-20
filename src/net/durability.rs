@@ -521,12 +521,15 @@ pub fn answer_guest_push(catalog: &Catalog, push: Push) -> Result<(Kept, Vec<cra
     Ok((Kept { kept }, claims))
 }
 
-/// Hold what a visitor pushed for a user it may write a view of: blocks,
-/// and of claims, only sets and their signs, which count as the user's
-/// view says. Returns what was kept, and the sets.
-pub fn answer_visitor_push(catalog: &Catalog, push: Push) -> Result<(Kept, Vec<crate::claim::Claim>)> {
+/// Hold what a visitor pushed for a user whose view of an anchor it may
+/// write, or pass on. Returns what was kept, and the sets and grants.
+///
+/// Blocks and sets are taken if it may write, grants on anchors if it may
+/// pass on, and signs; no other claims. What counts is as the user's view
+/// says.
+pub fn answer_visitor_push(catalog: &Catalog, push: Push, write: bool, grant: bool) -> Result<(Kept, Vec<crate::claim::Claim>)> {
     let mut kept = Vec::new();
-    let mut sets = Vec::new();
+    let mut said = Vec::new();
     for (cid, data) in push.blocks {
         let Ok(link) = Link::decode(&cid) else {
             continue;
@@ -535,14 +538,16 @@ pub fn answer_visitor_push(catalog: &Catalog, push: Push) -> Result<(Kept, Vec<c
             continue;
         };
         match crate::claim::Claim::parse(block.data()) {
-            Some(claim @ crate::claim::Claim::Set(_)) => sets.push(claim),
-            Some(crate::claim::Claim::Sign(_)) | None => {},
-            Some(_) => continue,
+            Some(claim @ crate::claim::Claim::Set(_)) if write => said.push(claim),
+            Some(crate::claim::Claim::Grant(given)) if grant && given.on().is_some() => said.push(crate::claim::Claim::Grant(given)),
+            Some(crate::claim::Claim::Sign(_)) => {},
+            None if write => {},
+            _ => continue,
         }
         catalog.put_block(&block, link.version())?;
         kept.push((ByteBuf::from(link.multihash().to_bytes()), Vec::new()));
     }
-    Ok((Kept { kept }, sets))
+    Ok((Kept { kept }, said))
 }
 
 /// What an audit did.

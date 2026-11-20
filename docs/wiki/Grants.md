@@ -123,13 +123,16 @@ view, and no one does once the owner isn't a user.
 **Visitors.** A key that's no user of the mesh, and that the mesh's own
 grants have never named (as founder, user, machine or client, given or
 taken anything), may still be given commands on a user's view: it's a
-**visitor**, and holds `/anchor/read` and `/anchor/write` there if the
-grants say it does, and nothing else, whatever it's given: what it gives
-counts for no one. Being no user, it has no devices: it signs its sets
-with its own key, which counts as itself where it may write, and taking
-write away names which of its sets stand, as for a user. A user taken
-from the mesh was named by its grants, so keeps nothing as a visitor.
-See [[Mesh#Visitors]] for how a visitor reads and writes.
+**visitor**, and holds there what the grants say, as a user would.
+Being no user, it has no devices: it signs with its own key, which is
+itself. Its sets count where it may write, and taking write away names
+which of them stand, as for a user. Its grants on a view are judged as
+a user's are, where it signs as itself, so it passes on what it may
+give, to users or other visitors, and what it gave goes with its power
+to give it. Its own views are no one's, since it's no user. A user
+taken from the mesh was named by its grants, so keeps nothing as a
+visitor, and signs nothing on a view. See [[Mesh#Visitors]] for how a
+visitor reads, writes and passes on.
 
 If B holds `/anchor/grant` on U's view of A and passes `/anchor/read` to
 C, that grant is judged in U's view (where B may give it), and in B's

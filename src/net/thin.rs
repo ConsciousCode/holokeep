@@ -86,6 +86,15 @@ pub fn is_thin(dir: &Path) -> bool {
     dir.join(TICKET).is_file()
 }
 
+/// A visitor's ticket, from its directory, for another visitor: a
+/// visitor's names no one, and certifies nothing, so it's anyone's the
+/// owner's shares let in. None, if it's a client's.
+pub fn visitor_ticket(dir: &Path) -> Result<Option<String>> {
+    let text = std::fs::read_to_string(dir.join(TICKET))?;
+    let ticket = Ticket::decode(&text)?;
+    Ok(ticket.user.as_ref().is_some_and(|(_, certificates)| certificates.is_empty()).then(|| text.trim().to_owned()))
+}
+
 /// Make a directory a thin client of the member a client's ticket is
 /// from, or of the same member again, wherever it listens now. Returns
 /// the ticket.
@@ -359,13 +368,8 @@ impl Thin {
     /// the owner's already. Returns the set's CID.
     pub async fn set_own(&mut self, view: &Link, value: &Link) -> Result<Link> {
         let key = self.visitor.clone().ok_or_else(|| Error::Invalid("a client of the mesh sets anchors through its account".into()))?;
-        let (anchor, owner) = crate::claim::viewed(view).ok_or_else(|| Error::Invalid(format!("{view} isn't a view of an anchor: `hk anchor shared` lists those shared with this key")))?;
-        let shared = self.ask(vec!["shared".to_owned()]).await?;
-        let writable = shared.iter().any(|line| {
-            let mut fields = line.split('\t');
-            fields.next() == Some(&view.to_string()) && fields.nth(1).is_some_and(|held| held.split(' ').any(|held| crate::claim::covers(held, crate::grants::WRITE)))
-        });
-        if !writable {
+        let (anchor, owner) = viewed(view)?;
+        if !self.holds(view, crate::grants::WRITE).await? {
             return Err(Error::Invalid(format!("{} hasn't let this key write {view}", crate::keys::peer_id(&owner))));
         }
         let mut prev = Vec::new();
@@ -375,22 +379,77 @@ impl Thin {
             prev.push(set.parse::<Link>().map_err(|_| Error::Invalid(format!("not a CID: {set}")))?);
             latest = latest.max(at.parse::<u64>().map_err(|_| Error::Invalid(format!("not a time: {at}")))?.saturating_add(1));
         }
-        let signed = match self.ask(vec!["signed".to_owned()]).await?.first() {
-            Some(sign) => Some(sign.parse::<Link>().map_err(|_| Error::Invalid(format!("not a CID: {sign}")))?),
-            None => None,
-        };
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
-        let at = now.max(latest);
+        let at = now().max(latest);
         let set = crate::claim::Set::new([anchor], value.clone(), at).ok_or_else(|| Error::Invalid("a set names an anchor".into()))?.after(Some(prev)).for_view(Some(owner));
         let set = crate::claim::Claim::Set(set);
-        let sign = crate::claim::Sign::new(&key, [set.cid()], signed, at).ok_or_else(|| Error::Invalid("nothing to sign".into()))?;
-        self.push(vec![set.block(), crate::claim::Claim::Sign(sign).block()]).await?;
+        self.sign_and_push(&key, &set, at).await?;
         let heads = self.ask(vec!["anchor".to_owned(), "heads".to_owned(), view.to_string()]).await?;
         if !heads.iter().any(|line| line.split('\t').next() == Some(&set.cid().to_string())) {
             return Err(Error::Invalid(format!("{} took the set, but it doesn't count in {view}: was write taken away?", self.member)));
         }
         Ok(set.cid())
     }
+
+    /// Give or take away commands on a view of an anchor shared with this
+    /// visitor, as itself: a grant signed with its own key, after the
+    /// mesh's grants, pushed to the member, which counts in the owner's
+    /// view if the visitor may give or take them away there. Taking write
+    /// away, what the target set till then stands. Returns its CID.
+    pub async fn share_own(&mut self, view: &Link, who: &Link, add: &[String], del: &[String]) -> Result<Link> {
+        let key = self.visitor.clone().ok_or_else(|| Error::Invalid("a client of the mesh shares through its account".into()))?;
+        let (anchor, owner) = viewed(view)?;
+        for need in std::iter::once(crate::grants::ANCHOR_GRANT).chain(add.iter().chain(del).map(String::as_str)) {
+            if !self.holds(view, need).await? {
+                return Err(Error::Invalid(format!("{} hasn't let this key give or take away {need} on {view}", crate::keys::peer_id(&owner))));
+            }
+        }
+        let stands = if del.iter().any(|command| crate::claim::covers(command, crate::grants::WRITE)) {
+            let latest = self.ask(vec!["anchor".to_owned(), "latest".to_owned(), view.to_string(), who.to_string()]).await?;
+            latest.iter().map(|set| set.parse::<Link>().map_err(|_| Error::Invalid(format!("not a CID: {set}")))).collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let heads = self.ask(vec!["grant".to_owned(), "heads".to_owned()]).await?;
+        let heads = heads.iter().map(|head| head.parse::<Link>().map_err(|_| Error::Invalid(format!("not a CID: {head}")))).collect::<Result<Vec<_>>>()?;
+        let grant = crate::claim::Grant::new([who.clone()], Some(anchor), add.iter().cloned(), del.iter().cloned(), stands, heads)
+            .ok_or_else(|| Error::Invalid("a grant names someone, and commands on an anchor given or taken away, not both".into()))?;
+        let grant = crate::claim::Claim::Grant(grant);
+        self.sign_and_push(&key, &grant, now()).await?;
+        let heads = self.ask(vec!["grant".to_owned(), "heads".to_owned()]).await?;
+        if !heads.contains(&grant.cid().to_string()) {
+            return Err(Error::Invalid(format!("{} didn't take the grant", self.member)));
+        }
+        Ok(grant.cid())
+    }
+
+    /// Whether this visitor holds a command on a view, as the member says.
+    async fn holds(&mut self, view: &Link, command: &str) -> Result<bool> {
+        let view = view.to_string();
+        Ok(self.ask(vec!["shared".to_owned()]).await?.iter().any(|line| {
+            let mut fields = line.split('\t');
+            fields.next() == Some(view.as_str()) && fields.nth(1).is_some_and(|held| held.split(' ').any(|held| crate::claim::covers(held, command)))
+        }))
+    }
+
+    /// Sign a claim with this visitor's key, after its last sign, and push
+    /// both to the member.
+    async fn sign_and_push(&mut self, key: &crate::keys::Key, claim: &crate::claim::Claim, at: u64) -> Result<()> {
+        let signed = match self.ask(vec!["signed".to_owned()]).await?.first() {
+            Some(sign) => Some(sign.parse::<Link>().map_err(|_| Error::Invalid(format!("not a CID: {sign}")))?),
+            None => None,
+        };
+        let sign = crate::claim::Sign::new(key, [claim.cid()], signed, at).ok_or_else(|| Error::Invalid("nothing to sign".into()))?;
+        self.push(vec![claim.block(), crate::claim::Claim::Sign(sign).block()]).await
+    }
+}
+
+/// The anchor a view is of, and whose view it is.
+fn viewed(view: &Link) -> Result<(Link, Link)> {
+    crate::claim::viewed(view).ok_or_else(|| Error::Invalid(format!("{view} isn't a view of an anchor: `hk anchor shared` lists those shared with this key")))
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs())
 }
 
 fn failed(member: PeerId, error: &request_response::OutboundFailure) -> Error {
@@ -439,6 +498,10 @@ impl Blocking {
 
     pub fn set_own(&self, view: &Link, value: &Link) -> Result<Link> {
         self.runtime.block_on(self.thin.borrow_mut().set_own(view, value))
+    }
+
+    pub fn share_own(&self, view: &Link, who: &Link, add: &[String], del: &[String]) -> Result<Link> {
+        self.runtime.block_on(self.thin.borrow_mut().share_own(view, who, add, del))
     }
 }
 

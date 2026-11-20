@@ -952,6 +952,17 @@ fn thin(dir: &Path, command: Command) -> anyhow::Result<()> {
         Command::Anchor(AnchorCommand::New) => ask(&connect()?, &["anchor", "new"])?,
         Command::Anchor(AnchorCommand::Root) => ask(&connect()?, &["anchor", "root"])?,
         Command::Anchor(AnchorCommand::Show { anchor }) => ask(&connect()?, &["anchor", "show", &anchor.to_string()])?,
+        // A visitor passes on what it may as itself
+        Command::Anchor(AnchorCommand::Share { anchor, who, commands }) if holokeep::net::thin::visitor_ticket(dir)?.is_some() => {
+            out!("{}", connect()?.share_own(&anchor, &key_named(&who)?, &anchor_commands(&commands)?, &[])?);
+        },
+        Command::Anchor(AnchorCommand::Unshare { anchor, who, commands }) if holokeep::net::thin::visitor_ticket(dir)?.is_some() => {
+            out!("{}", connect()?.share_own(&anchor, &key_named(&who)?, &[], &anchor_commands(&commands)?)?);
+        },
+        Command::Node(NodeArgs { command: NodeCommand::Invite { visitor: true, .. }, .. }) if holokeep::net::thin::visitor_ticket(dir)?.is_some() => {
+            out!("{}", holokeep::net::thin::visitor_ticket(dir)?.unwrap_or_default());
+            eprintln!("note: it's this visitor's own ticket, naming no one: it lets in whoever the owner's shares, and those passed on, say may read");
+        },
         Command::Anchor(AnchorCommand::Set { anchor, cid, lazy }) => {
             let client = connect()?;
             if client.is_visitor() {
@@ -1929,16 +1940,11 @@ fn revoke_device(dir: &Path, repo: &Catalog, peer: &str, until: &[String], dry_r
     Ok(())
 }
 
-/// Give or take away what a user may do with a view of an anchor: the
-/// acting user's own, or one they may pass on. Taking write away, the
-/// user's latest sets in the view stand.
+/// Commands on an anchor, by name or in full.
 #[cfg(feature = "net")]
-fn share(dir: Option<&PathBuf>, repo: &Catalog, anchor: &Link, who: &str, commands: &[String], give: bool) -> anyhow::Result<()> {
+fn anchor_commands(commands: &[String]) -> anyhow::Result<Vec<String>> {
     use holokeep::grants::{ANCHOR, ANCHOR_GRANT, READ, WRITE};
-    anyhow::ensure!(holokeep::claim::is_anchor(anchor), "{anchor} isn't an anchor");
-    let place = holokeep::net::mesh::Place::main(&repo_dir(dir.cloned())?);
-    let genesis = holokeep::net::daemon::members(&place)?.genesis()?.context("the mesh has no grants: `hk node grant init` first")?;
-    let commands: Vec<String> = commands
+    commands
         .iter()
         .map(|command| match command.as_str() {
             "read" => Ok(READ.to_owned()),
@@ -1948,14 +1954,20 @@ fn share(dir: Option<&PathBuf>, repo: &Catalog, anchor: &Link, who: &str, comman
             other if claim::is_command(other) && claim::covers(ANCHOR, other) => Ok(other.to_owned()),
             other => Err(anyhow::anyhow!("not a command on an anchor: {other} (read, write, grant, all, or one under /anchor)")),
         })
-        .collect::<anyhow::Result<_>>()?;
+        .collect()
+}
+
+/// Give or take away what a user may do with a view of an anchor: the
+/// acting user's own, or one they may pass on. Taking write away, the
+/// user's latest sets in the view stand.
+#[cfg(feature = "net")]
+fn share(dir: Option<&PathBuf>, repo: &Catalog, anchor: &Link, who: &str, commands: &[String], give: bool) -> anyhow::Result<()> {
+    use holokeep::grants::WRITE;
+    anyhow::ensure!(holokeep::claim::is_anchor(anchor), "{anchor} isn't an anchor");
+    let place = holokeep::net::mesh::Place::main(&repo_dir(dir.cloned())?);
+    let genesis = holokeep::net::daemon::members(&place)?.genesis()?.context("the mesh has no grants: `hk node grant init` first")?;
+    let commands = anchor_commands(commands)?;
     let who = key_named(who)?;
-    if give
-        && commands.iter().any(|command| !claim::covers(READ, command) && !claim::covers(WRITE, command))
-        && repo.grant_state(&genesis)?.is_some_and(|state| !state.holds(&who, holokeep::grants::USER))
-    {
-        eprintln!("note: {} is no user of the mesh, so only reads and writes, as a visitor: what it gives doesn't count", holokeep::keys::peer_id(&who));
-    }
     let cid = if give {
         repo.grant_on(&genesis, anchor, std::slice::from_ref(&who), &commands, &[], &[])?
     } else {

@@ -469,7 +469,7 @@ scenario_thin() {
 # A visitor: a key outside the mesh, no user of it, which one's owner
 # shares an anchor with, reading that and nothing else
 scenario_visitor() {
-    local peer ticket shared private anchor view written
+    local peer ticket shared private anchor view written friend
     machine guest
     peer=$(on guest hk node id)
     shared=$(sh_on one 'echo "shared with a visitor" | hk add -q -')
@@ -498,8 +498,22 @@ scenario_visitor() {
     [ "$(on one hk anchor show "$anchor" | head -1)" = "$written" ] || fail "one doesn't count the visitor's set"
     wait_for "two to count the visitor's set" sh_on two "hk anchor show '$anchor' | head -1 | grep -q '$written'"
     wait_for "two to have what the visitor wrote" sh_on two "[ \"\$(hk cat $written)\" = 'from a visitor' ]"
+    # Let pass it on, it shares with a friend of its own, who reads it
+    # through either member, till it takes that back
+    machine friend
+    friend=$(on friend hk node id)
+    on one hk anchor share "$anchor" "$peer" grant >/dev/null
+    wait_for "the visitor to be let pass it on" sh_on guest "hk anchor shared | grep -q /anchor/grant"
+    on guest hk anchor share "$view" "$friend" read >/dev/null || fail "the visitor couldn't pass it on"
+    on friend hk node join --thin "$(on guest hk node invite "$friend" --visitor 2>/dev/null)" 2>/dev/null
+    [ "$(on friend hk anchor show "$view")" = "$written" ] || fail "the friend can't see the anchor"
+    [ "$(on friend hk cat "$written")" = "from a visitor" ] || fail "the friend can't read what's shared"
+    wait_for "two to let the friend in" sh_on two "hk node peers | grep -q '^$friend	-	visitor'"
+    on guest hk anchor unshare "$view" "$friend" read >/dev/null || fail "the visitor couldn't take it back"
+    wait_for "one to shut the friend out" sh_on one "! hk node peers | grep -q '^$friend	'"
+    ! on friend hk anchor shared >/dev/null 2>&1 || fail "the friend still got in, unshared"
     # Unshared, it's shut out
-    on one hk anchor unshare "$anchor" "$peer" read write >/dev/null
+    on one hk anchor unshare "$anchor" "$peer" read write grant >/dev/null
     wait_for "one to shut the visitor out" sh_on one "! hk node peers | grep -q '^$peer	'"
     wait_for "two to shut the visitor out" sh_on two "! hk node peers | grep -q '^$peer	'"
     ! on guest hk anchor shared >/dev/null 2>&1 || fail "the visitor still got in, unshared"

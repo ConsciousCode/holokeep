@@ -697,9 +697,8 @@ async fn a_devices_claims_count_where_they_go_and_a_strangers_dont() {
     assert_eq!(fetch(&mut a, &mut b, link(signed)).await.0, 1);
     assert_eq!(fetch(&mut a, &mut b, link(unsigned)).await.0, 1);
     assert!(until(&mut [&mut a, &mut b], |n| tags(n[1], signed) == [link(&tag)]).await);
-    // The stranger's tag arrived along with its leaf, but doesn't count
-    let claims = b.catalog().claims().expect("claims");
-    assert!(!claims.backrefs(unsigned.cid().multihash()).expect("backrefs").is_empty());
+    // The stranger's tag arrives after its leaf, but doesn't count
+    assert!(until(&mut [&mut a, &mut b], |n| !n[1].catalog().claims().expect("claims").backrefs(unsigned.cid().multihash()).expect("backrefs").is_empty()).await);
     assert!(tags(&b, unsigned).is_empty());
 }
 
@@ -1690,10 +1689,12 @@ async fn a_client_of_the_mesh_connects_to_every_member_serving_its_user() {
     // connects to both
     assert!(until(&mut [&mut a, &mut b, &mut client], |n| n[2].connected().contains(&n[0].peer_id()) && n[2].connected().contains(&n[1].peer_id())).await);
     assert!(!a.members().contains(&peer).expect("contains") && !b.members().contains(&peer).expect("contains"));
-    // What only the other has, it reads from it
+    // What only the other has, it reads from it, whichever it asks first,
+    // so every node's driven
     let theirs = raw(b"only on b");
     b.catalog().put_block(&theirs, CidVersion::V1).expect("put");
-    assert_eq!(fetch(&mut b, &mut client, link(&theirs)).await, (1, vec![]));
+    client.fetch(link(&theirs)).expect("fetch");
+    assert!(until(&mut [&mut a, &mut b, &mut client], |n| has(n[2], &theirs)).await);
     // Forgetting it isn't enough; taking the grant away shuts it out of both
     assert!(a.forget_member(&peer).is_err());
     a.catalog().grant(&genesis, &[device.id()], &[], &[crate::grants::CLIENT.to_owned()]).expect("grant");
@@ -1810,4 +1811,51 @@ async fn a_visitor_let_write_sets_a_view_as_itself() {
     assert!(serving(&mut [&mut member], thin.push(vec![later.clone()])).await.is_err());
     assert!(!member.catalog().has(later.cid().multihash()).expect("has"));
     assert_eq!(member.catalog().anchor_value(&anchor).expect("value"), Some(link(&written)));
+}
+
+/// A visitor let pass a view on does, as itself: a friend it shares with
+/// is let in and reads it, and is shut out once the visitor takes it back.
+/// One not let pass it on can't.
+#[tokio::test]
+async fn a_visitor_passes_a_view_on() {
+    use crate::grants::{ANCHOR_GRANT, READ};
+    let mut member = node(mesh::fresh_swarm_key().expect("key")).await;
+    member.listen_for_clients(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
+    assert!(until(&mut [&mut member], |n| !n[0].client_listeners().is_empty()).await);
+    let root = one_user(&mut [&mut member]);
+    let genesis = found(&mut [&mut member], &root);
+    let note = raw(b"passed on");
+    member.catalog().put_block(&note, CidVersion::V1).expect("put");
+    let anchor = member.catalog().new_anchor().expect("anchor");
+    member.catalog().set_anchor(&anchor, &link(&note)).expect("set");
+    let (visitor, friend, stranger) = (crate::keys::Key::generate().expect("key"), crate::keys::Key::generate().expect("key"), crate::keys::Key::generate().expect("key"));
+    member.catalog().grant_on(&genesis, &anchor, &[visitor.id()], &[READ.to_owned(), ANCHOR_GRANT.to_owned()], &[], &[]).expect("share");
+    member.catalog().grant_on(&genesis, &anchor, &[stranger.id()], &[READ.to_owned()], &[], &[]).expect("share");
+    member.reload().expect("reload");
+    let view = crate::claim::view(&anchor, &root.id()).expect("view");
+    let read = [READ.to_owned()];
+
+    // One let only read can't pass it on
+    let mut theirs = thin_of(&member, &stranger, &root.id()).as_visitor(stranger.clone());
+    assert!(serving(&mut [&mut member], theirs.share_own(&view, &friend.id(), &read, &[])).await.is_err());
+    // Nor is a grant it signs and pushes itself taken
+    let heads = member.catalog().grant_state(&genesis).expect("state").expect("a mesh").heads();
+    let grant = crate::claim::Claim::Grant(crate::claim::Grant::new([friend.id()], Some(anchor.clone()), read.iter().cloned(), [], [], heads).expect("grant"));
+    let sign = crate::claim::Claim::Sign(crate::claim::Sign::new(&stranger, [grant.cid()], None, 1).expect("sign"));
+    let _ = serving(&mut [&mut member], theirs.push(vec![grant.block(), sign.block()])).await;
+    assert!(!member.catalog().has(grant.cid().multihash()).expect("has"));
+    assert!(!member.is_visitor(&PeerId::from_bytes(&friend.id().multihash().to_bytes()).expect("peer")));
+
+    let mut thin = thin_of(&member, &visitor, &root.id()).as_visitor(visitor.clone());
+    serving(&mut [&mut member], thin.share_own(&view, &friend.id(), &read, &[])).await.expect("passed on");
+    let mut friends = thin_of(&member, &friend, &root.id()).with_patience(Duration::from_millis(300)).as_visitor(friend.clone());
+    assert!(member.is_visitor(&friends.peer_id()), "the friend's let in");
+    let words = vec!["anchor".to_owned(), "show".to_owned(), view.to_string()];
+    assert_eq!(serving(&mut [&mut member], friends.ask(words)).await.expect("show"), [link(&note).to_string()]);
+    assert_eq!(serving(&mut [&mut member], friends.get(&[link(&note)])).await.expect("get").len(), 1);
+
+    // Taken back, the friend's shut out
+    serving(&mut [&mut member], thin.share_own(&view, &friend.id(), &[], &read)).await.expect("taken back");
+    assert!(!member.is_visitor(&friends.peer_id()));
+    assert!(serving(&mut [&mut member], friends.ask(vec!["shared".to_owned()])).await.is_err());
 }

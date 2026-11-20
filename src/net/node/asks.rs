@@ -9,7 +9,7 @@ use libp2p::request_response::{self, ResponseChannel};
 use super::{FetchId, Node};
 use crate::cid::CidRef as _;
 use crate::claim::covers;
-use crate::grants::WRITE;
+use crate::grants::{ANCHOR_GRANT, WRITE};
 use crate::net::durability::{self, Kept, Push};
 use crate::model::Link;
 use crate::net::mesh::Result;
@@ -120,31 +120,52 @@ impl Node {
                     lines.push(sign.to_string());
                 }
             },
-            _ => return Ok(error("a visitor may only read and write what's shared with it: whoami, shared, anchor show, anchor heads, signed, blocks, and pushes")),
+            // What a grant of its own would follow: the mesh's
+            ["grant", "heads"] => {
+                if let Some((_, state)) = &self.granted {
+                    lines.extend(state.heads().iter().map(ToString::to_string));
+                }
+            },
+            // What of someone's sets stand, taking their write away
+            ["anchor", "latest", view, who] => {
+                let (view, who) = (parse(view)?, parse(who)?);
+                for set in self.catalog.as_guest(key, |catalog| catalog.latest_sets_by(&view, &who))?? {
+                    lines.push(set.to_string());
+                }
+            },
+            _ => return Ok(error("a visitor may only read, write and pass on what's shared with it: whoami, shared, anchor show, anchor heads, anchor latest, grant heads, signed, blocks, and pushes")),
         }
         Ok(Answer { lines })
     }
 
     /// Hold what a visitor pushed, for the user it's pushed for, if this
     /// serves them and the visitor may write a view of theirs: what it
-    /// sets, and what that reaches. What a set of its reaches that isn't
+    /// sets, and what that reaches, and what it passes on. What a set of its reaches that isn't
     /// here is fetched, as it is for a guest's.
     pub(super) fn on_visitor_push(&mut self, key: &Link, push: Push, channel: ResponseChannel<Kept>) -> Result<()> {
+        // What it may do on any of the user's views
+        let (mut write, mut grant) = (false, false);
         let local = match (&self.granted, push.user()) {
-            (Some((_, state)), Some(user)) => self.locals()?.into_iter().find(|local| {
-                local.rooted
-                    && local.user_bytes().as_deref() == Some(user)
-                    && local.user.as_ref().is_some_and(|owner| state.shares().iter().any(|share| share.owner == *owner && share.user == *key && share.held.iter().any(|held| covers(held, WRITE))))
+            (Some((_, state)), Some(user)) => self.locals()?.into_iter().find(|local| local.rooted && local.user_bytes().as_deref() == Some(user)).inspect(|local| {
+                for share in state.shares().iter().filter(|share| local.user.as_ref() == Some(&share.owner) && share.user == *key) {
+                    write |= share.held.iter().any(|held| covers(held, WRITE));
+                    grant |= share.held.iter().any(|held| covers(held, ANCHOR_GRANT));
+                }
             }),
             _ => None,
         };
-        let Some(local) = local.filter(|local| self.recognizes(local)) else {
+        let Some(local) = local.filter(|local| (write || grant) && self.recognizes(local)) else {
             let _ = self.swarm.behaviour_mut().push.send_response(channel, Kept::default());
             return Ok(());
         };
-        let (kept, sets) = self.catalog.viewing(local.uid, |catalog| durability::answer_visitor_push(catalog, push))??;
+        let (kept, said) = self.catalog.viewing(local.uid, |catalog| durability::answer_visitor_push(catalog, push, write, grant))??;
         let _ = self.swarm.behaviour_mut().push.send_response(channel, kept);
-        self.took_guest_claims(&local, &sets)
+        self.took_guest_claims(&local, &said)?;
+        // What it passed on is worked out, and every member told
+        if said.iter().any(|claim| matches!(claim, crate::claim::Claim::Grant(_))) {
+            self.reload()?;
+        }
+        Ok(())
     }
 
     /// A fetch finished: answer what a client asked, if that's what it

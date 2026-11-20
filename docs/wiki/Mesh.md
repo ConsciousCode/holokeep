@@ -267,7 +267,7 @@ away as any share is, and every machine works out the same answer.
 
 1. `hk node id` in a directory of the visitor's prints its key.
 2. `hk anchor share <anchor> <peer> read` on a machine of the owner's,
-   and `write` too, if it's to set it.
+   and `write` too, if it's to set it, and `grant`, to pass it on.
 3. `hk node invite <peer> --visitor [--account <uid>]` prints a ticket
    saying where the members serving the owner listen for clients;
    nothing's certified.
@@ -280,8 +280,10 @@ client. A visitor reads as a guest of what's shared with its key, and
 nothing else: `blocks` answers only for blocks those views reach
 (`hk cat`, `hk get`), and `ask` only `whoami`, `shared` (the views shared
 with it, `hk anchor shared`, as `<view> <owner> <commands>`),
-`anchor show <view>`, and what a set of its own needs: `anchor heads
-<view>` (each head's CID and time) and `signed` (its last sign there).
+`anchor show <view>`, and what a set or grant of its own needs:
+`anchor heads <view>` (each head's CID and time), `grant heads` (the
+mesh's), `anchor latest <view> <key>` (a key's sets that stand, to take
+its write away), and `signed` (its last sign there).
 
 A visitor let write a view writes as itself, since no member may sign for
 it. `hk add` pushes the blocks, keeping nothing, and `hk anchor set
@@ -292,6 +294,15 @@ write a view of theirs; of claims, it takes only sets and their signs,
 which count in the owner's view as the grants say, there and on every
 machine they reach. It refuses anything pushed otherwise, and `hk anchor
 set` checks the set counts before it says so.
+
+A visitor let pass a view on (`/anchor/grant`) does as itself: `hk
+anchor share <view> <peer> read` (or `unshare`) signs a grant with its
+own key, after the mesh's, and pushes it. The member takes grants on
+anchors from a visitor that may give on a view of the user it pushes
+for, works the grants out again, and tells every member, so a visitor it
+let in is let in everywhere the owner's served. A visitor's ticket names
+no one and certifies nothing, so `hk node invite <peer> --visitor` on a
+visitor prints its own, for the friend to join with.
 
 Anything else it sends is dropped unanswered: notices, adverts, rosters,
 hosts, grants, and identify. It's told

@@ -294,7 +294,7 @@ impl State {
                 node.by
                     .iter()
                     .filter(|&by| {
-                        let user = users.is_none_or(|(mesh, prior)| self.holds_in(mesh, prior, by, USER));
+                        let user = users.is_none_or(|(mesh, prior)| self.may_sign(mesh, prior, by));
                         user && (*by == scope.founder || node.needs(scope).all(|need| self.holds_in(&judgement, &judged, by, need)))
                     })
                     .cloned()
@@ -344,7 +344,7 @@ impl State {
             valid
                 .iter()
                 .filter(|&signer| {
-                    let user = mesh.as_ref().is_none_or(|(mesh, state)| self.holds_in(mesh, state, signer, USER));
+                    let user = mesh.as_ref().is_none_or(|(mesh, state)| self.may_sign(mesh, state, signer));
                     user && (*signer == scope.founder || node.needs(scope).all(|need| self.holds_in(judgement, &heeded, signer, need)))
                 })
                 .cloned()
@@ -427,7 +427,7 @@ impl State {
                     continue;
                 }
                 let gives = signers.iter().any(|signer| {
-                    let user = users.is_none_or(|(mesh, state)| self.holds_in(mesh, state, signer, USER));
+                    let user = users.is_none_or(|(mesh, state)| self.may_sign(mesh, state, signer));
                     user && (*signer == scope.founder || node.gift_needs(scope).all(|need| self.holds_in_judged(scope, &judged, signer, need)))
                 });
                 if gives && let Some(slot) = judged.supported.get_mut(i) {
@@ -485,12 +485,19 @@ impl State {
         *who == self.founder || self.nodes.iter().any(|node| node.in_scope(&self.mesh.scope) && node.targets(who))
     }
 
+    /// Whether someone may sign grants on a view of an anchor, as the mesh
+    /// says in some state: a user of it, or a visitor, which its grants
+    /// have never named. What they may give is the view's to say.
+    fn may_sign(&self, mesh: &Judgement, state: &Judged, who: &Link) -> bool {
+        self.holds_in(mesh, state, who, USER) || !self.named(who)
+    }
+
     /// Whether someone holds a command on an owner's view of an anchor:
     /// the owner, everything while they're a user of the mesh; anyone
     /// else, as the owner's grants on it, and those they let others make,
-    /// say. One the mesh's grants have never named, a visitor, holds only
-    /// what lets it read and write, its sets signed by its own key: what it
-    /// gives, no one's said counts.
+    /// say. One the mesh's grants have never named, a visitor, holds what
+    /// they say as a user would, signing with its own key; one they named
+    /// that's no user now holds nothing.
     pub fn holds_on(&self, owner: &Link, anchor: &Link, who: &Link, command: &str) -> bool {
         if !self.holds(owner, USER) {
             return false;
@@ -498,7 +505,7 @@ impl State {
         if who == owner {
             return true;
         }
-        if !self.holds(who, USER) && (self.named(who) || !(covers(READ, command) || covers(WRITE, command))) {
+        if !self.holds(who, USER) && self.named(who) {
             return false;
         }
         self.view(owner, anchor).is_some_and(|view| self.holds_in(view, &view.judged, who, command))
@@ -830,17 +837,44 @@ mod tests {
     }
 
     #[test]
-    fn a_visitor_reads_and_writes_but_gives_nothing() {
+    fn a_visitor_holds_what_its_given_and_passes_it_on() {
         let (mut history, _, u, b, _, last) = users();
         let anchor = crate::claim::anchor().expect("anchor");
-        let visitor = crate::keys::Key::generate().expect("key").id();
-        history.grant_on(&u, &visitor, &anchor, &[ANCHOR_GRANT, READ, WRITE], &[], &[&last]);
+        let (visitor, friend) = (key(), key());
+        let given = history.grant_on(&u, &visitor, &anchor, &[ANCHOR_GRANT, READ, WRITE], &[], &[&last]);
         let state = history.state();
         assert!(state.holds_on(&u, &anchor, &visitor, READ) && state.holds_on(&u, &anchor, &visitor, WRITE));
-        assert!(!state.holds_on(&u, &anchor, &visitor, ANCHOR_GRANT) && !state.holds_on(&u, &anchor, &visitor, ANCHOR));
+        assert!(state.holds_on(&u, &anchor, &visitor, ANCHOR_GRANT) && !state.holds_on(&u, &anchor, &visitor, ANCHOR));
         assert!(!state.holds_on(&b, &anchor, &visitor, READ), "only on the view shared");
         let share = state.shares().into_iter().find(|share| share.user == visitor).expect("shared");
-        assert_eq!(share.held, [READ, WRITE]);
+        assert_eq!(share.held, [ANCHOR_GRANT, READ, WRITE]);
+
+        // Passed on, signed by its own key: to another visitor, and a user
+        let passed = history.grant_on(&visitor, &friend, &anchor, &[READ], &[], &[&given]);
+        let to_user = history.grant_on(&visitor, &b, &anchor, &[WRITE], &[], &[&passed]);
+        let beyond = history.grant_on(&visitor, &friend, &anchor, &[ANCHOR], &[], &[&to_user]);
+        let state = history.state();
+        assert!(state.counts(&passed) && state.counts(&to_user));
+        assert!(state.holds_on(&u, &anchor, &friend, READ) && state.holds_on(&u, &anchor, &b, WRITE));
+        assert!(!state.holds_on(&u, &anchor, &friend, ANCHOR), "it can't give what it doesn't hold");
+        assert!(!state.holds_on(&visitor, &anchor, &friend, READ), "its own view's no one's, being no user");
+
+        // Its power to give taken away, what it gave goes
+        history.grant_on(&u, &visitor, &anchor, &[], &[ANCHOR_GRANT], &[&beyond]);
+        let state = history.state();
+        assert!(state.holds_on(&u, &anchor, &visitor, READ));
+        assert!(!state.holds_on(&u, &anchor, &friend, READ) && !state.holds_on(&u, &anchor, &b, WRITE));
+    }
+
+    #[test]
+    fn a_key_the_mesh_named_signs_nothing_on_a_view() {
+        let (mut history, founder, u, b, c, last) = users();
+        let anchor = crate::claim::anchor().expect("anchor");
+        let given = history.grant_on(&u, &b, &anchor, &[ANCHOR_GRANT, READ], &[], &[&last]);
+        let removed = history.grant(&founder, &b, &[], &[USER], &[&given]);
+        let passed = history.grant_on(&b, &c, &anchor, &[READ], &[], &[&removed]);
+        let state = history.state();
+        assert!(!state.counts(&passed) && !state.holds_on(&u, &anchor, &c, READ), "no user now, and no visitor");
     }
 
     #[test]
