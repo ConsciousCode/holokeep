@@ -267,7 +267,8 @@ away as any share is, and every machine works out the same answer.
 
 1. `hk node id` in a directory of the visitor's prints its key.
 2. `hk anchor share <anchor> <peer> read` on a machine of the owner's,
-   and `write` too, if it's to set it, and `grant`, to pass it on.
+   and `write` too, if it's to set it, and `grant`, to pass it on; with
+   `--for 7d`, say, for only so long (see [[Grants#Expiry]]).
 3. `hk node invite <peer> --visitor [--account <uid>]` prints a ticket
    saying where the members serving the owner listen for clients;
    nothing's certified.
@@ -311,6 +312,9 @@ part of audits, trims or collection. Unshared, it's shut out as soon as
 the grant reaches each member. Kademlia and identify still answer it as
 they would any connection, so it may learn where members listen, which
 the swarm key keeps closed to it.
+
+A share that ends shuts a visitor out within 10 s of its time, on each
+member by its own clock, unless something else still lets it in.
 
 `hk node peers` lists visitors as `<peer> <state> visitor -`, and `hk
 node status` says how many are connected.

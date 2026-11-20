@@ -709,6 +709,8 @@ impl Node {
             Ok((grants, node.grant_evidence()?.into_iter().map(|(cid, _)| cid).collect()))
         };
         let before = cids(self)?;
+        // What a grant gave till a time that's passed, gone: news as much
+        let lapsed = self.granted.as_ref().and_then(|(_, state)| state.next_expiry()).is_some_and(|until| until <= now_secs());
         self.granted = match self.members.genesis()? {
             Some(genesis) => {
                 let state = self.catalog.grant_state(&genesis)?;
@@ -720,16 +722,17 @@ impl Node {
             None => None,
         };
         let after = cids(self)?;
+        let changed = before != after || lapsed;
         // Who may read and write whose views of anchors, for counting sets:
         // only a mesh with grants says, so another mesh's daemon leaves it
-        if before != after && let Some((_, state)) = &self.granted {
+        if changed && let Some((_, state)) = &self.granted {
             self.catalog.set_access(state)?;
             // What's shared with whom may have changed
             self.guests_noticed.clear();
         }
         // A client's member is the one it was told, whoever the machines are
         let (Some(machines), None) = (self.machines(), self.client_of) else {
-            return Ok(before != after);
+            return Ok(changed);
         };
         let me = self.peer_id();
         for peer in self.members.list()?.into_keys() {
@@ -746,7 +749,7 @@ impl Node {
                 self.members.add(&peer)?;
             }
         }
-        Ok(before != after)
+        Ok(changed)
     }
 
     /// Tell a member which grants this has, and what makes them count, if
@@ -1895,6 +1898,15 @@ impl Node {
     /// Let in every member, and learn where they listen, as of the list,
     /// and of the mesh's grants, if it has them: telling every member,
     /// if they've changed.
+    /// Work the grants out again if what one gave till a time has gone
+    /// since: who's let in, and what they may see, with it.
+    pub fn expire(&mut self) -> Result<()> {
+        if self.granted.as_ref().and_then(|(_, state)| state.next_expiry()).is_some_and(|until| until <= now_secs()) {
+            self.reload()?;
+        }
+        Ok(())
+    }
+
     pub fn reload(&mut self) -> Result<()> {
         if self.refresh_grants()? {
             for peer in self.connected() {
@@ -2305,3 +2317,8 @@ mod asks;
 
 #[cfg(test)]
 mod tests;
+
+/// Seconds since the epoch, by this machine's clock.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs())
+}

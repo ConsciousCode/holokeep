@@ -44,10 +44,29 @@ the user making it: its root key, or a device it certified (see
 | `del` | `[string]` | Commands taken away, sorted and distinct; omitted when empty. |
 | `stands` | `[Link]` | Only with a `del` covering `/anchor/write`: the targets' latest sets on `on` that still count (see [[#Taking write away]]). |
 | `prev` | `[Link]` | The grants its signer had seen last, sorted by CID bytes; empty for the first. |
+| `until` | integer | Only with no `del`: when what it gives goes, in seconds since the epoch (see [[#Expiry]]); omitted for good. |
 
 At least one of `add` and `del`, and nothing in one overlapping
 (covering, or covered by) anything in the other: `add: ["/mesh"], del:
 ["/mesh/machine"]` isn't a grant. Each grant means one thing.
+
+### Expiry
+
+A grant that gives, and takes nothing away, may say `until`: what it
+gives is held only before then, by the clock of the machine working it
+out. It's still in the history, and counts, so what was made after it
+stands as it did; but at its time it gives nothing, so what its targets
+passed on of it goes too, as when a giver's power goes, unless someone
+else gave it as well, and what they set till then still counts. Taking
+away has no `until`: it lasts, since an end to it would give back what
+it took, which is a grant's to do.
+
+Every machine works the grants out as of now, so machines whose clocks
+differ disagree for as long as they differ, about grants ending between
+them. A daemon works them out again within 10 s of a grant's time
+passing, and with them who may read and write each view and who's let
+in, so a visitor whose share's gone is shut out. A repo with no daemon
+running works them out as of whenever a grant's next made there.
 
 ```json
 {"add": ["/"], "claim": "grant", "prev": [], "target": [{"/": "bafzaa…"}]}
@@ -196,12 +215,13 @@ since sets don't say when they were made.
   longer counted as holding copies. Rosters from other members are
   heeded only for machines the grants say are in.
 - `hk node forget` refuses a machine the grants say is in.
-- `hk anchor share <anchor> <who> read|write|grant|all…` gives a user
-  commands on the acting user's view of an anchor, or on another's they
-  may pass on, if `<anchor>` is a view of one; `hk anchor unshare` takes
+- `hk anchor share <anchor> <who> read|write|grant|all… [--for <d>]`
+  gives a user commands on the acting user's view of an anchor, or on
+  another's they may pass on, if `<anchor>` is a view of one, for good or
+  for a while (`90s`, `30m`, `12h`, `7d`, `2w`); `hk anchor unshare` takes
   them away, naming what `stands` of theirs taking write; `hk anchor
   shared [<anchor>]` lists who holds what on views of anchors the acting
-  user owns or holds something on; `hk anchor view <anchor> <owner>`
+  user owns or holds something on, and till when, if all of it ends; `hk anchor view <anchor> <owner>`
   prints a view's CID, to show, mount or set.
 - Who may read and write each view is worked out from the grants into
   `anchor_access`, and the sets that stand into `anchor_stood`, when a

@@ -393,9 +393,10 @@ impl Thin {
     /// Give or take away commands on a view of an anchor shared with this
     /// visitor, as itself: a grant signed with its own key, after the
     /// mesh's grants, pushed to the member, which counts in the owner's
-    /// view if the visitor may give or take them away there. Taking write
-    /// away, what the target set till then stands. Returns its CID.
-    pub async fn share_own(&mut self, view: &Link, who: &Link, add: &[String], del: &[String]) -> Result<Link> {
+    /// view if the visitor may give or take them away there. What's given
+    /// goes at `until`, if it says. Taking write away, what the target set
+    /// till then stands. Returns its CID.
+    pub async fn share_own(&mut self, view: &Link, who: &Link, add: &[String], del: &[String], until: Option<u64>) -> Result<Link> {
         let key = self.visitor.clone().ok_or_else(|| Error::Invalid("a client of the mesh shares through its account".into()))?;
         let (anchor, owner) = viewed(view)?;
         for need in std::iter::once(crate::grants::ANCHOR_GRANT).chain(add.iter().chain(del).map(String::as_str)) {
@@ -412,7 +413,9 @@ impl Thin {
         let heads = self.ask(vec!["grant".to_owned(), "heads".to_owned()]).await?;
         let heads = heads.iter().map(|head| head.parse::<Link>().map_err(|_| Error::Invalid(format!("not a CID: {head}")))).collect::<Result<Vec<_>>>()?;
         let grant = crate::claim::Grant::new([who.clone()], Some(anchor), add.iter().cloned(), del.iter().cloned(), stands, heads)
-            .ok_or_else(|| Error::Invalid("a grant names someone, and commands on an anchor given or taken away, not both".into()))?;
+            .ok_or_else(|| Error::Invalid("a grant names someone, and commands on an anchor given or taken away, not both".into()))?
+            .until(until)
+            .ok_or_else(|| Error::Invalid("only what's given goes at a time: taking away lasts".into()))?;
         let grant = crate::claim::Claim::Grant(grant);
         self.sign_and_push(&key, &grant, now()).await?;
         let heads = self.ask(vec!["grant".to_owned(), "heads".to_owned()]).await?;
@@ -500,8 +503,8 @@ impl Blocking {
         self.runtime.block_on(self.thin.borrow_mut().set_own(view, value))
     }
 
-    pub fn share_own(&self, view: &Link, who: &Link, add: &[String], del: &[String]) -> Result<Link> {
-        self.runtime.block_on(self.thin.borrow_mut().share_own(view, who, add, del))
+    pub fn share_own(&self, view: &Link, who: &Link, add: &[String], del: &[String], until: Option<u64>) -> Result<Link> {
+        self.runtime.block_on(self.thin.borrow_mut().share_own(view, who, add, del, until))
     }
 }
 

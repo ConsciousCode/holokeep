@@ -519,6 +519,27 @@ scenario_visitor() {
     ! on guest hk anchor shared >/dev/null 2>&1 || fail "the visitor still got in, unshared"
 }
 
+# A share for a while: a visitor reads it, then it's gone by every
+# member's clock, and the visitor with it
+scenario_expiry() {
+    local peer anchor shared view
+    machine passer
+    peer=$(on passer hk node id)
+    shared=$(sh_on one 'echo "for a while" | hk add -q -')
+    anchor=$(on one hk anchor new)
+    on one hk anchor set "$anchor" "$shared" >/dev/null
+    on one hk anchor share "$anchor" "$peer" read --for 15s >/dev/null
+    on one hk anchor shared "$anchor" | grep -q "^.*	$peer	/anchor/read	until " || fail "the share doesn't say it ends"
+    on passer hk node join --thin "$(on one hk node invite "$peer" --visitor 2>/dev/null)" 2>/dev/null
+    view=$(on passer hk anchor shared | cut -f1)
+    [ "$(on passer hk cat "$shared")" = "for a while" ] || fail "the visitor can't read it while it lasts"
+    wait_for "two to let the passer in" sh_on two "hk node peers | grep -q '^$peer	-	visitor'"
+    wait_for "one to shut the passer out" sh_on one "! hk node peers | grep -q '^$peer	'"
+    wait_for "two to shut the passer out" sh_on two "! hk node peers | grep -q '^$peer	'"
+    ! on passer hk anchor show "$view" >/dev/null 2>&1 || fail "the passer still got in, its share gone"
+    ! on one hk anchor shared "$anchor" | grep -q "	$peer	/anchor/read" || fail "one still lists the share"
+}
+
 # A client of the mesh, not just of one member: ezra's machine listens for
 # clients too, and a thin client invited by one reads through it while
 # one's away
@@ -561,7 +582,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke shared client thin visitor several)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke shared client thin visitor expiry several)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

@@ -172,7 +172,22 @@ pub struct Share {
     /// Their sets that still count in the owner's view, write taken away
     /// from them: those `stands` named, and before them.
     pub stands: Vec<Link>,
+    /// When what's given them goes, if all of it does: the last of the
+    /// times the grants giving it hold till.
+    pub until: Option<u64>,
 }
+
+/// How long what's given someone lasts: for good, if any of it does, or
+/// till the latest time any of it holds till.
+#[derive(Default)]
+struct Lasting {
+    forever: bool,
+    latest: Option<u64>,
+}
+
+/// What's given someone on a view: the commands, which of their sets
+/// stand, and how long it lasts.
+type Given = (Link, std::collections::BTreeSet<String>, Vec<Link>, Lasting);
 
 /// A mesh's grants, worked out.
 pub struct State {
@@ -184,6 +199,9 @@ pub struct State {
     /// Grants which name a grant that isn't here, or that do, however far
     /// back: they wait till it is.
     waiting: Vec<Link>,
+    /// When it's worked out for, in seconds since the epoch: what a grant
+    /// gives till before then is gone.
+    now: u64,
 }
 
 impl State {
@@ -191,6 +209,13 @@ impl State {
     /// its one target, the founder, `/`, signed by them. None, if it
     /// doesn't, or isn't among them.
     pub fn new(genesis: &Link, grants: impl IntoIterator<Item = Signed>) -> Option<Self> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+        Self::at(genesis, grants, now)
+    }
+
+    /// Work out a mesh's grants as `new` does, as of a time: what's given
+    /// till before then is gone.
+    pub fn at(genesis: &Link, grants: impl IntoIterator<Item = Signed>, now: u64) -> Option<Self> {
         let all: BTreeMap<Vec<u8>, Signed> = grants.into_iter().map(|signed| (signed.cid.to_bytes(), signed)).collect();
         let first = all.get(&genesis.to_bytes())?;
         let [founder] = first.grant.target() else {
@@ -249,6 +274,7 @@ impl State {
             mesh: Judgement { scope: Scope { founder, on: None }, valid: Vec::new(), prior: Vec::new(), judged: Judged::empty() },
             anchors: Vec::new(),
             waiting,
+            now,
         };
         state.mesh = state.work_out(state.mesh.scope.clone(), None);
         // Every view of an anchor granted on: by whoever signed a grant on it
@@ -456,6 +482,7 @@ impl State {
             judged.supported.get(i).copied().unwrap_or(false)
                 && giving.in_scope(scope)
                 && giving.targets(who)
+                && giving.grant.lasts(self.now)
                 && giving.grant.add().iter().any(|add| covers(add, command))
                 && !self.nodes.iter().enumerate().any(|(j, taking)| {
                     judged.counts.get(j).is_some_and(Option::is_some)
@@ -521,28 +548,40 @@ impl State {
             let (owner, Some(anchor)) = (&view.scope.founder, &view.scope.on) else {
                 continue;
             };
-            let mut given: BTreeMap<Vec<u8>, (Link, std::collections::BTreeSet<String>, Vec<Link>)> = BTreeMap::new();
+            let mut given: BTreeMap<Vec<u8>, Given> = BTreeMap::new();
             for (i, node) in self.nodes.iter().enumerate().filter(|(_, node)| node.in_scope(&view.scope)) {
                 let counts = view.judged.counts.get(i).is_some_and(Option::is_some);
+                let holding = counts && view.judged.supported.get(i).copied().unwrap_or(false) && node.grant.lasts(self.now) && !node.grant.add().is_empty();
                 for target in node.grant.target().iter().filter(|target| *target != owner) {
-                    let entry = given.entry(target.to_bytes()).or_insert_with(|| (target.clone(), std::collections::BTreeSet::new(), Vec::new()));
+                    let entry = given.entry(target.to_bytes()).or_insert_with(|| (target.clone(), std::collections::BTreeSet::new(), Vec::new(), Lasting::default()));
                     entry.1.extend(node.grant.add().iter().cloned());
                     if counts && node.grant.del().iter().any(|del| covers(del, WRITE)) {
                         entry.2.extend(node.grant.stands().iter().cloned());
                     }
+                    if holding {
+                        entry.3.forever |= node.grant.expires().is_none();
+                        entry.3.latest = entry.3.latest.max(node.grant.expires());
+                    }
                 }
             }
-            for (user, commands, mut stands) in given.into_values() {
+            for (user, commands, mut stands, lasting) in given.into_values() {
                 let held: Vec<String> = commands.into_iter().filter(|command| self.holds_on(owner, anchor, &user, command)).collect();
                 if held.iter().any(|command| covers(command, WRITE)) {
                     stands.clear();
                 }
                 stands.sort_by_key(Link::to_bytes);
                 stands.dedup();
-                shares.push(Share { owner: owner.clone(), anchor: anchor.clone(), user, held, stands });
+                let until = if lasting.forever || held.is_empty() { None } else { lasting.latest };
+                shares.push(Share { owner: owner.clone(), anchor: anchor.clone(), user, held, stands, until });
             }
         }
         shares
+    }
+
+    /// When what some grant gives goes next, after the time this was
+    /// worked out for, if any does: when to work it out again.
+    pub fn next_expiry(&self) -> Option<u64> {
+        self.nodes.iter().filter_map(|node| node.grant.expires()).filter(|&until| until > self.now).min()
     }
 
     /// The mesh's founder, its first operator.
@@ -658,8 +697,21 @@ mod tests {
             cid
         }
 
+        /// `by` gives commands on a view of `anchor` to `to` till a time.
+        fn give_until(&mut self, by: &Link, to: &Link, anchor: &Link, add: &[&str], until: u64, prev: &[&Link]) -> Link {
+            let strings = |list: &[&str]| list.iter().map(|&c| c.to_owned()).collect::<Vec<_>>();
+            let grant = Grant::new([to.clone()], Some(anchor.clone()), strings(add), [], [], prev.iter().map(|&p| p.clone())).expect("grant").until(Some(until)).expect("until");
+            let cid = Claim::Grant(grant.clone()).cid();
+            self.grants.push(Signed { cid: cid.clone(), grant, by: vec![by.clone()] });
+            cid
+        }
+
         fn state(&self) -> State {
             State::new(&self.genesis, self.grants.iter().cloned()).expect("state")
+        }
+
+        fn state_at(&self, now: u64) -> State {
+            State::at(&self.genesis, self.grants.iter().cloned(), now).expect("state")
         }
     }
 
@@ -864,6 +916,30 @@ mod tests {
         let state = history.state();
         assert!(state.holds_on(&u, &anchor, &visitor, READ));
         assert!(!state.holds_on(&u, &anchor, &friend, READ) && !state.holds_on(&u, &anchor, &b, WRITE));
+    }
+
+    #[test]
+    fn what_a_grant_gives_till_a_time_goes_then_and_what_was_passed_on_with_it() {
+        let (mut history, _, u, b, c, last) = users();
+        let anchor = crate::claim::anchor().expect("anchor");
+        let given = history.give_until(&u, &b, &anchor, &[ANCHOR_GRANT, READ], 1000, &[&last]);
+        let passed = history.grant_on(&b, &c, &anchor, &[READ], &[], &[&given]);
+        let lasting = history.grant_on(&u, &c, &anchor, &[WRITE], &[], &[&passed]);
+        let before = history.state_at(999);
+        assert!(before.holds_on(&u, &anchor, &b, READ) && before.holds_on(&u, &anchor, &c, READ));
+        assert_eq!(before.next_expiry(), Some(1000));
+        let share = |state: &State, who: &Link| state.shares().into_iter().find(|share| share.user == *who).expect("shared");
+        assert_eq!((share(&before, &b).until, share(&before, &c).until), (Some(1000), None), "c holds write for good");
+        let after = history.state_at(1000);
+        assert!(!after.holds_on(&u, &anchor, &b, READ) && !after.holds_on(&u, &anchor, &b, ANCHOR_GRANT), "gone at its time");
+        assert!(!after.holds_on(&u, &anchor, &c, READ), "and what was passed on with it");
+        assert!(after.holds_on(&u, &anchor, &c, WRITE), "what's given for good stays");
+        assert!(after.counts(&given) && after.counts(&lasting), "it's still in the history");
+        assert_eq!(after.next_expiry(), None);
+        assert!(!after.shares().iter().any(|share| share.user == b && !share.held.is_empty()));
+        // Given again, for good, it holds again
+        history.grant_on(&u, &b, &anchor, &[READ], &[], &[&lasting]);
+        assert!(history.state_at(2000).holds_on(&u, &anchor, &b, READ));
     }
 
     #[test]

@@ -161,6 +161,9 @@ pub struct Grant {
     /// Sorted by CID bytes and distinct, as `prev` is.
     stands: Vec<Link>,
     prev: Vec<Link>,
+    /// When what it gives goes, in seconds since the epoch, by each
+    /// machine's clock: only for a grant that gives, and takes nothing.
+    until: Option<u64>,
 }
 
 /// Any claim this understands.
@@ -409,7 +412,23 @@ impl Grant {
         (!target.is_empty() && (!add.is_empty() || !del.is_empty())).then_some(())?;
         (!add.iter().any(|given| del.iter().any(|taken| covers(given, taken) || covers(taken, given)))).then_some(())?;
         (stands.is_empty() || del.iter().any(|command| covers(command, "/anchor/write"))).then_some(())?;
-        Some(Self { target, on, add, del, stands, prev: set(prev) })
+        Some(Self { target, on, add, del, stands, prev: set(prev), until: None })
+    }
+
+    /// What it gives goes at a time, in seconds since the epoch: None, if
+    /// it takes anything away, which lasts.
+    pub fn until(mut self, until: Option<u64>) -> Option<Self> {
+        (until.is_none() || self.del.is_empty()).then_some(())?;
+        self.until = until;
+        Some(self)
+    }
+
+    /// When what it gives goes, if it does.
+    pub const fn expires(&self) -> Option<u64> { self.until }
+
+    /// Whether what it gives still holds at a time.
+    pub fn lasts(&self, now: u64) -> bool {
+        self.until.is_none_or(|until| now < until)
     }
 
     pub fn target(&self) -> &[Link] { &self.target }
@@ -508,6 +527,9 @@ impl Claim {
                 }
                 if !grant.stands.is_empty() {
                     map.insert("stands".to_owned(), links(&grant.stands));
+                }
+                if let Some(until) = grant.until {
+                    map.insert("until".to_owned(), Ipld::Integer(until.into()));
                 }
                 ("grant", map)
             },
@@ -662,7 +684,12 @@ fn parse_grant(map: &mut BTreeMap<String, Ipld>, target: Vec<Link>) -> Option<Gr
         Some(_) => return None,
         None => None,
     };
-    Grant::new(target, on, add, del, stands, link_list(prev)?)
+    let until = match map.remove("until") {
+        Some(Ipld::Integer(until)) => Some(u64::try_from(until).ok()?),
+        Some(_) => return None,
+        None => None,
+    };
+    Grant::new(target, on, add, del, stands, link_list(prev)?)?.until(until)
 }
 
 fn link_list(list: Vec<Ipld>) -> Option<Vec<Link>> {
@@ -811,6 +838,22 @@ mod tests {
         assert!(Grant::new([user.clone()], None, cmds(&["/Mesh"]), [], [], []).is_none());
         assert!(Grant::new([user.clone()], None, cmds(&["/mesh/"]), [], [], []).is_none());
         assert!(Grant::new([user], None, [], cmds(&["/anchor/read"]), [cid(b"s")], []).is_none());
+    }
+
+    #[test]
+    fn a_grant_may_give_till_a_time() {
+        let user = crate::keys::Key::generate().expect("key").id();
+        let read = || vec!["/anchor/read".to_owned()];
+        let lasting = Grant::new([user.clone()], Some(cid(b"a")), read(), [], [], []).expect("grant");
+        let brief = lasting.clone().until(Some(1_800_000_000)).expect("until");
+        assert!(lasting.lasts(u64::MAX) && brief.lasts(1_799_999_999) && !brief.lasts(1_800_000_000));
+        assert_eq!(brief.expires(), Some(1_800_000_000));
+        let (lasting, brief) = (Claim::Grant(lasting), Claim::Grant(brief));
+        assert_eq!(Claim::parse(brief.block().data()), Some(brief.clone()));
+        assert_ne!(lasting.cid(), brief.cid());
+        assert_eq!(Claim::parse(lasting.block().data()), Some(lasting), "no until, as before");
+        // Taking away lasts
+        assert!(Grant::new([user], Some(cid(b"a")), [], read(), [], []).expect("grant").until(Some(1)).is_none());
     }
 
     #[test]

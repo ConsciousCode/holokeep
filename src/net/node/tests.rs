@@ -1837,7 +1837,7 @@ async fn a_visitor_passes_a_view_on() {
 
     // One let only read can't pass it on
     let mut theirs = thin_of(&member, &stranger, &root.id()).as_visitor(stranger.clone());
-    assert!(serving(&mut [&mut member], theirs.share_own(&view, &friend.id(), &read, &[])).await.is_err());
+    assert!(serving(&mut [&mut member], theirs.share_own(&view, &friend.id(), &read, &[], None)).await.is_err());
     // Nor is a grant it signs and pushes itself taken
     let heads = member.catalog().grant_state(&genesis).expect("state").expect("a mesh").heads();
     let grant = crate::claim::Claim::Grant(crate::claim::Grant::new([friend.id()], Some(anchor.clone()), read.iter().cloned(), [], [], heads).expect("grant"));
@@ -1847,7 +1847,7 @@ async fn a_visitor_passes_a_view_on() {
     assert!(!member.is_visitor(&PeerId::from_bytes(&friend.id().multihash().to_bytes()).expect("peer")));
 
     let mut thin = thin_of(&member, &visitor, &root.id()).as_visitor(visitor.clone());
-    serving(&mut [&mut member], thin.share_own(&view, &friend.id(), &read, &[])).await.expect("passed on");
+    serving(&mut [&mut member], thin.share_own(&view, &friend.id(), &read, &[], None)).await.expect("passed on");
     let mut friends = thin_of(&member, &friend, &root.id()).with_patience(Duration::from_millis(300)).as_visitor(friend.clone());
     assert!(member.is_visitor(&friends.peer_id()), "the friend's let in");
     let words = vec!["anchor".to_owned(), "show".to_owned(), view.to_string()];
@@ -1855,7 +1855,42 @@ async fn a_visitor_passes_a_view_on() {
     assert_eq!(serving(&mut [&mut member], friends.get(&[link(&note)])).await.expect("get").len(), 1);
 
     // Taken back, the friend's shut out
-    serving(&mut [&mut member], thin.share_own(&view, &friend.id(), &[], &read)).await.expect("taken back");
+    serving(&mut [&mut member], thin.share_own(&view, &friend.id(), &[], &read, None)).await.expect("taken back");
     assert!(!member.is_visitor(&friends.peer_id()));
     assert!(serving(&mut [&mut member], friends.ask(vec!["shared".to_owned()])).await.is_err());
+}
+
+/// What's shared till a time goes then: once it's passed, a visitor let
+/// in for so long is shut out, and told nothing more.
+#[tokio::test]
+async fn a_visitor_let_in_for_a_while_is_shut_out_after() {
+    use crate::grants::READ;
+    let mut member = node(mesh::fresh_swarm_key().expect("key")).await;
+    member.listen_for_clients(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
+    assert!(until(&mut [&mut member], |n| !n[0].client_listeners().is_empty()).await);
+    let root = one_user(&mut [&mut member]);
+    let genesis = found(&mut [&mut member], &root);
+    let anchor = member.catalog().new_anchor().expect("anchor");
+    let note = raw(b"for a while");
+    member.catalog().put_block(&note, CidVersion::V1).expect("put");
+    member.catalog().set_anchor(&anchor, &link(&note)).expect("set");
+    let visitor = crate::keys::Key::generate().expect("key");
+    let now = super::now_secs();
+    member.catalog().grant_on_until(&genesis, &anchor, &[visitor.id()], &[READ.to_owned()], &[], &[], Some(now + 2)).expect("share");
+    member.reload().expect("reload");
+    let mut thin = thin_of(&member, &visitor, &root.id()).as_visitor(visitor.clone());
+    assert!(member.is_visitor(&thin.peer_id()));
+    let shared = serving(&mut [&mut member], thin.ask(vec!["shared".to_owned()])).await.expect("shared");
+    assert!(shared.first().is_some_and(|line| line.ends_with(&format!("\tuntil {}", now + 2))), "{shared:?}");
+    // Not yet, then gone, and what's shared with it as a guest
+    member.expire().expect("expire");
+    assert!(member.is_visitor(&thin.peer_id()));
+    assert!(!member.catalog().guest_claims(&visitor.id()).expect("claims").is_empty());
+    while super::now_secs() < now + 2 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    member.expire().expect("expire");
+    assert!(!member.is_visitor(&thin.peer_id()));
+    assert!(member.catalog().guest_claims(&visitor.id()).expect("claims").is_empty());
+    assert!(serving(&mut [&mut member], thin.ask(vec!["shared".to_owned()])).await.is_err());
 }

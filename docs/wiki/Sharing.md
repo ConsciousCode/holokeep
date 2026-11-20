@@ -288,8 +288,9 @@ passing on what's shared with them through a member (see
 5. Capabilities for sharing outside the mesh. Begun: visitors, keys
    outside the mesh that users share views with to read, write and pass
    on, through a member that enforces it, as native grants, their sets
-   and grants signed by their own keys. To come: expiry, and
-   capabilities no member need enforce, encrypted down the tree.
+   and grants signed by their own keys; and grants that give for a
+   while, by each machine's clock. To come: capabilities no member need
+   enforce, encrypted down the tree.
 
 ## Open questions
 

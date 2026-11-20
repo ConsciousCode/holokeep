@@ -524,6 +524,11 @@ enum AnchorCommand {
         who: String,
         #[arg(required = true)]
         commands: Vec<String>,
+        /// For only so long, by each machine's clock: `90s`, `30m`, `12h`,
+        /// `7d` or `2w`. Then it's gone, and what they passed on with it;
+        /// what they set till then still counts
+        #[arg(long = "for", value_name = "DURATION", value_parser = parse_lasting)]
+        lasting: Option<u64>,
     },
     /// Take back what a user may do with your view of an anchor; and from
     /// those they passed it on to, unless someone else did too. Taking
@@ -953,11 +958,11 @@ fn thin(dir: &Path, command: Command) -> anyhow::Result<()> {
         Command::Anchor(AnchorCommand::Root) => ask(&connect()?, &["anchor", "root"])?,
         Command::Anchor(AnchorCommand::Show { anchor }) => ask(&connect()?, &["anchor", "show", &anchor.to_string()])?,
         // A visitor passes on what it may as itself
-        Command::Anchor(AnchorCommand::Share { anchor, who, commands }) if holokeep::net::thin::visitor_ticket(dir)?.is_some() => {
-            out!("{}", connect()?.share_own(&anchor, &key_named(&who)?, &anchor_commands(&commands)?, &[])?);
+        Command::Anchor(AnchorCommand::Share { anchor, who, commands, lasting }) if holokeep::net::thin::visitor_ticket(dir)?.is_some() => {
+            out!("{}", connect()?.share_own(&anchor, &key_named(&who)?, &anchor_commands(&commands)?, &[], ending(lasting))?);
         },
         Command::Anchor(AnchorCommand::Unshare { anchor, who, commands }) if holokeep::net::thin::visitor_ticket(dir)?.is_some() => {
-            out!("{}", connect()?.share_own(&anchor, &key_named(&who)?, &[], &anchor_commands(&commands)?)?);
+            out!("{}", connect()?.share_own(&anchor, &key_named(&who)?, &[], &anchor_commands(&commands)?, None)?);
         },
         Command::Node(NodeArgs { command: NodeCommand::Invite { visitor: true, .. }, .. }) if holokeep::net::thin::visitor_ticket(dir)?.is_some() => {
             out!("{}", holokeep::net::thin::visitor_ticket(dir)?.unwrap_or_default());
@@ -1940,6 +1945,42 @@ fn revoke_device(dir: &Path, repo: &Catalog, peer: &str, until: &[String], dry_r
     Ok(())
 }
 
+/// A duration, in seconds: a number and a unit, `s`, `m`, `h`, `d` or `w`.
+#[cfg(feature = "net")]
+fn parse_lasting(text: &str) -> Result<u64, String> {
+    let split = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: u64 = number.parse().map_err(|_| format!("not a duration: {text} (as 90s, 30m, 12h, 7d or 2w)"))?;
+    let scale = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        "w" => 604_800,
+        _ => return Err(format!("not a unit of time: {unit:?} (s, m, h, d or w)")),
+    };
+    number.checked_mul(scale).filter(|&secs| secs > 0).ok_or_else(|| format!("not a duration: {text}"))
+}
+
+/// When something lasting so long from now ends, in seconds since the
+/// epoch.
+#[cfg(feature = "net")]
+fn ending(lasting: Option<u64>) -> Option<u64> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    lasting.map(|secs| now.saturating_add(secs))
+}
+
+/// How long till a time, in seconds since the epoch, roughly: in its
+/// largest two units.
+#[cfg(feature = "net")]
+fn left(until: u64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    let secs = until.saturating_sub(now);
+    let parts = [(secs / 86_400, "d"), (secs / 3600 % 24, "h"), (secs / 60 % 60, "m"), (secs % 60, "s")];
+    let shown: Vec<String> = parts.iter().skip_while(|(n, _)| *n == 0).take(2).filter(|(n, _)| *n > 0).map(|(n, unit)| format!("{n}{unit}")).collect();
+    if shown.is_empty() { "0s".to_owned() } else { shown.join(" ") }
+}
+
 /// Commands on an anchor, by name or in full.
 #[cfg(feature = "net")]
 fn anchor_commands(commands: &[String]) -> anyhow::Result<Vec<String>> {
@@ -1958,10 +1999,11 @@ fn anchor_commands(commands: &[String]) -> anyhow::Result<Vec<String>> {
 }
 
 /// Give or take away what a user may do with a view of an anchor: the
-/// acting user's own, or one they may pass on. Taking write away, the
-/// user's latest sets in the view stand.
+/// acting user's own, or one they may pass on. Giving, `until` says till
+/// when, if it's not for good. Taking write away, the user's latest sets
+/// in the view stand.
 #[cfg(feature = "net")]
-fn share(dir: Option<&PathBuf>, repo: &Catalog, anchor: &Link, who: &str, commands: &[String], give: bool) -> anyhow::Result<()> {
+fn share(dir: Option<&PathBuf>, repo: &Catalog, anchor: &Link, who: &str, commands: &[String], give: bool, until: Option<u64>) -> anyhow::Result<()> {
     use holokeep::grants::WRITE;
     anyhow::ensure!(holokeep::claim::is_anchor(anchor), "{anchor} isn't an anchor");
     let place = holokeep::net::mesh::Place::main(&repo_dir(dir.cloned())?);
@@ -1969,7 +2011,7 @@ fn share(dir: Option<&PathBuf>, repo: &Catalog, anchor: &Link, who: &str, comman
     let commands = anchor_commands(commands)?;
     let who = key_named(who)?;
     let cid = if give {
-        repo.grant_on(&genesis, anchor, std::slice::from_ref(&who), &commands, &[], &[])?
+        repo.grant_on_until(&genesis, anchor, std::slice::from_ref(&who), &commands, &[], &[], until)?
     } else {
         let stands = if commands.iter().any(|command| claim::covers(command, WRITE)) {
             let view = holokeep::claim::viewed(anchor).map_or_else(|| repo.user().ok().flatten().and_then(|me| holokeep::claim::view(anchor, &me)), |_| Some(anchor.clone()));
@@ -2225,9 +2267,9 @@ fn anchor(dir: Option<&PathBuf>, mut repo: Catalog, command: AnchorCommand) -> a
             out!("{view}");
         },
         #[cfg(feature = "net")]
-        AnchorCommand::Share { anchor, who, commands } => share(dir, &repo, &anchor, &who, &commands, true)?,
+        AnchorCommand::Share { anchor, who, commands, lasting } => share(dir, &repo, &anchor, &who, &commands, true, ending(lasting))?,
         #[cfg(feature = "net")]
-        AnchorCommand::Unshare { anchor, who, commands } => share(dir, &repo, &anchor, &who, &commands, false)?,
+        AnchorCommand::Unshare { anchor, who, commands } => share(dir, &repo, &anchor, &who, &commands, false, None)?,
         #[cfg(feature = "net")]
         AnchorCommand::Shared { anchor } => {
             let place = holokeep::net::mesh::Place::main(&repo_dir(dir.cloned())?);
@@ -2241,7 +2283,8 @@ fn anchor(dir: Option<&PathBuf>, mut repo: Catalog, command: AnchorCommand) -> a
                     continue;
                 }
                 let stands = if share.stands.is_empty() { String::new() } else { format!("\t{} sets of theirs stand", share.stands.len()) };
-                out!("{}\t{}\t{}\t{}{stands}", holokeep::keys::peer_id(&share.owner), share.anchor, holokeep::keys::peer_id(&share.user), share.held.join(" "));
+                let until = share.until.map(|until| format!("\tuntil {until} ({} from now)", left(until))).unwrap_or_default();
+                out!("{}\t{}\t{}\t{}{stands}{until}", holokeep::keys::peer_id(&share.owner), share.anchor, holokeep::keys::peer_id(&share.user), share.held.join(" "));
             }
         },
         AnchorCommand::Set { anchor, cid, lazy } => {

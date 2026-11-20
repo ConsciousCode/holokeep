@@ -1122,6 +1122,14 @@ impl Catalog {
     /// says which of the targets' sets still count. Refused if it wouldn't
     /// count. Returns its CID.
     pub fn grant_on(&self, genesis: &Link, anchor: &Link, target: &[Link], add: &[String], del: &[String], stands: &[Link]) -> Result<Link> {
+        self.grant_on_until(genesis, anchor, target, add, del, stands, None)
+    }
+
+    /// Give or take away commands on a view of an anchor as `grant_on`
+    /// does, what's given going at a time, if `until` says, in seconds
+    /// since the epoch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_on_until(&self, genesis: &Link, anchor: &Link, target: &[Link], add: &[String], del: &[String], stands: &[Link], until: Option<u64>) -> Result<Link> {
         use crate::grants::{ANCHOR_GRANT, USER};
         let state = self.grant_state(genesis)?.ok_or_else(|| Error::User("this mesh's grants aren't here".into()))?;
         let user = self.user()?.ok_or_else(|| Error::User("this account has no user to grant as".into()))?;
@@ -1135,7 +1143,9 @@ impl Catalog {
             }
         }
         let grant = crate::claim::Grant::new(target.iter().cloned(), Some(of), add.iter().cloned(), del.iter().cloned(), stands.iter().cloned(), state.heads())
-            .ok_or_else(|| Error::User("a grant names someone, and commands on an anchor given or taken away, not both".into()))?;
+            .ok_or_else(|| Error::User("a grant names someone, and commands on an anchor given or taken away, not both".into()))?
+            .until(until)
+            .ok_or_else(|| Error::User("only what's given goes at a time: taking away lasts".into()))?;
         let cid = self.put_claim(&Claim::Grant(grant))?;
         self.refresh_access(genesis)?;
         Ok(cid)

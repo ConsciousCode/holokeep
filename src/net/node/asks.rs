@@ -97,7 +97,8 @@ impl Node {
                 };
                 for share in state.shares().into_iter().filter(|share| share.user == *key && !share.held.is_empty()) {
                     if let Some(view) = crate::claim::view(&share.anchor, &share.owner) {
-                        lines.push(format!("{view}\t{}\t{}", crate::keys::peer_id(&share.owner), share.held.join(" ")));
+                        let until = share.until.map(|until| format!("\tuntil {until}")).unwrap_or_default();
+                        lines.push(format!("{view}\t{}\t{}{until}", crate::keys::peer_id(&share.owner), share.held.join(" ")));
                     }
                 }
             },
