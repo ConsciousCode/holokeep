@@ -1,6 +1,6 @@
 **Partly a design.** Snapshots exist (see [[#Snapshots]]), and so does
-publishing a sealed anchor and reading its latest head from a CAR (see
-[[#Publishing, as it is now]]). The rest of this page isn't implemented
+publishing a sealed anchor, kept current, and reading its latest head
+from a CAR (see [[#Publishing, as it is now]]). The rest of this page isn't implemented
 yet. It's the plan for
 the last part of sharing across the boundary (see [[Sharing#Across the
 boundary]]), written down to be argued with before it's built.
@@ -240,19 +240,56 @@ directory's, the sealed root,
 
 ## Publishing, as it is now
 
-Implemented, as the first part of phase 2:
+Implemented, as the first parts of phase 2:
 
-- `hk cap publish <anchor> <car>` takes an anchor, or a path of the soup
-  that's one or a mount point of one (see `hk fs` on [[Mount]]). It seals what the anchor is now under the sealed anchor's read
-  key, makes a head block, and sets the sealed anchor to it, signed by
-  `K`, in the repo. It writes the sealed tree, the head block, the set
-  and its sign to a CARv1 whose root is the set, and prints the
-  capability, `{read, view}`, which is the same each time.
+- `hk cap publish <anchor> [-o <car>]` takes an anchor, or a path of the
+  soup that's one or a mount point of one (see `hk fs` on [[Mount]]). It
+  seals what's changed of what the anchor is since it was last
+  published, makes a head block, and sets the sealed anchor to it,
+  signed by `K`. With `-o`, it writes everything published of it, every
+  head, to a CARv1 whose root is the latest set. It prints the
+  capability, `{read, view}`, the same each time.
+- `hk cap unpublish <anchor>` stops: the vault lets go of what's
+  published, which is collected in time wherever it's held, and whoever
+  has the capability reads the last head till then.
+- `hk cap ls` lists the anchors published, each with its capability.
 - `hk cap import <capability> <car>` reads a sealed anchor's latest head
   from what the CAR holds, unseals its tree into the repo, and prints the
   plaintext root.
+- The running node publishes each published anchor again, every 10 s,
+  if its value's changed.
 
-How it differs from the rest of this page, for now:
+### Sealing what's changed
+
+Sealing again walks the new tree beside the last head's, which the
+owner can open: in each place, a block whose plaintext CID and key are
+the same as before is the same ciphertext, so isn't read or sealed
+again, and where a directory's changed, the one before it is opened to
+find, by entry name (or a HAMT's shard by its index), what's the same
+below. So only the paths to what's changed are sealed, as only they are
+written again in plaintext.
+
+### Manifests
+
+What's published is the vault's account's, as what it protects is (see
+[[Protected Meshes#Vaults]]). Each publish puts a **manifest**, a
+dag-cbor map, which the vault keeps in place of the one before:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `manifest` | string | `"holokeep-cap-1"` |
+| `view` | Link | The sealed view it's of. |
+| `blocks` | `[Link]` | What this publish made: the sealed blocks new since the last, the head block, the set and its sign. |
+| `parts` | `[Link]` | Further manifests naming the rest, past 1024 (omitted if none). |
+| `next` | Link | The manifest before (omitted for the first). |
+| `sealed` | bytes | Which plaintext anchor it's of, `{anchor}` in dag-cbor, sealed under `derive(secret, "manifest", "")` as a head block is. |
+
+Every link is plain, so whatever holds the vault keeps all of it, every
+head, from one keep, reading nothing. Which anchors the node publishes
+again is read from the vault's keeps, unsealing `sealed`, so nothing's
+kept about them in the clear.
+
+### How it differs from the rest of this page, for now
 
 - The read key is derived, `derive(secret, "read", anchor nonce)`, until
   read keys change (see [[#Revoking]]).
@@ -274,9 +311,8 @@ How it differs from the rest of this page, for now:
   sealed anchor, for no other view, whose sign by `K` verifies, and
   which no other such set names as `prev`, is a head, and the latest of
   them by `at`, then CID, is read.
-- It's all written to a CAR, the whole tree each time. Keeping a sealed
-  anchor current, pushing it to holders, and reading from them are the
-  rest of phase 2.
+- Readers read from a CAR. Holders of the vault in a protected mesh, and
+  reading from them, are the rest of phase 2.
 
 ## Judging a sealed view
 
@@ -392,10 +428,10 @@ In order, each of use alone:
    sealed nodes, derived keys and padding, and a capability on a fixed
    root with no heads, exported to and read from a CAR. Test vectors.
 2. **Sealed anchors, read-only.** Begun: owner keys, heads, judging by
-   `K`, published to and read from a CAR. To come: keeping a sealed
-   anchor current, publishing to a protected mesh with incremental
-   manifests, holders answering for heads and checking proofs at the
-   door, and readers remembering heads. Writer keys, and judging the
+   `K`, sealing what's changed, manifests the vault keeps, kept current
+   by the node, and read from a CAR. To come: holders in a protected
+   mesh, holders answering for heads and checking proofs at the door,
+   and readers remembering heads. Writer keys, and judging the
    grants that give them write, come with writing.
 3. **Mount points.** Sealed `mounts`, making a folder an anchor to share
    it, and capabilities on mounted anchors.

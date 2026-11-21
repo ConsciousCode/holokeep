@@ -455,7 +455,7 @@ Checklist:
 - [ ] Peergos BAT with friends
 - [ ] Capabilities: sharing by key, from ciphertext no member guards (see the wiki's Capabilities page)
   - [x] Snapshots: a sealed tree, keys derived down it, padded, and a capability on its root (`hk cap export/import`)
-  - [ ] Sealed anchors, read-only: owner keys, heads, views judged by their own keys, published to a CAR (`hk cap publish`), done; kept current, published to a protected mesh, read from holders, to come
+  - [ ] Sealed anchors, read-only: owner keys, heads, views judged by their own keys, sealing what's changed, manifests the vault keeps, kept current by the node, read from a CAR (`hk cap publish/unpublish/ls`), done; held in a protected mesh and read from holders, to come
   - [ ] Mount points: sharing a folder makes it an anchor
   - [ ] Writing by capability
   - [ ] Revoking read: new read keys

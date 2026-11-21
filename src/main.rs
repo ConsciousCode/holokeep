@@ -468,18 +468,28 @@ enum CapCommand {
         /// Where to write the ciphertext
         output: PathBuf,
     },
-    /// Publish what an anchor is now, sealed: its tree and a head naming
-    /// it, in a sealed anchor of its own whose owner key, derived from
-    /// this account's secret, signs it. Write it all to a `CARv1`, and print
-    /// a capability that reads the sealed anchor as it is whenever it's
-    /// read. Publishing again writes what's new, under the same capability
+    /// Publish what an anchor is now, sealed: what's changed of its tree
+    /// since it was last published, and a head naming it, in a sealed
+    /// anchor of its own whose owner key, derived from this account's
+    /// vault, signs it. The vault keeps it, and the running node publishes
+    /// it again as the anchor changes, till it's unpublished. Print a
+    /// capability that reads it as it is whenever it's read, the same each
+    /// time
     Publish {
         /// The anchor, or a path of the soup that's one or a mount point
         /// of one (see `hk fs`)
         anchor: PathBuf,
-        /// Where to write the ciphertext
-        output: PathBuf,
+        /// Write everything published of it, every head, to a `CARv1` too,
+        /// for someone to read from nothing
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
+    /// Stop publishing an anchor: the vault lets go of what's published of
+    /// it, which is collected in time wherever it's held, and whoever has
+    /// its capability reads its last head till then
+    Unpublish { anchor: PathBuf },
+    /// List the anchors published, each with its capability
+    Ls,
     /// Read a capability's DAG from a CAR of its ciphertext into the repo,
     /// unsealing and checking every block, and print its root: a
     /// snapshot's, or a sealed anchor's latest head's
@@ -2307,15 +2317,42 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
             let anchor = anchor_named(&repo, &anchor)?;
             let value = repo.anchor_value(&anchor)?.with_context(|| format!("{anchor} is nothing yet"))?;
             fetch_first(Some(&dir), &value)?;
-            let secret = holokeep::vault::Vault::open(&dir, repo.uid())?.derive_secret(b"capabilities");
-            let published = cap::Published::of(&secret, &anchor)?;
-            let publication = cap::publish(&mut repo, &published, &value)?;
-            let parent = output.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-            let mut file = io::BufWriter::new(tempfile::NamedTempFile::new_in(parent)?);
-            car::write_blocks(&mut file, std::slice::from_ref(&publication.set), &publication.blocks)?;
-            file.into_inner().map_err(io::IntoInnerError::into_error)?.persist(&output)?;
-            eprintln!("published {anchor} as it is now, {value}: whoever has this capability can read it as it is whenever they read it");
+            let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
+            let published = cap::Published::of(&cap::secret(&vault), &anchor)?;
+            let publication = cap::publish(&mut repo, &vault, &published, &value)?;
+            if let Some(output) = output {
+                let blocks = cap::published_blocks(&repo, &publication.manifest)?;
+                let parent = output.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+                let mut file = io::BufWriter::new(tempfile::NamedTempFile::new_in(parent)?);
+                car::write_blocks(&mut file, std::slice::from_ref(&publication.set), &blocks)?;
+                file.into_inner().map_err(io::IntoInnerError::into_error)?.persist(&output)?;
+            }
+            if publication.fresh {
+                eprintln!("published {anchor} as it is now, {value}: whoever has this capability can read it as it is whenever they read it");
+            } else {
+                eprintln!("{anchor} is published as it is already");
+            }
             out!("{}", published.capability().encode());
+            Ok(())
+        },
+        CapCommand::Unpublish { anchor } => {
+            let dir = repo_dir(repo)?;
+            let mut repo = open_repo(Some(dir.clone()))?;
+            let anchor = anchor_named(&repo, &anchor)?;
+            let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
+            let published = cap::Published::of(&cap::secret(&vault), &anchor)?;
+            anyhow::ensure!(cap::unpublish(&mut repo, &vault, &published)?, "{anchor} isn't published");
+            eprintln!("{anchor} is published no more: what's published of it is collected in time");
+            Ok(())
+        },
+        CapCommand::Ls => {
+            let dir = repo_dir(repo)?;
+            let mut repo = open_repo(Some(dir.clone()))?;
+            let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
+            let secret = cap::secret(&vault);
+            for (anchor, _) in cap::published(&mut repo, &vault)? {
+                out!("{anchor}\t{}", cap::Published::of(&secret, &anchor)?.capability().encode());
+            }
             Ok(())
         },
         CapCommand::Import { capability, car } => {

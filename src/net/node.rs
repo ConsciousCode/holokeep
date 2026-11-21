@@ -1978,6 +1978,43 @@ impl Node {
         Ok(())
     }
 
+    /// Let what's expired go (see `expire`), and publish again what's
+    /// changed of what's published (see `keep_published`).
+    pub fn tend(&mut self, repo: &std::path::Path) -> Result<()> {
+        self.expire()?;
+        self.keep_published(repo).map(drop)
+    }
+
+    /// Publish again each anchor this account's vault keeps published
+    /// whose value's changed since (see `crate::cap`): only what's changed
+    /// is sealed, so one that hasn't costs a look. What isn't all here yet
+    /// waits. Returns how many were published.
+    pub fn keep_published(&mut self, repo: &std::path::Path) -> Result<usize> {
+        let busy = |e: crate::cap::Error| match e {
+            crate::cap::Error::Store(e) => Error::Store(e),
+            crate::cap::Error::Io(e) => Error::Io(e),
+            e => Error::Invalid(e.to_string()),
+        };
+        let vault = crate::vault::Vault::open(repo, self.catalog.uid()).map_err(|e| Error::Invalid(e.to_string()))?;
+        let mut done = 0usize;
+        for (anchor, _) in crate::cap::published(&mut self.catalog, &vault).map_err(busy)? {
+            let Some(value) = self.catalog.anchor_value(&anchor)? else {
+                continue;
+            };
+            let published = crate::cap::Published::of(&crate::cap::secret(&vault), &anchor).map_err(busy)?;
+            match crate::cap::publish(&mut self.catalog, &vault, &published, &value) {
+                Ok(publication) if publication.fresh => {
+                    eprintln!("published {anchor} again, as {value}");
+                    done = done.saturating_add(1);
+                },
+                Ok(_) => {},
+                Err(crate::cap::Error::Store(e)) if e.is_busy() => return Err(Error::Store(e)),
+                Err(e) => eprintln!("{anchor} isn't published as it is yet: {e}"),
+            }
+        }
+        Ok(done)
+    }
+
     /// Ask each member connected for the time, to measure how far its
     /// clock is from this machine's (see `clock`), unless it's still to
     /// answer the last ask.

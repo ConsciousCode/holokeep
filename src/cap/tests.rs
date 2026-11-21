@@ -147,6 +147,13 @@ fn a_hamts_entries_keep_their_keys_as_its_shape_changes() {
     let files_before: HashSet<Vec<u8>> = before.blocks.iter().filter(|block| block.len() < 400).map(|block| AnyCid::V1(block.cid().clone()).to_bytes()).collect();
     let kept = files_before.intersection(&sealed_cids(&after)).count();
     assert!(kept >= 12, "only {kept} of the files kept their ciphertext");
+    // Sealed after the first, it's the same, and only what's new is made
+    for block in &before.blocks {
+        catalog.put_block(block, crate::cid::CidVersion::V1).expect("put");
+    }
+    let since = seal_since(&catalog, &grown, &read, Some((root, before.root))).expect("seal");
+    assert_eq!(since.root, after.root);
+    assert!(since.blocks.len() < after.blocks.len(), "{} of {}", since.blocks.len(), after.blocks.len());
 }
 
 #[test]
@@ -257,41 +264,80 @@ fn a_sealed_anchor_is_its_own_and_unrelated_to_what_its_of() {
 }
 
 #[test]
+fn sealing_again_after_an_edit_seals_only_whats_new() {
+    let t = tree("cap-since");
+    let repo = Scratch::new("cap-since-repo");
+    let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
+    let read = Zeroizing::new([4u8; 32]);
+    let first = import(&mut catalog, t.path(), &importer());
+    let before = seal(&catalog, &first, &read).expect("seal");
+    for block in &before.blocks {
+        catalog.put_block(block, crate::cid::CidVersion::V1).expect("put");
+    }
+    // Unchanged, nothing's new
+    let same = seal_since(&catalog, &first, &read, Some((first.clone(), before.root.clone()))).expect("seal");
+    assert_eq!((same.root.clone(), same.blocks.len()), (before.root.clone(), 0));
+
+    std::fs::write(t.path().join("docs/deep/secret.txt"), "the plans have changed").expect("write");
+    let second = import(&mut catalog, t.path(), &importer());
+    let after = seal_since(&catalog, &second, &read, Some((first, before.root))).expect("seal");
+    // The file, deep, docs and the root, as sealing it all again makes
+    assert_eq!(after.blocks.len(), 4);
+    let whole = seal(&catalog, &second, &read).expect("seal");
+    assert_eq!(after.root, whole.root);
+    assert!(sealed_cids(&after).is_subset(&sealed_cids(&whole)));
+}
+
+#[test]
 fn a_sealed_anchor_reads_as_its_latest_head_whatever_else_is_held() {
     let t = tree("cap-live");
     let repo = Scratch::new("cap-live-repo");
     let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
+    let vault = crate::vault::Vault::open(repo.path(), catalog.uid()).expect("vault");
     let anchor = crate::claim::anchor().expect("anchor");
-    let published = Published::of(&[3u8; 32], &anchor).expect("published");
+    let published = Published::of(&secret(&vault), &anchor).expect("published");
     let Capability::Live(live) = published.capability() else {
         panic!("not live");
     };
 
     let first = import(&mut catalog, t.path(), &importer());
-    let one = publish(&mut catalog, &published, &first).expect("publish");
-    assert_eq!(read_live(&held_of(&one.blocks), &live).expect("read").0, first);
-    let again = publish(&mut catalog, &published, &first).expect("publish");
-    assert_eq!(again.set, one.set, "nothing new to say");
+    let one = publish(&mut catalog, &vault, &published, &first).expect("publish");
+    assert!(one.fresh);
+    let held_one = held_of(&published_blocks(&catalog, &one.manifest).expect("blocks"));
+    assert_eq!(read_live(&held_one, &live).expect("read").0, first);
+    let again = publish(&mut catalog, &vault, &published, &first).expect("publish");
+    assert_eq!((again.set.clone(), again.manifest.clone(), again.fresh), (one.set.clone(), one.manifest.clone(), false), "nothing new to say");
 
     std::fs::write(t.path().join("docs/readme.md"), "read me again").expect("write");
     let second = import(&mut catalog, t.path(), &importer());
-    let two = publish(&mut catalog, &published, &second).expect("publish");
+    let two = publish(&mut catalog, &vault, &published, &second).expect("publish");
     assert_ne!(two.set, one.set);
-    // Both held, the later replaces the earlier
-    let both: Vec<Block> = one.blocks.iter().chain(&two.blocks).cloned().collect();
-    let (plain, blocks) = read_live(&held_of(&both), &live).expect("read");
+    // The vault keeps the latest manifest, which reaches every head
+    assert_eq!(published_list(&mut catalog, &vault), vec![(anchor, two.manifest.clone())]);
+    let everything = published_blocks(&catalog, &two.manifest).expect("blocks");
+    let (plain, blocks) = read_live(&held_of(&everything), &live).expect("read");
     assert_eq!(plain, second);
     assert_eq!(blocks.len(), dag(&catalog, &second).len());
+    assert!(sealed_cids(&Sealed { root: one.set, blocks: everything.clone() }).is_superset(&held_one.0.keys().cloned().collect()), "every head's held");
 
     // A later head signed by anyone else counts for nothing
     let forger = crate::keys::Key::generate().expect("key");
     let head = seal_head(live.read(), &first, &seal(&catalog, &first, live.read()).expect("seal").root).expect("head");
     let set = crate::claim::Claim::Set(crate::claim::Set::new([published.anchor.clone()], AnyCid::V1(head.cid().clone()), u64::MAX).expect("set").after(Some(Vec::new())));
     let sign = crate::claim::Claim::Sign(crate::claim::Sign::new(&forger, [set.cid()], None, u64::MAX).expect("sign"));
-    let with_forgery: Vec<Block> = both.iter().cloned().chain([head, set.block(), sign.block()]).collect();
+    let with_forgery: Vec<Block> = everything.iter().cloned().chain([head, set.block(), sign.block()]).collect();
     assert_eq!(read_live(&held_of(&with_forgery), &live).expect("read").0, second);
 
     // Nor does the right capability with another read key read anything
     let wrong = Live::new(live.view, Zeroizing::new([9u8; 32]));
-    assert!(read_live(&held_of(&both), &wrong).is_err());
+    assert!(read_live(&held_of(&everything), &wrong).is_err());
+
+    // Unpublished, the vault keeps none of it
+    assert!(unpublish(&mut catalog, &vault, &published).expect("unpublish"));
+    assert!(published_list(&mut catalog, &vault).is_empty());
+    assert!(!unpublish(&mut catalog, &vault, &published).expect("unpublish"));
+}
+
+fn published_list(catalog: &mut Catalog, vault: &crate::vault::Vault) -> Vec<(Link, Link)> {
+    published(catalog, vault).expect("published")
 }

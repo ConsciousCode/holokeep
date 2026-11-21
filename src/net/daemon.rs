@@ -615,7 +615,7 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, (low, high): (u64
                     notice_change(&mut node, &mut remounts, path, &mut changed_again)?;
                 }
                 unless_busy(node.redrive(), "what's underway")?;
-                unless_busy(node.expire(), "letting what's expired go")?;
+                unless_busy(node.tend(&place.repo), "letting what's expired go, and publishing what's changed")?;
                 unless_busy(node.announce(), "announcing")?;
                 // What's been added since is copied without waiting out a
                 // calm interval
