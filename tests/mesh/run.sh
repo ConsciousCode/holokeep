@@ -558,6 +558,21 @@ scenario_door() {
     grep -q "older than one read before" <<<"$older" || fail "the outsider couldn't read the older head, but not for being older: $older"
     on one hk cap unpublish "$anchor" 2>/dev/null
     ! on one hk cap ls | grep -q "^$anchor	" || fail "one still lists it, unpublished"
+
+    # A folder published is made an anchor, and read through what mounts it
+    local tree folder_cap whole_cap read inside
+    sh_on one 'mkdir -p /tmp/tree/shared && echo "in the folder" > /tmp/tree/shared/inside.txt && echo "on top" > /tmp/tree/top.txt'
+    tree=$(sh_on one 'hk add -q --no-keep /tmp/tree | tail -1')
+    inside=$(sh_on one 'hk add -q --no-keep /tmp/tree/shared | tail -1')
+    anchor=$(on one hk anchor new)
+    on one hk anchor set "$anchor" "$tree" >/dev/null
+    folder_cap=$(on one hk cap publish "anchors/$anchor/shared" --at "/ip4/$one_ip/tcp/4013/p2p/$one_peer" 2>/dev/null) || fail "one couldn't publish a folder"
+    [ "$(on one hk cap ls | wc -l)" = 1 ] || fail "publishing the folder published other than it"
+    [ "$(on outsider hk cap import "$folder_cap" 2>/dev/null)" = "root $inside" ] || fail "the outsider couldn't read the folder published"
+    whole_cap=$(on one hk cap publish "$anchor" --at "/ip4/$one_ip/tcp/4013/p2p/$one_peer" 2>/dev/null)
+    read=$(on outsider hk cap import "$whole_cap" 2>/dev/null)
+    grep -q "^mount shared	$inside$" <<<"$read" || fail "the outsider didn't read the folder through what mounts it: $read"
+    [ "$(on outsider hk cat "$(sh_on one 'hk add -q --no-keep /tmp/tree/shared/inside.txt')")" = "in the folder" ] || fail "what the outsider read through the mount point isn't the folder"
 }
 
 scenario_expiry() {

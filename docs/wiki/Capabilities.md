@@ -1,7 +1,8 @@
 **Partly a design.** Snapshots exist (see [[#Snapshots]]), and so do
 sealed anchors, read-only: published, kept current, held by friends,
-and read from a CAR or at a holder's door by anyone with the capability
-(see [[#Publishing, as it is now]] and [[#Doors]]). The rest of this page isn't implemented
+and read from a CAR or at a holder's door by anyone with the capability,
+through the anchors mounted in them (see [[#Publishing, as it is now]],
+[[#Doors]] and [[#Mount points]]). The rest of this page isn't implemented
 yet. It's the plan for
 the last part of sharing across the boundary (see [[Sharing#Across the
 boundary]]), written down to be argued with before it's built.
@@ -147,25 +148,58 @@ function of the length alone, the same on every machine.
 
 ## Mount points
 
-A plaintext mount point is a symlink to `/anchors/<anchor>`, sealed
-like any block. The parent's `mounts` table says, for its entry, which
-sealed anchor it is and how to read it:
+Implemented, but for revoking. A plaintext mount point is a symlink to
+`/anchors/<anchor>`, sealed like any block. The parent's `mounts` table
+says, for its entry, which sealed anchor it is and how to read it:
 
 | Key | Type | Meaning |
 |---|---|---|
 | `view` | Link | The sealed view of the anchor mounted. |
 | `read` | bytes | Its current read key. |
 
-So a reader of the parent reads the mounted anchor too, at its own
-latest head, and a capability on the mounted anchor reads it and
-nothing above. **Sharing a folder makes it an anchor**: the folder's
-content becomes a new anchor's value, and the folder a mount point to
-it. That's visible in the owner's tree, but the [[Mount|mount]] shows a
-mount point as the directory it was.
+A HAMT's mount points are in the `mounts` of the shard whose entry each
+is, by the entry's name less the index prefix. Entries whose names
+aren't UTF-8 aren't sealed as mount points.
+
+- **Sealing.** Publishing seals each mount point as the sealed anchor
+  its anchor is published as, `Published::of(secret, anchor)`, so its
+  view and read key are derived as any published anchor's. An entry is
+  looked at only if its link's `Tsize` is at most 256 bytes, or unsaid,
+  and it's dag-pb: a symlink whose target is `/anchors/` and an anchor's
+  CID, not a view's. A snapshot (`hk cap export`) seals mount points as
+  the symlinks they are, with no `mounts`.
+- **Publishing.** Publishing an anchor publishes each anchor a mount
+  point names in what's sealed anew, and so on down, each once, loops
+  and all; one that's nothing yet isn't. Each is published on its own,
+  with its own manifest and capability, listed by `hk cap ls`, and kept
+  current by the node as any is. Only what's sealed anew is looked at,
+  so a mount point in a directory unchanged since the last head isn't
+  published again by publishing what mounts it; it was when it was
+  first sealed. Unpublishing one leaves what mounts it naming it: its
+  readers read its last head while that's held.
+- **Reading.** A reader of the parent reads each mounted anchor too,
+  from the same CAR or door, at its own latest head, each sealed view
+  once, and remembers each head read (see [[#Remembered heads]]). A
+  mounted anchor that can't be read, or is behind, is said so, and the
+  rest is read: only the anchor the capability names must be. `hk cap
+  import` prints `mount <path>\t<plaintext root>` for each read, the path
+  `/`-separated from the root of the capability's anchor. A capability
+  on the mounted anchor reads it and nothing above.
+
+**Sharing a folder makes it an anchor**: `hk cap publish <path>` of a
+folder that's neither an anchor nor a mount point makes it one first,
+as `hk fs anchor` does (see [[Mount#From outside: `hk fs`]]): the
+folder's content becomes a new anchor's value, and the folder a mount
+point to it, in one set of the anchor whose folder it was. That's
+visible in the owner's tree, but the [[Mount|mount]] shows a mount point
+as the directory it was.
+
+A reader learns the plaintext anchor a mount point names, as the
+symlink's target, though not whose it is.
 
 Revoking a mounted anchor's readers changes its read key, which
 changes the parent's `mounts` entry, so the parent's path to the root
-is sealed again. Nothing else is.
+is sealed again. Nothing else is. That comes with revoking (phase 5).
 
 ## Heads
 
@@ -227,10 +261,9 @@ with no heads, and a capability of `root`, `plain` and `read`:
   checking each against its plaintext CID and each sealed node's
   padding, puts them in the repo, and prints the plaintext root.
 
-Reading from a holder rather than a CAR waits for a way in for
-non-members (see [[#Reading]]). Sealed nodes with `mounts` are refused,
-and `keys` are followed but never written, until the phases that make
-them.
+A snapshot can be read at a door too (`--from`), as any sealed blocks
+can (see [[#Doors]]). It seals no `mounts` (see [[#Mount points]]), and
+`keys` are followed but never written, until revoking makes them.
 
 A test vector: the file `hello, sealed world` (a raw leaf) in a
 directory as `hello.txt`, `bafybeig3b3oi7lruke4xl5rd6b5qsi6bmug2x6ltoqhf276doiiirzvcq4`,
@@ -503,8 +536,9 @@ In order, each of use alone:
    protected meshes, read from a CAR or at a holder's door, and readers
    remembering heads. Writer keys, and judging the
    grants that give them write, come with writing.
-3. **Mount points.** Sealed `mounts`, making a folder an anchor to share
-   it, and capabilities on mounted anchors.
+3. **Mount points.** Done: sealed `mounts`, publishing what's mounted,
+   reading through mount points, making a folder an anchor to share it,
+   and capabilities on mounted anchors.
 4. **Writing.** Write capabilities, counting their inner sets through
    the visitor rule, merging on unsealing, and taking write away.
 5. **Revoking read.** New read keys, `keys` and `past`, sealed boxes for

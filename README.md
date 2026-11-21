@@ -457,7 +457,7 @@ Checklist:
 - [ ] Capabilities: sharing by key, from ciphertext no member guards (see the wiki's Capabilities page)
   - [x] Snapshots: a sealed tree, keys derived down it, padded, and a capability on its root (`hk cap export/import`)
   - [x] Sealed anchors, read-only: owner keys, heads, views judged by their own keys, sealing what's changed, manifests the vault keeps, kept current by the node, held by friends' protected meshes, read from a CAR or at a holder's door by anyone with the capability, who remembers the head it read and refuses an older one offered as the latest (`hk cap publish/unpublish/ls`, `hk node run --door`, `hk cap import --from`)
-  - [ ] Mount points: sharing a folder makes it an anchor
+  - [x] Mount points: sealed `mounts`, publishing and reading through what's mounted, and sharing a folder makes it an anchor (`hk cap publish <folder>`)
   - [ ] Writing by capability
   - [ ] Revoking read: new read keys
 

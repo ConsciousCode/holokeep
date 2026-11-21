@@ -2006,13 +2006,13 @@ impl Node {
             let Some(value) = self.catalog.anchor_value(&anchor)? else {
                 continue;
             };
-            let published = crate::cap::Published::of(&crate::cap::secret(&vault), &anchor).map_err(busy)?;
-            match crate::cap::publish(&mut self.catalog, &vault, &published, &value) {
-                Ok(publication) if publication.fresh => {
-                    eprintln!("published {anchor} again, as {value}");
-                    done = done.saturating_add(1);
+            match crate::cap::publish_mounted(&mut self.catalog, &vault, &anchor, &value) {
+                Ok(publications) => {
+                    for (anchor, publication) in publications.iter().filter(|(_, publication)| publication.fresh) {
+                        eprintln!("published {anchor} again, its head {}", publication.set);
+                        done = done.saturating_add(1);
+                    }
                 },
-                Ok(_) => {},
                 Err(crate::cap::Error::Store(e)) if e.is_busy() => return Err(Error::Store(e)),
                 Err(e) => eprintln!("{anchor} isn't published as it is yet: {e}"),
             }

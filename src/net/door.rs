@@ -286,6 +286,12 @@ impl Reader {
     }
 }
 
+impl crate::cap::Heads for Reader {
+    fn heads_of(&self, live: &crate::cap::Live) -> crate::cap::Result<Vec<Vec<u8>>> {
+        Ok(self.heads(&live.view, live.read()).map_err(|e| crate::cap::Error::Invalid(e.to_string()))?.into_iter().map(|(_, data)| data).collect())
+    }
+}
+
 impl crate::cap::Source for Reader {
     fn sealed(&self, wanted: &[(Link, [u8; 32])]) -> crate::cap::Result<Vec<Vec<u8>>> {
         let me = self.me();

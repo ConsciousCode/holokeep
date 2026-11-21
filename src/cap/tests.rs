@@ -181,7 +181,7 @@ fn sealed_nodes_are_padded_to_their_size_class() {
 #[test]
 fn a_sealed_node_has_one_form() {
     let link: Link = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku".parse().expect("cid");
-    let node = encode(b"block", std::slice::from_ref(&link)).expect("encode");
+    let node = encode(b"block", std::slice::from_ref(&link), &BTreeMap::new()).expect("encode");
     assert_eq!(node.len(), 256);
     let opened = decode(&node).expect("decode");
     assert_eq!((opened.block.as_slice(), opened.links.as_slice()), (&b"block"[..], std::slice::from_ref(&link)));
@@ -387,4 +387,84 @@ fn read_held(blocks: &[Block], live: &Live) -> Result<(Link, Vec<Block>)> {
 
 fn published_list(catalog: &mut Catalog, vault: &crate::vault::Vault) -> Vec<(Link, Link)> {
     published(catalog, vault).expect("published")
+}
+
+/// Every block published of each publication, held together.
+fn held_all(catalog: &Catalog, publications: &[(Link, Publication)]) -> Held {
+    let mut held = Held::default();
+    for (_, publication) in publications {
+        for block in published_blocks(catalog, &publication.manifest).expect("blocks") {
+            held.insert(block);
+        }
+    }
+    held
+}
+
+#[test]
+fn a_mounted_anchor_is_published_with_what_mounts_it_and_read_through_it() {
+    let repo = Scratch::new("cap-mounts-repo");
+    let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
+    let vault = crate::vault::Vault::open(repo.path(), catalog.uid()).expect("vault");
+    let (outer, inner, empty) = (catalog.new_anchor().expect("anchor"), catalog.new_anchor().expect("anchor"), catalog.new_anchor().expect("anchor"));
+
+    // The inner anchor mounts the outer, a loop, and is mounted in it
+    let t = tree("cap-mounts-inner");
+    std::os::unix::fs::symlink(format!("/anchors/{outer}"), t.path().join("up")).expect("symlink");
+    let inner_value = import(&mut catalog, t.path(), &importer());
+    catalog.set_anchor(&inner, &inner_value).expect("set");
+    let top = Scratch::new("cap-mounts-outer");
+    std::fs::create_dir_all(top.path().join("shared")).expect("mkdir");
+    std::fs::write(top.path().join("note.txt"), "outside").expect("write");
+    std::os::unix::fs::symlink(format!("/anchors/{inner}"), top.path().join("shared/inner")).expect("symlink");
+    // One that's nothing yet, and a symlink that only looks like one
+    std::os::unix::fs::symlink(format!("/anchors/{empty}"), top.path().join("nothing")).expect("symlink");
+    std::os::unix::fs::symlink("/anchors/not-one", top.path().join("odd")).expect("symlink");
+    let outer_value = import(&mut catalog, top.path(), &importer());
+    catalog.set_anchor(&outer, &outer_value).expect("set");
+
+    let publications = publish_mounted(&mut catalog, &vault, &outer, &outer_value).expect("publish");
+    let anchors: Vec<&Link> = publications.iter().map(|(anchor, _)| anchor).collect();
+    assert_eq!(anchors, vec![&outer, &inner], "the outer, then what's mounted in it, each once, and nothing for what's nothing");
+    let mut listed: Vec<Link> = published_list(&mut catalog, &vault).into_iter().map(|(anchor, _)| anchor).collect();
+    listed.sort_by_key(CidRef::to_bytes);
+    let mut wanted = vec![outer.clone(), inner.clone()];
+    wanted.sort_by_key(CidRef::to_bytes);
+    assert_eq!(listed, wanted, "each is published on its own too");
+
+    let held = held_all(&catalog, &publications);
+    let Capability::Live(live) = Published::of(&secret(&vault), &outer).expect("published").capability() else {
+        panic!("not live");
+    };
+    let reading = read(&held, &live, &|_| Vec::new()).expect("read");
+    assert_eq!(reading.plain, outer_value);
+    let mounts: Vec<(&str, std::result::Result<&Link, &String>)> = reading.mounts.iter().map(|mounted| (mounted.path.as_str(), mounted.read.as_ref())).collect();
+    assert_eq!(mounts.len(), 2, "{mounts:?}");
+    assert!(mounts.contains(&("shared/inner", Ok(&inner_value))), "{mounts:?}");
+    assert!(mounts.iter().any(|(path, read)| *path == "nothing" && read.is_err()), "what's nothing yet is said so: {mounts:?}");
+    // Every block of both trees, and a head of each to remember; the loop back up is read once
+    let read_cids: HashSet<Vec<u8>> = reading.blocks.iter().map(|block| AnyCid::V1(block.cid().clone()).to_bytes()).collect();
+    assert!(dag(&catalog, &inner_value).iter().all(|cid| read_cids.contains(&AnyCid::V1(Link::decode(cid).expect("cid").into()).to_bytes())));
+    assert_eq!(reading.heads.len(), 2);
+
+    // A capability on the mounted anchor reads it and nothing above
+    let Capability::Live(inner_live) = Published::of(&secret(&vault), &inner).expect("published").capability() else {
+        panic!("not live");
+    };
+    let below = read(&held, &inner_live, &|_| Vec::new()).expect("read");
+    assert_eq!(below.plain, inner_value);
+    assert_eq!(below.mounts.iter().map(|mounted| (mounted.path.as_str(), mounted.read.clone().ok())).collect::<Vec<_>>(), vec![("up", Some(outer_value.clone())), ("up/nothing", None)], "up is the outer, as mounted, and what it mounts");
+
+    // A snapshot seals mount points as the symlinks they are
+    let snapshot = seal_tree(&catalog, &outer_value, &[3u8; 32], None, None).expect("seal");
+    assert!(snapshot.1.is_empty());
+}
+
+#[test]
+fn a_sealed_nodes_mount_points_read_back_and_must_be_views() {
+    let opened = encode(b"block", &[], &BTreeMap::from([("ghost".to_owned(), Mount { view: crate::claim::view(&crate::claim::anchor().expect("anchor"), &crate::keys::Key::generate().expect("key").id()).expect("view"), read: Zeroizing::new([1u8; 32]) })])).expect("encode");
+    let decoded = decode(&opened).expect("decode");
+    assert_eq!(decoded.mounts.len(), 1);
+    // The view must be one
+    let bad = encode(b"block", &[], &BTreeMap::from([("bad".to_owned(), Mount { view: crate::claim::anchor().expect("anchor"), read: Zeroizing::new([1u8; 32]) })])).expect("encode");
+    assert!(decode(&bad).is_err());
 }
