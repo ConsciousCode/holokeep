@@ -106,6 +106,25 @@ async fn members_tell_each_other_of_members() {
     assert!(until(&mut [&mut a, &mut b, &mut c], |n| connected(n[0], n[1]) && connected(n[0], n[2]) && connected(n[1], n[2])).await);
 }
 
+#[tokio::test]
+async fn members_measure_each_others_clocks() {
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let (mut a, mut b) = (node(swarm_key).await, node(swarm_key).await);
+    invite(&a, &b, swarm_key);
+    a.reload().expect("reload");
+    b.reload().expect("reload");
+    b.dial_members().expect("dial");
+    assert!(until(&mut [&mut a, &mut b], |n| connected(n[0], n[1])).await);
+    a.measure_clocks();
+    b.measure_clocks();
+    let (pa, pb) = (a.peer_id(), b.peer_id());
+    assert!(until(&mut [&mut a, &mut b], |n| n[0].clocks().of(&pb).is_some() && n[1].clocks().of(&pa).is_some()).await);
+    // One clock, so near none apart, and within the round trip
+    let offset = a.clocks().of(&pb).expect("measured");
+    assert!(offset.ahead.unsigned_abs() <= offset.trip.max(1000), "{offset:?}");
+    assert_eq!(a.clocks().mesh().map(|(_, members)| members), Some(1));
+}
+
 //--------------//
 //-[ Fetching ]-//
 //--------------//

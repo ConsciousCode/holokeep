@@ -115,10 +115,15 @@ holds() { [ "$(sh_on "$1" "cat '$2'")" = "$3" ]; }
 
 # Two nodes: what's written on one is read on the other
 scenario_write_read() {
+    local two_peer
     sh_on one 'mkdir /soup/wiki && echo "hello from one" > /soup/wiki/page.md'
     wait_for "two to read one's page" holds two /soup/wiki/page.md "hello from one"
     sh_on two 'echo "two was here" > /soup/wiki/two.md'
     wait_for "one to read two's page" holds one /soup/wiki/two.md "two was here"
+    # Connected, they measure each other's clocks
+    two_peer=$(on two hk node id)
+    wait_for "one to measure two's clock" sh_on one "hk node clocks | grep -q '^$two_peer'"
+    sh_on one 'hk node status' | grep -q '^clock	' || fail "one's status doesn't say how far its clock is"
 }
 
 # Taking turns at one file, each sees the other's edit, and writing something

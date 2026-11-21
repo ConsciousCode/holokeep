@@ -7,6 +7,7 @@
 
 pub mod blocks;
 pub mod clients;
+pub mod clock;
 pub mod collect;
 pub mod durability;
 pub mod grants;

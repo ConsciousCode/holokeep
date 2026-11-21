@@ -42,6 +42,7 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport, identify, kad,
 use serde::{Deserialize, Serialize};
 
 use super::blocks::{self, Blocks, Fetch, Want};
+use super::clock::{self, Clocks, Offset, Told};
 use super::clients::{Gate, Ports};
 use super::collect::{self, Condemn, Condemned, Verdict};
 use super::durability::{self, Advert, Audit, Haves, Kept, Push, Report, Sightings, Trickle};
@@ -143,6 +144,7 @@ pub struct Behaviour {
     hosts: request_response::cbor::Behaviour<Hosts, Hosts>,
     grants: request_response::cbor::Behaviour<Have, Sent>,
     asks: request_response::cbor::Behaviour<super::thin::Ask, super::thin::Answer>,
+    clock: request_response::cbor::Behaviour<clock::Asked, Told>,
 }
 
 /// A fetch, as the node knows it.
@@ -173,6 +175,10 @@ pub enum Event {
     Trimmed { id: TrimId, report: trim::Report },
     /// Garbage was let go of, as members answered.
     Collected { collected: usize },
+    /// This machine's clock was found far from the mesh's, or back near
+    /// it: how far ahead the mesh's is, in microseconds, and of how many
+    /// members.
+    Skewed { ahead: i64, members: usize, far: bool },
 }
 
 /// A transport for the mesh, over some base transport: the private
@@ -320,6 +326,12 @@ pub struct Node {
     client_addrs: BTreeMap<PeerId, Vec<Multiaddr>>,
     /// Events which happened outside `next`, for it to return first.
     ready: VecDeque<Event>,
+    /// How far members' clocks are from this machine's, and when each
+    /// ask for the time unanswered was made, by this machine's clock.
+    clocks: Clocks,
+    clocking: HashMap<request_response::OutboundRequestId, (PeerId, u64)>,
+    /// Whether this machine's clock was last found far from the mesh's.
+    skewed: bool,
 }
 
 impl Node {
@@ -361,6 +373,7 @@ impl Node {
             hosts: exchange(hosts::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_secs(20))),
             grants: exchange(super::grants::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1))),
             asks: exchange(super::thin::PROTOCOL, request_response::Config::default().with_request_timeout(super::thin::ANSWER)),
+            clock: exchange(clock::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_secs(10))),
         };
         let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(IDLE);
         let swarm = Swarm::new(transport, behaviour, peer, config);
@@ -411,6 +424,9 @@ impl Node {
             member_ports: HashMap::new(),
             client_addrs: BTreeMap::new(),
             ready: VecDeque::new(),
+            clocks: Clocks::default(),
+            clocking: HashMap::new(),
+            skewed: false,
         };
         node.reload()?;
         Ok(node)
@@ -554,6 +570,7 @@ impl Node {
             BehaviourEvent::Condemn(event) => from(event),
             BehaviourEvent::Hosts(event) => from(event),
             BehaviourEvent::Grants(event) => from(event),
+            BehaviourEvent::Clock(event) => from(event),
             _ => None,
         };
         peer.is_some_and(|peer| self.visitors.contains_key(&peer))
@@ -1038,8 +1055,10 @@ impl Node {
     }
 
     /// Notice each connected member of structure which arrived since it
-    /// was last noticed, unless it's still to answer the last.
+    /// was last noticed, unless it's still to answer the last, and ask
+    /// each the time.
     pub fn announce(&mut self) -> Result<()> {
+        self.measure_clocks();
         // A device revoked since is a client no more
         self.reload_clients()?;
         self.tell_hosts()?;
@@ -1895,9 +1914,6 @@ impl Node {
         self.fetches.iter().find(|(_, (_, fetch))| fetch.asked(request)).map(|(&id, _)| id)
     }
 
-    /// Let in every member, and learn where they listen, as of the list,
-    /// and of the mesh's grants, if it has them: telling every member,
-    /// if they've changed.
     /// Work the grants out again if what one gave till a time has gone
     /// since: who's let in, and what they may see, with it.
     pub fn expire(&mut self) -> Result<()> {
@@ -1907,6 +1923,56 @@ impl Node {
         Ok(())
     }
 
+    /// Ask each member connected for the time, to measure how far its
+    /// clock is from this machine's (see `clock`), unless it's still to
+    /// answer the last ask.
+    pub fn measure_clocks(&mut self) {
+        let asking: HashSet<PeerId> = self.clocking.values().map(|(peer, _)| *peer).collect();
+        for peer in self.connected().into_iter().filter(|peer| !self.clients.contains_key(peer) && !asking.contains(peer)) {
+            let id = self.swarm.behaviour_mut().clock.send_request(&peer, clock::Asked::default());
+            self.clocking.insert(id, (peer, clock::now()));
+        }
+    }
+
+    /// What's been measured of members' clocks.
+    pub const fn clocks(&self) -> &Clocks {
+        &self.clocks
+    }
+
+    /// Answer an ask for the time, or take in an answer: saying so if
+    /// this machine's clock has gone far from the mesh's, or come back.
+    fn on_clock(&mut self, event: request_response::Event<clock::Asked, Told>) -> Option<Event> {
+        match event {
+            request_response::Event::Message { message: request_response::Message::Request { channel, .. }, .. } => {
+                let got = clock::now();
+                let _ = self.swarm.behaviour_mut().clock.send_response(channel, Told { got, sent: clock::now() });
+                None
+            },
+            request_response::Event::Message { peer, message: request_response::Message::Response { request_id, response }, .. } => {
+                let heard = clock::now();
+                let (asked_of, asked) = self.clocking.remove(&request_id)?;
+                if asked_of != peer {
+                    return None;
+                }
+                self.clocks.record(peer, Offset::of(asked, response, heard));
+                let (ahead, members) = self.clocks.mesh()?;
+                let far = ahead.unsigned_abs() > clock::SKEW.unsigned_abs();
+                (far != self.skewed).then(|| {
+                    self.skewed = far;
+                    Event::Skewed { ahead, members, far }
+                })
+            },
+            request_response::Event::OutboundFailure { request_id, .. } => {
+                self.clocking.remove(&request_id);
+                None
+            },
+            _ => None,
+        }
+    }
+
+    /// Let in every member, and learn where they listen, as of the list,
+    /// and of the mesh's grants, if it has them: telling every member,
+    /// if they've changed.
     pub fn reload(&mut self) -> Result<()> {
         if self.refresh_grants()? {
             for peer in self.connected() {
@@ -2251,6 +2317,7 @@ impl Node {
             },
             SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
                 self.on_disconnected(&peer_id);
+                self.clocks.forget(&peer_id);
                 Some(Event::Disconnected(peer_id))
             },
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => Some(Event::Failed(peer_id, error.to_string())),
@@ -2308,6 +2375,7 @@ impl Node {
                 self.on_ask(event)?;
                 None
             },
+            SwarmEvent::Behaviour(BehaviourEvent::Clock(event)) => self.on_clock(event),
             _ => None,
         })
     }

@@ -775,6 +775,10 @@ fn report(event: &Event) {
         Event::Failed(..) | Event::Audited { .. } | Event::Trimmed { .. } => {},
         Event::Fetched { fetched, missing, .. } => eprintln!("fetched {fetched} blocks, {} missing", missing.len()),
         Event::Collected { collected } => eprintln!("collected: {collected} let go of"),
+        Event::Skewed { ahead, members, far: true } => {
+            eprintln!("this machine's clock is {} from the mesh's, the median of {members} members': set it right, as what's given till a time goes by it", crate::net::clock::shown(ahead.saturating_neg()));
+        },
+        Event::Skewed { ahead, members, far: false } => eprintln!("this machine's clock is back near the mesh's: {} from the median of {members} members'", crate::net::clock::shown(ahead.saturating_neg())),
     }
 }
 
@@ -822,6 +826,9 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
         let _ = writeln!(out, "client of\t{member}");
     }
     let _ = writeln!(out, "connected\t{}", node.connected().len());
+    if let Some((ahead, members)) = node.clocks().mesh() {
+        let _ = writeln!(out, "clock\t{} from the mesh's, the median of {members} members'", crate::net::clock::shown(ahead.saturating_neg()));
+    }
     if !node.clients().is_empty() {
         let connected = node.connected().iter().filter(|peer| node.is_client(peer)).count();
         let _ = writeln!(out, "clients\t{} of {} connected", connected, node.clients().len());
@@ -916,6 +923,11 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
     match line.trim() {
         "peers" => out.push_str(&peers(node)?),
         "status" => out.push_str(&status(node, copies, collecting, alone)?),
+        "clocks" => {
+            for (peer, offset) in node.clocks().all() {
+                let _ = writeln!(out, "{peer}\t{}\t{} round trip", crate::net::clock::shown(offset.ahead), crate::net::clock::shown(i64::try_from(offset.trip).unwrap_or(i64::MAX)).trim_start_matches('+'));
+            }
+        },
         "scan-lost" => {
             node.scan_lost()?;
             out.push_str("scanning\n");

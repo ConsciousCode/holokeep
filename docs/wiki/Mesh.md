@@ -358,6 +358,7 @@ them; omitted otherwise.
 | `/holokeep/dropped/1.0.0` | `{keys: [key]}` | `{}` | "I let go of these." |
 | `/holokeep/condemn/1.0.0` | `{blocks: [key]}` | `{kept: [key]}` | "Does a keep of yours reach these?" |
 | `/holokeep/ask/1.0.0` | `{words: [string]}` | `{lines: [string]}` | A [[#Thin clients\|thin client]]'s command, answered as its account. |
+| `/holokeep/clock/1.0.0` | `{}` | `{got: uint, sent: uint}` | "What's the time?" (see [[#Clocks]]). |
 
 A request or response may be up to 64 MiB. libp2p's CBOR codec allows a
 megabyte a request and ten a response by default, too little for a push
@@ -399,7 +400,31 @@ Durability (`adverts`, `push`), trimming (`trim`, `dropped`) and garbage
 collection (`condemn`) are described in
 [[Replication and Retention]].
 
-Source: `src/net/node.rs`, `src/net/clients.rs`, `src/net/thin.rs`, `src/net/node/asks.rs`, `src/net/hosts.rs`, `src/net/grants.rs`, `src/net/mesh.rs`, `src/net/blocks.rs`, `src/net/structure.rs`, `src/net/daemon.rs`.
+### Clocks
+
+Every announce, 10 s, a member asks each other member connected, not
+clients or visitors, for the time, unless it's still to answer the
+last. As NTP does, it notes when it asked (`t1`) and heard back (`t4`)
+by its own clock, and the member says when the ask arrived (`got`,
+`t2`) and its answer left (`sent`, `t3`), by its, all in microseconds
+since the Unix epoch:
+
+```
+ahead = ((t2 - t1) + (t3 - t4)) / 2      how far ahead the member's clock is
+trip  = (t4 - t1) - (t3 - t2)            the round trip, less the member's time answering
+```
+
+Of each member's last 8, the one with the shortest `trip` counts, as
+the least delayed. The **mesh's clock** is the median of the members'
+`ahead`, with this machine's own as 0. When this machine's clock goes
+more than 2 s from it, or comes back, the node says so where it logs.
+`hk node clocks` lists each member's `ahead` and `trip`, and `hk node
+status` the mesh's as `clock`.
+
+It's advisory: nothing is judged by it. A grant's expiry is still each
+machine's own clock's (see [[Grants#Expiry]]).
+
+Source: `src/net/node.rs`, `src/net/clock.rs`, `src/net/clients.rs`, `src/net/thin.rs`, `src/net/node/asks.rs`, `src/net/hosts.rs`, `src/net/grants.rs`, `src/net/mesh.rs`, `src/net/blocks.rs`, `src/net/structure.rs`, `src/net/daemon.rs`.
 
 ## Forgetting members
 

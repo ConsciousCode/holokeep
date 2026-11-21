@@ -280,6 +280,10 @@ enum NodeCommand {
     /// How the running node is: connected members, blocks, and the
     /// trickle's pace
     Status,
+    /// How far each connected member's clock is from this machine's, and
+    /// the round trip it was measured over: advisory, as nothing's judged
+    /// by it
+    Clocks,
     /// Have the running node audit every block now, not a few at a time:
     /// advertise those short of the copies it runs with, or of these, and
     /// copy them to other members
@@ -1627,6 +1631,11 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
         NodeCommand::Trim => {
             let report = daemon::trim(place)?.context("this node isn't running: start `hk node run`")?;
             out!("let go of {} of {} spare blocks, freeing {} bytes", report.dropped, report.considered, report.freed);
+        },
+        NodeCommand::Clocks => {
+            for line in &daemon::ask(place, "clocks")?.context("this node isn't running: start `hk node run`")? {
+                out!("{line}");
+            }
         },
         NodeCommand::Status => {
             let lines = daemon::ask(place, "status")?.context("this node isn't running: start `hk node run`")?;

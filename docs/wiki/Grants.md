@@ -63,7 +63,9 @@ it took, which is a grant's to do.
 
 Every machine works the grants out as of now, so machines whose clocks
 differ disagree for as long as they differ, about grants ending between
-them. A daemon works them out again within 10 s of a grant's time
+them. Members measure how far apart their clocks are, and a daemon says
+when its own is more than 2 s from the mesh's, but judges by its own
+regardless (see [[Mesh#Clocks]]). A daemon works them out again within 10 s of a grant's time
 passing, and with them who may read and write each view and who's let
 in, so a visitor whose share's gone is shut out. A repo with no daemon
 running works them out as of whenever a grant's next made there.
