@@ -468,8 +468,21 @@ enum CapCommand {
         /// Where to write the ciphertext
         output: PathBuf,
     },
+    /// Publish what an anchor is now, sealed: its tree and a head naming
+    /// it, in a sealed anchor of its own whose owner key, derived from
+    /// this account's secret, signs it. Write it all to a `CARv1`, and print
+    /// a capability that reads the sealed anchor as it is whenever it's
+    /// read. Publishing again writes what's new, under the same capability
+    Publish {
+        /// The anchor, or a path of the soup that's one or a mount point
+        /// of one (see `hk fs`)
+        anchor: PathBuf,
+        /// Where to write the ciphertext
+        output: PathBuf,
+    },
     /// Read a capability's DAG from a CAR of its ciphertext into the repo,
-    /// unsealing and checking every block, and print its root
+    /// unsealing and checking every block, and print its root: a
+    /// snapshot's, or a sealed anchor's latest head's
     Import {
         capability: String,
         car: PathBuf,
@@ -2257,13 +2270,27 @@ fn soup_fs(repo: Option<PathBuf>, command: FsCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The anchor a CID or a path of the soup names: one, or a mount point of
+/// one (see `hk fs`).
+fn anchor_named(repo: &Catalog, named: &Path) -> anyhow::Result<Link> {
+    if let Some(anchor) = named.to_str().and_then(|text| text.parse::<Link>().ok()) {
+        return Ok(anchor);
+    }
+    let located = holokeep::fs::locate(repo, &holokeep::fs::soup_path(named))?;
+    match located.at.as_ref().map(|at| holokeep::fs::mount_point(repo, at)).transpose()?.flatten() {
+        Some(mounted) => Ok(mounted),
+        None if located.rel.as_os_str().is_empty() => Ok(located.anchor),
+        None => anyhow::bail!("{} isn't an anchor, nor a mount point of one: make it one with `hk fs anchor`", named.display()),
+    }
+}
+
 fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
-    use holokeep::cap::{self, Capability, Held};
+    use holokeep::cap::{self, Capability, Held, Snapshot};
     match command {
         CapCommand::Export { cid, output } => {
             fetch_first(repo.as_ref(), &cid)?;
             let repo = open_repo(repo)?;
-            let read = Capability::fresh_key()?;
+            let read = cap::fresh_key()?;
             let sealed = cap::seal(&repo, &cid, &read)?;
             // Written aside and renamed, so a failed export leaves nothing
             let dir = output.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
@@ -2271,13 +2298,33 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
             car::write_blocks(&mut file, std::slice::from_ref(&sealed.root), &sealed.blocks)?;
             file.into_inner().map_err(io::IntoInnerError::into_error)?.persist(&output)?;
             eprintln!("sealed {} blocks: whoever has this capability can read all of it", sealed.blocks.len());
-            out!("{}", Capability::new(sealed.root, cid, read).encode());
+            out!("{}", Capability::Snapshot(Snapshot::new(sealed.root, cid, read)).encode());
+            Ok(())
+        },
+        CapCommand::Publish { anchor, output } => {
+            let dir = repo_dir(repo)?;
+            let mut repo = open_repo(Some(dir.clone()))?;
+            let anchor = anchor_named(&repo, &anchor)?;
+            let value = repo.anchor_value(&anchor)?.with_context(|| format!("{anchor} is nothing yet"))?;
+            fetch_first(Some(&dir), &value)?;
+            let secret = holokeep::vault::Vault::open(&dir, repo.uid())?.derive_secret(b"capabilities");
+            let published = cap::Published::of(&secret, &anchor)?;
+            let publication = cap::publish(&mut repo, &published, &value)?;
+            let parent = output.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+            let mut file = io::BufWriter::new(tempfile::NamedTempFile::new_in(parent)?);
+            car::write_blocks(&mut file, std::slice::from_ref(&publication.set), &publication.blocks)?;
+            file.into_inner().map_err(io::IntoInnerError::into_error)?.persist(&output)?;
+            eprintln!("published {anchor} as it is now, {value}: whoever has this capability can read it as it is whenever they read it");
+            out!("{}", published.capability().encode());
             Ok(())
         },
         CapCommand::Import { capability, car } => {
             let capability = Capability::decode(&capability)?;
             let held = Held::from_car(io::BufReader::new(std::fs::File::open(&car).with_context(|| format!("opening {}", car.display()))?))?;
-            let blocks = cap::unseal(&held, &capability)?;
+            let (plain, blocks) = match &capability {
+                Capability::Snapshot(snapshot) => (snapshot.plain.clone(), cap::unseal(&held, snapshot)?),
+                Capability::Live(live) => cap::read_live(&held, live)?,
+            };
             open_repo(repo)?.batch_breathing(|repo| {
                 for block in &blocks {
                     repo.put_block(block, holokeep::cid::CidVersion::V1)?;
@@ -2285,7 +2332,7 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
                 Ok::<_, anyhow::Error>(())
             })?;
             eprintln!("unsealed {} blocks from {}", blocks.len(), car.display());
-            out!("root {}", capability.plain);
+            out!("root {plain}");
             Ok(())
         },
     }

@@ -59,6 +59,11 @@ impl Key {
         Ok(Self(SigningKey::from_bytes(&secret)))
     }
 
+    /// The key from a 32-byte seed, as derived ones are.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        Self(SigningKey::from_bytes(seed))
+    }
+
     /// The key as libp2p encodes a keypair.
     pub fn to_protobuf(&self) -> Vec<u8> {
         [&SECRET_PREFIX[..], &self.0.to_keypair_bytes()].concat()

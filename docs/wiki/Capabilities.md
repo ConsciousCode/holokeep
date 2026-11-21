@@ -1,6 +1,7 @@
-**Mostly a design.** Snapshots exist: sealing a DAG, its capability,
-and `hk cap export` and `import` (see [[#Snapshots]]). The rest of this
-page, from sealed anchors on, isn't implemented yet. It's the plan for
+**Partly a design.** Snapshots exist (see [[#Snapshots]]), and so does
+publishing a sealed anchor and reading its latest head from a CAR (see
+[[#Publishing, as it is now]]). The rest of this page isn't implemented
+yet. It's the plan for
 the last part of sharing across the boundary (see [[Sharing#Across the
 boundary]]), written down to be argued with before it's built.
 
@@ -38,9 +39,9 @@ sealed view  = identity CID of dag-cbor {"anchor": sealed nonce, "of": K}
 
 - `derive(k, label, data) = HMAC-SHA256(k, label || 0x00 || data)`, as
   [[Protected Meshes#Vaults|vaults]] derive.
-- `secret` is a random 32 bytes of the user's, kept in the account and
-  sealed with the vault for recovery (see [[Protected Meshes#Recovery
-  from the passphrase]]), as the vault's own secret is.
+- `secret` is derived from the account's vault secret,
+  `derive(vault secret, "capabilities", "")`, so it's kept and recovered
+  with it (see [[Protected Meshes#Recovery from the passphrase]]).
 - `K` is unrelated to the user's key and to every other anchor's, so a
   holder can't tell whose a sealed anchor is, or that two are the same
   person's.
@@ -237,6 +238,46 @@ sealed under a read key of 32 bytes `0x42`, is two blocks, the file's
 directory's, the sealed root,
 `bafkreifhyh75rbh3ekfa64angthj2xfmlkd7yesd2vepbtbcemxrac5scy`.
 
+## Publishing, as it is now
+
+Implemented, as the first part of phase 2:
+
+- `hk cap publish <anchor> <car>` takes an anchor, or a path of the soup
+  that's one or a mount point of one (see `hk fs` on [[Mount]]). It seals what the anchor is now under the sealed anchor's read
+  key, makes a head block, and sets the sealed anchor to it, signed by
+  `K`, in the repo. It writes the sealed tree, the head block, the set
+  and its sign to a CARv1 whose root is the set, and prints the
+  capability, `{read, view}`, which is the same each time.
+- `hk cap import <capability> <car>` reads a sealed anchor's latest head
+  from what the CAR holds, unseals its tree into the repo, and prints the
+  plaintext root.
+
+How it differs from the rest of this page, for now:
+
+- The read key is derived, `derive(secret, "read", anchor nonce)`, until
+  read keys change (see [[#Revoking]]).
+- `K` signs heads itself, from the one machine whose vault secret it's
+  derived from, rather than through writer keys it grants
+  `/anchor/write`. Writers come with writing (phase 4). Its sets follow
+  one another: each names as `prev` the set its last sign signed.
+  Publishing what's already the latest head sets nothing new.
+- A head block is `{plain, root}`, the plaintext root, which the root
+  block's key and nonce are derived with, and the sealed root, padded
+  and sealed under `derive(read key, "head", "")` alone: the 43-byte
+  header with a BAT `derive(head key, "bat", padded)`, then a 24-byte
+  nonce `derive(head key, "nonce", padded)[0..24]`, then
+  XChaCha20-Poly1305 under `derive(head key, "key", "")`, with the header
+  as associated data. So the same head seals the same way. `set`,
+  `sign` and `past` come with writing and revoking.
+- A reader judges the sealed view in itself, not by the catalog's views,
+  which a repo with no users would let anything count in: a set of the
+  sealed anchor, for no other view, whose sign by `K` verifies, and
+  which no other such set names as `prev`, is a head, and the latest of
+  them by `at`, then CID, is read.
+- It's all written to a CAR, the whole tree each time. Keeping a sealed
+  anchor current, pushing it to holders, and reading from them are the
+  rest of phase 2.
+
 ## Judging a sealed view
 
 Inside a mesh, a view is judged against the mesh's grants: its owner
@@ -350,11 +391,12 @@ In order, each of use alone:
 1. **Snapshots.** Done: the sealer, on the vault's block format, with
    sealed nodes, derived keys and padding, and a capability on a fixed
    root with no heads, exported to and read from a CAR. Test vectors.
-2. **Sealed anchors, read-only.** Owner and writer keys, heads, judging
-   a sealed view on its own, keeping a sealed anchor current, publishing
-   to a protected mesh with incremental manifests, holders answering
-   for heads and checking proofs at the door, and readers remembering
-   heads.
+2. **Sealed anchors, read-only.** Begun: owner keys, heads, judging by
+   `K`, published to and read from a CAR. To come: keeping a sealed
+   anchor current, publishing to a protected mesh with incremental
+   manifests, holders answering for heads and checking proofs at the
+   door, and readers remembering heads. Writer keys, and judging the
+   grants that give them write, come with writing.
 3. **Mount points.** Sealed `mounts`, making a folder an anchor to share
    it, and capabilities on mounted anchors.
 4. **Writing.** Write capabilities, counting their inner sets through

@@ -904,6 +904,14 @@ impl Catalog {
     /// The key's last sign is read and the next written in one
     /// transaction, so two writers can't both follow it: the second
     /// fails, rather than forking the chain.
+    /// Sign claims here with a key other than this device's, as a sealed
+    /// anchor's owner key signs its heads: in one sign following the
+    /// key's last here. Returns the sign's CID, if there was anything to
+    /// sign.
+    pub fn sign_with_key(&self, key: &crate::keys::Key, claims: impl IntoIterator<Item = Link>) -> Result<Option<Link>> {
+        self.sign_with(key, claims)
+    }
+
     fn sign_with(&self, key: &crate::keys::Key, claims: impl IntoIterator<Item = Link>) -> Result<Option<Link>> {
         let store = self.claims.as_ref().ok_or(Error::NoClaims)?;
         let mut fresh = Vec::new();

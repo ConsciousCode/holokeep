@@ -66,9 +66,9 @@ fn a_sealed_tree_unseals_whole_with_its_capability_and_says_nothing_without() {
     let repo = Scratch::new("cap-repo");
     let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
     let root = import(&mut catalog, t.path(), &importer());
-    let read = Capability::fresh_key().expect("key");
+    let read = fresh_key().expect("key");
     let sealed = seal(&catalog, &root, &read).expect("seal");
-    let cap = Capability::new(sealed.root.clone(), root.clone(), read);
+    let cap = Snapshot::new(sealed.root.clone(), root.clone(), read);
 
     let blocks = unseal(&held(&sealed), &cap).expect("unseal");
     let unsealed: HashSet<Vec<u8>> = blocks.iter().map(|block| AnyCid::V1(block.cid().clone()).to_bytes()).collect();
@@ -83,9 +83,9 @@ fn a_sealed_tree_unseals_whole_with_its_capability_and_says_nothing_without() {
     }
 
     // Another key opens nothing, nor does the right one for another root
-    let wrong = Capability::new(sealed.root.clone(), root, Capability::fresh_key().expect("key"));
+    let wrong = Snapshot::new(sealed.root.clone(), root, fresh_key().expect("key"));
     assert!(unseal(&held(&sealed), &wrong).is_err());
-    let other = Capability::new(sealed.root.clone(), sealed.blocks.first().map(|block| AnyCid::V1(block.cid().clone())).expect("one"), Zeroizing::new(**cap.read()));
+    let other = Snapshot::new(sealed.root.clone(), sealed.blocks.first().map(|block| AnyCid::V1(block.cid().clone())).expect("one"), Zeroizing::new(**cap.read()));
     assert!(unseal(&held(&sealed), &other).is_err());
 }
 
@@ -134,7 +134,7 @@ fn a_hamts_entries_keep_their_keys_as_its_shape_changes() {
     let read = Zeroizing::new([3u8; 32]);
     let root = import(&mut catalog, &p, &sharded);
     let before = seal(&catalog, &root, &read).expect("seal");
-    let cap = Capability::new(before.root.clone(), root.clone(), Zeroizing::new(*read));
+    let cap = Snapshot::new(before.root.clone(), root.clone(), Zeroizing::new(*read));
     assert_eq!(unseal(&held(&before), &cap).expect("unseal").len(), dag(&catalog, &root).len());
 
     for i in 12..40 {
@@ -195,11 +195,16 @@ fn a_sealed_node_has_one_form() {
 fn a_capability_reads_back_as_written() {
     let root: Link = "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku".parse().expect("cid");
     let plain: Link = "bafkqaaa".parse().expect("cid");
-    let cap = Capability::new(root.clone(), plain.clone(), Zeroizing::new([5u8; 32]));
+    let cap = Capability::Snapshot(Snapshot::new(root.clone(), plain.clone(), Zeroizing::new([5u8; 32])));
     let text = cap.encode();
     assert!(text.starts_with("hkcapb"), "{text}");
-    let back = Capability::decode(&format!("  {text}\n")).expect("decode");
+    let Capability::Snapshot(back) = Capability::decode(&format!("  {text}\n")).expect("decode") else {
+        panic!("not a snapshot");
+    };
     assert_eq!((&back.root, &back.plain, **back.read()), (&root, &plain, [5u8; 32]));
+    let view = crate::claim::view(&crate::claim::anchor().expect("anchor"), &crate::keys::Key::generate().expect("key").id()).expect("view");
+    let live = Capability::Live(Live::new(view.clone(), Zeroizing::new([6u8; 32]))).encode();
+    assert!(matches!(Capability::decode(&live).expect("decode"), Capability::Live(back) if back.view == view && **back.read() == [6u8; 32]));
     assert!(Capability::decode(&text.replacen("hkcap", "hkcop", 1)).is_err());
     assert!(Capability::decode("hkcapbaaaa").is_err());
 }
@@ -223,4 +228,70 @@ fn a_fixed_tree_seals_to_known_blocks() {
     assert_eq!(sealed.root.to_string(), "bafkreifhyh75rbh3ekfa64angthj2xfmlkd7yesd2vepbtbcemxrac5scy");
     // The file, then the directory naming it
     assert_eq!(cids, ["bafkreic2niwyy4jblogxyxnaov4iyrw625y7r6ai6zv3bhlsh2wovsrpxe", "bafkreifhyh75rbh3ekfa64angthj2xfmlkd7yesd2vepbtbcemxrac5scy"]);
+}
+
+//-----------------------//
+//-[ Sealed anchors ]----//
+//-----------------------//
+
+fn held_of(blocks: &[Block]) -> Held {
+    let mut held = Held::default();
+    for block in blocks {
+        held.insert(block.clone());
+    }
+    held
+}
+
+#[test]
+fn a_sealed_anchor_is_its_own_and_unrelated_to_what_its_of() {
+    let (secret, other) = ([1u8; 32], [2u8; 32]);
+    let (a, b) = (crate::claim::anchor().expect("anchor"), crate::claim::anchor().expect("anchor"));
+    let published = Published::of(&secret, &a).expect("published");
+    assert_eq!(published.view, Published::of(&secret, &a).expect("again").view, "derived, not kept");
+    assert_ne!(published.view, Published::of(&secret, &b).expect("b").view);
+    assert_ne!(published.view, Published::of(&other, &a).expect("another's").view);
+    let (sealed, owner) = crate::claim::viewed(&published.view).expect("a view");
+    assert_eq!((&sealed, &owner), (&published.anchor, &published.owner.id()));
+    assert_ne!(crate::claim::anchor_nonce(&sealed), crate::claim::anchor_nonce(&a));
+    assert!(Published::of(&secret, &published.view).is_err(), "a view's published by its owner");
+}
+
+#[test]
+fn a_sealed_anchor_reads_as_its_latest_head_whatever_else_is_held() {
+    let t = tree("cap-live");
+    let repo = Scratch::new("cap-live-repo");
+    let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
+    let anchor = crate::claim::anchor().expect("anchor");
+    let published = Published::of(&[3u8; 32], &anchor).expect("published");
+    let Capability::Live(live) = published.capability() else {
+        panic!("not live");
+    };
+
+    let first = import(&mut catalog, t.path(), &importer());
+    let one = publish(&mut catalog, &published, &first).expect("publish");
+    assert_eq!(read_live(&held_of(&one.blocks), &live).expect("read").0, first);
+    let again = publish(&mut catalog, &published, &first).expect("publish");
+    assert_eq!(again.set, one.set, "nothing new to say");
+
+    std::fs::write(t.path().join("docs/readme.md"), "read me again").expect("write");
+    let second = import(&mut catalog, t.path(), &importer());
+    let two = publish(&mut catalog, &published, &second).expect("publish");
+    assert_ne!(two.set, one.set);
+    // Both held, the later replaces the earlier
+    let both: Vec<Block> = one.blocks.iter().chain(&two.blocks).cloned().collect();
+    let (plain, blocks) = read_live(&held_of(&both), &live).expect("read");
+    assert_eq!(plain, second);
+    assert_eq!(blocks.len(), dag(&catalog, &second).len());
+
+    // A later head signed by anyone else counts for nothing
+    let forger = crate::keys::Key::generate().expect("key");
+    let head = seal_head(live.read(), &first, &seal(&catalog, &first, live.read()).expect("seal").root).expect("head");
+    let set = crate::claim::Claim::Set(crate::claim::Set::new([published.anchor.clone()], AnyCid::V1(head.cid().clone()), u64::MAX).expect("set").after(Some(Vec::new())));
+    let sign = crate::claim::Claim::Sign(crate::claim::Sign::new(&forger, [set.cid()], None, u64::MAX).expect("sign"));
+    let with_forgery: Vec<Block> = both.iter().cloned().chain([head, set.block(), sign.block()]).collect();
+    assert_eq!(read_live(&held_of(&with_forgery), &live).expect("read").0, second);
+
+    // Nor does the right capability with another read key read anything
+    let wrong = Live::new(live.view, Zeroizing::new([9u8; 32]));
+    assert!(read_live(&held_of(&both), &wrong).is_err());
 }

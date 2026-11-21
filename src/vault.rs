@@ -154,6 +154,37 @@ impl<'a> Sealer<'a> {
     }
 }
 
+/// Bytes sealed under a key alone.
+///
+/// For what's opened without knowing a plaintext CID to derive with, as
+/// a sealed anchor's heads are: the
+/// header, its BAT derived from the bytes, then a nonce derived from them
+/// too, so the same bytes seal the same way, then the ciphertext.
+pub fn seal_bytes(key: &[u8; 32], data: &[u8]) -> Result<Block> {
+    let mut header = Vec::with_capacity(HEADER);
+    header.extend_from_slice(&MAGIC);
+    header.extend_from_slice(&BATS);
+    header.extend_from_slice(derive(key, b"bat", data).as_ref());
+    let nonce = nonce_of(derive(key, b"nonce", data).as_ref())?;
+    let ciphertext = cipher(&derive(key, b"key", b""))?
+        .encrypt(&nonce.into(), Payload { msg: data, aad: &header })
+        .map_err(|_| invalid("encrypting failed"))?;
+    Ok(Block::hash(Cidv1Spec::new(RAW_CODEC, MultihashFunc::Sha2_256), [header, nonce.to_vec(), ciphertext].concat().into()))
+}
+
+/// The bytes `seal_bytes` sealed under a key.
+pub fn open_bytes(key: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>> {
+    let (Some(header), Some(nonce), Some(ciphertext)) = (sealed.get(..HEADER), sealed.get(HEADER..HEADER.saturating_add(24)), sealed.get(HEADER.saturating_add(24)..)) else {
+        return Err(invalid("not a sealed block"));
+    };
+    if !header.starts_with(&MAGIC) {
+        return Err(invalid("not a sealed block"));
+    }
+    cipher(&derive(key, b"key", b""))?
+        .decrypt(&nonce_of(nonce)?.into(), Payload { msg: ciphertext, aad: header })
+        .map_err(|_| invalid("a sealed block that doesn't open with this key"))
+}
+
 fn cipher(key: &[u8; 32]) -> Result<XChaCha20Poly1305> {
     XChaCha20Poly1305::new_from_slice(key).map_err(|e| invalid(e.to_string()))
 }
@@ -198,6 +229,12 @@ impl Vault {
         let key = crate::keys::account_key(repo, uid)?;
         let secret = load_or_make_secret(&repo.join("accounts").join(format!("{uid}.secret")))?;
         Ok(Self { uid, key, secret })
+    }
+
+    /// A secret of its own for something else, derived from the vault's,
+    /// so it's kept and recovered with it: as capabilities' is.
+    pub fn derive_secret(&self, label: &[u8]) -> Zeroizing<[u8; 32]> {
+        derive(&self.secret, label, b"")
     }
 
     /// The vault's account.

@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use zeroize::Zeroizing;
 
 use crate::block::{Block, IDENTITY};
-use crate::cid::{AnyCid, BaseCid as _, CidRef as _, DAG_PB_CODEC};
+use crate::cid::{AnyCid, BaseCid as _, CidRef, DAG_PB_CODEC};
 use crate::export::Fetch;
 use crate::model::{Ipld, Link};
 use crate::pb::PbNode;
@@ -43,6 +43,8 @@ pub enum Error {
     Vault(#[from] crate::vault::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Store(#[from] crate::store::Error),
     #[error("{0}")]
     Invalid(String),
 }
@@ -88,7 +90,26 @@ fn encode(block: &[u8], links: &[Link]) -> Result<Vec<u8>> {
     if !links.is_empty() {
         map.insert("links".to_owned(), Ipld::List(links.iter().cloned().map(Ipld::Link).collect()));
     }
-    let mut bytes = crate::dagcbor::to_vec(&Ipld::Map(map)).map_err(|e| invalid(format!("encoding a sealed node: {e}")))?;
+    pad(map)
+}
+
+/// A padded dag-cbor map, read: one canonical map, then only zeros, to
+/// the size class its length makes it.
+fn unpad(bytes: &[u8], what: &str) -> Result<BTreeMap<String, Ipld>> {
+    let (value, rest): (Ipld, &[u8]) = crate::dagcbor::from_slice_first(bytes).map_err(|e| invalid(format!("a {what} that isn't one: {e}")))?;
+    let len = bytes.len().saturating_sub(rest.len());
+    if rest.iter().any(|&byte| byte != 0) || bytes.len() != padded(len) {
+        return Err(invalid(format!("a {what} padded wrongly")));
+    }
+    match value {
+        Ipld::Map(map) => Ok(map),
+        _ => Err(invalid(format!("a {what} that isn't a map"))),
+    }
+}
+
+/// A dag-cbor map, padded to its size class.
+fn pad(map: BTreeMap<String, Ipld>) -> Result<Vec<u8>> {
+    let mut bytes = crate::dagcbor::to_vec(&Ipld::Map(map)).map_err(|e| invalid(format!("encoding: {e}")))?;
     bytes.resize(padded(bytes.len()), 0);
     Ok(bytes)
 }
@@ -104,14 +125,7 @@ struct Opened {
 /// A sealed node, read: one canonical dag-cbor map, then only zeros, to
 /// the size class its length makes it.
 fn decode(bytes: &[u8]) -> Result<Opened> {
-    let (value, rest): (Ipld, &[u8]) = crate::dagcbor::from_slice_first(bytes).map_err(|e| invalid(format!("a sealed node that isn't one: {e}")))?;
-    let len = bytes.len().saturating_sub(rest.len());
-    if rest.iter().any(|&byte| byte != 0) || bytes.len() != padded(len) {
-        return Err(invalid("a sealed node padded wrongly"));
-    }
-    let Ipld::Map(mut map) = value else {
-        return Err(invalid("a sealed node that isn't a map"));
-    };
+    let mut map = unpad(bytes, "sealed node")?;
     let Some(Ipld::Bytes(block)) = map.remove("block") else {
         return Err(invalid("a sealed node with no block"));
     };
@@ -233,7 +247,7 @@ impl<F: Fetch> Sealing<'_, F> {
 /// Unseal the DAG a capability names, fetching sealed blocks from
 /// `src`: every plaintext block, root first, each checked against its
 /// CID. Identity CIDs are left out, being in their parents.
-pub fn unseal(src: &impl Fetch, cap: &Capability) -> Result<Vec<Block>> {
+pub fn unseal(src: &impl Fetch, cap: &Snapshot) -> Result<Vec<Block>> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut stack = vec![(cap.plain.clone(), cap.root.clone(), root_key(&cap.read), None::<Key>)];
@@ -285,40 +299,209 @@ impl Fetch for Held {
     }
 }
 
-/// What lets whoever holds it read a sealed DAG: its sealed root, its
-/// plaintext root, which each block's key and nonce are derived with, and
-/// the read key.
-pub struct Capability {
+/// A plaintext anchor, as it's published sealed.
+///
+/// It's a sealed anchor of its own, whose owner key `K` alone signs what
+/// counts in its view, and the read key its heads and tree are sealed
+/// with. Each is derived from the
+/// user's capabilities' secret and the anchor's nonce, so nothing need be
+/// kept, and no one without the secret can tell whose a sealed anchor is,
+/// or which plaintext anchor.
+pub struct Published {
+    /// The sealed anchor, and its owner's view of it, which is what
+    /// counts.
+    pub anchor: Link,
+    pub view: Link,
+    owner: crate::keys::Key,
+    read: Key,
+}
+
+impl Published {
+    pub fn of(secret: &[u8; 32], anchor: &Link) -> Result<Self> {
+        let nonce = crate::claim::anchor_nonce(anchor).ok_or_else(|| invalid(format!("{anchor} isn't an anchor: only an anchor's owner publishes it")))?;
+        let owner = crate::keys::Key::from_seed(&derive(secret, b"owner", &nonce));
+        let sealed: [u8; 16] = derive(secret, b"nonce", &nonce).first_chunk::<16>().copied().unwrap_or_default();
+        let sealed = crate::claim::anchor_of(sealed)?;
+        let view = crate::claim::view(&sealed, &owner.id()).ok_or_else(|| invalid("a sealed anchor with no view"))?;
+        Ok(Self { anchor: sealed, view, owner, read: derive(secret, b"read", &nonce) })
+    }
+
+    /// What reads it.
+    pub fn capability(&self) -> Capability {
+        Capability::Live(Live { view: self.view.clone(), read: Zeroizing::new(*self.read) })
+    }
+}
+
+/// The key a sealed anchor's heads are sealed with, from its read key.
+fn head_key(read: &[u8; 32]) -> Key {
+    derive(read, b"head", b"")
+}
+
+/// A head block: what the sealed anchor's value is, its plaintext root,
+/// which its root block's key and nonce are derived with, and its sealed
+/// root, padded and sealed under the head key.
+fn seal_head(read: &[u8; 32], plain: &Link, root: &Link) -> Result<Block> {
+    let body = pad(BTreeMap::from([("plain".to_owned(), Ipld::Link(plain.clone())), ("root".to_owned(), Ipld::Link(root.clone()))]))?;
+    Ok(crate::vault::seal_bytes(&head_key(read), &body)?)
+}
+
+/// What a head block says: the plaintext root and the sealed root.
+fn open_head(read: &[u8; 32], sealed: &[u8]) -> Result<(Link, Link)> {
+    let mut map = unpad(&crate::vault::open_bytes(&head_key(read), sealed)?, "head")?;
+    match (map.remove("plain"), map.remove("root"), map.is_empty()) {
+        (Some(Ipld::Link(plain)), Some(Ipld::Link(root)), true) => Ok((plain, root)),
+        _ => Err(invalid("a head that isn't one")),
+    }
+}
+
+/// What publishing made: the set now the sealed anchor's latest, and every
+/// block a reader needs, sealed blocks, the head, the set and its sign.
+pub struct Publication {
+    pub set: Link,
+    pub blocks: Vec<Block>,
+}
+
+/// Publish what an anchor is now, `value`, as its sealed anchor's head.
+///
+/// Its tree's sealed, and a head naming it set in the sealed view after
+/// the last head, signed by its owner key, in the catalog. Nothing new is
+/// set if the last head's already of it.
+pub fn publish(catalog: &mut crate::store::Catalog, published: &Published, value: &Link) -> Result<Publication> {
+    let sealed = seal(catalog, value, &published.read)?;
+    let head = seal_head(&published.read, value, &sealed.root)?;
+    let head_cid = AnyCid::V1(head.cid().clone());
+    let claim_block = |catalog: &crate::store::Catalog, cid: &Link| -> Result<Block> {
+        catalog.get_block(cid)?.ok_or_else(|| invalid(format!("{cid} isn't here")))
+    };
+    // The owner key signs heads alone, one after another: its last sign
+    // is of the last head
+    let last_sign = catalog.claims().map(|claims| claims.head(&published.owner.id())).transpose()?.flatten();
+    let last = match &last_sign {
+        Some(sign) => match crate::claim::Claim::parse(claim_block(catalog, sign)?.data()) {
+            Some(crate::claim::Claim::Sign(sign)) => sign.signs().to_vec(),
+            _ => return Err(invalid("the owner key's last sign isn't one")),
+        },
+        None => Vec::new(),
+    };
+    for set in &last {
+        if let Some(crate::claim::Claim::Set(was)) = crate::claim::Claim::parse(claim_block(catalog, set)?.data())
+            && *was.value() == head_cid
+        {
+            let mut blocks = sealed.blocks;
+            blocks.extend([head, claim_block(catalog, set)?]);
+            blocks.extend(last_sign.iter().map(|sign| claim_block(catalog, sign)).collect::<Result<Vec<_>>>()?);
+            return Ok(Publication { set: set.clone(), blocks });
+        }
+    }
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    let set = crate::claim::Set::new([published.anchor.clone()], head_cid, at).ok_or_else(|| invalid("a set of nothing"))?.after(Some(last));
+    let set = crate::claim::Claim::Set(set);
+    catalog.put_block(&set.block(), crate::cid::CidVersion::V1)?;
+    let sign = catalog.sign_with_key(&published.owner, [set.cid()])?.ok_or_else(|| invalid("the head's signed already"))?;
+    let mut blocks = sealed.blocks;
+    blocks.extend([head, set.block(), claim_block(catalog, &sign)?]);
+    Ok(Publication { set: set.cid(), blocks })
+}
+
+/// Read a sealed anchor from what's held, as its latest head.
+///
+/// Of the sets of its sealed anchor signed by the owner key its view
+/// names, the latest of those no other replaces is unsealed. Returns its
+/// plaintext root, and every block of it, root first.
+pub fn read_live(src: &Held, live: &Live) -> Result<(Link, Vec<Block>)> {
+    let (anchor, owner) = crate::claim::viewed(&live.view).ok_or_else(|| invalid("not a sealed view"))?;
+    let mut sets = BTreeMap::new();
+    let mut signed = std::collections::HashSet::new();
+    for data in src.0.values() {
+        match crate::claim::Claim::parse(data) {
+            Some(crate::claim::Claim::Set(set)) if set.target().contains(&anchor) && set.owner().is_none() => {
+                let cid = crate::claim::Claim::Set(set.clone()).cid();
+                sets.insert(cid.to_bytes(), (cid, set));
+            },
+            Some(crate::claim::Claim::Sign(sign)) if *sign.by() == owner && sign.verify() => {
+                signed.extend(sign.signs().iter().map(CidRef::to_bytes));
+            },
+            _ => {},
+        }
+    }
+    sets.retain(|cid, _| signed.contains(cid));
+    let replaced: std::collections::HashSet<Vec<u8>> = sets.values().flat_map(|(_, set)| set.prev().unwrap_or_default().iter().map(CidRef::to_bytes)).collect();
+    let (_, head) = sets
+        .into_iter()
+        .filter(|(cid, _)| !replaced.contains(cid))
+        .max_by(|(a, (_, x)), (b, (_, y))| x.at().cmp(&y.at()).then_with(|| a.cmp(b)))
+        .map(|(_, head)| head)
+        .ok_or_else(|| invalid("no head of the sealed anchor its owner signed"))?;
+    let (plain, root) = open_head(&live.read, &src.fetch(head.value())?)?;
+    let blocks = unseal(src, &Snapshot::new(root, plain.clone(), Zeroizing::new(*live.read)))?;
+    Ok((plain, blocks))
+}
+
+/// A fresh read key, random.
+pub fn fresh_key() -> Result<Key> {
+    let mut read = Zeroizing::new([0u8; 32]);
+    getrandom::getrandom(read.as_mut()).map_err(std::io::Error::other)?;
+    Ok(read)
+}
+
+/// What lets whoever holds it read a sealed DAG, fixed: its sealed root,
+/// its plaintext root, which each block's key and nonce are derived with,
+/// and the read key.
+pub struct Snapshot {
     pub root: Link,
     pub plain: Link,
     read: Key,
 }
 
-impl Capability {
+impl Snapshot {
     pub const fn new(root: Link, plain: Link, read: Key) -> Self {
         Self { root, plain, read }
-    }
-
-    /// A fresh read key, random.
-    pub fn fresh_key() -> Result<Key> {
-        let mut read = Zeroizing::new([0u8; 32]);
-        getrandom::getrandom(read.as_mut()).map_err(std::io::Error::other)?;
-        Ok(read)
     }
 
     pub const fn read(&self) -> &Key {
         &self.read
     }
+}
 
-    /// As text: `hkcap`, then dag-cbor `{plain, read, root}` in multibase
-    /// base32.
+/// What lets whoever holds it read a sealed anchor, as it is whenever
+/// it's read: its sealed view, which names its owner key, and its read key.
+pub struct Live {
+    pub view: Link,
+    read: Key,
+}
+
+impl Live {
+    pub const fn new(view: Link, read: Key) -> Self {
+        Self { view, read }
+    }
+
+    pub const fn read(&self) -> &Key {
+        &self.read
+    }
+}
+
+/// A capability, as it's written: `hkcap`, then dag-cbor in multibase
+/// base32, of `{plain, read, root}` for a snapshot or `{read, view}` for
+/// a sealed anchor.
+pub enum Capability {
+    Snapshot(Snapshot),
+    Live(Live),
+}
+
+impl Capability {
     pub fn encode(&self) -> String {
-        let map = Ipld::Map(BTreeMap::from([
-            ("plain".to_owned(), Ipld::Link(self.plain.clone())),
-            ("read".to_owned(), Ipld::Bytes(self.read.to_vec())),
-            ("root".to_owned(), Ipld::Link(self.root.clone())),
-        ]));
-        let bytes = Zeroizing::new(crate::dagcbor::to_vec(&map).unwrap_or_default());
+        let map = match self {
+            Self::Snapshot(snapshot) => BTreeMap::from([
+                ("plain".to_owned(), Ipld::Link(snapshot.plain.clone())),
+                ("read".to_owned(), Ipld::Bytes(snapshot.read.to_vec())),
+                ("root".to_owned(), Ipld::Link(snapshot.root.clone())),
+            ]),
+            Self::Live(live) => BTreeMap::from([
+                ("read".to_owned(), Ipld::Bytes(live.read.to_vec())),
+                ("view".to_owned(), Ipld::Link(live.view.clone())),
+            ]),
+        };
+        let bytes = Zeroizing::new(crate::dagcbor::to_vec(&Ipld::Map(map)).unwrap_or_default());
         format!("{PREFIX}{}", multibase::encode(multibase::Base::Base32Lower, bytes.as_slice()))
     }
 
@@ -330,14 +513,19 @@ impl Capability {
         let Ok(Ipld::Map(mut map)) = crate::dagcbor::from_slice(&bytes) else {
             return Err(not());
         };
-        let (Some(Ipld::Link(root)), Some(Ipld::Link(plain)), Some(Ipld::Bytes(read))) = (map.remove("root"), map.remove("plain"), map.remove("read")) else {
-            return Err(invalid("a capability missing its root, plaintext root or read key"));
+        let Some(Ipld::Bytes(read)) = map.remove("read") else {
+            return Err(invalid("a capability with no read key"));
         };
         let read = Zeroizing::new(<[u8; 32]>::try_from(read.as_slice()).map_err(|_| invalid("a capability's read key isn't 32 bytes"))?);
+        let capability = match (map.remove("view"), map.remove("root"), map.remove("plain")) {
+            (Some(Ipld::Link(view)), None, None) if crate::claim::viewed(&view).is_some() => Self::Live(Live { view, read }),
+            (None, Some(Ipld::Link(root)), Some(Ipld::Link(plain))) => Self::Snapshot(Snapshot { root, plain, read }),
+            _ => return Err(invalid("a capability naming neither a sealed view nor a sealed root and its plaintext")),
+        };
         if let Some(other) = map.keys().next() {
             return Err(invalid(format!("a capability with `{other}` in it, which this doesn't read yet")));
         }
-        Ok(Self { root, plain, read })
+        Ok(capability)
     }
 }
 

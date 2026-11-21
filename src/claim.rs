@@ -717,7 +717,16 @@ pub fn root_anchor(key: &Link) -> std::io::Result<Link> {
     anchor_of(hash.first_chunk::<16>().copied().unwrap_or_default())
 }
 
-fn anchor_of(nonce: [u8; 16]) -> std::io::Result<Link> {
+/// An anchor's nonce, if it's an anchor and not a view of one.
+pub fn anchor_nonce(anchor: &Link) -> Option<[u8; 16]> {
+    match parse_anchor(anchor)? {
+        (nonce, None) => Some(nonce),
+        _ => None,
+    }
+}
+
+/// The anchor with this nonce.
+pub fn anchor_of(nonce: [u8; 16]) -> std::io::Result<Link> {
     let value = Ipld::Map(BTreeMap::from([("anchor".to_owned(), Ipld::Bytes(nonce.to_vec()))]));
     let data = dagcbor::to_vec(&value).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
     Block::identity(DAG_CBOR_CODEC, data.into())
