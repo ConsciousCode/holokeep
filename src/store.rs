@@ -1994,6 +1994,12 @@ impl Catalog {
         Ok((found, latest))
     }
 
+    /// The catalog's latest generation, of blocks or dissolved claims:
+    /// changed whenever anything's written, by any process.
+    pub fn generation(&self) -> Result<i64> {
+        volume::generation(&self.db)
+    }
+
     /// Blocks here whose multihashes were first known after `after`, by
     /// their ids, which only grow: what's arrived, mostly, since a block is
     /// usually known first when it's put. Up to `limit` of them, and the

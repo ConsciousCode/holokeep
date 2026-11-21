@@ -367,6 +367,9 @@ pub struct Node {
     /// Whether this machine's clock was last found far from the mesh's.
     skewed: bool,
     redial: Redial,
+    /// The catalog's generation when members were last noticed of what
+    /// arrived.
+    noticed: i64,
 }
 
 impl Node {
@@ -463,6 +466,7 @@ impl Node {
             clocking: HashMap::new(),
             skewed: false,
             redial: Redial::default(),
+            noticed: 0,
         };
         node.reload()?;
         Ok(node)
@@ -1105,6 +1109,21 @@ impl Node {
             } else if !telling.contains(&peer) {
                 self.tell(peer);
             }
+        }
+        Ok(())
+    }
+
+    /// Notice each connected member of what's arrived, if anything's been
+    /// written since this last looked, by this process or another, such
+    /// as a mount committing: soon, rather than at the next announce.
+    pub fn announce_written(&mut self) -> Result<()> {
+        let generation = self.catalog.generation()?;
+        if generation == self.noticed {
+            return Ok(());
+        }
+        self.noticed = generation;
+        for peer in self.connected() {
+            self.announce_to(peer)?;
         }
         Ok(())
     }

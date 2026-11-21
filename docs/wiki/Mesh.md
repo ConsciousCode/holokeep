@@ -382,7 +382,10 @@ their DAGs, which is how `hk mount` reads only what's read.
 ### Backrefs (`notices`)
 
 Structure (UnixFS nodes, IPLD, claims, dissolved claims included) is
-noticed to members with the keys it links to, in batches of 256. A
+noticed to members with the keys it links to, in batches of 256: every
+10 s, and within 2 s of anything being written to the catalog, by the
+daemon or another process such as the mount, as its latest generation
+changing says (see [[Storage]]). A
 member wants what it lacks that links to something it holds, or to
 something else wanted from the same notice. Rules that keep this from
 spreading everything everywhere:

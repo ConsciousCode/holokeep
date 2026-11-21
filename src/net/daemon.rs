@@ -50,7 +50,8 @@ pub struct Listen {
 }
 
 /// How often to dial members which aren't connected and are due to be,
-/// each waiting longer after each failed dial (see `Node::dial_members`).
+/// each waiting longer after each failed dial (see `Node::dial_members`),
+/// and to notice members of what's been written since, if anything has.
 const REDIAL: Duration = Duration::from_secs(2);
 
 /// How often to notice members of structure which arrived, such as from
@@ -601,7 +602,10 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, (low, high): (u64
                     joining = !join_now(&mut node, &mut alone, place, &listen, (low, high))?;
                 }
             },
-            _ = redial.tick() => unless_busy(node.dial_members(), "dialing members")?,
+            _ = redial.tick() => {
+                unless_busy(node.dial_members(), "dialing members")?;
+                unless_busy(node.announce_written(), "noticing members of what's written")?;
+            },
             _ = announce.tick() => {
                 // Anything that was busy before, tried again
                 if joining {

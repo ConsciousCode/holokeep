@@ -30,7 +30,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-say() { printf '\033[1m%s\033[0m\n' "$*" >&2; }
+say() { printf '\033[1m%s\033[0m (%ds)\n' "$*" "$SECONDS" >&2; }
 
 # Run a command on a node, or a shell line
 on() { local node=$1; shift; podman exec "$run-$node" "$@"; }
