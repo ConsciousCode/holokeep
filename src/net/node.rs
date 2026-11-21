@@ -1990,6 +1990,11 @@ impl Node {
     /// is sealed, so one that hasn't costs a look. What isn't all here yet
     /// waits. Returns how many were published.
     pub fn keep_published(&mut self, repo: &std::path::Path) -> Result<usize> {
+        // A protected mesh's node acts for a vault, which publishes nothing
+        // of its own: what it publishes is its account's, from theirs
+        if crate::vault::is_vault(self.catalog.uid()) {
+            return Ok(0);
+        }
         let busy = |e: crate::cap::Error| match e {
             crate::cap::Error::Store(e) => Error::Store(e),
             crate::cap::Error::Io(e) => Error::Io(e),

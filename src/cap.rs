@@ -299,31 +299,59 @@ impl<F: Fetch> Sealing<'_, F> {
     }
 }
 
-/// Unseal the DAG a capability names, fetching sealed blocks from
-/// `src`: every plaintext block, root first, each checked against its
-/// CID. Identity CIDs are left out, being in their parents.
-pub fn unseal(src: &impl Fetch, cap: &Snapshot) -> Result<Vec<Block>> {
+/// Where sealed blocks are read from, each asked for with its block
+/// access token.
+///
+/// A holder outside the reader's meshes wants proof of it (see
+/// `crate::net::door`). Anything blocks can be fetched from is one,
+/// heeding no tokens.
+pub trait Source {
+    /// Sealed blocks, by CID, each with its token: their bytes, in order.
+    fn sealed(&self, wanted: &[(Link, [u8; 32])]) -> Result<Vec<Vec<u8>>>;
+}
+
+impl<F: Fetch> Source for F {
+    fn sealed(&self, wanted: &[(Link, [u8; 32])]) -> Result<Vec<Vec<u8>>> {
+        self.prefetch(&wanted.iter().map(|(cid, _)| cid.clone()).collect::<Vec<_>>());
+        wanted.iter().map(|(cid, _)| Ok(self.fetch(cid)?)).collect()
+    }
+}
+
+/// A sealed node's block access token, from its key and plaintext CID.
+fn node_bat(key: &[u8; 32], plain: &Link) -> [u8; 32] {
+    *derive(key, b"bat", &plain.to_bytes())
+}
+
+/// Unseal the DAG a capability names, fetching sealed blocks from `src`.
+///
+/// Returns every plaintext block, root first, each checked against its
+/// CID. Identity CIDs are left out, being in their parents. Each level's
+/// blocks are asked for at once.
+pub fn unseal(src: &impl Source, cap: &Snapshot) -> Result<Vec<Block>> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut stack = vec![(cap.plain.clone(), cap.root.clone(), root_key(&cap.read), None::<Key>)];
-    while let Some((plain, sealed, key, within)) = stack.pop() {
-        if plain.hashcode() == IDENTITY || !seen.insert((plain.to_bytes(), *key)) {
-            continue;
+    let mut level = vec![(cap.plain.clone(), cap.root.clone(), root_key(&cap.read), None::<Key>)];
+    while !level.is_empty() {
+        level.retain(|(plain, _, key, _)| plain.hashcode() != IDENTITY && seen.insert((plain.to_bytes(), **key)));
+        let wanted: Vec<(Link, [u8; 32])> = level.iter().map(|(plain, sealed, key, _)| (sealed.clone(), node_bat(key, plain))).collect();
+        let fetched = src.sealed(&wanted)?;
+        let mut next = Vec::new();
+        for ((plain, _, key, within), bytes) in level.into_iter().zip(fetched) {
+            let opened = decode(&Sealer::new(&key).open(&plain, &bytes)?)?;
+            let block = Block::verify(plain.clone().into(), opened.block.into_boxed_slice()).map_err(|_| invalid(format!("{plain} unsealed to other bytes")))?;
+            let children = children(&plain, block.data(), &key, within.as_ref())?;
+            if children.len() != opened.links.len() {
+                return Err(invalid(format!("{plain}'s sealed node has {} links for its {}", opened.links.len(), children.len())));
+            }
+            for (child, sealed) in children.into_iter().zip(opened.links) {
+                // A key that doesn't derive, kept from an earlier read key
+                let kept = child.entry.as_deref().and_then(|entry| std::str::from_utf8(entry).ok()).and_then(|entry| opened.keys.get(entry));
+                let key = kept.map_or(child.key, |kept| Zeroizing::new(**kept));
+                next.push((child.cid, sealed, key, child.within));
+            }
+            out.push(block);
         }
-        let bytes = src.fetch(&sealed)?;
-        let opened = decode(&Sealer::new(&key).open(&plain, &bytes)?)?;
-        let block = Block::verify(plain.clone().into(), opened.block.into_boxed_slice()).map_err(|_| invalid(format!("{plain} unsealed to other bytes")))?;
-        let children = children(&plain, block.data(), &key, within.as_ref())?;
-        if children.len() != opened.links.len() {
-            return Err(invalid(format!("{plain}'s sealed node has {} links for its {}", opened.links.len(), children.len())));
-        }
-        for (child, sealed) in children.into_iter().zip(opened.links).rev() {
-            // A key that doesn't derive, kept from an earlier read key
-            let kept = child.entry.as_deref().and_then(|entry| std::str::from_utf8(entry).ok()).and_then(|entry| opened.keys.get(entry));
-            let key = kept.map_or(child.key, |kept| Zeroizing::new(**kept));
-            stack.push((child.cid, sealed, key, child.within));
-        }
-        out.push(block);
+        level = next;
     }
     Ok(out)
 }
@@ -346,6 +374,40 @@ impl Held {
     pub fn insert(&mut self, block: Block) {
         self.0.insert(AnyCid::V1(block.cid().clone()).to_bytes(), block.into_data().into_vec());
     }
+
+    /// Every block held, as claims among them might be.
+    pub fn all(&self) -> impl Iterator<Item = &[u8]> {
+        self.0.values().map(Vec::as_slice)
+    }
+}
+
+/// The claims a catalog holds of a sealed anchor, its view's anchor: its
+/// sets, and what signs them, as blocks, to judge which count.
+pub fn claims_about(catalog: &crate::store::Catalog, view: &Link) -> Result<Vec<(Link, Vec<u8>)>> {
+    use crate::store::RefIndex as _;
+    let (anchor, _) = crate::claim::viewed(view).ok_or_else(|| invalid("not a sealed view"))?;
+    let mut out = Vec::new();
+    for key in catalog.backrefs(anchor.multihash())? {
+        let Some(set) = catalog.cid_of(key.as_ref())? else {
+            continue;
+        };
+        let Some(block) = catalog.get_block(&set)? else {
+            continue;
+        };
+        if !matches!(crate::claim::Claim::parse(block.data()), Some(crate::claim::Claim::Set(_))) {
+            continue;
+        }
+        for sign in catalog.backrefs(set.multihash())? {
+            if let Some(cid) = catalog.cid_of(sign.as_ref())?
+                && let Some(sign) = catalog.get_block(&cid)?
+                && matches!(crate::claim::Claim::parse(sign.data()), Some(crate::claim::Claim::Sign(_)))
+            {
+                out.push((cid, sign.into_data().into_vec()));
+            }
+        }
+        out.push((set, block.into_data().into_vec()));
+    }
+    Ok(out)
 }
 
 impl Fetch for Held {
@@ -387,13 +449,20 @@ impl Published {
 
     /// What reads it.
     pub fn capability(&self) -> Capability {
-        Capability::Live(Live { view: self.view.clone(), read: Zeroizing::new(*self.read) })
+        Capability::Live(Live::new(self.view.clone(), Zeroizing::new(*self.read)))
     }
 }
 
 /// The key a sealed anchor's heads are sealed with, from its read key.
 fn head_key(read: &[u8; 32]) -> Key {
     derive(read, b"head", b"")
+}
+
+/// The block access token of every head of a sealed anchor, from its read
+/// key: what a reader proves it knows to be told of its heads, or given
+/// one.
+pub fn head_bat(read: &[u8; 32]) -> [u8; 32] {
+    *derive(&head_key(read), b"bat", b"")
 }
 
 /// A head block: what the sealed anchor's value is, its plaintext root,
@@ -665,11 +734,11 @@ pub fn published_blocks(catalog: &crate::store::Catalog, manifest: &Link) -> Res
 /// Of the sets of its sealed anchor signed by the owner key its view
 /// names, the latest of those no other replaces is unsealed. Returns its
 /// plaintext root, and every block of it, root first.
-pub fn read_live(src: &Held, live: &Live) -> Result<(Link, Vec<Block>)> {
+pub fn read_live<'a>(src: &impl Source, claims: impl IntoIterator<Item = &'a [u8]>, live: &Live) -> Result<(Link, Vec<Block>)> {
     let (anchor, owner) = crate::claim::viewed(&live.view).ok_or_else(|| invalid("not a sealed view"))?;
     let mut sets = BTreeMap::new();
     let mut signed = std::collections::HashSet::new();
-    for data in src.0.values() {
+    for data in claims {
         match crate::claim::Claim::parse(data) {
             Some(crate::claim::Claim::Set(set)) if set.target().contains(&anchor) && set.owner().is_none() => {
                 let cid = crate::claim::Claim::Set(set.clone()).cid();
@@ -689,7 +758,8 @@ pub fn read_live(src: &Held, live: &Live) -> Result<(Link, Vec<Block>)> {
         .max_by(|(a, (_, x)), (b, (_, y))| x.at().cmp(&y.at()).then_with(|| a.cmp(b)))
         .map(|(_, head)| head)
         .ok_or_else(|| invalid("no head of the sealed anchor its owner signed"))?;
-    let (plain, root) = open_head(&live.read, &src.fetch(head.value())?)?;
+    let fetched = src.sealed(&[(head.value().clone(), head_bat(&live.read))])?;
+    let (plain, root) = open_head(&live.read, fetched.first().ok_or_else(|| invalid("no head"))?)?;
     let blocks = unseal(src, &Snapshot::new(root, plain.clone(), Zeroizing::new(*live.read)))?;
     Ok((plain, blocks))
 }
@@ -725,11 +795,21 @@ impl Snapshot {
 pub struct Live {
     pub view: Link,
     read: Key,
+    /// Where some holders' doors are, as multiaddrs ending in their peer
+    /// IDs (see `crate::net::door`), if it says.
+    pub at: Vec<String>,
 }
 
 impl Live {
     pub const fn new(view: Link, read: Key) -> Self {
-        Self { view, read }
+        Self { view, read, at: Vec::new() }
+    }
+
+    /// The same, saying where holders' doors are.
+    #[must_use]
+    pub fn at(mut self, at: Vec<String>) -> Self {
+        self.at = at;
+        self
     }
 
     pub const fn read(&self) -> &Key {
@@ -753,10 +833,16 @@ impl Capability {
                 ("read".to_owned(), Ipld::Bytes(snapshot.read.to_vec())),
                 ("root".to_owned(), Ipld::Link(snapshot.root.clone())),
             ]),
-            Self::Live(live) => BTreeMap::from([
-                ("read".to_owned(), Ipld::Bytes(live.read.to_vec())),
-                ("view".to_owned(), Ipld::Link(live.view.clone())),
-            ]),
+            Self::Live(live) => {
+                let mut map = BTreeMap::from([
+                    ("read".to_owned(), Ipld::Bytes(live.read.to_vec())),
+                    ("view".to_owned(), Ipld::Link(live.view.clone())),
+                ]);
+                if !live.at.is_empty() {
+                    map.insert("at".to_owned(), Ipld::List(live.at.iter().cloned().map(Ipld::String).collect()));
+                }
+                map
+            },
         };
         let bytes = Zeroizing::new(crate::dagcbor::to_vec(&Ipld::Map(map)).unwrap_or_default());
         format!("{PREFIX}{}", multibase::encode(multibase::Base::Base32Lower, bytes.as_slice()))
@@ -774,8 +860,16 @@ impl Capability {
             return Err(invalid("a capability with no read key"));
         };
         let read = Zeroizing::new(<[u8; 32]>::try_from(read.as_slice()).map_err(|_| invalid("a capability's read key isn't 32 bytes"))?);
+        let at = match map.remove("at") {
+            None => Vec::new(),
+            Some(Ipld::List(at)) => at.into_iter().map(|addr| match addr {
+                Ipld::String(addr) => Ok(addr),
+                _ => Err(invalid("a capability's door that isn't a multiaddr")),
+            }).collect::<Result<_>>()?,
+            Some(_) => return Err(invalid("a capability's doors that aren't a list")),
+        };
         let capability = match (map.remove("view"), map.remove("root"), map.remove("plain")) {
-            (Some(Ipld::Link(view)), None, None) if crate::claim::viewed(&view).is_some() => Self::Live(Live { view, read }),
+            (Some(Ipld::Link(view)), None, None) if crate::claim::viewed(&view).is_some() => Self::Live(Live { view, read, at }),
             (None, Some(Ipld::Link(root)), Some(Ipld::Link(plain))) => Self::Snapshot(Snapshot { root, plain, read }),
             _ => return Err(invalid("a capability naming neither a sealed view nor a sealed root and its plaintext")),
         };

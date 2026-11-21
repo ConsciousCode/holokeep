@@ -69,6 +69,11 @@ pub const fn vault_of(uid: u32) -> u32 {
     0x8000_0000 | (uid & 0x3FFF_FFFF)
 }
 
+/// Whether an account's a vault, as a protected mesh's node acts for.
+pub const fn is_vault(uid: u32) -> bool {
+    uid & 0xC000_0000 == 0x8000_0000
+}
+
 /// One of the host's accounts' vault: its account, key and secret.
 pub struct Vault {
     uid: u32,
@@ -158,13 +163,14 @@ impl<'a> Sealer<'a> {
 ///
 /// For what's opened without knowing a plaintext CID to derive with, as
 /// a sealed anchor's heads are: the
-/// header, its BAT derived from the bytes, then a nonce derived from them
-/// too, so the same bytes seal the same way, then the ciphertext.
+/// header, its BAT derived from the key alone, so whoever has the key can
+/// prove they do before they have the bytes, then a nonce derived from
+/// the bytes, so the same bytes seal the same way, then the ciphertext.
 pub fn seal_bytes(key: &[u8; 32], data: &[u8]) -> Result<Block> {
     let mut header = Vec::with_capacity(HEADER);
     header.extend_from_slice(&MAGIC);
     header.extend_from_slice(&BATS);
-    header.extend_from_slice(derive(key, b"bat", data).as_ref());
+    header.extend_from_slice(derive(key, b"bat", b"").as_ref());
     let nonce = nonce_of(derive(key, b"nonce", data).as_ref())?;
     let ciphertext = cipher(&derive(key, b"key", b""))?
         .encrypt(&nonce.into(), Payload { msg: data, aad: &header })

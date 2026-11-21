@@ -18,3 +18,4 @@ pub mod structure;
 pub mod thin;
 pub mod trim;
 pub mod daemon;
+pub mod door;

@@ -263,6 +263,13 @@ enum NodeCommand {
         /// the clients' keys get in
         #[arg(long, num_args = 0..=1, default_missing_value = holokeep::net::daemon::LISTEN_CLIENTS)]
         clients: Option<String>,
+        /// Open a door too, here [default: port 4013]: where anyone, in no
+        /// mesh, may read the sealed anchors this repo holds by capability
+        /// (`hk cap import --from`), proving for each block they know its
+        /// keys, and nothing else. It's a swarm of its own, apart from the
+        /// mesh's, which no one let in there reaches
+        #[arg(long, num_args = 0..=1, default_missing_value = holokeep::net::daemon::LISTEN_DOOR)]
+        door: Option<String>,
     },
     /// Let go now of every copy here the mesh can spare, short of space or
     /// not
@@ -483,6 +490,11 @@ enum CapCommand {
         /// for someone to read from nothing
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Say in the capability where a holder's door is, as a multiaddr
+        /// ending in its peer ID (`hk node run --door` there), for readers
+        /// to go to; as many as there are
+        #[arg(long)]
+        at: Vec<String>,
     },
     /// Stop publishing an anchor: the vault lets go of what's published of
     /// it, which is collected in time wherever it's held, and whoever has
@@ -490,12 +502,18 @@ enum CapCommand {
     Unpublish { anchor: PathBuf },
     /// List the anchors published, each with its capability
     Ls,
-    /// Read a capability's DAG from a CAR of its ciphertext into the repo,
-    /// unsealing and checking every block, and print its root: a
-    /// snapshot's, or a sealed anchor's latest head's
+    /// Read a capability's DAG into the repo, unsealing and checking every
+    /// block, and print its root: a snapshot's, or a sealed anchor's latest
+    /// head's. From a CAR of its ciphertext, or from a holder's door, where
+    /// it's let in by proving it has the capability
     Import {
         capability: String,
-        car: PathBuf,
+        /// A CAR of its ciphertext
+        car: Option<PathBuf>,
+        /// A holder's door, as a multiaddr ending in its peer ID [default:
+        /// those the capability says]
+        #[arg(long, conflicts_with = "car")]
+        from: Vec<String>,
     },
 }
 
@@ -1683,13 +1701,16 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
         NodeCommand::Invite { .. } => anyhow::bail!("--quota is for a protected mesh, which is a friend's, not an account's"),
         NodeCommand::Join { ticket, thin: true, .. } => thin_join(place, &ticket)?,
         NodeCommand::Join { ticket, account, thin: false } => join(place, &ticket, account)?,
-        NodeCommand::Run { listen, copies, low_water, high_water, no_collect, no_lost_scan, shared, clients } => {
+        NodeCommand::Run { listen, copies, low_water, high_water, no_collect, no_lost_scan, shared, clients, door } => {
             let listen = listen.as_deref().unwrap_or_else(|| if place.is_main() { daemon::LISTEN } else { "/ip4/0.0.0.0/tcp/0" });
             anyhow::ensure!(clients.is_none() || place.is_main(), "clients are of the main mesh");
             let listen = daemon::Listen {
                 members: listen.parse().context("not a multiaddr")?,
                 clients: clients.map(|addr| addr.parse()).transpose().context("not a multiaddr")?,
             };
+            if let Some(door) = door {
+                holokeep::net::door::open(&place.repo, &holokeep::net::mesh::node_key(&place.repo)?, door.parse().context("not a multiaddr")?)?;
+            }
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
             runtime.block_on(daemon::run(place, listen, copies, (low_water, high_water), !no_collect, !no_lost_scan, shared))?;
         },
@@ -2294,6 +2315,45 @@ fn anchor_named(repo: &Catalog, named: &Path) -> anyhow::Result<Link> {
     }
 }
 
+/// Read what a capability names from the first holder's door that has
+/// it: those given, or else those it says.
+#[cfg(feature = "net")]
+fn read_at_doors(capability: &holokeep::cap::Capability, from: Vec<String>) -> anyhow::Result<(Link, Vec<holokeep::block::Block>)> {
+    use holokeep::cap::{self, Capability};
+    let doors = if from.is_empty() {
+        match capability {
+            Capability::Live(live) => live.at.clone(),
+            Capability::Snapshot(_) => Vec::new(),
+        }
+    } else {
+        from
+    };
+    anyhow::ensure!(!doors.is_empty(), "say where to read it from: a CAR, or a holder's door with --from");
+    let mut errors = Vec::new();
+    for door in doors {
+        let read = || -> anyhow::Result<(Link, Vec<holokeep::block::Block>)> {
+            let reader = holokeep::net::door::Reader::connect(&door.parse().context("not a multiaddr")?)?;
+            Ok(match capability {
+                Capability::Snapshot(snapshot) => (snapshot.plain.clone(), cap::unseal(&reader, snapshot)?),
+                Capability::Live(live) => {
+                    let claims = reader.heads(&live.view, live.read())?;
+                    cap::read_live(&reader, claims.iter().map(|(_, data)| data.as_slice()), live)?
+                },
+            })
+        };
+        match read() {
+            Ok(read) => return Ok(read),
+            Err(e) => errors.push(format!("{door}: {e}")),
+        }
+    }
+    anyhow::bail!("no door had it: {}", errors.join("; "))
+}
+
+#[cfg(not(feature = "net"))]
+fn read_at_doors(_: &holokeep::cap::Capability, _: Vec<String>) -> anyhow::Result<(Link, Vec<holokeep::block::Block>)> {
+    anyhow::bail!("this hk reads from a CAR alone: it's built without networking")
+}
+
 fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
     use holokeep::cap::{self, Capability, Held, Snapshot};
     match command {
@@ -2311,7 +2371,7 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
             out!("{}", Capability::Snapshot(Snapshot::new(sealed.root, cid, read)).encode());
             Ok(())
         },
-        CapCommand::Publish { anchor, output } => {
+        CapCommand::Publish { anchor, output, at } => {
             let dir = repo_dir(repo)?;
             let mut repo = open_repo(Some(dir.clone()))?;
             let anchor = anchor_named(&repo, &anchor)?;
@@ -2332,7 +2392,11 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
             } else {
                 eprintln!("{anchor} is published as it is already");
             }
-            out!("{}", published.capability().encode());
+            let capability = match published.capability() {
+                Capability::Live(live) => Capability::Live(live.at(at)),
+                snapshot @ Capability::Snapshot(_) => snapshot,
+            };
+            out!("{}", capability.encode());
             Ok(())
         },
         CapCommand::Unpublish { anchor } => {
@@ -2355,12 +2419,17 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
             }
             Ok(())
         },
-        CapCommand::Import { capability, car } => {
+        CapCommand::Import { capability, car, from } => {
             let capability = Capability::decode(&capability)?;
-            let held = Held::from_car(io::BufReader::new(std::fs::File::open(&car).with_context(|| format!("opening {}", car.display()))?))?;
-            let (plain, blocks) = match &capability {
-                Capability::Snapshot(snapshot) => (snapshot.plain.clone(), cap::unseal(&held, snapshot)?),
-                Capability::Live(live) => cap::read_live(&held, live)?,
+            let (plain, blocks) = match car {
+                Some(car) => {
+                    let held = Held::from_car(io::BufReader::new(std::fs::File::open(&car).with_context(|| format!("opening {}", car.display()))?))?;
+                    match &capability {
+                        Capability::Snapshot(snapshot) => (snapshot.plain.clone(), cap::unseal(&held, snapshot)?),
+                        Capability::Live(live) => cap::read_live(&held, held.all(), live)?,
+                    }
+                },
+                None => read_at_doors(&capability, from)?,
             };
             open_repo(repo)?.batch_breathing(|repo| {
                 for block in &blocks {
@@ -2368,7 +2437,7 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
                 }
                 Ok::<_, anyhow::Error>(())
             })?;
-            eprintln!("unsealed {} blocks from {}", blocks.len(), car.display());
+            eprintln!("unsealed {} blocks", blocks.len());
             out!("root {plain}");
             Ok(())
         },

@@ -42,6 +42,9 @@ pub const LISTEN: &str = "/ip4/0.0.0.0/tcp/4011";
 /// Where a node listens for clients, if it's to, unless told otherwise.
 pub const LISTEN_CLIENTS: &str = "/ip4/0.0.0.0/tcp/4012";
 
+/// Where a door listens, by default (see `door`).
+pub const LISTEN_DOOR: &str = "/ip4/0.0.0.0/tcp/4013";
+
 /// Where a node listens: for members, and for clients, if it's to.
 #[derive(Debug, Clone)]
 pub struct Listen {

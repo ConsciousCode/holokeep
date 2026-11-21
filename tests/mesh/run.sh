@@ -526,6 +526,33 @@ scenario_visitor() {
 
 # A share for a while: a visitor reads it, then it's gone by every
 # member's clock, and the visitor with it
+# An anchor published sealed, read at a member's door by a machine in no
+# mesh, by its capability alone; and read again as one's node publishes
+# what it's become
+scenario_door() {
+    local anchor note again one_peer one_ip cap
+    anchor=$(on one hk anchor new)
+    note=$(sh_on one 'echo "read at the door" | hk add -q -')
+    on one hk anchor set "$anchor" "$note" >/dev/null
+    one_peer=$(on one hk node id)
+    one_ip=$(podman inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$run-one")
+    cap=$(on one hk cap publish "$anchor" --at "/ip4/$one_ip/tcp/4013/p2p/$one_peer" 2>/dev/null)
+    on one hk cap ls | grep -q "^$anchor	" || fail "one doesn't list what it published"
+    machine outsider
+    [ "$(on outsider hk cap import "$cap" 2>/dev/null)" = "root $note" ] || fail "the outsider couldn't read it at the door"
+    [ "$(on outsider hk cat "$note")" = "read at the door" ] || fail "what the outsider read isn't what was published"
+    # Another character in the middle, where every one says something
+    local wrong=${cap:0:30}
+    if [ "${cap:30:1}" = a ]; then wrong+=b; else wrong+=a; fi
+    wrong+=${cap:31}
+    ! on outsider hk cap import "$wrong" >/dev/null 2>&1 || fail "a capability that isn't one read it"
+    again=$(sh_on one 'echo "and again" | hk add -q -')
+    on one hk anchor set "$anchor" "$again" >/dev/null
+    wait_for "the outsider to read what one's node published again" sh_on outsider "test \"\$(hk cap import '$cap' 2>/dev/null)\" = 'root $again'"
+    on one hk cap unpublish "$anchor" 2>/dev/null
+    ! on one hk cap ls | grep -q "^$anchor	" || fail "one still lists it, unpublished"
+}
+
 scenario_expiry() {
     local peer anchor shared view
     machine passer
@@ -580,14 +607,14 @@ podman network create "$net" >/dev/null
 say "a mesh of two"
 machine one
 machine two
-node_up one --clients
+node_up one --clients --door
 invite one two
 node_up two
 mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke shared client thin visitor expiry several)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke shared client thin visitor expiry door several)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

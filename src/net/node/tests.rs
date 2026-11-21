@@ -668,6 +668,45 @@ async fn a_vaults_keeps_reach_a_friend_holding_it() {
 }
 
 #[tokio::test]
+async fn a_friend_holding_the_vault_holds_what_its_published_and_it_reads_from_that() {
+    let scratch = crate::testutil::Scratch::new("node-published");
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    a.catalog_mut().set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
+    let vault = crate::vault::Vault::open(scratch.path(), a.catalog().uid()).expect("vault");
+    // A friend's account, the vault its user
+    let friend = 0xC000_0000;
+    b.catalog_mut().act_for(friend, crate::keys::Key::generate().expect("key")).expect("act");
+    b.catalog().claims().expect("claims").set_user(friend, &vault.key().id()).expect("user");
+    b.catalog_mut().act_for(friend, crate::keys::Key::generate().expect("key")).expect("act");
+
+    let anchor = crate::claim::anchor().expect("anchor");
+    let published = crate::cap::Published::of(&crate::cap::secret(&vault), &anchor).expect("published");
+    let publication = crate::cap::publish(a.catalog_mut(), &vault, &published, &link(&blocks[0])).expect("publish");
+    let everything = crate::cap::published_blocks(a.catalog(), &publication.manifest).expect("blocks");
+    // As the node of a protected mesh, holding the vault, acts for it
+    a.catalog_mut().act_for(vault.uid(), vault.key().clone()).expect("act");
+    a.reload().expect("reload");
+    // Holding the vault, it holds what's published, every block of it,
+    // once it's heard what this hosts now
+    a.announce().expect("announce");
+    let friend_peer = b.peer_id();
+    assert!(until(&mut [&mut a, &mut b], |n| n[0].heard.contains(&friend_peer)).await, "heard");
+    let id = a.audit(2).expect("audit");
+    audited(&mut [&mut a, &mut b], &[(0, id)]).await;
+    assert!(until(&mut [&mut a, &mut b], |n| everything.iter().all(|block| holds(n[1], &AnyCid::V1(block.cid().clone())))).await, "every published block");
+    assert!(until(&mut [&mut a, &mut b], |n| n[1].catalog().kept_for_acting(publication.manifest.multihash()).expect("kept")).await, "the manifest kept");
+
+    // And whoever has the capability reads it from what the friend holds
+    let crate::cap::Capability::Live(live) = published.capability() else {
+        panic!("not live");
+    };
+    let claims = crate::cap::claims_about(b.catalog(), &live.view).expect("claims");
+    let (plain, read) = crate::cap::read_live(b.catalog(), claims.iter().map(|(_, data)| data.as_slice()), &live).expect("read");
+    assert_eq!(plain, link(&blocks[0]));
+    assert_eq!(read.len(), blocks.len());
+}
+
+#[tokio::test]
 async fn a_keep_noticed_with_its_target_goes_with_it() {
     let (mut a, mut b, blocks) = Box::pin(holding()).await;
     one_user(&mut [&mut a, &mut b]);

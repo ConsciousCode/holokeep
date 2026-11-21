@@ -1,6 +1,7 @@
-**Partly a design.** Snapshots exist (see [[#Snapshots]]), and so does
-publishing a sealed anchor, kept current, and reading its latest head
-from a CAR (see [[#Publishing, as it is now]]). The rest of this page isn't implemented
+**Partly a design.** Snapshots exist (see [[#Snapshots]]), and so do
+sealed anchors, read-only: published, kept current, held by friends,
+and read from a CAR or at a holder's door by anyone with the capability
+(see [[#Publishing, as it is now]] and [[#Doors]]). The rest of this page isn't implemented
 yet. It's the plan for
 the last part of sharing across the boundary (see [[Sharing#Across the
 boundary]]), written down to be argued with before it's built.
@@ -253,9 +254,11 @@ Implemented, as the first parts of phase 2:
   published, which is collected in time wherever it's held, and whoever
   has the capability reads the last head till then.
 - `hk cap ls` lists the anchors published, each with its capability.
-- `hk cap import <capability> <car>` reads a sealed anchor's latest head
-  from what the CAR holds, unseals its tree into the repo, and prints the
-  plaintext root.
+- `hk cap import <capability> [<car>]` reads a sealed anchor's latest
+  head from what a CAR holds, or at a holder's door (`--from`, or the
+  doors the capability names), unseals its tree into the repo, and prints
+  the plaintext root. `hk cap publish --at <multiaddr>` names doors in the
+  capability it prints.
 - The running node publishes each published anchor again, every 10 s,
   if its value's changed.
 
@@ -289,6 +292,15 @@ head, from one keep, reading nothing. Which anchors the node publishes
 again is read from the vault's keeps, unsealing `sealed`, so nothing's
 kept about them in the clear.
 
+So a friend's protected mesh holding the vault (see [[Protected
+Meshes#Holding for a friend]]) holds what's published as it holds
+anything the vault keeps: the node of the user's protected mesh, acting
+for the vault, copies it there, and the friend's node keeps it for the
+vault's keep. What a holder has is enough to read from: the sets of the
+sealed anchor and their signs, by what links to the sealed anchor, and
+the rest by CID. Only the user's own node publishes; a protected mesh's,
+acting for the vault, doesn't.
+
 ### How it differs from the rest of this page, for now
 
 - The read key is derived, `derive(secret, "read", anchor nonce)`, until
@@ -301,7 +313,8 @@ kept about them in the clear.
 - A head block is `{plain, root}`, the plaintext root, which the root
   block's key and nonce are derived with, and the sealed root, padded
   and sealed under `derive(read key, "head", "")` alone: the 43-byte
-  header with a BAT `derive(head key, "bat", padded)`, then a 24-byte
+  header with a BAT `derive(head key, "bat", "")`, the same for every
+  head, so a reader can prove it knows it before it has one, then a 24-byte
   nonce `derive(head key, "nonce", padded)[0..24]`, then
   XChaCha20-Poly1305 under `derive(head key, "key", "")`, with the header
   as associated data. So the same head seals the same way. `set`,
@@ -311,8 +324,43 @@ kept about them in the clear.
   sealed anchor, for no other view, whose sign by `K` verifies, and
   which no other such set names as `prev`, is a head, and the latest of
   them by `at`, then CID, is read.
-- Readers read from a CAR. Holders of the vault in a protected mesh, and
-  reading from them, are the rest of phase 2.
+- Readers remember no heads yet, so a holder serving an old head as
+  the latest goes unnoticed, and read from one door at a time.
+
+## Doors
+
+Implemented. A holder may open a **door** (`hk node run --door
+[<addr>]`, port 4013 by default): a libp2p swarm of its own, apart from
+the mesh's, over TCP with noise and yamux and no private network, as
+the node's key, which lets anyone in, to ask `/holokeep/cap/1.0.0` and
+nothing else. Whoever's let in there never reaches the mesh's swarm. It
+reads the repo through a catalog of its own, on a thread of its own, so
+it answers for whatever's held, a friend's vault too.
+
+Requests are serde CBOR:
+
+| Request | Answer |
+|---|---|
+| `{Heads: {view: CID bytes, at: uint, proof: bytes}}` | The sets of the sealed view's anchor, their signs, and the head blocks they set it to. |
+| `{Blocks: {wanted: [[CID bytes, proof]], at: uint}}` | Each block whose proof holds, to about 4 MiB; the rest are asked again. |
+
+The answer is `{blocks: [[CID bytes, data]]}`, nothing for what isn't
+proved or held. A proof is that of [[Protected Meshes#Block access
+tokens]], over the CID asked for (the sealed view, for heads), the
+asker's peer ID, and `at`, which must be within 300 s of the door's
+clock:
+
+- **Heads** are given to whoever proves the heads' token,
+  `derive(head key, "bat", "")`, checked against the token in a head
+  block held: so only to whoever has the read key.
+- **Blocks** are given to whoever proves each one's token, checked
+  against the token it carries. A reader derives a sealed node's,
+  `derive(node key, "bat", plaintext CID)`, as it unseals its parent,
+  and asks for each level's blocks at once, 64 to a request. A plaintext
+  block carries no token, so is never given.
+
+A reader checks every block it's given against its CID, and judges the
+heads as it would from anywhere (see [[#Publishing, as it is now]]).
 
 ## Judging a sealed view
 
@@ -427,11 +475,10 @@ In order, each of use alone:
 1. **Snapshots.** Done: the sealer, on the vault's block format, with
    sealed nodes, derived keys and padding, and a capability on a fixed
    root with no heads, exported to and read from a CAR. Test vectors.
-2. **Sealed anchors, read-only.** Begun: owner keys, heads, judging by
-   `K`, sealing what's changed, manifests the vault keeps, kept current
-   by the node, and read from a CAR. To come: holders in a protected
-   mesh, holders answering for heads and checking proofs at the door,
-   and readers remembering heads. Writer keys, and judging the
+2. **Sealed anchors, read-only.** Done, but for readers remembering
+   heads: owner keys, heads, judging by `K`, sealing what's changed,
+   manifests the vault keeps, kept current by the node, held by friends'
+   protected meshes, and read from a CAR or at a holder's door. Writer keys, and judging the
    grants that give them write, come with writing.
 3. **Mount points.** Sealed `mounts`, making a folder an anchor to share
    it, and capabilities on mounted anchors.
@@ -444,13 +491,13 @@ In order, each of use alone:
 
 ## Open questions
 
-- How a holder knows who may ask it for heads: a head-lookup token, from
-  the read key, would keep a revoked reader from watching, but holders
-  would need to check it without the key.
+- Head lookups prove the read key, so a reader whose read key's been
+  changed can't watch new heads through a door, but one who kept the old
+  read key can still be told the old heads.
 - Witnesses: holders countersigning when they received a set, so a
   write's time is something other than its writer's word.
 - Coarsening `at` in sealed sets, to say less of when the owner works.
 - Whether `past` should chain back to the first read key, or a new
   reader see history only from when they were let in.
 
-Source: `src/cap.rs`, `src/vault.rs`, `src/dagcbor.rs`, `src/main.rs`.
+Source: `src/cap.rs`, `src/vault.rs`, `src/dagcbor.rs`, `src/net/door.rs`, `src/net/node.rs` (`keep_published`), `src/main.rs`.

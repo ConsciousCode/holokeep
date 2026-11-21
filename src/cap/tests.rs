@@ -304,7 +304,7 @@ fn a_sealed_anchor_reads_as_its_latest_head_whatever_else_is_held() {
     let one = publish(&mut catalog, &vault, &published, &first).expect("publish");
     assert!(one.fresh);
     let held_one = held_of(&published_blocks(&catalog, &one.manifest).expect("blocks"));
-    assert_eq!(read_live(&held_one, &live).expect("read").0, first);
+    assert_eq!(read_live(&held_one, held_one.all(), &live).expect("read").0, first);
     let again = publish(&mut catalog, &vault, &published, &first).expect("publish");
     assert_eq!((again.set.clone(), again.manifest.clone(), again.fresh), (one.set.clone(), one.manifest.clone(), false), "nothing new to say");
 
@@ -315,7 +315,7 @@ fn a_sealed_anchor_reads_as_its_latest_head_whatever_else_is_held() {
     // The vault keeps the latest manifest, which reaches every head
     assert_eq!(published_list(&mut catalog, &vault), vec![(anchor, two.manifest.clone())]);
     let everything = published_blocks(&catalog, &two.manifest).expect("blocks");
-    let (plain, blocks) = read_live(&held_of(&everything), &live).expect("read");
+    let (plain, blocks) = read_held(&everything, &live).expect("read");
     assert_eq!(plain, second);
     assert_eq!(blocks.len(), dag(&catalog, &second).len());
     assert!(sealed_cids(&Sealed { root: one.set, blocks: everything.clone() }).is_superset(&held_one.0.keys().cloned().collect()), "every head's held");
@@ -326,16 +326,21 @@ fn a_sealed_anchor_reads_as_its_latest_head_whatever_else_is_held() {
     let set = crate::claim::Claim::Set(crate::claim::Set::new([published.anchor.clone()], AnyCid::V1(head.cid().clone()), u64::MAX).expect("set").after(Some(Vec::new())));
     let sign = crate::claim::Claim::Sign(crate::claim::Sign::new(&forger, [set.cid()], None, u64::MAX).expect("sign"));
     let with_forgery: Vec<Block> = everything.iter().cloned().chain([head, set.block(), sign.block()]).collect();
-    assert_eq!(read_live(&held_of(&with_forgery), &live).expect("read").0, second);
+    assert_eq!(read_held(&with_forgery, &live).expect("read").0, second);
 
     // Nor does the right capability with another read key read anything
     let wrong = Live::new(live.view, Zeroizing::new([9u8; 32]));
-    assert!(read_live(&held_of(&everything), &wrong).is_err());
+    assert!(read_held(&everything, &wrong).is_err());
 
     // Unpublished, the vault keeps none of it
     assert!(unpublish(&mut catalog, &vault, &published).expect("unpublish"));
     assert!(published_list(&mut catalog, &vault).is_empty());
     assert!(!unpublish(&mut catalog, &vault, &published).expect("unpublish"));
+}
+
+fn read_held(blocks: &[Block], live: &Live) -> Result<(Link, Vec<Block>)> {
+    let held = held_of(blocks);
+    read_live(&held, held.all(), live)
 }
 
 fn published_list(catalog: &mut Catalog, vault: &crate::vault::Vault) -> Vec<(Link, Link)> {
