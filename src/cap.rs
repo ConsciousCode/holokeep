@@ -47,6 +47,8 @@ pub enum Error {
     Store(#[from] crate::store::Error),
     #[error("{0}")]
     Invalid(String),
+    #[error("its latest head is older than one read before: what has it may be out of date, or keeping the latest from you")]
+    Behind,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -735,33 +737,111 @@ pub fn published_blocks(catalog: &crate::store::Catalog, manifest: &Link) -> Res
 /// names, the latest of those no other replaces is unsealed. Returns its
 /// plaintext root, and every block of it, root first.
 pub fn read_live<'a>(src: &impl Source, claims: impl IntoIterator<Item = &'a [u8]>, live: &Live) -> Result<(Link, Vec<Block>)> {
+    read_live_after(src, claims, &[], live).map(|read| (read.plain, read.blocks))
+}
+
+/// A sealed anchor as read: its plaintext root, every block of it, root
+/// first, and the head read, as its set and the owner key's sign of it,
+/// for a reader to remember (see `Remembered`).
+pub struct Read {
+    pub plain: Link,
+    pub blocks: Vec<Block>,
+    pub head: Vec<Vec<u8>>,
+}
+
+/// Read a sealed anchor from what's held, as its latest head, judging it
+/// beside the head read before, `remembered`.
+///
+/// What's held can't forge a head, but it can keep the latest back,
+/// offering an older one as if it were. The head read before is judged
+/// with what's offered, so an older head never replaces it: if it's still
+/// the latest, and isn't offered, what's held is behind it, and it's an
+/// error, `Error::Behind`, as it may be read elsewhere.
+pub fn read_live_after<'a>(src: &impl Source, claims: impl IntoIterator<Item = &'a [u8]>, remembered: &'a [Vec<u8>], live: &Live) -> Result<Read> {
     let (anchor, owner) = crate::claim::viewed(&live.view).ok_or_else(|| invalid("not a sealed view"))?;
     let mut sets = BTreeMap::new();
-    let mut signed = std::collections::HashSet::new();
-    for data in claims {
+    let mut signs: HashMap<Vec<u8>, &[u8]> = HashMap::new();
+    let mut offered = std::collections::HashSet::new();
+    let given = claims.into_iter().map(|data| (data, true)).chain(remembered.iter().map(|data| (data.as_slice(), false)));
+    for (data, is_offered) in given {
         match crate::claim::Claim::parse(data) {
             Some(crate::claim::Claim::Set(set)) if set.target().contains(&anchor) && set.owner().is_none() => {
-                let cid = crate::claim::Claim::Set(set.clone()).cid();
-                sets.insert(cid.to_bytes(), (cid, set));
+                let cid = crate::claim::Claim::Set(set.clone()).cid().to_bytes();
+                if is_offered {
+                    offered.insert(cid.clone());
+                }
+                sets.insert(cid, (set, data));
             },
             Some(crate::claim::Claim::Sign(sign)) if *sign.by() == owner && sign.verify() => {
-                signed.extend(sign.signs().iter().map(CidRef::to_bytes));
+                for signed in sign.signs() {
+                    signs.entry(signed.to_bytes()).or_insert(data);
+                }
             },
             _ => {},
         }
     }
-    sets.retain(|cid, _| signed.contains(cid));
-    let replaced: std::collections::HashSet<Vec<u8>> = sets.values().flat_map(|(_, set)| set.prev().unwrap_or_default().iter().map(CidRef::to_bytes)).collect();
-    let (_, head) = sets
+    sets.retain(|cid, _| signs.contains_key(cid));
+    let replaced: std::collections::HashSet<Vec<u8>> = sets.values().flat_map(|(set, _)| set.prev().unwrap_or_default().iter().map(CidRef::to_bytes)).collect();
+    let (cid, (head, data)) = sets
         .into_iter()
         .filter(|(cid, _)| !replaced.contains(cid))
-        .max_by(|(a, (_, x)), (b, (_, y))| x.at().cmp(&y.at()).then_with(|| a.cmp(b)))
-        .map(|(_, head)| head)
+        .max_by(|(a, (x, _)), (b, (y, _))| x.at().cmp(&y.at()).then_with(|| a.cmp(b)))
         .ok_or_else(|| invalid("no head of the sealed anchor its owner signed"))?;
+    if !offered.contains(&cid) {
+        return Err(Error::Behind);
+    }
+    let sign = signs.get(&cid).copied().unwrap_or_default();
     let fetched = src.sealed(&[(head.value().clone(), head_bat(&live.read))])?;
     let (plain, root) = open_head(&live.read, fetched.first().ok_or_else(|| invalid("no head"))?)?;
     let blocks = unseal(src, &Snapshot::new(root, plain.clone(), Zeroizing::new(*live.read)))?;
-    Ok((plain, blocks))
+    Ok(Read { plain, blocks, head: vec![data.to_vec(), sign.to_vec()] })
+}
+
+/// The head a reader last read of a sealed anchor.
+///
+/// It's kept in the reader's repo, per account, by sealed view: so what's
+/// offered later is judged beside it, and a head older than it is noticed
+/// (see `read_live_after`).
+///
+/// It's the reader's alone, unshared and unsigned by it: a file, a
+/// dag-cbor list of the set and its sign, under `heads/<uid>/<view>`.
+pub struct Remembered {
+    path: std::path::PathBuf,
+}
+
+impl Remembered {
+    pub fn of(repo: &std::path::Path, uid: u32, view: &Link) -> Self {
+        Self { path: repo.join("heads").join(uid.to_string()).join(view.to_string()) }
+    }
+
+    /// What's remembered: nothing, if nothing's been read.
+    pub fn claims(&self) -> Result<Vec<Vec<u8>>> {
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let Ok(Ipld::List(list)) = crate::dagcbor::from_slice(&bytes) else {
+            return Err(invalid(format!("{}: not a remembered head", self.path.display())));
+        };
+        list.into_iter().map(|item| match item {
+            Ipld::Bytes(data) => Ok(data),
+            _ => Err(invalid(format!("{}: not a remembered head", self.path.display()))),
+        }).collect()
+    }
+
+    /// Remember a head read, in place of what was: written aside and
+    /// renamed, so it's one or the other.
+    pub fn remember(&self, head: &[Vec<u8>]) -> Result<()> {
+        let dir = self.path.parent().ok_or_else(|| invalid("nowhere to remember"))?;
+        std::fs::create_dir_all(dir)?;
+        let bytes = crate::dagcbor::to_vec(&Ipld::List(head.iter().cloned().map(Ipld::Bytes).collect())).map_err(|e| invalid(format!("{e}")))?;
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        file.as_file().sync_all()?;
+        file.persist(&self.path).map_err(|e| e.error)?;
+        Ok(())
+    }
 }
 
 /// A fresh read key, random.

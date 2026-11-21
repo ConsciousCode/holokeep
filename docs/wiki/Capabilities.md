@@ -324,8 +324,26 @@ acting for the vault, doesn't.
   sealed anchor, for no other view, whose sign by `K` verifies, and
   which no other such set names as `prev`, is a head, and the latest of
   them by `at`, then CID, is read.
-- Readers remember no heads yet, so a holder serving an old head as
-  the latest goes unnoticed, and read from one door at a time.
+- A reader remembers the head it last read of each sealed view (see
+  [[#Remembered heads]]), so a holder offering an older head as the
+  latest is noticed. It reads from one door at a time, trying the next
+  if one fails or is behind.
+
+### Remembered heads
+
+`hk cap import` keeps the head it read of a sealed view in the reader's
+repo, at `heads/<uid>/<sealed view>`: a dag-cbor list of two byte
+strings, the set and the sign by `K` that signs it, written aside and
+renamed, once everything read is in the repo. It's the reader's alone,
+neither shared nor signed.
+
+The next read judges the remembered head with the heads offered, as
+one more: a newer head names it as `prev`, or is later, and replaces
+it. If it's still the latest and wasn't offered, what's offered is
+behind, whether out of date or withholding, and the read fails, "its
+latest head is older than one read before", so the next door is tried.
+A reader with nothing remembered reads whatever's latest of what's
+offered.
 
 ## Doors
 
@@ -336,6 +354,10 @@ the node's key, which lets anyone in, to ask `/holokeep/cap/1.0.0` and
 nothing else. Whoever's let in there never reaches the mesh's swarm. It
 reads the repo through a catalog of its own, on a thread of its own, so
 it answers for whatever's held, a friend's vault too.
+
+The name is only that it's where outsiders come in. It isn't a
+Solaris door, a call into a server through a path, which the README
+suggests as a way to think of servers mounted on anchors.
 
 Requests are serde CBOR:
 
@@ -398,9 +420,10 @@ the owner's mesh anything. Holders check them only at the door where
 non-members fetch.
 
 Holders can withhold, serving an old head as the latest, or none, but
-can't forge one. A reader remembers the heads it has seen, refuses an
-answer that's neither a descendant of them nor a sibling it can see,
-and asks more than one holder.
+can't forge one. A reader remembers the head it last read and refuses
+an answer older than it (see [[#Remembered heads]]); one asking several
+holders at once, and taking the latest any offers, isn't implemented
+yet.
 
 ## Writing
 
@@ -475,10 +498,10 @@ In order, each of use alone:
 1. **Snapshots.** Done: the sealer, on the vault's block format, with
    sealed nodes, derived keys and padding, and a capability on a fixed
    root with no heads, exported to and read from a CAR. Test vectors.
-2. **Sealed anchors, read-only.** Done, but for readers remembering
-   heads: owner keys, heads, judging by `K`, sealing what's changed,
+2. **Sealed anchors, read-only.** Done: owner keys, heads, judging by `K`, sealing what's changed,
    manifests the vault keeps, kept current by the node, held by friends'
-   protected meshes, and read from a CAR or at a holder's door. Writer keys, and judging the
+   protected meshes, read from a CAR or at a holder's door, and readers
+   remembering heads. Writer keys, and judging the
    grants that give them write, come with writing.
 3. **Mount points.** Sealed `mounts`, making a folder an anchor to share
    it, and capabilities on mounted anchors.

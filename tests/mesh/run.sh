@@ -546,9 +546,16 @@ scenario_door() {
     if [ "${cap:30:1}" = a ]; then wrong+=b; else wrong+=a; fi
     wrong+=${cap:31}
     ! on outsider hk cap import "$wrong" >/dev/null 2>&1 || fail "a capability that isn't one read it"
+    # What's published now, kept aside, for a holder left behind to offer
+    on one hk cap publish "$anchor" -o /tmp/first.car >/dev/null || fail "one couldn't write what's published to a CAR"
+    on one cat /tmp/first.car | podman exec -i "$run-outsider" sh -c 'cat > /tmp/first.car' || fail "couldn't give the outsider the CAR"
     again=$(sh_on one 'echo "and again" | hk add -q -')
     on one hk anchor set "$anchor" "$again" >/dev/null
     wait_for "the outsider to read what one's node published again" sh_on outsider "test \"\$(hk cap import '$cap' 2>/dev/null)\" = 'root $again'"
+    # Having read the newer, the outsider won't take the older as the latest
+    local older
+    older=$(on outsider hk cap import "$cap" /tmp/first.car 2>&1) && fail "the outsider took an older head as the latest: $older"
+    grep -q "older than one read before" <<<"$older" || fail "the outsider couldn't read the older head, but not for being older: $older"
     on one hk cap unpublish "$anchor" 2>/dev/null
     ! on one hk cap ls | grep -q "^$anchor	" || fail "one still lists it, unpublished"
 }

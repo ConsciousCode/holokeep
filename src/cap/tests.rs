@@ -338,6 +338,48 @@ fn a_sealed_anchor_reads_as_its_latest_head_whatever_else_is_held() {
     assert!(!unpublish(&mut catalog, &vault, &published).expect("unpublish"));
 }
 
+#[test]
+fn a_reader_remembers_the_head_it_read_and_notices_an_older_one_offered() {
+    let t = tree("cap-behind");
+    let repo = Scratch::new("cap-behind-repo");
+    let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
+    let vault = crate::vault::Vault::open(repo.path(), catalog.uid()).expect("vault");
+    let published = Published::of(&secret(&vault), &crate::claim::anchor().expect("anchor")).expect("published");
+    let Capability::Live(live) = published.capability() else {
+        panic!("not live");
+    };
+    let first = import(&mut catalog, t.path(), &importer());
+    let one = publish(&mut catalog, &vault, &published, &first).expect("publish");
+    let held_one = held_of(&published_blocks(&catalog, &one.manifest).expect("blocks"));
+
+    let reader = Scratch::new("cap-behind-reader");
+    let remembered = Remembered::of(reader.path(), 1000, &live.view);
+    assert!(remembered.claims().expect("nothing yet").is_empty());
+    let read = read_live_after(&held_one, held_one.all(), &[], &live).expect("read");
+    assert_eq!(read.plain, first);
+    remembered.remember(&read.head).expect("remember");
+    assert_eq!(remembered.claims().expect("claims"), read.head);
+    // The same head again, offered again, reads
+    assert_eq!(read_live_after(&held_one, held_one.all(), &read.head, &live).expect("read").plain, first);
+
+    std::fs::write(t.path().join("docs/readme.md"), "newer").expect("write");
+    let second = import(&mut catalog, t.path(), &importer());
+    let two = publish(&mut catalog, &vault, &published, &second).expect("publish");
+    let held_two = held_of(&published_blocks(&catalog, &two.manifest).expect("blocks"));
+    // A newer head replaces the one remembered
+    let newer = read_live_after(&held_two, held_two.all(), &remembered.claims().expect("claims"), &live).expect("read");
+    assert_eq!(newer.plain, second);
+    remembered.remember(&newer.head).expect("remember");
+
+    // Offered only the first now, what has it is behind
+    let behind = read_live_after(&held_one, held_one.all(), &remembered.claims().expect("claims"), &live);
+    assert!(matches!(behind, Err(Error::Behind)), "an older head's noticed");
+    // Though one forgetting reads it as the latest it's shown
+    assert_eq!(read_live_after(&held_one, held_one.all(), &[], &live).expect("read").plain, first);
+    // And what's remembered is its reader's, by account and view
+    assert!(Remembered::of(reader.path(), 1001, &live.view).claims().expect("claims").is_empty());
+}
+
 fn read_held(blocks: &[Block], live: &Live) -> Result<(Link, Vec<Block>)> {
     let held = held_of(blocks);
     read_live(&held, held.all(), live)

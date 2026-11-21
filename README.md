@@ -54,6 +54,7 @@ Hardware becomes like a hermit crab's shell: discard the old, move into the new,
 - Social data sharing
 - Distributed application hosting
 - General transport via anchor mounts: mount arbitrary RPC servers on anchors to be serviced by nodes, à la 9P. This could let you access a node's local filesystem and facilities through the DAG.
+  - An intuition pump for it, besides 9P: [Solaris doors](https://en.wikipedia.org/wiki/Doors_(computing)). A server process creates a door and `fattach`es it to a path; a client opens the path and `door_call`s it, a synchronous call the kernel hands straight to the server, arguments and file descriptors and all. The path is only where to find it, and the descriptor is a capability, passable to anyone over another door. An anchor a node services would be the path, and what's handed out the capability. This isn't what `hk node run --door` means: that door is a swarm outsiders read capabilities at, not a call into a server.
 
 ### Prior art
 
@@ -455,7 +456,7 @@ Checklist:
 - [ ] Peergos BAT with friends
 - [ ] Capabilities: sharing by key, from ciphertext no member guards (see the wiki's Capabilities page)
   - [x] Snapshots: a sealed tree, keys derived down it, padded, and a capability on its root (`hk cap export/import`)
-  - [x] Sealed anchors, read-only: owner keys, heads, views judged by their own keys, sealing what's changed, manifests the vault keeps, kept current by the node, held by friends' protected meshes, read from a CAR or at a holder's door by anyone with the capability (`hk cap publish/unpublish/ls`, `hk node run --door`, `hk cap import --from`)
+  - [x] Sealed anchors, read-only: owner keys, heads, views judged by their own keys, sealing what's changed, manifests the vault keeps, kept current by the node, held by friends' protected meshes, read from a CAR or at a holder's door by anyone with the capability, who remembers the head it read and refuses an older one offered as the latest (`hk cap publish/unpublish/ls`, `hk node run --door`, `hk cap import --from`)
   - [ ] Mount points: sharing a folder makes it an anchor
   - [ ] Writing by capability
   - [ ] Revoking read: new read keys
