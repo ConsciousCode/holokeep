@@ -197,4 +197,38 @@ a file's open to write shows once it's closed.
 A commit does the first of those too, whenever the anchor has moved on from its
 base, so it never replaces what it didn't see.
 
-Source: `src/mount.rs`, `src/mount/write.rs`, `src/store/overlay.rs`, `src/store.rs` (`preserve_in_place`).
+## From outside: `hk fs`
+
+`hk fs` works on paths as the mount shows them, without going through
+it: a path under a running mount, absolute or from the working
+directory, found among the kernel's mounts whose source is `holokeep`;
+or, when it's under none, a path of the soup itself, a name the root
+anchor has or `anchors/<anchor>/…`. A path's followed through mount
+points, so what's at it is found in the anchor whose directory names
+it, as the mount would write it there.
+
+- `hk fs stat <path>…` says the anchor it's in and where (`at`), its
+  CID and what it is, the anchor a mount point names and what that is
+  now, and its tags. It reads what's committed: what the mount's yet to
+  commit isn't there.
+- `hk fs rm <path>…` unlinks each path from the anchor naming it, a
+  directory whole, in one set for each anchor, of every head it has.
+  It's built as an overlay is, with each path marked gone and no work
+  directory (`Catalog::edit_value`), so nothing under a directory is
+  read, however big, where `rm -r` through the mount must list and
+  unlink all of it, POSIX refusing to remove a directory with anything
+  in it. Every other name is kept, dotfiles too. What it held is
+  collected only once nothing else keeps or references it (see
+  [[Replication and Retention#Garbage collection]]). Unlinking a mount
+  point leaves its anchor as it was; what an anchor is can't be
+  unlinked, only a mount point of it.
+- `hk fs anchor <path>` makes what's at a path an anchor of its own, set
+  to it, and puts a mount point to it where it was, so it's versioned,
+  kept and shared on its own. It prints the new anchor.
+
+The mount follows these as it follows any set made elsewhere (see
+[[#In step with what's set elsewhere]]): an anchor it has nothing of
+its own to commit for is shown as set, and what it's yet to commit is
+committed as a fork of the set, which merging resolves.
+
+Source: `src/mount.rs`, `src/mount/write.rs`, `src/store/overlay.rs`, `src/store.rs` (`preserve_in_place`), `src/fs.rs`.

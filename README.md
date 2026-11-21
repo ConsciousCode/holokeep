@@ -396,6 +396,8 @@ Checklist:
   - [x] Keeping what the root names: the root anchor kept, and mount points links to what they mount, for keeps and collection alike
   - [x] Rules (`.souprules`, gitignore-like, per directory and at the top of the root): detaching application state (`.obsidian/`, `.git/`) into anchors of its own as it's made, a least pace, by name, path or application
   - [x] Rules for value: how many copies, by keeps that say (`hk keep add --copies`, `copies=` in rules), the nearest keep on each path deciding and the most of any path winning, for audits and trims alike
+  - [x] Paths from outside the mount: what's at one, its CID, anchor and tags; unlinking a directory whole in one set, reading nothing under it; making a path an anchor of its own (`hk fs stat/rm/anchor`)
+  - [ ] What's at a path through the mount itself, as extended attributes
   - [ ] `copies=0`: caches the mesh may drop whole under pressure
   - [ ] Detaching files, not only directories
   - [x] Git objects as `git-raw` blocks, named by git's SHA-1, linking as go-ipld-git reads them; importing a repository's loose objects and packs, deltas applied, keeping what its refs name (`hk git import`)

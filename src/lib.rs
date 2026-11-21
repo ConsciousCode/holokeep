@@ -26,6 +26,7 @@ pub mod links;
 pub mod delta;
 pub mod git;
 pub mod export;
+pub mod fs;
 #[cfg(feature = "fuse")]
 pub mod mount;
 pub mod model;

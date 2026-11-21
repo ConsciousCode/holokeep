@@ -344,7 +344,7 @@ impl Catalog {
         let base = self.overlay_base(&mount.anchor)?;
         let root = base.as_ref().map(|(value, _)| value.clone());
         let importer = mount.importer();
-        let built = self.overlay_node(&importer, mount, Path::new(""), root.clone().map(|cid| (cid, None)), &marks)?;
+        let built = self.overlay_node(&importer, Some(&mount.path), Path::new(""), root.clone().map(|cid| (cid, None)), &marks)?;
         let value: Link = match built {
             Some(link) => link.cid.into(),
             // Everything's gone: an empty directory
@@ -384,21 +384,37 @@ impl Catalog {
         Ok(Some(shown))
     }
 
+    /// What a value becomes with marks over it, and no work directory:
+    /// each marked path gone, or the block it names put there, making
+    /// directories as needed, and the directories over them built again,
+    /// the rest keeping the links they had. Nothing else is read, so
+    /// whatever's under what's gone isn't. Every name's kept, dotfiles too.
+    /// An empty directory if nothing's left.
+    pub fn edit_value(&mut self, root: Option<Link>, marks: &Marks) -> Result<Link> {
+        let importer = crate::import::Importer { hidden: true, ..crate::import::Importer::default() };
+        Ok(match self.overlay_node(&importer, None, Path::new(""), root.map(|cid| (cid, None)), marks)? {
+            Some(link) => link.cid.into(),
+            None => importer.directory.builder().finalize(&mut InPlace::new(self))?.cid.into(),
+        })
+    }
+
     /// What's at a path of an overlay now, built over what the anchor had
-    /// there, or nothing.
-    fn overlay_node(&mut self, importer: &crate::import::Importer, mount: &Mount, rel: &Path, base: Base, marks: &Marks) -> Result<Option<DagLink>> {
+    /// there, or nothing: of its work directory, if it has one.
+    fn overlay_node(&mut self, importer: &crate::import::Importer, work: Option<&Path>, rel: &Path, base: Base, marks: &Marks) -> Result<Option<DagLink>> {
         let base = marks.get(rel).map_or(base, |mark| mark.clone().map(|(cid, size)| (cid, Some(size))));
         // Joining nothing would add a slash, which a file anchor's work
         // file isn't under
-        let work = if rel.as_os_str().is_empty() { mount.path.clone() } else { mount.path.join(rel) };
-        let meta = match fs::symlink_metadata(&work) {
-            Ok(meta) => Some(meta),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
+        let work_at = work.map(|work| if rel.as_os_str().is_empty() { work.to_path_buf() } else { work.join(rel) });
+        let meta = match work_at.as_ref().map(fs::symlink_metadata) {
+            Some(Ok(meta)) => Some(meta),
+            None => None,
+            Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => None,
+            Some(Err(e)) => return Err(e.into()),
         };
+        let work_here = work_at.unwrap_or_default();
         let marked_below = marks.range(rel.to_path_buf()..).take_while(|(path, _)| path.starts_with(rel)).any(|(path, _)| path != rel);
         match meta {
-            Some(meta) if !meta.is_dir() => Ok(importer.add_path(&work, &mut InPlace::new(self), &mut |_, _| {})?),
+            Some(meta) if !meta.is_dir() => Ok(importer.add_path(&work_here, &mut InPlace::new(self), &mut |_, _| {})?),
             None if !marked_below => Ok(base.map(|(cid, size)| DagLink { cid: Cidv1::from(cid), tsize: size.unwrap_or_default(), filesize: 0 })),
             _ => {
                 // A directory, of what's in the work directory over what
@@ -419,7 +435,7 @@ impl Catalog {
                     }
                 }
                 if meta.is_some() {
-                    for entry in fs::read_dir(&work)? {
+                    for entry in fs::read_dir(&work_here)? {
                         entries.entry(entry?.file_name().as_bytes().to_vec()).or_insert(None);
                     }
                 }
@@ -429,7 +445,7 @@ impl Catalog {
                         continue;
                     }
                     let child = rel.join(std::ffi::OsStr::from_bytes(&name));
-                    if let Some(link) = self.overlay_node(importer, mount, &child, base, marks)? {
+                    if let Some(link) = self.overlay_node(importer, work, &child, base, marks)? {
                         dir.add_link(name, link, &mut InPlace::new(self))?;
                     }
                 }

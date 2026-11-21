@@ -93,6 +93,12 @@ enum Command {
     /// capability can read, and whoever holds only the ciphertext can't
     #[command(subcommand)]
     Cap(CapCommand),
+    /// Paths of the soup as the mount shows them, from outside it: what's
+    /// at one, and unlinking or promoting it in one set. A path's one
+    /// under a running mount, or else of the soup itself: a name the root
+    /// has, or anchors/<anchor>/…
+    #[command(subcommand)]
+    Fs(FsCommand),
     /// Print the account this acts for: the host's uid, the key the repo
     /// signs with for it, and its user, if it's in a mesh. In a repo
     /// another user owns, `hk keep` and `hk tag` act for an account of
@@ -429,6 +435,26 @@ enum KeepCommand {
     },
     /// List what's kept
     Ls,
+}
+
+#[derive(Subcommand, Debug)]
+enum FsCommand {
+    /// Say what's at each path: its CID and what it is, the anchor it's
+    /// in and where, the anchor a mount point names, and its tags
+    Stat {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// Unlink each path from the anchor naming it, a directory whole, in
+    /// one set for each anchor, reading nothing under it. What it held is
+    /// collected only once nothing else keeps or references it
+    Rm {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// Make what's at a path an anchor of its own, mounted where it was,
+    /// so it's versioned, kept and shared on its own; print the anchor
+    Anchor { path: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1075,6 +1101,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Whoami => whoami(args.repo),
         Command::Protect(command) => protect(&repo_dir(args.repo)?, command),
         Command::Cap(command) => cap(args.repo, command),
+        Command::Fs(command) => soup_fs(args.repo, command),
         Command::Device(command) => device(&repo_dir(args.repo.clone())?, command),
         Command::Anchor(command) => anchor(args.repo.as_ref(), open_repo(args.repo.clone())?, command),
         Command::Block(BlockCommand::Get { cid }) => {
@@ -2171,6 +2198,63 @@ fn git_import(repo: Option<PathBuf>, git: &Path, no_keep: bool) -> anyhow::Resul
         }
         anyhow::Ok(())
     })
+}
+
+fn soup_fs(repo: Option<PathBuf>, command: FsCommand) -> anyhow::Result<()> {
+    use holokeep::fs;
+    let dir = repo_dir(repo)?;
+    let mut repo = open_repo(Some(dir.clone()))?;
+    fetch_through_node(&mut repo, &dir);
+    let locate = |repo: &Catalog, path: &Path| -> anyhow::Result<fs::Located> { Ok(fs::locate(repo, &fs::soup_path(path))?) };
+    match command {
+        FsCommand::Stat { paths } => {
+            for (i, path) in paths.iter().enumerate() {
+                let located = locate(&repo, path)?;
+                if i > 0 {
+                    out!("");
+                }
+                if paths.len() > 1 {
+                    out!("path\t{}", path.display());
+                }
+                out!("anchor\t{}", located.anchor);
+                if !located.rel.as_os_str().is_empty() {
+                    out!("at\t{}", located.rel.display());
+                }
+                let Some(cid) = located.at else {
+                    out!("cid\tnone: the anchor's nothing yet");
+                    continue;
+                };
+                out!("cid\t{cid}");
+                match holokeep::export::stat(&repo, &cid) {
+                    Ok(holokeep::export::Kind::Directory) => out!("kind\tdirectory"),
+                    Ok(holokeep::export::Kind::File(size)) => out!("kind\tfile, {size} bytes"),
+                    Ok(holokeep::export::Kind::Symlink(target)) => out!("kind\tsymlink to {}", String::from_utf8_lossy(&target)),
+                    Err(e) => out!("kind\tunknown: {e}"),
+                }
+                if let Some(mounted) = fs::mount_point(&repo, &cid).unwrap_or_default() {
+                    out!("mounts\t{mounted}");
+                    out!("which is\t{}", repo.anchor_value(&mounted)?.map_or_else(|| "nothing yet".to_owned(), |value| value.to_string()));
+                }
+                if let Some(claims) = repo.claims() {
+                    let tags: Vec<String> = claims.tags(cid.multihash())?.iter().map(|tag| claim::tag_name(tag).map_or_else(|| tag.to_string(), ToOwned::to_owned)).collect();
+                    if !tags.is_empty() {
+                        out!("tags\t{}", tags.join(" "));
+                    }
+                }
+            }
+        },
+        FsCommand::Rm { paths } => {
+            let located = paths.iter().map(|path| locate(&repo, path)).collect::<anyhow::Result<Vec<_>>>()?;
+            for (anchor, value) in fs::remove(&mut repo, &located)? {
+                eprintln!("{anchor} is {value} now");
+            }
+        },
+        FsCommand::Anchor { path } => {
+            let located = locate(&repo, &path)?;
+            out!("{}", fs::promote(&mut repo, &located)?);
+        },
+    }
+    Ok(())
 }
 
 fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
