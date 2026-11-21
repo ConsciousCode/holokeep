@@ -1,7 +1,8 @@
-**Not yet implemented: a design.** Nothing on this page exists in the
-code. It's the plan for the last part of sharing across the boundary
-(see [[Sharing#Across the boundary]]), written down to be argued with
-before it's built.
+**Mostly a design.** Snapshots exist: sealing a DAG, its capability,
+and `hk cap export` and `import` (see [[#Snapshots]]). The rest of this
+page, from sealed anchors on, isn't implemented yet. It's the plan for
+the last part of sharing across the boundary (see [[Sharing#Across the
+boundary]]), written down to be argued with before it's built.
 
 A **capability** is a short string that lets whoever holds it read an
 anchor, and perhaps write it, from ciphertext anyone may hold. No
@@ -72,8 +73,15 @@ child key, by CID:   derive(k_parent, "cid", child plaintext CID bytes)
   subtree beside the path keeps its keys and its ciphertext. Only the
   path is sealed again, as only the path is written again in plaintext.
 - **An unnamed link** derives by CID: a file's chunks and the nodes
-  between them, and a sharded directory's internal shard nodes, keyed
-  under the directory's key. A file is shared whole or not at all.
+  between them, and anything linked to by a block that isn't a UnixFS
+  directory. A file is shared whole or not at all.
+- **A sharded directory** (a HAMT) keys its shards by CID and its
+  entries by name, both from the directory's own key, not the shard's:
+  an entry's name is its link's name less the shard's index prefix (2
+  hex digits at fanout 256). So an entry keeps its key, and its
+  ciphertext, however the HAMT's shards are reshaped around it.
+- **An identity CID** isn't sealed: it's in its parent already, and
+  stays as it is in `links`.
 - **A mount point** doesn't derive: its key is stored in the parent's
   sealed node (see [[#Mount points]]).
 - **An entry kept from an earlier read key** doesn't derive either: its
@@ -197,12 +205,37 @@ A capability is dag-cbor in multibase, base32, as a ticket is (see
 |---|---|---|
 | `view` | Link | The sealed view, which names `K`. Omitted for a snapshot. |
 | `root` | Link | A fixed sealed root: a snapshot, with no heads. Omitted otherwise. |
-| `read` | bytes | The read key, or a snapshot's root key. |
+| `plain` | Link | A snapshot's plaintext root, which its root block's key and nonce are derived with. Omitted otherwise, as a head says it. |
+| `read` | bytes | The read key. |
 | `writer` | bytes | An ed25519 seed `K` has given `/anchor/write`, for a capability that writes (omitted for one that reads). |
 | `at` | `[Multiaddr]` | Where some holders of the ciphertext listen (omitted if found otherwise). |
 
 Each write capability has a writer of its own, so each has a sign chain
 of its own, and taking one's write away leaves the others'.
+
+## Snapshots
+
+Implemented. A snapshot is a DAG sealed under a fresh random read key,
+with no heads, and a capability of `root`, `plain` and `read`:
+
+- `hk cap export <cid> <car>` seals the DAG, fetching what isn't here
+  through the node first, writes its sealed blocks to a CARv1 whose root
+  is the sealed root, and prints the capability.
+- `hk cap import <capability> <car>` unseals every block from the CAR,
+  checking each against its plaintext CID and each sealed node's
+  padding, puts them in the repo, and prints the plaintext root.
+
+Reading from a holder rather than a CAR waits for a way in for
+non-members (see [[#Reading]]). Sealed nodes with `mounts` are refused,
+and `keys` are followed but never written, until the phases that make
+them.
+
+A test vector: the file `hello, sealed world` (a raw leaf) in a
+directory as `hello.txt`, `bafybeig3b3oi7lruke4xl5rd6b5qsi6bmug2x6ltoqhf276doiiirzvcq4`,
+sealed under a read key of 32 bytes `0x42`, is two blocks, the file's
+`bafkreic2niwyy4jblogxyxnaov4iyrw625y7r6ai6zv3bhlsh2wovsrpxe` and the
+directory's, the sealed root,
+`bafkreifhyh75rbh3ekfa64angthj2xfmlkd7yesd2vepbtbcemxrac5scy`.
 
 ## Judging a sealed view
 
@@ -312,12 +345,11 @@ with its own; the head merging them names one, and the other in `past`.
 
 ## Phases
 
-None of this exists yet. In order, each of use alone:
+In order, each of use alone:
 
-1. **Snapshots.** The sealer, on the vault's block format, with sealed
-   nodes, derived keys and padding, and a capability on a fixed root
-   with no heads, to export (`hk cap export <cid>`) and read from a CAR
-   or a holder. Test vectors.
+1. **Snapshots.** Done: the sealer, on the vault's block format, with
+   sealed nodes, derived keys and padding, and a capability on a fixed
+   root with no heads, exported to and read from a CAR. Test vectors.
 2. **Sealed anchors, read-only.** Owner and writer keys, heads, judging
    a sealed view on its own, keeping a sealed anchor current, publishing
    to a protected mesh with incremental manifests, holders answering
@@ -342,3 +374,5 @@ None of this exists yet. In order, each of use alone:
 - Coarsening `at` in sealed sets, to say less of when the owner works.
 - Whether `past` should chain back to the first read key, or a new
   reader see history only from when they were let in.
+
+Source: `src/cap.rs`, `src/vault.rs`, `src/dagcbor.rs`, `src/main.rs`.

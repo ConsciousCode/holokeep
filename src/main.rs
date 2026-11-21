@@ -89,6 +89,10 @@ enum Command {
     /// joins their protected meshes
     #[command(subcommand)]
     Protect(ProtectCommand),
+    /// Share by capability: a DAG sealed, which whoever holds its
+    /// capability can read, and whoever holds only the ciphertext can't
+    #[command(subcommand)]
+    Cap(CapCommand),
     /// Print the account this acts for: the host's uid, the key the repo
     /// signs with for it, and its user, if it's in a mesh. In a repo
     /// another user owns, `hk keep` and `hk tag` act for an account of
@@ -425,6 +429,25 @@ enum KeepCommand {
     },
     /// List what's kept
     Ls,
+}
+
+#[derive(Subcommand, Debug)]
+enum CapCommand {
+    /// Seal the DAG under a CID with a fresh read key, write its
+    /// ciphertext to a `CARv1`, and print a capability that reads it.
+    /// Whoever has the capability can read all of it, and the CAR alone
+    /// says only how many blocks there are, to a size class
+    Export {
+        cid: Link,
+        /// Where to write the ciphertext
+        output: PathBuf,
+    },
+    /// Read a capability's DAG from a CAR of its ciphertext into the repo,
+    /// unsealing and checking every block, and print its root
+    Import {
+        capability: String,
+        car: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1051,6 +1074,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Lost(command) => lost(args.repo, command),
         Command::Whoami => whoami(args.repo),
         Command::Protect(command) => protect(&repo_dir(args.repo)?, command),
+        Command::Cap(command) => cap(args.repo, command),
         Command::Device(command) => device(&repo_dir(args.repo.clone())?, command),
         Command::Anchor(command) => anchor(args.repo.as_ref(), open_repo(args.repo.clone())?, command),
         Command::Block(BlockCommand::Get { cid }) => {
@@ -2147,6 +2171,40 @@ fn git_import(repo: Option<PathBuf>, git: &Path, no_keep: bool) -> anyhow::Resul
         }
         anyhow::Ok(())
     })
+}
+
+fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
+    use holokeep::cap::{self, Capability, Held};
+    match command {
+        CapCommand::Export { cid, output } => {
+            fetch_first(repo.as_ref(), &cid)?;
+            let repo = open_repo(repo)?;
+            let read = Capability::fresh_key()?;
+            let sealed = cap::seal(&repo, &cid, &read)?;
+            // Written aside and renamed, so a failed export leaves nothing
+            let dir = output.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+            let mut file = io::BufWriter::new(tempfile::NamedTempFile::new_in(dir)?);
+            car::write_blocks(&mut file, std::slice::from_ref(&sealed.root), &sealed.blocks)?;
+            file.into_inner().map_err(io::IntoInnerError::into_error)?.persist(&output)?;
+            eprintln!("sealed {} blocks: whoever has this capability can read all of it", sealed.blocks.len());
+            out!("{}", Capability::new(sealed.root, cid, read).encode());
+            Ok(())
+        },
+        CapCommand::Import { capability, car } => {
+            let capability = Capability::decode(&capability)?;
+            let held = Held::from_car(io::BufReader::new(std::fs::File::open(&car).with_context(|| format!("opening {}", car.display()))?))?;
+            let blocks = cap::unseal(&held, &capability)?;
+            open_repo(repo)?.batch_breathing(|repo| {
+                for block in &blocks {
+                    repo.put_block(block, holokeep::cid::CidVersion::V1)?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
+            eprintln!("unsealed {} blocks from {}", blocks.len(), car.display());
+            out!("root {}", capability.plain);
+            Ok(())
+        },
+    }
 }
 
 fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {

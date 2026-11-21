@@ -246,6 +246,20 @@ pub fn deserialize_canon<'de, D, T>(dec: D) -> Result<Canon<T>, Error>
     Ok(Canon::new(value, dec.is_canon()))
 }
 
+/// Deserialize one value from the start of an input, noting whether it
+/// was canonical, and returning the decoder, at whatever follows it.
+pub fn deserialize_first<'de, D, T>(dec: D) -> Result<(Canon<T>, D), Error>
+    where
+        D: Decoder<'de>,
+        T: serde::Deserialize<'de>,
+{
+    let mut de = de::Deserializer::new(dec);
+    let value = serde::Deserialize::deserialize(&mut de)?;
+    let dec = de.into_inner();
+    let canon = dec.is_canon();
+    Ok((Canon::new(value, canon), dec))
+}
+
 /// Serialize a value, returning the encoder to collect its output from.
 pub fn serialize<E, T>(enc: E, value: &T) -> Result<E, Error>
     where

@@ -69,6 +69,16 @@ pub fn from_slice_canon<'de, T: serde::Deserialize<'de>>(input: &'de [u8]) -> Re
     harness::deserialize_canon(Deserializer::new(input))
 }
 
+/// Decode one DAG-CBOR value from the start of an input, which must be
+/// canonical, returning it and what follows it.
+pub fn from_slice_first<'de, T: serde::Deserialize<'de>>(input: &'de [u8]) -> Result<(T, &'de [u8]), Error> {
+    let (value, dec) = harness::deserialize_first(Deserializer::new(input))?;
+    match value {
+        Canon::Can(value) => Ok((value, dec.rest())),
+        Canon::Non(_) => Err(<Error as serde::de::Error>::custom("not canonical")),
+    }
+}
+
 #[derive(Copy, Clone)]
 enum Size {
     Count1,

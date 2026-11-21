@@ -42,6 +42,11 @@ impl<'de> Deserializer<'de> {
         Self { cursor: input, canon: true }
     }
 
+    /// What's left of the input, not yet decoded.
+    pub const fn rest(&self) -> &'de [u8] {
+        self.cursor
+    }
+
     /// Mark the parsed value as noncanonical.
     const fn noncanonical(&mut self) { self.canon = false; }
 

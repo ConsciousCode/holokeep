@@ -6,6 +6,7 @@
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::must_use_candidate)]
 
 pub mod cid;
+pub mod cap;
 pub mod car;
 pub mod claim;
 pub mod grants;

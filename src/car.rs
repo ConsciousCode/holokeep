@@ -177,6 +177,15 @@ fn write_section(out: &mut impl Write, cid: &Link, data: &[u8]) -> io::Result<()
     out.write_all(data)
 }
 
+/// Write blocks as a `CARv1` with these roots, in the order given.
+pub fn write_blocks(out: &mut impl Write, roots: &[Link], blocks: &[Block]) -> io::Result<()> {
+    write_header(out, roots)?;
+    for block in blocks {
+        write_section(out, &crate::cid::AnyCid::V1(block.cid().clone()), block.data())?;
+    }
+    Ok(())
+}
+
 /// Write the whole DAG under `root` as a `CARv1`, like `ipfs dag export`:
 /// depth first, each block the first time it's reached. Returns how many
 /// blocks were written.

@@ -419,6 +419,8 @@ Checklist:
   - [x] Anchors: empty identities (identity CIDs of 16 random bytes) which are whatever their latest `Set` claim says; a kept anchor references only what it is now, so what it was is collected after the grace period (`hk anchor new/set/show`)
   - [x] Files imported in place as mounts on anchors, kept through them, and imported again as they change; the path is known only to the node with the file (`hk add --nocopy`)
   - [ ] Kademlia provider records, once broadcast wants don't scale
+  - [x] Measuring how far apart members' clocks are, advisorily (`hk node clocks`)
+  - [ ] Configuration beyond the command line: a node's tunables, such as how often it pings and how long it waits, so tests can run them short and nodes in one mesh can differ
 - [ ] Public Amino DHT
 - [ ] BitTorrent bridging
 - [ ] User ownership model
@@ -449,6 +451,12 @@ Checklist:
   - [x] Claims noticed before what they're about: a notice's blocks are wanted together, so a keep noticed with what it keeps goes with it, and any push takes what links to it along after; a signature is noticed by what it signs, not its key or chain
   - [x] Recovering from the passphrase alone: the vault and root sealed where friends hold them, brought back by a friend's re-invite
 - [ ] Peergos BAT with friends
+- [ ] Capabilities: sharing by key, from ciphertext no member guards (see the wiki's Capabilities page)
+  - [x] Snapshots: a sealed tree, keys derived down it, padded, and a capability on its root (`hk cap export/import`)
+  - [ ] Sealed anchors, read-only: owner and writer keys, heads, views judged by their own keys, published to a protected mesh
+  - [ ] Mount points: sharing a folder makes it an anchor
+  - [ ] Writing by capability
+  - [ ] Revoking read: new read keys
 
 ## Open questions
 

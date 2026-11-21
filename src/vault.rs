@@ -101,6 +101,59 @@ fn hmac(key: &[u8; 32], message: &[u8]) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(<[u8; 32]>::try_from(outer.as_slice()).unwrap_or_default())
 }
 
+/// A key derived from another: `HMAC-SHA256(key, label || 0x00 || data)`.
+pub fn derive(key: &[u8; 32], label: &[u8], data: &[u8]) -> Zeroizing<[u8; 32]> {
+    hmac(key, &[label, &[0], data].concat())
+}
+
+/// Seals blocks under a 32-byte key, and opens them, in the encrypted
+/// block format.
+///
+/// The key, nonce and BAT are each derived from the key and the
+/// plaintext's CID, so the same block under the same key seals the same
+/// way every time. A vault's key is its secret; a capability's, each
+/// node's key (see `crate::cap`).
+pub struct Sealer<'a> {
+    key: &'a [u8; 32],
+}
+
+impl<'a> Sealer<'a> {
+    pub const fn new(key: &'a [u8; 32]) -> Self {
+        Self { key }
+    }
+
+    /// Bytes, as the plaintext `plain` is sealed: its ciphertext, as a
+    /// raw block.
+    pub fn seal(&self, plain: &Link, data: &[u8]) -> Result<Block> {
+        let name = plain.to_bytes();
+        let mut header = Vec::with_capacity(HEADER);
+        header.extend_from_slice(&MAGIC);
+        header.extend_from_slice(&BATS);
+        header.extend_from_slice(derive(self.key, b"bat", &name).as_ref());
+        let nonce = nonce_of(derive(self.key, b"nonce", &name).as_ref())?;
+        let ciphertext = cipher(&derive(self.key, b"key", &name))?
+            .encrypt(&nonce.into(), Payload { msg: data, aad: &header })
+            .map_err(|_| invalid("encrypting failed"))?;
+        Ok(Block::hash(Cidv1Spec::new(RAW_CODEC, MultihashFunc::Sha2_256), [header, ciphertext].concat().into()))
+    }
+
+    /// The bytes sealed as the plaintext `plain` is, from their
+    /// ciphertext, unchecked but for decrypting.
+    pub fn open(&self, plain: &Link, sealed: &[u8]) -> Result<Vec<u8>> {
+        let (Some(header), Some(ciphertext)) = (sealed.get(..HEADER), sealed.get(HEADER..)) else {
+            return Err(invalid("not an encrypted block"));
+        };
+        if header.get(..MAGIC.len()) != Some(&MAGIC[..]) || header.get(MAGIC.len()..MAGIC.len().saturating_add(BATS.len())) != Some(&BATS[..]) {
+            return Err(invalid("not an encrypted block"));
+        }
+        let name = plain.to_bytes();
+        let nonce = nonce_of(derive(self.key, b"nonce", &name).as_ref())?;
+        cipher(&derive(self.key, b"key", &name))?
+            .decrypt(&nonce.into(), Payload { msg: ciphertext, aad: header })
+            .map_err(|_| invalid(format!("{plain} doesn't decrypt with this key")))
+    }
+}
+
 fn cipher(key: &[u8; 32]) -> Result<XChaCha20Poly1305> {
     XChaCha20Poly1305::new_from_slice(key).map_err(|e| invalid(e.to_string()))
 }
@@ -158,36 +211,17 @@ impl Vault {
     }
 
     fn derive(&self, label: &[u8], data: &[u8]) -> Zeroizing<[u8; 32]> {
-        hmac(&self.secret, &[label, &[0], data].concat())
+        derive(&self.secret, label, data)
     }
 
     /// A block, encrypted: its ciphertext as a raw block.
     pub fn seal(&self, plain: &Link, data: &[u8]) -> Result<Block> {
-        let name = plain.to_bytes();
-        let mut header = Vec::with_capacity(HEADER);
-        header.extend_from_slice(&MAGIC);
-        header.extend_from_slice(&BATS);
-        header.extend_from_slice(self.derive(b"bat", &name).as_ref());
-        let nonce = nonce_of(self.derive(b"nonce", &name).as_ref())?;
-        let ciphertext = cipher(&self.derive(b"key", &name))?
-            .encrypt(&nonce.into(), Payload { msg: data, aad: &header })
-            .map_err(|_| invalid("encrypting failed"))?;
-        Ok(Block::hash(Cidv1Spec::new(RAW_CODEC, MultihashFunc::Sha2_256), [header, ciphertext].concat().into()))
+        Sealer::new(&self.secret).seal(plain, data)
     }
 
     /// A block back from its ciphertext, checked against its CID.
     pub fn unseal(&self, plain: &Link, sealed: &[u8]) -> Result<Block> {
-        let (Some(header), Some(ciphertext)) = (sealed.get(..HEADER), sealed.get(HEADER..)) else {
-            return Err(invalid("not an encrypted block"));
-        };
-        if header.get(..MAGIC.len()) != Some(&MAGIC[..]) || header.get(MAGIC.len()..MAGIC.len().saturating_add(BATS.len())) != Some(&BATS[..]) {
-            return Err(invalid("not an encrypted block"));
-        }
-        let name = plain.to_bytes();
-        let nonce = nonce_of(self.derive(b"nonce", &name).as_ref())?;
-        let data = cipher(&self.derive(b"key", &name))?
-            .decrypt(&nonce.into(), Payload { msg: ciphertext, aad: header })
-            .map_err(|_| invalid(format!("{plain} doesn't decrypt with this vault's secret")))?;
+        let data = Sealer::new(&self.secret).open(plain, sealed).map_err(|_| invalid(format!("{plain} doesn't decrypt with this vault's secret")))?;
         Block::verify(plain.clone().into(), data.into_boxed_slice()).map_err(|_| invalid(format!("{plain} decrypted to other bytes")))
     }
 
