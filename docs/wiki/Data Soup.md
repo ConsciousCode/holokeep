@@ -31,38 +31,38 @@ the holokeep repository; this wiki is the reference.
 
 ## Vocabulary
 
-| Term | Meaning |
-|---|---|
-| block | An immutable byte string, named by its multihash. |
-| CID | A multihash plus a version and codec: how to read a block's bytes. |
-| claim | A small dag-cbor block about other blocks (a tag, a keep, a set, a signature). |
-| dissolved | A claim small enough to be its own identity CID, stored as rows with no hash. |
-| precipitated | A claim stored as an ordinary sha2-256 block. |
-| anchor | A stable identity whose value changes, by `set` claims. |
-| root anchor | An account's top-level anchor, the top of `hk mount`. |
-| view | One user's view of an anchor, what the sets that count for them say, named by an anchor CID of its own; see [[Anchors and Names#Views]]. |
-| repo | Everything one node keeps: its catalog database and volumes (`~/.holokeep`). |
-| volume | A place bytes are kept: a SQLite file, a flatfs directory, a drive. |
-| form | How a volume breaks a block down: rows, JSONB, raw bytes, file ranges, deltas. |
-| delta | A block kept as copies from another block's bytes and bytes of its own. |
-| catalog | A node's index over its volumes. |
-| node | One machine running holokeep, named by its ed25519 key (= libp2p peer ID). |
-| device | A node's key, certified by a user. |
-| user | A root key, sealed with a passphrase, that certifies devices. |
-| account | A user a repo serves, by uid: one of the host's users, or a user with no login there. |
-| mesh | Machines serving one or more users, each user's blocks only on machines hosting them (private), or a vault's holders (protected). |
-| vault | An account's internal account for what it encrypts for friends to hold. |
-| machine | A mesh member, named by `node.key`; trusted by every user of the mesh. In a mesh with grants, one given `/mesh/machine`. Planned to be distinct from devices, see [[Sharing]]. |
-| grant | A claim giving or taking away commands in a mesh, or on a user's view of an anchor, after the grants before it; see [[Grants]]. |
-| command | What a grant gives, as a path from `/`: `/mesh/user`, `/mesh/machine`, `/mesh/grant`, and on a view of an anchor `/anchor/read`, `/anchor/write`, `/anchor/grant`. |
-| operator | A user holding `/mesh`; the **founder**, whose first grant names the mesh, holds `/`. |
-| client | A device acting for its user through a member machine, not a member itself (planned; local clients exist). |
-| role | A set of privileges granted to users and other roles, as in SQL (planned). |
-| keep | A claim saying to keep a DAG; what nothing keeps is collected. |
-| tomb | A claim retracting other claims. |
-| mount point | A symlink to an anchor, which the mount shows as the anchor. |
-| rules file | A `.souprules` file, saying what's made below it becomes. |
-| git-raw | The codec of git objects as blocks, named by git's SHA-1. |
+| Term         | Meaning                                                                                                                                                                        |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| block        | An immutable byte string, named by its multihash.                                                                                                                              |
+| CID          | A multihash plus a version and codec: how to read a block's bytes.                                                                                                             |
+| claim        | A small dag-cbor block about other blocks (a tag, a keep, a set, a signature).                                                                                                 |
+| dissolved    | A claim small enough to be its own identity CID, stored as rows with no hash.                                                                                                  |
+| precipitated | A claim stored as an ordinary sha2-256 block.                                                                                                                                  |
+| anchor       | A stable identity whose value changes, by `set` claims.                                                                                                                        |
+| root anchor  | An account's top-level anchor, the top of `hk mount`.                                                                                                                          |
+| view         | One user's view of an anchor, what the sets that count for them say, named by an anchor CID of its own; see [[Anchors and Names#Views]].                                       |
+| repo         | Everything one node keeps: its catalog database and volumes (`~/.holokeep`).                                                                                                   |
+| volume       | A place bytes are kept: a SQLite file, a flatfs directory, a drive.                                                                                                            |
+| form         | How a volume breaks a block down: rows, JSONB, raw bytes, file ranges, deltas.                                                                                                 |
+| delta        | A block kept as copies from another block's bytes and bytes of its own.                                                                                                        |
+| catalog      | A node's index over its volumes.                                                                                                                                               |
+| node         | One machine running holokeep, named by its ed25519 key (= libp2p peer ID).                                                                                                     |
+| device       | A node's key, certified by a user.                                                                                                                                             |
+| user         | A root key, sealed with a passphrase, that certifies devices.                                                                                                                  |
+| account      | A user a repo serves, by uid: one of the host's users, or a user with no login there.                                                                                          |
+| mesh         | Machines serving one or more users, each user's blocks only on machines hosting them (private), or a vault's holders (protected).                                              |
+| vault        | An account's internal account for what it encrypts for friends to hold.                                                                                                        |
+| machine      | A mesh member, named by `node.key`; trusted by every user of the mesh. In a mesh with grants, one given `/mesh/machine`. Planned to be distinct from devices, see [[Sharing]]. |
+| grant        | A claim giving or taking away commands in a mesh, or on a user's view of an anchor, after the grants before it; see [[Grants]].                                                |
+| command      | What a grant gives, as a path from `/`: `/mesh/user`, `/mesh/machine`, `/mesh/grant`, and on a view of an anchor `/anchor/read`, `/anchor/write`, `/anchor/grant`.             |
+| operator     | A user holding `/mesh`; the **founder**, whose first grant names the mesh, holds `/`.                                                                                          |
+| client       | A device acting for its user through a member machine, not a member itself (planned; local clients exist).                                                                     |
+| role         | A set of privileges granted to users and other roles, as in SQL (planned).                                                                                                     |
+| keep         | A claim saying to keep a DAG; what nothing keeps is collected.                                                                                                                 |
+| tomb         | A claim retracting other claims.                                                                                                                                               |
+| mount point  | A symlink to an anchor, which the mount shows as the anchor.                                                                                                                   |
+| rules file   | A `.souprules` file, saying what's made below it becomes.                                                                                                                      |
+| git-raw      | The codec of git objects as blocks, named by git's SHA-1.                                                                                                                      |
 
 ## Invariants
 

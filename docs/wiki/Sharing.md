@@ -259,13 +259,14 @@ passing on what's shared with them through a member (see
   are users, and a friend to each customer's mesh.
 - **Capabilities** (designed in [[Capabilities]], not yet implemented).
   Sharing with someone outside the mesh means giving them keys, not
-  permissions. A block access token only lets a holder
-  that can't read a block decide whether to hand it over; read access is
-  holding the decryption key. Scoped sharing (a folder, not everything)
-  needs keys derived down the tree, as Peergos's cryptree does, whereas a
-  vault's keys are derived per block from one secret, so all or nothing.
-- Revoking a capability means encrypting again, which is one reason
-  grants, not capabilities, are used inside the boundary.
+  permissions. Each anchor shared is sealed separately, owned by a key
+  of its own that judges what counts in it with no mesh, with keys
+  derived down its tree, so sharing a folder makes it an anchor. A block
+  access token only lets a holder that can't read a block decide whether
+  to hand it over; read access is holding the decryption key.
+- Revoking a capability's read means sealing what's new under a new
+  key, which is one reason grants, not capabilities, are used inside
+  the boundary: there, trust saves the encrypting.
 - **UCAN at the edge.** [UCAN](https://github.com/ucan-wg/spec) tokens,
   signed chains of delegation from a resource's owner, suit a remote
   client or someone outside the mesh: a member machine checks the chain
@@ -291,7 +292,7 @@ passing on what's shared with them through a member (see
    on, through a member that enforces it, as native grants, their sets
    and grants signed by their own keys; and grants that give for a
    while, by each machine's clock. To come: capabilities no member need
-   enforce, encrypted down the tree.
+   enforce, on sealed anchors judged by their own keys.
 
 ## Open questions
 
