@@ -109,6 +109,13 @@ What's encrypted in each sealed block is a dag-cbor map, padded:
 | `keys` | `{string: bytes}` | Node keys for entries that don't derive theirs, kept from an earlier read key (omitted if none). |
 | `mounts` | `{string: Mount}` | The sealed anchor each mount point among the entries names (omitted if none). |
 
+`links` can't be worked out from `block`: a child's ciphertext CID is
+the hash of its sealed bytes, which needs its plaintext, which the
+reader has only once it has fetched the child by that CID. Carrying
+them keeps the sealed tree an ordinary Merkle DAG, which holders can
+check, keep, collect and serve as any other blocks, with no index of
+labels as Peergos has.
+
 A file's chunks are sealed nodes too, with only `block`. The plaintext
 block is unchanged UnixFS (or whatever it was), so what's unsealed is
 exactly the plaintext DAG, CID for CID: sealing is a projection of the
@@ -178,8 +185,7 @@ head nonce = derive(read key, "head nonce", inner set CID bytes)[0..24]
 - A machine hosting the owner keeps each sealed anchor current. When the
   plaintext anchor's value changes, it seals the path to each change,
   makes a head, and pushes the ciphertext, with a manifest, to wherever
-  the anchor is published, as a vault pushes (see [[Protected
-  Meshes#Manifests]]). Manifests are incremental: each lists what's new
+  the anchor is published, as a vault pushes (see [[Protected Meshes#Manifests]]). Manifests are incremental: each lists what's new
   and links the one before by `next`.
 
 ## Capability strings
@@ -224,8 +230,7 @@ A holder of a capability fetches heads for the sealed view from
 holders, judges which count, unseals the latest, and walks down,
 deriving each node's key from its parent's and its name or CID, and
 checking each plaintext against its CID. To ask a holder for a block,
-it proves it knows the block's access token (see [[Protected
-Meshes#Block access tokens]]).
+it proves it knows the block's access token (see [[Protected Meshes#Block access tokens]]).
 
 Block access tokens are the holders' policy, not a secret: every holder
 and every past reader knows them. They stop an honest holder from
@@ -246,8 +251,7 @@ sets the plaintext anchor's value, seals the path to each change under
 the current read key, and makes a head whose `prev` names the heads it
 read. Several writers fork, as plaintext anchors do; nothing is
 refused. Holders can't merge sealed heads, so they show the latest, as
-an anchor whose heads aren't all directories does (see [[Anchors and
-Names#Forks and merges]]). A writer that reads several heads unseals
+an anchor whose heads aren't all directories does (see [[Anchors and Names#Forks and merges]]). A writer that reads several heads unseals
 them and their common ancestor, merges the plaintext as any anchor's
 heads merge, and seals the result when it next writes. Two writers
 sealing the same plaintext make the same blocks.
@@ -295,16 +299,16 @@ with its own; the head merging them names one, and the other in `past`.
 
 ## What holders learn
 
-| | Holokeep | Peergos |
-|---|---|---|
-| Block sizes, how many, when they change | Yes, to a size class | Yes, to a size class |
-| How blocks link | No | No, but its label map is public |
-| Who owns a tree | No | Its owner proofs are public |
-| When heads are made, how many writers, the shape of their forks | Yes: sets are in the clear | No: one signer, compare-and-swap |
-| Which writer made each head | A writer's key, not who it is | No |
-| The grants on the anchor | Yes | No |
-| Which blocks were pushed together | Yes, by manifest | Partly |
-| That a path went back to earlier content | Yes: sealing is deterministic | No |
+|                                                                 | Holokeep                      | Peergos                          |
+| --------------------------------------------------------------- | ----------------------------- | -------------------------------- |
+| Block sizes, how many, when they change                         | Yes, to a size class          | Yes, to a size class             |
+| How blocks link                                                 | No                            | No, but its label map is public  |
+| Who owns a tree                                                 | No                            | Its owner proofs are public      |
+| When heads are made, how many writers, the shape of their forks | Yes: sets are in the clear    | No: one signer, compare-and-swap |
+| Which writer made each head                                     | A writer's key, not who it is | No                               |
+| The grants on the anchor                                        | Yes                           | No                               |
+| Which blocks were pushed together                               | Yes, by manifest              | Partly                           |
+| That a path went back to earlier content                        | Yes: sealing is deterministic | No                               |
 
 ## Phases
 
