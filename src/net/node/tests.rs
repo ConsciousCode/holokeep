@@ -106,6 +106,27 @@ async fn members_tell_each_other_of_members() {
     assert!(until(&mut [&mut a, &mut b, &mut c], |n| connected(n[0], n[1]) && connected(n[0], n[2]) && connected(n[1], n[2])).await);
 }
 
+#[test]
+fn a_member_not_reached_is_dialled_less_often_till_it_is() {
+    let (peer, start) = (PeerId::random(), std::time::Instant::now());
+    let at = |secs| start + Duration::from_secs(secs);
+    let mut redial = super::Redial::default();
+    assert!(redial.due(&peer, start), "never dialled");
+    // Each wait twice the last, from 2 s to a minute
+    let mut now = 0;
+    for wait in [2, 4, 8, 16, 32, 60, 60] {
+        redial.dialled(peer, at(now));
+        assert!(!redial.due(&peer, at(now + wait - 1)), "dialled again before {wait} s");
+        assert!(redial.due(&peer, at(now + wait)), "not dialled again after {wait} s");
+        now += wait;
+    }
+    // Reached, or lost, it's dialled at once again
+    redial.reset(&peer);
+    assert!(redial.due(&peer, at(now)));
+    redial.dialled(peer, at(now));
+    assert!(redial.due(&peer, at(now + 2)));
+}
+
 #[tokio::test]
 async fn members_measure_each_others_clocks() {
     let swarm_key = mesh::fresh_swarm_key().expect("key");

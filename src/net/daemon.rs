@@ -49,12 +49,9 @@ pub struct Listen {
     pub clients: Option<Multiaddr>,
 }
 
-/// How often to dial members which aren't connected.
-const REDIAL: Duration = Duration::from_mins(1);
-
-/// How soon members are dialled again once one's disconnected, rather
-/// than at the next round: it may only have moved networks.
-const REDIAL_SOON: Duration = Duration::from_secs(2);
+/// How often to dial members which aren't connected and are due to be,
+/// each waiting longer after each failed dial (see `Node::dial_members`).
+const REDIAL: Duration = Duration::from_secs(2);
 
 /// How often to notice members of structure which arrived, such as from
 /// commands run since.
@@ -583,9 +580,6 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, (low, high): (u64
         tokio::select! {
             event = node.next() => match event {
                 Ok(event) => {
-                    if let Event::Disconnected(_) = &event {
-                        redial.reset_after(REDIAL_SOON);
-                    }
                     // Still pressed, and a trim helped: again, at once
                     if let Event::Trimmed { report, .. } = &event
                         && report.dropped > 0

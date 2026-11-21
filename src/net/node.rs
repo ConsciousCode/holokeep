@@ -26,7 +26,7 @@
 use std::path::PathBuf;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{AsyncRead, AsyncWrite, StreamExt};
 use libp2p::allow_block_list::{self, AllowedPeers};
@@ -145,6 +145,40 @@ pub struct Behaviour {
     grants: request_response::cbor::Behaviour<Have, Sent>,
     asks: request_response::cbor::Behaviour<super::thin::Ask, super::thin::Answer>,
     clock: request_response::cbor::Behaviour<clock::Asked, Told>,
+}
+
+/// The least and most time between dials of a member that isn't
+/// connected: each failed dial doubles it, from the least, so a member
+/// that was restarting is reached within seconds and one that's offline
+/// is tried once a minute.
+const REDIAL_LEAST: Duration = Duration::from_secs(2);
+const REDIAL_MOST: Duration = Duration::from_mins(1);
+
+/// When each member not connected is next to be dialled, and how long
+/// after that if that fails too.
+#[derive(Debug, Default)]
+struct Redial {
+    due: HashMap<PeerId, (Instant, Duration)>,
+}
+
+impl Redial {
+    /// Whether a member's due a dial: never dialled, or its wait's over.
+    fn due(&self, peer: &PeerId, now: Instant) -> bool {
+        self.due.get(peer).is_none_or(|(at, _)| *at <= now)
+    }
+
+    /// A member's dialled: not again till its wait's over, which doubles
+    /// for the dial after.
+    fn dialled(&mut self, peer: PeerId, now: Instant) {
+        let wait = self.due.get(&peer).map_or(REDIAL_LEAST, |(_, wait)| *wait);
+        self.due.insert(peer, (now.checked_add(wait).unwrap_or(now), wait.saturating_mul(2).min(REDIAL_MOST)));
+    }
+
+    /// A member's connected, or was and isn't: dialled at once when it
+    /// next needs to be, as it may only have moved networks.
+    fn reset(&mut self, peer: &PeerId) {
+        self.due.remove(peer);
+    }
 }
 
 /// A fetch, as the node knows it.
@@ -332,6 +366,7 @@ pub struct Node {
     clocking: HashMap<request_response::OutboundRequestId, (PeerId, u64)>,
     /// Whether this machine's clock was last found far from the mesh's.
     skewed: bool,
+    redial: Redial,
 }
 
 impl Node {
@@ -427,6 +462,7 @@ impl Node {
             clocks: Clocks::default(),
             clocking: HashMap::new(),
             skewed: false,
+            redial: Redial::default(),
         };
         node.reload()?;
         Ok(node)
@@ -2044,9 +2080,9 @@ impl Node {
 
     /// Dial every member with an address which isn't connected.
     pub fn dial_members(&mut self) -> Result<()> {
-        let me = self.peer_id();
+        let (me, now) = (self.peer_id(), Instant::now());
         for (peer, addrs) in self.members.list()? {
-            if peer != me && !addrs.is_empty() && !self.swarm.is_connected(&peer) {
+            if peer != me && !addrs.is_empty() && !self.swarm.is_connected(&peer) && self.redial.due(&peer, now) {
                 self.dial(peer, addrs);
             }
         }
@@ -2054,6 +2090,7 @@ impl Node {
     }
 
     fn dial(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) {
+        self.redial.dialled(peer, Instant::now());
         let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer).addresses(addrs).build();
         // A failed dial is reported as an event
         let _ = self.swarm.dial(opts);
@@ -2133,6 +2170,7 @@ impl Node {
     /// A member's newly connected: tell it of the members, notice it of
     /// what it's missed, and vouch for its sightings from now on.
     fn on_connected(&mut self, peer: PeerId) -> Result<()> {
+        self.redial.reset(&peer);
         // A visitor's told nothing: it asks for what's shared with it
         if self.visitors.contains_key(&peer) {
             return Ok(());
@@ -2174,6 +2212,7 @@ impl Node {
     }
 
     fn on_disconnected(&mut self, peer: &PeerId) {
+        self.redial.reset(peer);
         self.noticing.retain(|(noticed, _)| noticed != peer);
         self.guests_noticed.retain(|(noticed, _), _| noticed != peer);
         self.hosting.remove(peer);

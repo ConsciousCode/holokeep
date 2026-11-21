@@ -321,8 +321,11 @@ node status` says how many are connected.
 
 ## Connections
 
-Members are dialled on start and once a minute after, and a member is
-dialled again 2 s after its connection drops. Every connection is pinged
+Members are dialled on start. One that isn't reached is dialled again
+2 s later, then after twice as long each time, to at most a minute, so
+a member that was restarting, as an inviter does on joining a mesh, is
+reached within seconds, and one that's offline is tried once a minute.
+Connecting, or a connection dropping, starts it from 2 s again. Every connection is pinged
 every 10 s, and one whose ping fails is closed, so a peer that slept or
 changed networks isn't left as connected over a dead link: it's
 redialled instead.
