@@ -30,7 +30,9 @@ A symlink to an anchor, `/anchors/<anchor>`, is shown as the anchor
 itself (see [[Anchors and Names#Mount points]]), so the root's names are
 directories, and tools that won't follow symlinks, such as Obsidian,
 see the anchors' contents. `ln -s ~/soup/anchors/<anchor> name` makes
-one anywhere writable.
+one anywhere writable. An anchor that's nothing yet, as `hk anchor new`
+makes, is an empty directory to fill, at `anchors/<anchor>` and at any
+mount point of it; one whose value isn't here is shown as the symlink.
 
 - **Writes** under a mount point go to its anchor; the directory holding
   the mount point doesn't change.
