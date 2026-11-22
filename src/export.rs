@@ -27,6 +27,27 @@ pub trait Fetch {
     /// Blocks about to be fetched, so a source that gets them from
     /// elsewhere can ask for them all at once rather than one by one.
     fn prefetch(&self, _cids: &[Link]) {}
+
+    /// Whether a block's a directory, which a raw one can't be. A source
+    /// may know without decoding it again.
+    fn is_dir(&self, cid: &Link) -> io::Result<bool>
+    where
+        Self: Sized,
+    {
+        if cid.codec() == RAW_CODEC {
+            return Ok(false);
+        }
+        Ok(stat(self, cid)? == Kind::Directory)
+    }
+
+    /// A directory's entry by name, as its block and the size it's said to
+    /// be. A source may find it without listing the directory again.
+    fn entry(&self, dir: &Link, name: &[u8]) -> io::Result<Option<(Link, Option<u64>)>>
+    where
+        Self: Sized,
+    {
+        Ok(list(self, dir)?.into_iter().find(|entry| entry.name == name).map(|entry| (entry.cid, entry.size)))
+    }
 }
 
 impl Fetch for Catalog {
