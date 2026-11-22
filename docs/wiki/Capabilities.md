@@ -337,29 +337,62 @@ acting for the vault, doesn't.
 
 - The read key is derived, `derive(secret, "read", anchor nonce)`, until
   read keys change (see [[#Revoking]]).
-- `K` signs heads itself, from the one machine whose vault secret it's
-  derived from, rather than through writer keys it grants
-  `/anchor/write`. Writers come with writing (phase 4). Its sets follow
-  one another: each names as `prev` the set its last sign signed.
-  Publishing what's already the latest head sets nothing new.
-- A head block is `{plain, root}`, the plaintext root, which the root
-  block's key and nonce are derived with, and the sealed root, padded
-  and sealed under `derive(read key, "head", "")` alone: the 43-byte
-  header with a BAT `derive(head key, "bat", "")`, the same for every
-  head, so a reader can prove it knows it before it has one, then a 24-byte
-  nonce `derive(head key, "nonce", padded)[0..24]`, then
-  XChaCha20-Poly1305 under `derive(head key, "key", "")`, with the header
-  as associated data. So the same head seals the same way. `set`,
-  `sign` and `past` come with writing and revoking.
+- Each of the owner's machines writes with a **writer key** of its own,
+  an ed25519 key from the seed `derive(secret, "writer", anchor nonce ||
+  device key CID bytes)`, the device key being the catalog's signer (none,
+  if it has none). Before its first head, `K` gives it `/anchor/write` on
+  the sealed anchor (see [[#Writers' grants]]). A head's set names as
+  `prev` every head of the sealed view there is. Publishing what's
+  already the one latest head's value sets nothing new.
+- A head block is padded and sealed under `derive(read key, "head", "")`
+  alone: the 43-byte header with a BAT `derive(head key, "bat", "")`, the
+  same for every head, so a reader can prove it knows it before it has
+  one, then a 24-byte nonce `derive(head key, "nonce", padded)[0..24]`,
+  then XChaCha20-Poly1305 under `derive(head key, "key", "")`, with the
+  header as associated data. So the same head seals the same way. It's a
+  dag-cbor map:
+
+  | Key | Type | Meaning |
+  |---|---|---|
+  | `plain` | Link | The plaintext root, which the root block's key and nonce are derived with. |
+  | `root` | Link | The sealed root. |
+  | `sets` | `[Link]` | The plaintext anchor's sets it's of, by CID, sorted: its heads where it was published (omitted if none). |
+  | `set`, `sign` | bytes | For a head a capability's writer made, the plaintext set it carries and its sign (not yet made). |
+
+  `past` comes with revoking.
 - A reader judges the sealed view in itself, not by the catalog's views,
   which a repo with no users would let anything count in: a set of the
-  sealed anchor, for no other view, whose sign by `K` verifies, and
-  which no other such set names as `prev`, is a head, and the latest of
-  them by `at`, then CID, is read.
+  sealed anchor, for no other view, signed by `K`, or by a key `K` let
+  write and hasn't taken that from (see [[#Writers' grants]]), and which
+  no other such set names as `prev`, is a head, and the latest of them
+  by `at`, then CID, is read.
 - A reader remembers the head it last read of each sealed view (see
   [[#Remembered heads]]), so a holder offering an older head as the
   latest is noticed. It reads from one door at a time, trying the next
   if one fails or is behind.
+
+### Writers' grants
+
+A sealed view's grants are judged as a mesh's are (see [[Grants]]), on
+their own: `K` founds a mesh of one, and every other key is a visitor
+of it, holding what `K`'s grants on the sealed anchor say.
+
+- The first grant is `{target: [K], add: ["/"], prev: []}`, the same for
+  every `K`, so a reader makes it itself; it's held, with `K`'s sign,
+  but needn't be sent. A writer's grant gives `/anchor/write` on the
+  sealed anchor, after the grants before it, signed by `K`.
+- A set counts if `K` signed it, or a key holding `/anchor/write` then,
+  or if it's among, or before, the sets a grant taking a writer's write
+  away says stand.
+- A head's grants go with it: in the manifest, and in what a door
+  answers for heads, as claims about the sealed anchor. A catalog
+  finds grants by the anchor they're on, not by reference: a hashed
+  block's link to an identity CID isn't indexed.
+- In a mesh's own grants, those after another first grant, as a sealed
+  view's are, are another history, not waiting for anything of the
+  mesh's.
+- A head read before is taken to count as it did, whatever grants are
+  offered with it now (see [[#Remembered heads]]).
 
 ### Remembered heads
 
@@ -545,12 +578,12 @@ In order, each of use alone:
 2. **Sealed anchors, read-only.** Done: owner keys, heads, judging by `K`, sealing what's changed,
    manifests the vault keeps, kept current by the node, held by friends'
    protected meshes, read from a CAR or at a holder's door, and readers
-   remembering heads. Writer keys, and judging the
-   grants that give them write, come with writing.
+   remembering heads.
 3. **Mount points.** Done: sealed `mounts`, publishing what's mounted,
    reading through mount points, making a folder an anchor to share it,
    and capabilities on mounted anchors.
-4. **Writing.** Write capabilities, counting their inner sets through
+4. **Writing.** Begun: the owner's machines write with writer keys `K`
+   lets write, judged by `K`'s grants alone. To come: write capabilities, counting their inner sets through
    the visitor rule, merging on unsealing, and taking write away.
 5. **Revoking read.** New read keys, `keys` and `past`, sealed boxes for
    read grants, and sealing everything again when asked.
@@ -564,7 +597,10 @@ In order, each of use alone:
   one event. A compromise, not yet built: the add's inner set says
   where it moved from, and the remove's where to, inside the sealed
   inner set, so holders don't learn that two sealed anchors are
-  related. Sequencing a file's many moves needn't rest on `at`: an add
+  related. A reader of only one side still sees that it moved; naming
+  the other side's plaintext set, not its sealed one, gives them nothing
+  to look up, where a sealed set's CID would lead to its sealed view and
+  the times and sizes of its heads. Sequencing a file's many moves needn't rest on `at`: an add
   naming, by CID, the set of the source anchor it read is after it by
   construction, so a file's moves chain causally, as a Merkle clock
   does. The cost is a reference from one anchor's history into

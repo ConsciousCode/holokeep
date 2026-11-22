@@ -31,9 +31,10 @@ fn the_door_answers_only_what_a_capability_proves() {
         let proof = crate::vault::prove(&crate::cap::head_bat(read), &live.view, &for_whom.to_bytes(), at);
         answer(&catalog, &asker, Asked::Heads { view: ByteBuf::from(live.view.to_bytes()), at, proof: ByteBuf::from(proof.to_vec()) }, now).expect("answer").blocks
     };
-    // A set, its sign and the head
+    // A set, its sign and the head, and the grant letting its writer
+    // write, with the owner key's sign
     let told = heads(live.read(), &asker, now);
-    assert_eq!(told.len(), 3, "{told:?}");
+    assert_eq!(told.len(), 5, "{told:?}");
     assert!(heads(&[0u8; 32], &asker, now).is_empty(), "another read key");
     assert!(heads(live.read(), &other, now).is_empty(), "a proof of someone else's");
     assert!(heads(live.read(), &asker, now - 3600).is_empty(), "a proof long since");

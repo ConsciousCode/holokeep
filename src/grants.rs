@@ -241,7 +241,22 @@ impl State {
                 break;
             }
         }
-        let waiting = pending.iter().map(|signed| signed.cid.clone()).collect();
+        // Grants of another history, after another first grant, as a
+        // sealed anchor's are (see `crate::cap`): no part of this one, so
+        // not waiting for anything of it
+        let mut foreign: std::collections::HashSet<Vec<u8>> = all.values().filter(|signed| signed.cid != *genesis && signed.grant.prev().is_empty()).map(|signed| signed.cid.to_bytes()).collect();
+        loop {
+            let before = foreign.len();
+            for signed in &pending {
+                if signed.grant.prev().iter().any(|prev| foreign.contains(&prev.to_bytes())) {
+                    foreign.insert(signed.cid.to_bytes());
+                }
+            }
+            if foreign.len() == before {
+                break;
+            }
+        }
+        let waiting = pending.iter().filter(|signed| !foreign.contains(&signed.cid.to_bytes())).map(|signed| signed.cid.clone()).collect();
         let mut order: Vec<(usize, Vec<u8>)> = depth.into_iter().map(|(cid, depth)| (depth, cid)).collect();
         order.sort();
         let index: BTreeMap<&[u8], usize> = order.iter().enumerate().map(|(i, (_, cid))| (cid.as_slice(), i)).collect();
@@ -991,8 +1006,18 @@ mod tests {
         let absent = Claim::Grant(Grant::new([user.clone()], None, [USER.to_owned()], [], [], [history.genesis.clone()]).expect("grant")).cid();
         let waiting = history.grant(&founder, &user, &[USER], &[], &[&absent]);
         let state = history.state();
-        assert_eq!(state.waiting(), [waiting]);
+        assert_eq!(state.waiting(), std::slice::from_ref(&waiting));
         assert!(!state.holds(&user, USER));
+        // Grants after another first grant, a history of their own, wait for nothing here
+        let other = key();
+        let other_first = Grant::new([other.clone()], None, ["/".to_owned()], [], [], []).expect("grant");
+        let other_cid = Claim::Grant(other_first.clone()).cid();
+        let after_other = Grant::new([user.clone()], Some(other.clone()), [WRITE.to_owned()], [], [], [other_cid.clone()]).expect("grant");
+        let after_cid = Claim::Grant(after_other.clone()).cid();
+        let mut with_other = history.grants.clone();
+        with_other.push(Signed { cid: other_cid, grant: other_first, by: vec![other.clone()] });
+        with_other.push(Signed { cid: after_cid, grant: after_other, by: vec![other] });
+        assert_eq!(State::new(&history.genesis, with_other).expect("state").waiting(), [waiting]);
         // Nor is a history with another first, or none, any mesh's
         assert!(State::new(&absent, history.grants.iter().cloned()).is_none());
         let impostor = key();

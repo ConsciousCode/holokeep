@@ -322,7 +322,7 @@ fn a_sealed_anchor_reads_as_its_latest_head_whatever_else_is_held() {
 
     // A later head signed by anyone else counts for nothing
     let forger = crate::keys::Key::generate().expect("key");
-    let head = seal_head(live.read(), &first, &seal(&catalog, &first, live.read()).expect("seal").root).expect("head");
+    let head = seal_head(live.read(), &HeadBlock::new(first.clone(), seal(&catalog, &first, live.read()).expect("seal").root)).expect("head");
     let set = crate::claim::Claim::Set(crate::claim::Set::new([published.anchor.clone()], AnyCid::V1(head.cid().clone()), u64::MAX).expect("set").after(Some(Vec::new())));
     let sign = crate::claim::Claim::Sign(crate::claim::Sign::new(&forger, [set.cid()], None, u64::MAX).expect("sign"));
     let with_forgery: Vec<Block> = everything.iter().cloned().chain([head, set.block(), sign.block()]).collect();
@@ -467,4 +467,79 @@ fn a_sealed_nodes_mount_points_read_back_and_must_be_views() {
     // The view must be one
     let bad = encode(b"block", &[], &BTreeMap::from([("bad".to_owned(), Mount { view: crate::claim::anchor().expect("anchor"), read: Zeroizing::new([1u8; 32]) })])).expect("encode");
     assert!(decode(&bad).is_err());
+}
+
+
+/// The claims a catalog holds of a published anchor, judged: its heads,
+/// latest first, as set CIDs.
+fn heads_held(catalog: &Catalog, published: &Published) -> Vec<Link> {
+    use crate::cid::Cid as _;
+    let claims = claims_about(catalog, &published.view).expect("claims");
+    let mut gathered = Gathered::default();
+    for (_, data) in &claims {
+        gathered.add(&published.anchor, data);
+    }
+    heads_among(&gathered, &published.owner.id(), &published.anchor, &std::collections::HashSet::new()).expect("heads").into_iter().map(|(cid, ..)| Link::decode(&cid).expect("cid")).collect()
+}
+
+#[test]
+fn each_machine_writes_with_a_key_the_owner_key_lets_write_and_can_have_it_taken_away() {
+    let t = tree("cap-writers");
+    let repo = Scratch::new("cap-writers-repo");
+    let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
+    let vault = crate::vault::Vault::open(repo.path(), catalog.uid()).expect("vault");
+    let anchor = catalog.new_anchor().expect("anchor");
+    let published = Published::of(&secret(&vault), &anchor).expect("published");
+    let Capability::Live(live) = published.capability() else {
+        panic!("not live");
+    };
+    let first = import(&mut catalog, t.path(), &importer());
+    catalog.set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
+    catalog.set_anchor(&anchor, &first).expect("set");
+    let one = publish(&mut catalog, &vault, &published, &first).expect("publish");
+    // The head says which plaintext sets it's of
+    let latest = last_head(&catalog, &published).expect("head").expect("a head");
+    assert_eq!(latest.block.sets, catalog.anchor_heads(&anchor).expect("heads").into_iter().map(|(set, ..)| set).collect::<Vec<_>>());
+    assert!(!latest.block.sets.is_empty());
+
+    // Another machine, another writer, after the first
+    std::fs::write(t.path().join("docs/readme.md"), "from the other machine").expect("write");
+    let second = import(&mut catalog, t.path(), &importer());
+    catalog.set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
+    let two = publish(&mut catalog, &vault, &published, &second).expect("publish");
+    assert_eq!(heads_held(&catalog, &published), vec![two.set.clone()]);
+    let everything = |catalog: &Catalog| held_all(catalog, &[(anchor.clone(), Publication { set: two.set.clone(), manifest: two.manifest.clone(), fresh: true, mounted: Vec::new() })]);
+    assert_eq!(read(&everything(&catalog), &live, &|_| Vec::new()).expect("read").plain, second);
+    let writers: Vec<Link> = [&one.set, &two.set].iter().map(|set| {
+        let held = everything(&catalog);
+        held.0.values().find_map(|data| match crate::claim::Claim::parse(data) {
+            Some(crate::claim::Claim::Sign(sign)) if sign.signs().contains(set) => Some(sign.by().clone()),
+            _ => None,
+        }).expect("signed")
+    }).collect();
+    assert_ne!(writers[0], writers[1], "each machine its own key");
+    assert!(writers.iter().all(|writer| *writer != published.owner.id()), "not the owner key itself");
+
+    // The second machine's write taken away, standing at the first's head:
+    // its head counts no more, and the first's is the latest again
+    let claims = claims_about(&catalog, &published.view).expect("claims");
+    let mut gathered = Gathered::default();
+    for (_, data) in &claims {
+        gathered.add(&published.anchor, data);
+    }
+    let judge = Judge::of(&published.owner.id(), &published.anchor, gathered.signed_grants(), &BTreeMap::new()).expect("judge");
+    let prev = judge.state.as_ref().expect("state").heads();
+    let take = crate::claim::Claim::Grant(crate::claim::Grant::new([writers[1].clone()], Some(published.anchor.clone()), [], [crate::grants::WRITE.to_owned()], [], prev).expect("grant"));
+    catalog.put_block(&take.block(), crate::cid::CidVersion::V1).expect("put");
+    catalog.sign_with_key(&published.owner, [take.cid()]).expect("sign");
+    assert_eq!(heads_held(&catalog, &published), vec![one.set.clone()]);
+
+    // A set by a key never let write counts for nothing, however late
+    let stranger = crate::keys::Key::generate().expect("key");
+    let head = seal_head(live.read(), &HeadBlock::new(first.clone(), seal(&catalog, &first, live.read()).expect("seal").root)).expect("head");
+    let later = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("now").as_secs() + 1_000_000;
+    let set = crate::claim::Claim::Set(crate::claim::Set::new([published.anchor.clone()], AnyCid::V1(head.cid().clone()), later).expect("set").after(Some(vec![one.set.clone()])));
+    catalog.put_block(&set.block(), crate::cid::CidVersion::V1).expect("put");
+    catalog.sign_with_key(&stranger, [set.cid()]).expect("sign");
+    assert_eq!(heads_held(&catalog, &published), vec![one.set]);
 }
