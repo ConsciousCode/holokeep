@@ -530,6 +530,16 @@ enum CapCommand {
         #[arg(long)]
         at: Vec<String>,
     },
+    /// Change a published anchor's read key: whoever has a capability with
+    /// the old one reads nothing new, though what they've read they keep.
+    /// What's unchanged keeps its ciphertext. Print a capability with the
+    /// new key, for whoever's still to read it; writers need new
+    /// capabilities too (`hk cap grant`)
+    Rekey {
+        anchor: PathBuf,
+        #[arg(long)]
+        at: Vec<String>,
+    },
     /// List who may write a published anchor, by key: this account's
     /// machines and capabilities' writers, whether each still may, and if
     /// not, how many of its sets stand
@@ -2442,7 +2452,7 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
             let value = repo.anchor_value(&anchor)?.with_context(|| format!("{anchor} is nothing yet"))?;
             fetch_first(Some(&dir), &value)?;
             let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
-            let published = cap::Published::of(&cap::secret(&vault), &anchor)?;
+            let published = cap::Published::current(&mut repo, &vault, &anchor)?;
             let publications = cap::publish_mounted(&mut repo, &vault, &anchor, &value)?;
             if let Some(output) = output {
                 let mut blocks = Vec::new();
@@ -2476,7 +2486,7 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
             let mut repo = open_repo(Some(dir.clone()))?;
             let anchor = anchor_named(&repo, &anchor)?;
             let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
-            let published = cap::Published::of(&cap::secret(&vault), &anchor)?;
+            let published = cap::Published::current(&mut repo, &vault, &anchor)?;
             anyhow::ensure!(cap::unpublish(&mut repo, &vault, &published)?, "{anchor} isn't published");
             eprintln!("{anchor} is published no more: what's published of it is collected in time");
             Ok(())
@@ -2485,9 +2495,8 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
             let dir = repo_dir(repo)?;
             let mut repo = open_repo(Some(dir.clone()))?;
             let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
-            let secret = cap::secret(&vault);
             for (anchor, _) in cap::published(&mut repo, &vault)? {
-                out!("{anchor}\t{}", cap::Published::of(&secret, &anchor)?.capability().encode());
+                out!("{anchor}\t{}", cap::Published::current(&mut repo, &vault, &anchor)?.capability().encode());
             }
             Ok(())
         },
@@ -2495,6 +2504,20 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
         CapCommand::Grant { anchor, at } => cap_grant(repo, &anchor, at),
         CapCommand::Take { car } => cap_take(repo, &car),
         CapCommand::Writers { anchor } => cap_writers(repo, &anchor),
+        CapCommand::Rekey { anchor, at } => {
+            let dir = repo_dir(repo)?;
+            let mut repo = open_repo(Some(dir.clone()))?;
+            let anchor = anchor_named(&repo, &anchor)?;
+            let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
+            let published = cap::rekey(&mut repo, &vault, &anchor)?;
+            eprintln!("{anchor} has a new read key, its epoch {}: older capabilities read nothing new", published.epoch);
+            let capability = match published.capability() {
+                Capability::Live(live) => Capability::Live(live.at(at)),
+                other => other,
+            };
+            out!("{}", capability.encode());
+            Ok(())
+        },
         CapCommand::Revoke { anchor, writer } => cap_revoke(repo, &anchor, &writer),
         CapCommand::Write { capability, root, output, car, from } => cap_write(repo, &capability, &root, output.as_deref(), &car, from),
     }
@@ -2612,7 +2635,7 @@ fn cap_grant(repo: Option<PathBuf>, anchor: &Path, at: Vec<String>) -> anyhow::R
     let mut repo = open_repo(Some(dir.clone()))?;
     let anchor = anchor_named(&repo, anchor)?;
     let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
-    let published = cap::Published::of(&cap::secret(&vault), &anchor)?;
+    let published = cap::Published::current(&mut repo, &vault, &anchor)?;
     let seed = cap::add_writer(&mut repo, &vault, &published)?;
     let Capability::Write(write) = published.write_capability(seed, repo.user()?) else {
         anyhow::bail!("not a write capability");
@@ -2628,10 +2651,10 @@ fn cap_grant(repo: Option<PathBuf>, anchor: &Path, at: Vec<String>) -> anyhow::R
 fn cap_writers(repo: Option<PathBuf>, anchor: &Path) -> anyhow::Result<()> {
     use holokeep::cap;
     let dir = repo_dir(repo)?;
-    let repo = open_repo(Some(dir.clone()))?;
+    let mut repo = open_repo(Some(dir.clone()))?;
     let anchor = anchor_named(&repo, anchor)?;
     let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
-    let published = cap::Published::of(&cap::secret(&vault), &anchor)?;
+    let published = cap::Published::current(&mut repo, &vault, &anchor)?;
     for writer in cap::writers(&repo, &vault, &published)? {
         let may = if writer.writes { "writes".to_owned() } else { format!("taken away, {} sets stand", writer.stands.len()) };
         let whose = if writer.this_machine { "\tthis machine" } else { "" };
@@ -2648,7 +2671,7 @@ fn cap_revoke(repo: Option<PathBuf>, anchor: &Path, writer: &str) -> anyhow::Res
     let anchor = anchor_named(&repo, anchor)?;
     let writer = key_named(writer)?;
     let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
-    let published = cap::Published::of(&cap::secret(&vault), &anchor)?;
+    let published = cap::Published::current(&mut repo, &vault, &anchor)?;
     let stands = cap::take_write(&mut repo, &vault, &published, &writer)?;
     take_plaintext_write(&dir, &repo, &anchor, &writer)?;
     eprintln!("{} may write {anchor} no more: {} of its sets stand, and nothing after", holokeep::keys::peer_id(&writer), stands.len());

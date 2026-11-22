@@ -729,3 +729,82 @@ fn writers_forking_are_merged_by_the_owner_and_write_taken_away_stops_one() {
     assert!(take_in(&mut catalog, &vault).expect("take in").is_empty(), "not taken in");
     assert_eq!(catalog.anchor_value(&anchor).expect("value"), Some(merged));
 }
+
+#[test]
+fn sealing_under_a_new_read_key_keeps_whats_unchanged_with_its_key_said() {
+    let t = tree("cap-rekey-seal");
+    let repo = Scratch::new("cap-rekey-seal-repo");
+    let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
+    let (old, new) = (Zeroizing::new([5u8; 32]), Zeroizing::new([6u8; 32]));
+    let root = import(&mut catalog, t.path(), &importer());
+    let first = seal(&catalog, &root, &old).expect("seal");
+    for block in &first.blocks {
+        catalog.put_block(block, crate::cid::CidVersion::V1).expect("put");
+    }
+    // Under the new key, only the root's sealed again: its entries are as
+    // they were, their keys in it
+    let (again, _) = seal_tree(&catalog, &root, &new, Some((root.clone(), first.root, old)), MountKeys::None).expect("seal");
+    assert_eq!(again.blocks.len(), 1, "the root alone");
+    for block in &again.blocks {
+        catalog.put_block(block, crate::cid::CidVersion::V1).expect("put");
+    }
+    let snapshot = Snapshot::new(again.root.clone(), root.clone(), new.clone());
+    let distinct = |blocks: Vec<Block>| blocks.iter().map(|block| AnyCid::V1(block.cid().clone()).to_bytes()).collect::<HashSet<_>>().len();
+    assert_eq!(distinct(unseal(&catalog, &snapshot).expect("unseal")), dag(&catalog, &root).len());
+    assert!(unseal(&catalog, &Snapshot::new(again.root.clone(), root.clone(), Zeroizing::new([5u8; 32]))).is_err(), "the old key doesn't read the new root");
+
+    // An edit after: what's kept stays kept, what's changed is the new key's
+    std::fs::write(t.path().join("docs/deep/secret.txt"), "new plans").expect("write");
+    let edited = import(&mut catalog, t.path(), &importer());
+    let (after, _) = seal_tree(&catalog, &edited, &new, Some((root, again.root, new.clone())), MountKeys::None).expect("seal");
+    assert_eq!(after.blocks.len(), 4, "the file, deep, docs and the root");
+    for block in &after.blocks {
+        catalog.put_block(block, crate::cid::CidVersion::V1).expect("put");
+    }
+    assert_eq!(distinct(unseal(&catalog, &Snapshot::new(after.root, edited.clone(), new)).expect("unseal")), dag(&catalog, &edited).len());
+}
+
+#[test]
+fn a_new_read_key_reads_whats_new_and_back_through_the_old_and_the_old_reads_nothing_new() {
+    let t = tree("cap-rekey");
+    let repo = Scratch::new("cap-rekey-repo");
+    let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
+    let vault = crate::vault::Vault::open(repo.path(), catalog.uid()).expect("vault");
+    catalog.set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
+    let anchor = catalog.new_anchor().expect("anchor");
+    let first = import(&mut catalog, t.path(), &importer());
+    catalog.set_anchor(&anchor, &first).expect("set");
+    let before = Published::current(&mut catalog, &vault, &anchor).expect("published");
+    assert_eq!(before.epoch, 0);
+    assert!(rekey(&mut catalog, &vault, &anchor).is_err(), "not published yet");
+    publish(&mut catalog, &vault, &before, &first).expect("publish");
+    let held = |catalog: &mut Catalog| {
+        let (_, manifest) = published_list(catalog, &vault).into_iter().next().expect("published");
+        held_of(&published_blocks(catalog, &manifest).expect("blocks"))
+    };
+    let Capability::Live(old) = before.capability() else {
+        panic!("not live");
+    };
+
+    let after = rekey(&mut catalog, &vault, &anchor).expect("rekey");
+    assert_eq!(after.epoch, 1);
+    assert_eq!(Published::current(&mut catalog, &vault, &anchor).expect("published").epoch, 1, "the vault says so");
+    assert_eq!(after.view, before.view, "the same sealed anchor");
+    let Capability::Live(new) = after.capability() else {
+        panic!("not live");
+    };
+    assert_ne!(old.read(), new.read());
+    let now = held(&mut catalog);
+    assert!(read(&now, &old, &|_| Vec::new()).is_err(), "the old key reads nothing new");
+    let reading = read(&now, &new, &|_| Vec::new()).expect("read");
+    assert_eq!(reading.plain, first);
+    assert_eq!(reading.base.expect("base").block.past.as_deref(), Some(&**old.read()), "the key before, to read back with");
+
+    // Edited and published again, on the new key, readers of it read it
+    std::fs::write(t.path().join("docs/readme.md"), "after the new key").expect("write");
+    let second = import(&mut catalog, t.path(), &importer());
+    catalog.set_anchor(&anchor, &second).expect("set");
+    let again = Published::current(&mut catalog, &vault, &anchor).expect("published");
+    assert!(publish(&mut catalog, &vault, &again, &second).expect("publish").fresh);
+    assert_eq!(read(&held(&mut catalog), &new, &|_| Vec::new()).expect("read").plain, second);
+}

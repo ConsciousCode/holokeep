@@ -578,6 +578,12 @@ scenario_door() {
     on one hk cap writers "$anchor" | grep -q "^$writer	taken away" || fail "one doesn't list the writer's write as taken away"
     late=$(sh_on outsider 'echo "too late" | hk add -q -')
     ! on outsider hk cap write "$wcap" "$late" >/dev/null 2>&1 || fail "the door took a write from a writer whose write's taken away"
+    # A new read key: the old capability reads nothing new, the new one reads
+    local rekeyed
+    rekeyed=$(on one hk cap rekey "$anchor" --at "/ip4/$one_ip/tcp/4013/p2p/$one_peer" 2>/dev/null) || fail "one couldn't change the read key"
+    [ "$rekeyed" != "$cap" ] || fail "the new capability is the old"
+    ! on outsider hk cap import "$cap" >/dev/null 2>&1 || fail "the old capability read what's sealed with the new key"
+    on outsider hk cap import "$rekeyed" 2>/dev/null | grep -q "^root " || fail "the new capability didn't read it"
     on one hk cap unpublish "$anchor" 2>/dev/null
     ! on one hk cap ls | grep -q "^$anchor	" || fail "one still lists it, unpublished"
 

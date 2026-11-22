@@ -339,8 +339,10 @@ acting for the vault, doesn't.
 
 ### How it differs from the rest of this page, for now
 
-- The read key is derived, `derive(secret, "read", anchor nonce)`, until
-  read keys change (see [[#Revoking]]).
+- The read key is derived: `derive(secret, "read", anchor nonce)` for
+  its first epoch, 0, and `derive(secret, "read", anchor nonce ||
+  epoch as 4 big-endian bytes)` for each after (see [[#New read keys,
+  as it is now]]).
 - Each of the owner's machines writes with a **writer key** of its own,
   an ed25519 key from the seed `derive(secret, "writer", anchor nonce ||
   device key CID bytes)`, the device key being the catalog's signer (none,
@@ -361,9 +363,8 @@ acting for the vault, doesn't.
   | `plain` | Link | The plaintext root, which the root block's key and nonce are derived with. |
   | `root` | Link | The sealed root. |
   | `sets` | `[Link]` | The plaintext anchor's sets it's of, by CID, sorted: its heads where it was published (omitted if none). |
-  | `set`, `sign` | bytes | For a head a capability's writer made, the plaintext set it carries and its sign (not yet made). |
-
-  `past` comes with revoking.
+  | `set`, `sign` | bytes | For a head a capability's writer made, the plaintext set it carries and its sign. |
+  | `past` | bytes | The read key before the one it's sealed with, for a head after the read key's changed (omitted for the first epoch). |
 - A reader judges the sealed view in itself, not by the catalog's views,
   which a repo with no users would let anything count in: a set of the
   sealed anchor, for no other view, signed by `K`, or by a key `K` let
@@ -425,6 +426,41 @@ acting for the vault, doesn't.
     heads, even if the value is the same.
 - `hk cap import` and `hk cap write` read several CARs as one, as a
   reader of what's published and a writer's CAR beside it needs.
+
+### New read keys, as it is now
+
+- `hk cap rekey <anchor>` moves a published anchor to its next epoch:
+  what it is now is published again, sealed under that epoch's read
+  key, and the vault's manifest says the epoch, in the sealed map beside
+  `anchor`, as `epoch` (omitted for 0). It prints a capability with the
+  new key; whoever's to go on reading needs it, as writers need new
+  write capabilities (`hk cap grant`). Their write grants stand.
+- **Sealing across keys.** Publishing seals after the latest head the
+  owner's machines made, under the key that head's sealed with. An
+  entry unchanged since, whose key under the new read key would differ,
+  keeps its ciphertext: its parent's sealed node says its node key in
+  `keys`, by name, and nothing under it is sealed again. So a new read
+  key seals only the root, and the paths to what's changed after; an
+  entry kept stays kept, its key carried on, till it changes. A file's
+  chunks, a HAMT's shards, and anything else not named, are sealed again
+  under the new key when what holds them changes.
+- **Reading back.** Each head after the first epoch says the key before
+  in `past`. A reader merging heads (see [[#Writing]]) opens each with
+  its capability's key or one a later head's `past` gave, and unseals
+  each tree with the key that opened its head. The owner's machines
+  open heads with every epoch's key, derived.
+- **The old key.** A capability with an old key still proves the old
+  heads' token at a door, so is still told the heads, but opens none
+  sealed since: `hk cap import` says its key's been changed. What it
+  read before, and what's kept unchanged since, it can still unseal
+  from blocks it gets: revoking makes a key useless for what's new, not
+  for what it had.
+- **Not yet.** A mounted anchor's new key reaches the `mounts` of what
+  mounts it only when the directory holding the mount point is sealed
+  again; till then readers of the parent can't read the mount, and are
+  told so. Remaining readers get the new key in a new capability, not a
+  sealed box to their key; and sealing everything again, forgetting the
+  old ciphertext, is still to come.
 
 ### Taking write away, as it is now
 
@@ -709,8 +745,9 @@ In order, each of use alone:
    heads to a door or a CAR; the owner's machines take them in and merge
    them; write is taken away; readers and writers merge forks; and a
    friend's door keeps writes for the owner while it's away.
-5. **Revoking read.** New read keys, `keys` and `past`, sealed boxes for
-   read grants, and sealing everything again when asked.
+5. **Revoking read.** Begun: new read keys by epoch, `keys` and `past`.
+   To come: sealed boxes for read grants, and sealing everything again
+   when asked.
 6. **The vault as a capability**: a sealed root anchor only its owner
    can read, if one scheme for both is wanted.
 

@@ -88,10 +88,20 @@ pub const fn padded(len: usize) -> usize {
 /// A sealed node: a plaintext block, its links' ciphertext CIDs, and the
 /// sealed anchor each mount point among its entries is, as dag-cbor,
 /// padded with zeros.
+#[cfg(test)]
 fn encode(block: &[u8], links: &[Link], mounts: &BTreeMap<String, Mount>) -> Result<Vec<u8>> {
+    encode_keeping(block, links, mounts, &BTreeMap::new())
+}
+
+/// A sealed node, as `encode` makes it, with node keys for entries that
+/// don't derive theirs, kept from an earlier read key, by name.
+fn encode_keeping(block: &[u8], links: &[Link], mounts: &BTreeMap<String, Mount>, keys: &BTreeMap<String, Key>) -> Result<Vec<u8>> {
     let mut map = BTreeMap::from([("block".to_owned(), Ipld::Bytes(block.to_vec()))]);
     if !links.is_empty() {
         map.insert("links".to_owned(), Ipld::List(links.iter().cloned().map(Ipld::Link).collect()));
+    }
+    if !keys.is_empty() {
+        map.insert("keys".to_owned(), Ipld::Map(keys.iter().map(|(name, key)| (name.clone(), Ipld::Bytes(key.to_vec()))).collect()));
     }
     if !mounts.is_empty() {
         let mounts = mounts.iter().map(|(name, mount)| {
@@ -286,7 +296,7 @@ pub fn seal(src: &impl Fetch, root: &Link, read: &[u8; 32]) -> Result<Sealed> {
 /// earlier tree's opened along each path that's changed, to find what's
 /// the same below it.
 pub fn seal_since(src: &impl Fetch, root: &Link, read: &[u8; 32], before: Option<(Link, Link)>) -> Result<Sealed> {
-    seal_tree(src, root, read, before, MountKeys::None).map(|(sealed, _)| sealed)
+    seal_tree(src, root, read, before.map(|(plain, sealed)| (plain, sealed, Zeroizing::new(*read))), MountKeys::None).map(|(sealed, _)| sealed)
 }
 
 /// How mount points are sealed.
@@ -298,15 +308,18 @@ pub fn seal_since(src: &impl Fetch, root: &Link, read: &[u8; 32], before: Option
 #[derive(Clone, Copy)]
 pub enum MountKeys<'a> {
     None,
-    Secret(&'a [u8; 32]),
+    /// The capabilities' secret, and the epoch of each anchor's read key
+    /// that's published past its first, by its CID's bytes.
+    Secret(&'a [u8; 32], &'a HashMap<Vec<u8>, u32>),
     Known(&'a [Mount]),
 }
 
 /// Seal a DAG as `seal_since` does, each mount point among a directory's
 /// entries as `mounts` says (see `Mount`). Returns the anchors mount
 /// points name in what was sealed, which is only what's new.
-fn seal_tree(src: &impl Fetch, root: &Link, read: &[u8; 32], before: Option<(Link, Link)>, mounts: MountKeys<'_>) -> Result<(Sealed, Vec<Link>)> {
+fn seal_tree(src: &impl Fetch, root: &Link, read: &[u8; 32], before: Option<(Link, Link, Key)>, mounts: MountKeys<'_>) -> Result<(Sealed, Vec<Link>)> {
     let mut sealing = Sealing { src, mounts, mounted: Vec::new(), done: HashMap::new(), blocks: Vec::new() };
+    let before = before.map(|(plain, sealed, was_read)| Before { plain, sealed, key: root_key(&was_read), within: None });
     let root = sealing.seal(root, &root_key(read), None, before)?;
     Ok((Sealed { root, blocks: sealing.blocks }, sealing.mounted))
 }
@@ -325,7 +338,7 @@ struct Sealing<'a, F> {
 impl<F: Fetch> Sealing<'_, F> {
     /// Seal a block and what's under it, under its key, with what was in
     /// its place before, if anything was: its plaintext and sealed CIDs.
-    fn seal(&mut self, cid: &Link, key: &Key, within: Option<&Key>, before: Option<(Link, Link)>) -> Result<Link> {
+    fn seal(&mut self, cid: &Link, key: &Key, within: Option<&Key>, before: Option<Before>) -> Result<Link> {
         if cid.hashcode() == IDENTITY {
             return Ok(cid.clone());
         }
@@ -334,27 +347,36 @@ impl<F: Fetch> Sealing<'_, F> {
             return Ok(sealed.clone());
         }
         // Nothing's changed here: it's sealed already
-        if let Some((was, sealed)) = &before
-            && was == cid
+        if let Some(before) = &before
+            && before.plain == *cid
+            && *before.key == **key
         {
-            self.done.insert(done, sealed.clone());
-            return Ok(sealed.clone());
+            self.done.insert(done, before.sealed.clone());
+            return Ok(before.sealed.clone());
         }
         let data = self.src.fetch(cid)?;
-        let mut was = match before {
-            Some((was, sealed)) => self.opened(&was, &sealed, key, within),
-            None => HashMap::new(),
-        };
+        let mut was = before.map_or_else(HashMap::new, |before| self.opened(&before));
         let mut links = Vec::new();
         let mut mounts = BTreeMap::new();
+        let mut keys = BTreeMap::new();
         for child in children(cid, &data, key, within)? {
             if let Some((name, mount)) = self.mount(&child)? {
                 mounts.insert(name, mount);
             }
             let before = child.place.as_ref().and_then(|place| was.remove(place));
+            // Unchanged, but under another key than it would derive: kept as
+            // it was, its key said, as after the read key's changed
+            if let (Some(before), Some(name)) = (&before, child.entry.as_deref().and_then(|entry| std::str::from_utf8(entry).ok()))
+                && before.plain == child.cid
+                && *before.key != *child.key
+            {
+                keys.insert(name.to_owned(), Zeroizing::new(*before.key));
+                links.push(before.sealed.clone());
+                continue;
+            }
             links.push(self.seal(&child.cid, &child.key, child.within.as_ref(), before)?);
         }
-        let block = Sealer::new(key).seal(cid, &encode(&data, &links, &mounts)?)?;
+        let block = Sealer::new(key).seal(cid, &encode_keeping(&data, &links, &mounts, &keys)?)?;
         let sealed = AnyCid::V1(block.cid().clone());
         self.blocks.push(block);
         self.done.insert(done, sealed.clone());
@@ -380,8 +402,8 @@ impl<F: Fetch> Sealing<'_, F> {
             return Ok(None);
         };
         let mount = match self.mounts {
-            MountKeys::Secret(secret) => {
-                let published = Published::of(secret, &anchor)?;
+            MountKeys::Secret(secret, epochs) => {
+                let published = Published::at(secret, &anchor, epochs.get(&anchor.to_bytes()).copied().unwrap_or(0))?;
                 Mount { view: published.view, read: published.read, of: Some(anchor.clone()) }
             },
             MountKeys::Known(known) => match known.iter().find(|mount| mount.of.as_ref() == Some(&anchor)) {
@@ -400,28 +422,41 @@ impl<F: Fetch> Sealing<'_, F> {
     /// noted as sealed, by plaintext CID and key, and those whose place is
     /// said by name are returned by it, to follow down. Nothing, if it
     /// can't be opened, so what's under it is sealed again.
-    fn opened(&mut self, plain: &Link, sealed: &Link, key: &Key, within: Option<&Key>) -> HashMap<Vec<u8>, (Link, Link)> {
+    fn opened(&mut self, before: &Before) -> HashMap<Vec<u8>, Before> {
         let mut places = HashMap::new();
-        let Ok(bytes) = self.src.fetch(sealed) else {
+        let Ok(bytes) = self.src.fetch(&before.sealed) else {
             return places;
         };
-        let Ok(node) = Sealer::new(key).open(plain, &bytes).map_err(Error::from).and_then(|opened| decode(&opened)) else {
+        let Ok(node) = Sealer::new(&before.key).open(&before.plain, &bytes).map_err(Error::from).and_then(|opened| decode(&opened)) else {
             return places;
         };
-        let Ok(children) = children(plain, &node.block, key, within) else {
+        let Ok(children) = children(&before.plain, &node.block, &before.key, before.within.as_ref()) else {
             return places;
         };
-        if children.len() != node.links.len() || !node.keys.is_empty() {
+        if children.len() != node.links.len() {
             return places;
         }
         for (child, sealed) in children.into_iter().zip(node.links) {
-            self.done.insert((child.cid.to_bytes(), *child.key), sealed.clone());
+            // A key it kept from before, if it said one
+            let kept = child.entry.as_deref().and_then(|entry| std::str::from_utf8(entry).ok()).and_then(|entry| node.keys.get(entry));
+            let key = kept.map_or(child.key, |kept| Zeroizing::new(**kept));
+            self.done.insert((child.cid.to_bytes(), *key), sealed.clone());
             if let Some(place) = child.place {
-                places.insert(place, (child.cid, sealed));
+                places.insert(place, Before { plain: child.cid, sealed, key, within: child.within });
             }
         }
         places
     }
+}
+
+/// What was sealed in a place before: its plaintext and sealed CIDs, the
+/// key it was sealed under, and the key of the directory whose HAMT it's
+/// a shard of, if it is one.
+struct Before {
+    plain: Link,
+    sealed: Link,
+    key: Key,
+    within: Option<Key>,
 }
 
 /// Where sealed blocks are read from, each asked for with its block
@@ -617,18 +652,52 @@ pub struct Published {
     pub of: Link,
     owner: crate::keys::Key,
     read: Key,
+    /// Which read key it's on, from 0, the first; the next changes it,
+    /// which the last head's readers don't have (see `rekey`).
+    pub epoch: u32,
+    /// Every read key it's been on before, the latest first.
+    pasts: Vec<Key>,
     /// What its manifests seal which plaintext anchor it is with.
     manifest: Key,
 }
 
+/// An anchor's read key, as published, at an epoch: the first's derived
+/// from its nonce alone, each after from the epoch too.
+fn read_key(secret: &[u8; 32], nonce: &[u8; 16], epoch: u32) -> Key {
+    if epoch == 0 {
+        derive(secret, b"read", nonce)
+    } else {
+        derive(secret, b"read", &[nonce.as_slice(), &epoch.to_be_bytes()].concat())
+    }
+}
+
 impl Published {
+    /// An anchor as published on its first read key.
     pub fn of(secret: &[u8; 32], anchor: &Link) -> Result<Self> {
+        Self::at(secret, anchor, 0)
+    }
+
+    /// An anchor as published on the read key of an epoch.
+    pub fn at(secret: &[u8; 32], anchor: &Link, epoch: u32) -> Result<Self> {
         let nonce = crate::claim::anchor_nonce(anchor).ok_or_else(|| invalid(format!("{anchor} isn't an anchor: only an anchor's owner publishes it")))?;
         let owner = crate::keys::Key::from_seed(&derive(secret, b"owner", &nonce));
         let sealed: [u8; 16] = derive(secret, b"nonce", &nonce).first_chunk::<16>().copied().unwrap_or_default();
         let sealed = crate::claim::anchor_of(sealed)?;
         let view = crate::claim::view(&sealed, &owner.id()).ok_or_else(|| invalid("a sealed anchor with no view"))?;
-        Ok(Self { anchor: sealed, view, of: anchor.clone(), owner, read: derive(secret, b"read", &nonce), manifest: derive(secret, b"manifest", b"") })
+        let pasts = (0..epoch).rev().map(|before| read_key(secret, &nonce, before)).collect();
+        Ok(Self { anchor: sealed, view, of: anchor.clone(), owner, read: read_key(secret, &nonce, epoch), epoch, pasts, manifest: derive(secret, b"manifest", b"") })
+    }
+
+    /// An anchor as published now, on the read key the vault's manifest of
+    /// it says: the first, if it's not published.
+    pub fn current(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, anchor: &Link) -> Result<Self> {
+        let epoch = epochs(catalog, vault)?.into_iter().find(|(of, _)| of == anchor).map_or(0, |(_, epoch)| epoch);
+        Self::at(&secret(vault), anchor, epoch)
+    }
+
+    /// Every read key it's been on, this one first.
+    fn keys(&self) -> impl Iterator<Item = &Key> {
+        std::iter::once(&self.read).chain(&self.pasts)
     }
 
     /// What writes it, as a writer whose key's seed is given, for an
@@ -668,11 +737,14 @@ pub struct HeadBlock {
     pub sets: Vec<Link>,
     pub set: Option<Vec<u8>>,
     pub sign: Option<Vec<u8>>,
+    /// The read key before the one it's sealed with, if that's changed: so
+    /// a reader with this one reads what was before (see `rekey`).
+    pub past: Option<Key>,
 }
 
 impl HeadBlock {
     pub const fn new(plain: Link, root: Link) -> Self {
-        Self { plain, root, sets: Vec::new(), set: None, sign: None }
+        Self { plain, root, sets: Vec::new(), set: None, sign: None, past: None }
     }
 }
 
@@ -689,6 +761,9 @@ fn seal_head(read: &[u8; 32], head: &HeadBlock) -> Result<Block> {
     if let (Some(set), Some(sign)) = (&head.set, &head.sign) {
         map.insert("set".to_owned(), Ipld::Bytes(set.clone()));
         map.insert("sign".to_owned(), Ipld::Bytes(sign.clone()));
+    }
+    if let Some(past) = &head.past {
+        map.insert("past".to_owned(), Ipld::Bytes(past.to_vec()));
     }
     Ok(crate::vault::seal_bytes(&head_key(read), &pad(map)?)?)
 }
@@ -713,10 +788,21 @@ fn open_head(read: &[u8; 32], sealed: &[u8]) -> Result<HeadBlock> {
         (Some(Ipld::Bytes(set)), Some(Ipld::Bytes(sign))) => (Some(set), Some(sign)),
         _ => return Err(bad()),
     };
+    let past = match map.remove("past") {
+        None => None,
+        Some(Ipld::Bytes(past)) => Some(Zeroizing::new(<[u8; 32]>::try_from(past.as_slice()).map_err(|_| bad())?)),
+        Some(_) => return Err(bad()),
+    };
     if !map.is_empty() {
         return Err(bad());
     }
-    Ok(HeadBlock { plain, root, sets, set, sign })
+    Ok(HeadBlock { plain, root, sets, set, sign, past })
+}
+
+/// A head block, opened with whichever of some read keys it's sealed
+/// with, and that key.
+fn open_head_with<'k>(keys: impl IntoIterator<Item = &'k Key>, sealed: &[u8]) -> Option<(HeadBlock, Key)> {
+    keys.into_iter().find_map(|key| open_head(key, sealed).ok().map(|head| (head, Zeroizing::new(**key))))
 }
 
 /// The first of a sealed view's grants: its owner key, given everything,
@@ -1006,8 +1092,8 @@ pub struct Taken {
 pub fn take_in(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault) -> Result<Vec<Taken>> {
     let secret = secret(vault);
     let mut taken = Vec::new();
-    for (anchor, _) in published(catalog, vault)? {
-        let published = Published::of(&secret, &anchor)?;
+    for (anchor, _, epoch) in published_at(catalog, vault)? {
+        let published = Published::at(&secret, &anchor, epoch)?;
         let claims = claims_about(catalog, &published.view)?;
         let mut gathered = Gathered::default();
         for (_, data) in &claims {
@@ -1017,7 +1103,7 @@ pub fn take_in(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault)
             let Some(block) = catalog.get_block(set.value())? else {
                 continue;
             };
-            let Ok(head) = open_head(&published.read, block.data()) else {
+            let Some((head, key)) = open_head_with(published.keys(), block.data()) else {
                 continue;
             };
             let (Some(inner), Some(sign)) = (head.set, head.sign) else {
@@ -1035,7 +1121,7 @@ pub fn take_in(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault)
                 continue;
             }
             // Not all here yet, as while it's still arriving: next time
-            let blocks = match unseal(catalog, &Snapshot::new(head.root.clone(), head.plain.clone(), Zeroizing::new(*published.read))) {
+            let blocks = match unseal(catalog, &Snapshot::new(head.root.clone(), head.plain.clone(), key)) {
                 Ok(blocks) => blocks,
                 Err(Error::Store(e)) if e.is_busy() => return Err(Error::Store(e)),
                 Err(e) => {
@@ -1071,7 +1157,11 @@ pub fn take_in(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault)
 struct Head {
     sets: Vec<Link>,
     block: HeadBlock,
-    ours: Option<HeadBlock>,
+    /// The read key the latest's sealed with.
+    key: Key,
+    /// The latest head the owner's machines made, and the read key it's
+    /// sealed with.
+    ours: Option<(HeadBlock, Key)>,
 }
 
 fn last_head(catalog: &crate::store::Catalog, published: &Published) -> Result<Option<Head>> {
@@ -1086,15 +1176,15 @@ fn last_head(catalog: &crate::store::Catalog, published: &Published) -> Result<O
     let Some((_, latest, ..)) = heads.first() else {
         return Ok(None);
     };
-    let block = open_head(&published.read, block_here(catalog, latest.value())?.data())?;
+    let (block, key) = open_head_with(published.keys(), block_here(catalog, latest.value())?.data()).ok_or_else(|| invalid("the latest head opens with none of its read keys"))?;
     let sets = heads.iter().filter_map(|(cid, ..)| crate::cid::Cid::decode(cid).ok()).collect();
     let mut counting = counting_among(&gathered, &owner, &published.anchor, &none)?;
     counting.sort_by(|(a, x, ..), (b, y, ..)| y.at().cmp(&x.at()).then_with(|| b.cmp(a)));
     let ours = counting.iter().find_map(|(_, set, ..)| {
-        let head = open_head(&published.read, catalog.get_block(set.value()).ok()??.data()).ok()?;
-        head.set.is_none().then_some(head)
+        let (head, key) = open_head_with(published.keys(), catalog.get_block(set.value()).ok()??.data())?;
+        head.set.is_none().then_some((head, key))
     });
-    Ok(Some(Head { sets, block, ours }))
+    Ok(Some(Head { sets, block, key, ours }))
 }
 
 /// The key a machine of the owner's writes a sealed anchor with: derived
@@ -1160,8 +1250,9 @@ pub struct Publication {
 pub fn publish(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, published: &Published, value: &Link) -> Result<Publication> {
     let secret = secret(vault);
     let last = last_head(catalog, published)?;
-    let ours = last.as_ref().and_then(|head| head.ours.as_ref()).map(|ours| (ours.plain.clone(), ours.root.clone()));
-    let (sealed, mounted) = seal_tree(catalog, value, &published.read, ours, MountKeys::Secret(&secret))?;
+    let ours = last.as_ref().and_then(|head| head.ours.as_ref()).map(|(ours, key)| (ours.plain.clone(), ours.root.clone(), key.clone()));
+    let epochs: HashMap<Vec<u8>, u32> = epochs(catalog, vault)?.into_iter().filter(|(_, epoch)| *epoch > 0).map(|(anchor, epoch)| (anchor.to_bytes(), epoch)).collect();
+    let (sealed, mounted) = seal_tree(catalog, value, &published.read, ours, MountKeys::Secret(&secret, &epochs))?;
     let previous = as_vault(catalog, vault, |catalog| Ok(kept_manifests(catalog)?.into_iter().find(|(_, manifest)| manifest.view.as_ref() == Some(&published.view)).map(|(cid, _)| cid)))?;
     let mut sets: Vec<Link> = catalog.anchor_heads(&published.of)?.into_iter().map(|(set, ..)| set).collect();
     sets.sort_by_key(CidRef::to_bytes);
@@ -1170,12 +1261,14 @@ pub fn publish(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault,
         && last.block.plain == *value
         && last.block.sets == sets
         && last.sets.len() == 1
+        && *last.key == *published.read
     {
         let set = last.sets.first().cloned().unwrap_or_else(|| value.clone());
         return Ok(Publication { set, manifest: previous.clone(), fresh: false, mounted });
     }
     let mut block = HeadBlock::new(value.clone(), sealed.root.clone());
     block.sets = sets;
+    block.past = published.pasts.first().cloned();
     let head = seal_head(&published.read, &block)?;
     let head_cid = AnyCid::V1(head.cid().clone());
     let nonce = crate::claim::anchor_nonce(&published.of).ok_or_else(|| invalid("not an anchor"))?;
@@ -1210,7 +1303,11 @@ pub fn publish(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault,
 /// naming them, in parts if there are many, after the manifest it keeps,
 /// `previous`, which it keeps in that one's place. Returns the manifest.
 fn keep_entries(catalog: &crate::store::Catalog, published: &Published, previous: Option<&Link>, entries: Vec<Link>) -> Result<Link> {
-    let of = crate::dagcbor::to_vec(&Ipld::Map(BTreeMap::from([("anchor".to_owned(), Ipld::Link(published.of.clone()))]))).map_err(|e| invalid(format!("{e}")))?;
+    let mut of = BTreeMap::from([("anchor".to_owned(), Ipld::Link(published.of.clone()))]);
+    if published.epoch > 0 {
+        of.insert("epoch".to_owned(), Ipld::Integer(i128::from(published.epoch)));
+    }
+    let of = crate::dagcbor::to_vec(&Ipld::Map(of)).map_err(|e| invalid(format!("{e}")))?;
     let of = crate::vault::seal_bytes(&published.manifest, &of)?.into_data().into_vec();
     let mut top = Manifest { view: Some(published.view.clone()), blocks: Vec::new(), parts: Vec::new(), next: previous.cloned(), sealed: Some(of) };
     if entries.len() <= ENTRIES {
@@ -1386,6 +1483,27 @@ pub fn write(catalog: &mut crate::store::Catalog, cap: &Write, base: &Base, valu
     Ok(Written { blocks, set: set.block(), sign: block_here(catalog, &sign)? })
 }
 
+/// Change a published anchor's read key, publishing what it is now as
+/// the next epoch's (see `Published::at`).
+///
+/// What's sealed after is sealed under the new key; what's unchanged
+/// keeps its ciphertext, its node keys said in its parent's `keys`. The
+/// head says the key before in `past`, so whoever has the new key reads
+/// back through every key before; whoever has only an old one reads
+/// nothing new. Its readers to be need a capability with the new key.
+/// Returns it as published now.
+pub fn rekey(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, anchor: &Link) -> Result<Published> {
+    let current = Published::current(catalog, vault, anchor)?;
+    if !epochs(catalog, vault)?.iter().any(|(of, _)| of == anchor) {
+        return Err(invalid(format!("{anchor} isn't published")));
+    }
+    let value = catalog.anchor_value(anchor)?.ok_or_else(|| invalid(format!("{anchor} is nothing yet")))?;
+    let epoch = current.epoch.checked_add(1).ok_or_else(|| invalid("no epoch after"))?;
+    let next = Published::at(&secret(vault), anchor, epoch)?;
+    publish(catalog, vault, &next, &value)?;
+    Ok(next)
+}
+
 /// Publish what an anchor is now, and what's mounted in it.
 ///
 /// It's published as `publish` does, then each anchor a mount point names
@@ -1394,12 +1512,12 @@ pub fn write(catalog: &mut crate::store::Catalog, cap: &Write, base: &Base, valu
 /// anchor that's nothing yet isn't published. Returns each anchor
 /// published and its publication, the anchor asked for first.
 pub fn publish_mounted(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, anchor: &Link, value: &Link) -> Result<Vec<(Link, Publication)>> {
-    let secret = secret(vault);
     let mut done = Vec::new();
     let mut seen = std::collections::HashSet::from([anchor.to_bytes()]);
     let mut queue = std::collections::VecDeque::from([(anchor.clone(), value.clone())]);
     while let Some((anchor, value)) = queue.pop_front() {
-        let publication = publish(catalog, vault, &Published::of(&secret, &anchor)?, &value)?;
+        let published = Published::current(catalog, vault, &anchor)?;
+        let publication = publish(catalog, vault, &published, &value)?;
         for mounted in &publication.mounted {
             if seen.insert(mounted.to_bytes())
                 && let Some(value) = catalog.anchor_value(mounted)?
@@ -1414,6 +1532,12 @@ pub fn publish_mounted(catalog: &mut crate::store::Catalog, vault: &crate::vault
 
 /// The anchors the vault keeps published, each with its manifest.
 pub fn published(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault) -> Result<Vec<(Link, Link)>> {
+    Ok(published_at(catalog, vault)?.into_iter().map(|(anchor, manifest, _)| (anchor, manifest)).collect())
+}
+
+/// The anchors the vault keeps published, each with its manifest and the
+/// epoch of the read key it's on.
+fn published_at(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault) -> Result<Vec<(Link, Link, u32)>> {
     let key = derive(&secret(vault), b"manifest", b"");
     let manifests = as_vault(catalog, vault, |catalog| kept_manifests(catalog))?;
     Ok(manifests.into_iter().filter_map(|(cid, manifest)| {
@@ -1421,11 +1545,20 @@ pub fn published(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vaul
         let Ok(Ipld::Map(mut map)) = crate::dagcbor::from_slice(&of) else {
             return None;
         };
+        let epoch = match map.remove("epoch") {
+            Some(Ipld::Integer(epoch)) => u32::try_from(epoch).ok()?,
+            _ => 0,
+        };
         match map.remove("anchor") {
-            Some(Ipld::Link(anchor)) => Some((anchor, cid)),
+            Some(Ipld::Link(anchor)) => Some((anchor, cid, epoch)),
             _ => None,
         }
     }).collect())
+}
+
+/// Each anchor the vault keeps published, with the epoch of its read key.
+fn epochs(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault) -> Result<Vec<(Link, u32)>> {
+    Ok(published_at(catalog, vault)?.into_iter().map(|(anchor, _, epoch)| (anchor, epoch)).collect())
 }
 
 /// Stop keeping a sealed anchor published.
@@ -1529,7 +1662,7 @@ fn read_one<'a>(src: &impl Source, claims: impl IntoIterator<Item = &'a [u8]>, r
         return Err(Error::Behind);
     }
     let fetched = src.sealed(&[(head.value().clone(), head_bat(&live.read))])?;
-    let block = open_head(&live.read, fetched.first().ok_or_else(|| invalid("no head"))?)?;
+    let block = open_head(&live.read, fetched.first().ok_or_else(|| invalid("no head"))?).map_err(|_| invalid("its latest head isn't sealed with this capability's read key, which its owner has changed since: ask them for another"))?;
     let (plain, root) = (block.plain.clone(), block.root.clone());
     let set = crate::cid::Cid::decode(&cid).map_err(|_| invalid("a head's set with no CID"))?;
     let (blocks, mounts) = unseal_mounts(src, &Snapshot::new(root, plain.clone(), Zeroizing::new(*live.read)))?;
@@ -1713,8 +1846,31 @@ fn merge_forks(catalog: &crate::store::Catalog, src: &impl Source, live: &Live, 
     included.dedup();
     let wanted: Vec<(Link, [u8; 32])> = included.iter().filter_map(|cid| by.get(cid)).map(|set| (set.value().clone(), head_bat(&live.read))).collect();
     let fetched = src.sealed(&wanted)?;
-    let opened: Vec<HeadBlock> = fetched.iter().map(|data| open_head(&live.read, data)).collect::<Result<_>>()?;
-    let snapshots: Vec<Snapshot> = opened.iter().map(|block| Snapshot::new(block.root.clone(), block.plain.clone(), Zeroizing::new(*live.read))).collect();
+    // Each with the read key it's sealed with: this one, or one before,
+    // as the heads after say in `past`
+    let mut keys = vec![Zeroizing::new(*live.read)];
+    let mut opened: Vec<Option<(HeadBlock, Key)>> = vec![None; fetched.len()];
+    loop {
+        let mut more = false;
+        for (slot, data) in opened.iter_mut().zip(&fetched) {
+            if slot.is_none()
+                && let Some((head, key)) = open_head_with(&keys, data)
+            {
+                if let Some(past) = &head.past
+                    && !keys.iter().any(|known| **known == **past)
+                {
+                    keys.push(past.clone());
+                }
+                *slot = Some((head, key));
+                more = true;
+            }
+        }
+        if !more {
+            break;
+        }
+    }
+    let opened: Vec<(HeadBlock, Key)> = opened.into_iter().collect::<Option<_>>().ok_or_else(|| invalid("a head sealed with a read key this capability's never had"))?;
+    let snapshots: Vec<Snapshot> = opened.iter().map(|(block, key)| Snapshot::new(block.root.clone(), block.plain.clone(), key.clone())).collect();
     let (blocks, mounts) = unseal_all(src, &snapshots)?;
     for block in &blocks {
         catalog.put_block(block, crate::cid::CidVersion::V1)?;
@@ -1722,7 +1878,7 @@ fn merge_forks(catalog: &crate::store::Catalog, src: &impl Source, live: &Live, 
     let link = |cid: &[u8]| -> Result<Link> { crate::cid::Cid::decode(cid).map_err(|_| invalid("a set with no CID")) };
     let mut history = Vec::with_capacity(included.len());
     let mut blocks_of = HashMap::new();
-    for (cid, block) in included.iter().zip(opened) {
+    for (cid, (block, _)) in included.iter().zip(opened) {
         let set = by.get(cid).ok_or_else(|| invalid("a set gone"))?;
         let prev = if latest_common.contains(cid) {
             Vec::new()
