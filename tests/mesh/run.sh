@@ -556,6 +556,15 @@ scenario_door() {
     local older
     older=$(on outsider hk cap import "$cap" /tmp/first.car 2>&1) && fail "the outsider took an older head as the latest: $older"
     grep -q "older than one read before" <<<"$older" || fail "the outsider couldn't read the older head, but not for being older: $older"
+    # A writer outside: reads at the door, writes to a CAR, which one takes in
+    local wcap written
+    wcap=$(on one hk cap grant "$anchor" --at "/ip4/$one_ip/tcp/4013/p2p/$one_peer" 2>/dev/null) || fail "one couldn't let a writer write"
+    written=$(sh_on outsider 'echo "written from outside" | hk add -q -')
+    on outsider hk cap write "$wcap" "$written" -o /tmp/written.car >/dev/null 2>&1 || fail "the outsider couldn't write"
+    on outsider cat /tmp/written.car | podman exec -i "$run-one" sh -c 'cat > /tmp/written.car' || fail "couldn't give one the CAR"
+    on one hk cap take /tmp/written.car >/dev/null 2>&1 || fail "one didn't take in what the outsider wrote"
+    [ "$(on one hk anchor show "$anchor" | tail -1 | cut -f2)" = "$written" ] || fail "one's anchor isn't what the outsider wrote"
+    wait_for "the outsider to read what it wrote, as one publishes it" sh_on outsider "test \"\$(hk cap import '$cap' 2>/dev/null)\" = 'root $written'"
     on one hk cap unpublish "$anchor" 2>/dev/null
     ! on one hk cap ls | grep -q "^$anchor	" || fail "one still lists it, unpublished"
 

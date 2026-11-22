@@ -555,15 +555,16 @@ fn a_write_capability_writes_a_head_its_readers_read_carrying_the_plaintext_set(
     let first = import(&mut catalog, t.path(), &importer());
     catalog.set_anchor(&anchor, &first).expect("set");
     let published = Published::of(&secret(&vault), &anchor).expect("published");
-    let owner = crate::keys::Key::generate().expect("key").id();
+    // A repo of no mesh has no user: whatever's set counts
+    let owner = catalog.user().expect("user");
     assert!(add_writer(&mut catalog, &vault, &published).is_err(), "not published yet");
     publish(&mut catalog, &vault, &published, &first).expect("publish");
     let seed = add_writer(&mut catalog, &vault, &published).expect("writer");
-    let capability = published.write_capability(seed, Some(owner.clone()));
+    let capability = published.write_capability(seed, owner.clone());
     let Capability::Write(write_cap) = Capability::decode(&capability.encode()).expect("decode") else {
         panic!("not a write capability");
     };
-    assert_eq!((&write_cap.of, write_cap.owner.as_ref()), (&anchor, Some(&owner)));
+    assert_eq!((&write_cap.of, &write_cap.owner), (&anchor, &owner));
     let owners_held = |catalog: &mut Catalog| {
         let (_, manifest) = published_list(catalog, &vault).into_iter().next().expect("published");
         let mut held = Held::default();
@@ -599,19 +600,36 @@ fn a_write_capability_writes_a_head_its_readers_read_carrying_the_plaintext_set(
     let Some(crate::claim::Claim::Set(inner)) = block.set.as_deref().and_then(crate::claim::Claim::parse) else {
         panic!("no plaintext set");
     };
-    assert_eq!((inner.target(), inner.value(), inner.owner()), ([anchor.clone()].as_slice(), &edited, Some(&owner)));
+    assert_eq!((inner.target(), inner.value(), inner.owner()), ([anchor.clone()].as_slice(), &edited, owner.as_ref()));
     assert_eq!(inner.prev().map(<[Link]>::to_vec), Some(catalog.anchor_heads(&anchor).expect("heads").into_iter().map(|(set, ..)| set).collect()));
     let Some(crate::claim::Claim::Sign(sign)) = block.sign.as_deref().and_then(crate::claim::Claim::parse) else {
         panic!("no sign");
     };
     assert!(sign.verify() && sign.signs().contains(&crate::claim::Claim::Set(inner).cid()) && *sign.by() == write_cap.writer().id());
 
+    // The owner takes it in, once: the plaintext anchor is what was written,
+    // after what it was, and it's published again as that
+    for block in &written.blocks {
+        catalog.put_block(block, crate::cid::CidVersion::V1).expect("put");
+    }
+    let taken = take_in(&mut catalog, &vault).expect("take in");
+    assert_eq!(taken.iter().map(|taken| &taken.anchor).collect::<Vec<_>>(), vec![&anchor]);
+    assert_eq!(catalog.anchor_value(&anchor).expect("value"), Some(edited.clone()));
+    assert!(take_in(&mut catalog, &vault).expect("take in").is_empty(), "taken in once");
+    let again = publish(&mut catalog, &vault, &published, &edited).expect("publish");
+    assert!(again.fresh, "the owner's head follows the writer's");
+    let held = owners_held(&mut catalog);
+    let after = read(&held, &live, &|_| Vec::new()).expect("read");
+    assert_eq!((after.plain, after.base.expect("base").set), (edited.clone(), again.set));
+
     // A writer the owner key never let write writes nothing anyone reads
     let forged = Write::new(Live::new(live.view.clone(), Zeroizing::new(**live.read())), fresh_key().expect("key"), anchor, None);
     let mut held = owners_held(&mut catalog);
-    let stranger = write(&mut theirs, &forged, &base, &edited).expect("write");
+    std::fs::write(t.path().join("docs/readme.md"), "forged").expect("write");
+    let forgery = import(&mut theirs, t.path(), &importer());
+    let stranger = write(&mut theirs, &forged, &base, &forgery).expect("write");
     for block in stranger.blocks {
         held.insert(block);
     }
-    assert_eq!(read(&held, &live, &|_| Vec::new()).expect("read").plain, first);
+    assert_eq!(read(&held, &live, &|_| Vec::new()).expect("read").plain, edited);
 }

@@ -530,6 +530,12 @@ enum CapCommand {
         #[arg(long)]
         at: Vec<String>,
     },
+    /// Take in what writers wrote of anchors this account publishes, from
+    /// CARs `hk cap write` wrote: each anchor's set as they wrote it, and
+    /// published again. A running node takes in what reaches it by itself
+    Take {
+        car: Vec<PathBuf>,
+    },
     /// Write a sealed anchor with a write capability: a tree here, after
     /// its latest head, read from a CAR or at a holder's door. Write what's
     /// sealed of it, the head, and the writer's signs to a `CARv1`, for a
@@ -2488,6 +2494,7 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
             out!("{}", Capability::Write(write).encode());
             Ok(())
         },
+        CapCommand::Take { car } => cap_take(repo, &car),
         CapCommand::Write { capability, root, output, car, from } => cap_write(repo, &capability, &root, &output, &car, from),
     }
 }
@@ -2518,6 +2525,30 @@ fn held_of(cars: &[PathBuf]) -> anyhow::Result<holokeep::cap::Held> {
         held.add_car(io::BufReader::new(std::fs::File::open(car).with_context(|| format!("opening {}", car.display()))?))?;
     }
     Ok(held)
+}
+
+/// `hk cap take`: take in what writers wrote, from CARs, and publish
+/// what's taken in again.
+fn cap_take(repo: Option<PathBuf>, car: &[PathBuf]) -> anyhow::Result<()> {
+    use holokeep::cap;
+    let dir = repo_dir(repo)?;
+    let mut repo = open_repo(Some(dir.clone()))?;
+    let held = held_of(car)?;
+    repo.batch_breathing(|repo| {
+        for block in held.blocks() {
+            repo.put_block(&block, holokeep::cid::CidVersion::V1)?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+    let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
+    let taken = cap::take_in(&mut repo, &vault)?;
+    for taken in &taken {
+        out!("{}\t{}", taken.anchor, taken.set);
+        let value = repo.anchor_value(&taken.anchor)?.with_context(|| format!("{} is nothing", taken.anchor))?;
+        cap::publish_mounted(&mut repo, &vault, &taken.anchor, &value)?;
+    }
+    anyhow::ensure!(!taken.is_empty(), "nothing in them a writer wrote of an anchor this account publishes, that isn't here already");
+    Ok(())
 }
 
 /// `hk cap write`: write a sealed anchor with a write capability, after

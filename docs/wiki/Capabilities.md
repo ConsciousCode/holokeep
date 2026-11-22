@@ -236,16 +236,16 @@ head nonce = derive(read key, "head nonce", inner set CID bytes)[0..24]
 A capability is dag-cbor in multibase, base32, as a ticket is (see
 [[Mesh#Joining]]), starting `hkcap`:
 
-| Key | Type | Meaning |
-|---|---|---|
-| `view` | Link | The sealed view, which names `K`. Omitted for a snapshot. |
-| `root` | Link | A fixed sealed root: a snapshot, with no heads. Omitted otherwise. |
-| `plain` | Link | A snapshot's plaintext root, which its root block's key and nonce are derived with. Omitted otherwise, as a head says it. |
-| `read` | bytes | The read key. |
-| `write` | bytes | An ed25519 seed `K` has given `/anchor/write`, for a capability that writes (omitted for one that reads). |
-| `of` | Link | The plaintext anchor, which the plaintext sets it writes are of (with `write` only). |
-| `for` | Link | The user whose view of the plaintext anchor those sets are for, its owner (with `write` only; omitted if the owner's repo has no user). |
-| `at` | `[Multiaddr]` | Where some holders of the ciphertext listen (omitted if found otherwise). |
+| Key     | Type          | Meaning                                                                                                                                 |
+| ------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `view`  | Link          | The sealed view, which names `K`. Omitted for a snapshot.                                                                               |
+| `root`  | Link          | A fixed sealed root: a snapshot, with no heads. Omitted otherwise.                                                                      |
+| `plain` | Link          | A snapshot's plaintext root, which its root block's key and nonce are derived with. Omitted otherwise, as a head says it.               |
+| `read`  | bytes         | The read key.                                                                                                                           |
+| `write` | bytes         | An ed25519 seed `K` has given `/anchor/write`, for a capability that writes (omitted for one that reads).                               |
+| `of`    | Link          | The plaintext anchor, which the plaintext sets it writes are of (with `write` only).                                                    |
+| `for`   | Link          | The user whose view of the plaintext anchor those sets are for, its owner (with `write` only; omitted if the owner's repo has no user). |
+| `at`    | `[Multiaddr]` | Where some holders of the ciphertext listen (omitted if found otherwise).                                                               |
 
 Each write capability has a writer of its own, so each has a sign chain
 of its own, and taking one's write away leaves the others'. A write
@@ -398,9 +398,30 @@ acting for the vault, doesn't.
     writer's catalog beside the sign, which is on the writer's chain.
   - The head's set in the sealed view is after the head read, signed by
     the writer key.
-  - Sealed blocks, head block, set and sign go to the CAR. Holders
-    taking writes in (4c), and the owner's machines counting the inner
-    set in the plaintext (4d), come next.
+  - Sealed blocks, head block, set and sign go to the CAR.
+- **Taking in.** The owner's node, as it keeps what's published
+  current, and `hk cap take <car>...`, which puts a writer's CARs in
+  the repo first, take in each set that counts in a sealed view the
+  vault publishes whose head carries an inner set not here yet:
+  - The inner set must be of the plaintext anchor that sealed view is
+    published from, valued what the head's `plain` is, and its sign must
+    verify. Whether it's here is whether the catalog has a sign of it by
+    its signer.
+  - Its tree is unsealed into the repo, as the owner's account, with the
+    inner set and its sign.
+  - It counts in the owner's view if the mesh's grants let its writer
+    write the plaintext anchor, as a visitor. If it doesn't, as with no
+    grants, the owner's machine sets the anchor to its value itself,
+    after the inner set and what that's after: `K`'s grants, which are
+    the owner's, let it write. So the history keeps the writer's set and
+    sign either way.
+  - What it forks merges as any fork does, and the anchor's published
+    again. Publishing seals after the latest head the owner's machines
+    made, not a writer's, so what the writer wrote, sealed again the
+    same, goes in the vault's manifest; and it publishes again when the
+    plaintext sets the latest head says it's of aren't the anchor's
+    heads, even if the value is the same.
+- Pushing a write to a holder's door comes next (4c).
 - `hk cap import` and `hk cap write` read several CARs as one, as a
   reader of what's published and a writer's CAR beside it needs.
 
@@ -616,9 +637,10 @@ In order, each of use alone:
    reading through mount points, making a folder an anchor to share it,
    and capabilities on mounted anchors.
 4. **Writing.** Begun: the owner's machines write with writer keys `K`
-   lets write, judged by `K`'s grants alone, and write capabilities
-   write heads to a CAR. To come: holders taking writes in, counting their inner sets through
-   the visitor rule, merging on unsealing, and taking write away.
+   lets write, judged by `K`'s grants alone; write capabilities write
+   heads to a CAR; and the owner's machines take them in. To come:
+   pushing writes to doors, merging several heads on reading
+   and writing, and taking write away.
 5. **Revoking read.** New read keys, `keys` and `past`, sealed boxes for
    read grants, and sealing everything again when asked.
 6. **The vault as a capability**: a sealed root anchor only its owner

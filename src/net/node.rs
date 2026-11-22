@@ -2002,6 +2002,10 @@ impl Node {
         };
         let vault = crate::vault::Vault::open(repo, self.catalog.uid()).map_err(|e| Error::Invalid(e.to_string()))?;
         let mut done = 0usize;
+        // What writers wrote first, to publish with the rest
+        for taken in crate::cap::take_in(&mut self.catalog, &vault).map_err(busy)? {
+            eprintln!("took in what a writer wrote of {}, {}", taken.anchor, taken.set);
+        }
         for (anchor, _) in crate::cap::published(&mut self.catalog, &vault).map_err(busy)? {
             let Some(value) = self.catalog.anchor_value(&anchor)? else {
                 continue;

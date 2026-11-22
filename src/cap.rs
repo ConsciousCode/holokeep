@@ -533,6 +533,14 @@ impl Held {
         self.0.insert(AnyCid::V1(block.cid().clone()).to_bytes(), block.into_data().into_vec());
     }
 
+    /// Every block held, as blocks.
+    pub fn blocks(&self) -> impl Iterator<Item = Block> + '_ {
+        self.0.iter().filter_map(|(cid, data)| {
+            let link: Link = crate::cid::Cid::decode(cid).ok()?;
+            Block::verify(link.into(), data.clone().into_boxed_slice()).ok()
+        })
+    }
+
     /// Every block held, as claims among them might be.
     pub fn all(&self) -> impl Iterator<Item = &[u8]> {
         self.0.values().map(Vec::as_slice)
@@ -908,24 +916,106 @@ type Judged<'a> = (Vec<u8>, crate::claim::Set, &'a [u8], &'a [u8]);
 /// `at`, then CID: the sets that count, signed by a key that may write it
 /// (see `Judge`), or `trusted`, which no other replaces.
 fn heads_among<'a>(gathered: &Gathered<'a>, owner: &Link, anchor: &Link, trusted: &std::collections::HashSet<Vec<u8>>) -> Result<Vec<Judged<'a>>> {
-    let sets: BTreeMap<Vec<u8>, crate::claim::Set> = gathered.sets.iter().map(|(cid, (set, _))| (cid.clone(), set.clone())).collect();
-    let judge = Judge::of(owner, anchor, gathered.signed_grants(), &sets)?;
-    let counting: Vec<Judged<'a>> = gathered.sets.iter().filter_map(|(cid, (set, data))| {
-        let signs = gathered.signs.get(cid)?;
-        let sign = signs.iter().find(|(by, _)| judge.counts(cid, by)).or_else(|| signs.first().filter(|_| trusted.contains(cid)))?;
-        Some((cid.clone(), set.clone(), *data, sign.1))
-    }).collect();
+    let counting = counting_among(gathered, owner, anchor, trusted)?;
     let replaced: std::collections::HashSet<Vec<u8>> = counting.iter().flat_map(|(_, set, ..)| set.prev().unwrap_or_default().iter().map(CidRef::to_bytes)).collect();
     let mut heads: Vec<Judged<'a>> = counting.into_iter().filter(|(cid, ..)| !replaced.contains(cid)).collect();
     heads.sort_by(|(a, x, ..), (b, y, ..)| y.at().cmp(&x.at()).then_with(|| b.cmp(a)));
     Ok(heads)
 }
 
+/// The sets of a sealed view among the claims gathered that count, as
+/// `heads_among` judges them, replaced or not.
+fn counting_among<'a>(gathered: &Gathered<'a>, owner: &Link, anchor: &Link, trusted: &std::collections::HashSet<Vec<u8>>) -> Result<Vec<Judged<'a>>> {
+    let sets: BTreeMap<Vec<u8>, crate::claim::Set> = gathered.sets.iter().map(|(cid, (set, _))| (cid.clone(), set.clone())).collect();
+    let judge = Judge::of(owner, anchor, gathered.signed_grants(), &sets)?;
+    Ok(gathered.sets.iter().filter_map(|(cid, (set, data))| {
+        let signs = gathered.signs.get(cid)?;
+        let sign = signs.iter().find(|(by, _)| judge.counts(cid, by)).or_else(|| signs.first().filter(|_| trusted.contains(cid)))?;
+        Some((cid.clone(), set.clone(), *data, sign.1))
+    }).collect())
+}
+
+/// What a writer's head took in carried: the plaintext anchor, and the
+/// plaintext set, now here.
+pub struct Taken {
+    pub anchor: Link,
+    pub set: Link,
+}
+
+/// Take in what capabilities' writers wrote of the anchors the vault
+/// publishes, as the catalog holds it.
+///
+/// Each set that counts in a sealed view whose head carries a plaintext
+/// set (see `write`) of the anchor it's published from, signed by its
+/// writer, and that isn't here yet, is unsealed into the catalog, as the
+/// account it acts for, with that set and its sign. The set counts in the
+/// owner's view if the mesh's grants let its writer write the anchor, as
+/// a visitor (see `crate::grants`). If it doesn't, the owner sets the
+/// anchor to its value, after it and what it's after: the owner key's
+/// grants let it write, and they're the owner's. Merging what it forks
+/// is the anchor's, as for any fork. What's taken in is published again
+/// with the rest.
+pub fn take_in(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault) -> Result<Vec<Taken>> {
+    let secret = secret(vault);
+    let mut taken = Vec::new();
+    for (anchor, _) in published(catalog, vault)? {
+        let published = Published::of(&secret, &anchor)?;
+        let claims = claims_about(catalog, &published.view)?;
+        let mut gathered = Gathered::default();
+        for (_, data) in &claims {
+            gathered.add(&published.anchor, data);
+        }
+        for (_, set, ..) in counting_among(&gathered, &published.owner.id(), &published.anchor, &std::collections::HashSet::new())? {
+            let Some(block) = catalog.get_block(set.value())? else {
+                continue;
+            };
+            let Ok(head) = open_head(&published.read, block.data()) else {
+                continue;
+            };
+            let (Some(inner), Some(sign)) = (head.set, head.sign) else {
+                continue;
+            };
+            let (Some(crate::claim::Claim::Set(said)), Some(crate::claim::Claim::Sign(signed))) = (crate::claim::Claim::parse(&inner), crate::claim::Claim::parse(&sign)) else {
+                continue;
+            };
+            let inner_cid = crate::claim::Claim::Set(said.clone()).cid();
+            // Of the anchor it's published from, its value the head's, and signed
+            if said.target() != std::slice::from_ref(&anchor) || *said.value() != head.plain || !signed.verify() || !signed.signs().contains(&inner_cid) {
+                continue;
+            }
+            if catalog.claims().map(|claims| claims.signed_by(&inner_cid, signed.by())).transpose()?.unwrap_or(false) {
+                continue;
+            }
+            let blocks = unseal(catalog, &Snapshot::new(head.root.clone(), head.plain.clone(), Zeroizing::new(*published.read)))?;
+            let prev: Vec<Link> = said.prev().unwrap_or_default().iter().cloned().chain([inner_cid.clone()]).collect();
+            let value = said.value().clone();
+            catalog.batch(|catalog| {
+                for block in &blocks {
+                    catalog.put_block(block, crate::cid::CidVersion::V1)?;
+                }
+                catalog.put_block(&crate::claim::Claim::Set(said).block(), crate::cid::CidVersion::V1)?;
+                catalog.put_block(&crate::claim::Claim::Sign(signed).block(), crate::cid::CidVersion::V1)?;
+                // Not counting as a visitor's, as without the mesh's grant, it's
+                // set as the owner's, after it: the owner key's grants let it write
+                if !catalog.sets_of(&anchor)?.iter().any(|(set, ..)| *set == inner_cid) {
+                    catalog.set_anchor_wrote(&anchor, &value, prev, &[])?;
+                }
+                Ok::<_, Error>(())
+            })?;
+            taken.push(Taken { anchor: anchor.clone(), set: inner_cid });
+        }
+    }
+    Ok(taken)
+}
+
 /// A sealed anchor's heads as a catalog holds them: every head's set, to
-/// name as `prev`, and the latest's head block, opened.
+/// name as `prev`; the latest's head block, opened; and the latest head
+/// the owner's machines made, carrying no writer's set, whose blocks the
+/// vault keeps, to seal after.
 struct Head {
     sets: Vec<Link>,
     block: HeadBlock,
+    ours: Option<HeadBlock>,
 }
 
 fn last_head(catalog: &crate::store::Catalog, published: &Published) -> Result<Option<Head>> {
@@ -934,13 +1024,21 @@ fn last_head(catalog: &crate::store::Catalog, published: &Published) -> Result<O
     for (_, data) in &claims {
         gathered.add(&published.anchor, data);
     }
-    let heads = heads_among(&gathered, &published.owner.id(), &published.anchor, &std::collections::HashSet::new())?;
+    let owner = published.owner.id();
+    let none = std::collections::HashSet::new();
+    let heads = heads_among(&gathered, &owner, &published.anchor, &none)?;
     let Some((_, latest, ..)) = heads.first() else {
         return Ok(None);
     };
     let block = open_head(&published.read, block_here(catalog, latest.value())?.data())?;
     let sets = heads.iter().filter_map(|(cid, ..)| crate::cid::Cid::decode(cid).ok()).collect();
-    Ok(Some(Head { sets, block }))
+    let mut counting = counting_among(&gathered, &owner, &published.anchor, &none)?;
+    counting.sort_by(|(a, x, ..), (b, y, ..)| y.at().cmp(&x.at()).then_with(|| b.cmp(a)));
+    let ours = counting.iter().find_map(|(_, set, ..)| {
+        let head = open_head(&published.read, catalog.get_block(set.value()).ok()??.data()).ok()?;
+        head.set.is_none().then_some(head)
+    });
+    Ok(Some(Head { sets, block, ours }))
 }
 
 /// The key a machine of the owner's writes a sealed anchor with: derived
@@ -1006,17 +1104,22 @@ pub struct Publication {
 pub fn publish(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, published: &Published, value: &Link) -> Result<Publication> {
     let secret = secret(vault);
     let last = last_head(catalog, published)?;
-    let (sealed, mounted) = seal_tree(catalog, value, &published.read, last.as_ref().map(|head| (head.block.plain.clone(), head.block.root.clone())), MountKeys::Secret(&secret))?;
+    let ours = last.as_ref().and_then(|head| head.ours.as_ref()).map(|ours| (ours.plain.clone(), ours.root.clone()));
+    let (sealed, mounted) = seal_tree(catalog, value, &published.read, ours, MountKeys::Secret(&secret))?;
     let previous = as_vault(catalog, vault, |catalog| Ok(kept_manifests(catalog)?.into_iter().find(|(_, manifest)| manifest.view.as_ref() == Some(&published.view)).map(|(cid, _)| cid)))?;
+    let mut sets: Vec<Link> = catalog.anchor_heads(&published.of)?.into_iter().map(|(set, ..)| set).collect();
+    sets.sort_by_key(CidRef::to_bytes);
+    // Nothing new: one head, of this, saying it's of the sets there are
     if let (Some(last), Some(previous)) = (&last, &previous)
         && last.block.plain == *value
+        && last.block.sets == sets
         && last.sets.len() == 1
     {
         let set = last.sets.first().cloned().unwrap_or_else(|| value.clone());
         return Ok(Publication { set, manifest: previous.clone(), fresh: false, mounted });
     }
     let mut block = HeadBlock::new(value.clone(), sealed.root.clone());
-    block.sets = catalog.anchor_heads(&published.of)?.into_iter().map(|(set, ..)| set).collect();
+    block.sets = sets;
     let head = seal_head(&published.read, &block)?;
     let head_cid = AnyCid::V1(head.cid().clone());
     let nonce = crate::claim::anchor_nonce(&published.of).ok_or_else(|| invalid("not an anchor"))?;
