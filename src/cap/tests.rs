@@ -633,3 +633,84 @@ fn a_write_capability_writes_a_head_its_readers_read_carrying_the_plaintext_set(
     }
     assert_eq!(read(&held, &live, &|_| Vec::new()).expect("read").plain, edited);
 }
+
+#[test]
+fn writers_forking_are_merged_by_the_owner_and_write_taken_away_stops_one() {
+    let t = tree("cap-forks");
+    let repo = Scratch::new("cap-forks-repo");
+    let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
+    let vault = crate::vault::Vault::open(repo.path(), catalog.uid()).expect("vault");
+    catalog.set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
+    let anchor = catalog.new_anchor().expect("anchor");
+    let first = import(&mut catalog, t.path(), &importer());
+    catalog.set_anchor(&anchor, &first).expect("set");
+    let published = Published::of(&secret(&vault), &anchor).expect("published");
+    publish(&mut catalog, &vault, &published, &first).expect("publish");
+    let caps: Vec<Write> = (0..2).map(|_| {
+        let seed = add_writer(&mut catalog, &vault, &published).expect("writer");
+        let Capability::Write(write) = published.write_capability(seed, None) else {
+            panic!("not a write capability");
+        };
+        write
+    }).collect();
+    let held = |catalog: &mut Catalog| {
+        let (_, manifest) = published_list(catalog, &vault).into_iter().next().expect("published");
+        held_of(&published_blocks(catalog, &manifest).expect("blocks"))
+    };
+    let Capability::Live(live) = published.capability() else {
+        panic!("not live");
+    };
+    let base = read(&held(&mut catalog), &live, &|_| Vec::new()).expect("read").base.expect("base");
+
+    // Each writes a file of its own, after the same head, in a repo of its own
+    let mut written = Vec::new();
+    for (i, (cap, file)) in caps.iter().zip(["docs/readme.md", "docs/deep/secret.txt"]).enumerate() {
+        let edit = tree(&format!("cap-forks-{i}"));
+        std::fs::write(edit.path().join(file), format!("written by writer {i}")).expect("write");
+        let mut theirs = Catalog::open_repo(&repo.path().join(format!("writer-{i}"))).expect("catalog");
+        let value = import(&mut theirs, edit.path(), &importer());
+        written.push(write(&mut theirs, cap, &base, &value).expect("write"));
+    }
+    let mut both = held(&mut catalog);
+    for block in written.iter().flat_map(Written::all) {
+        both.insert(block);
+    }
+    assert_eq!(read(&both, &live, &|_| Vec::new()).expect("read").forked, 1, "a fork, not yet merged");
+
+    // The owner takes both in and merges them, in one head after both
+    for block in written.iter().flat_map(Written::all) {
+        catalog.put_block(&block, crate::cid::CidVersion::V1).expect("put");
+    }
+    assert_eq!(take_in(&mut catalog, &vault).expect("take in").len(), 2);
+    let merged = catalog.anchor_value(&anchor).expect("value").expect("a value");
+    let wanted = tree("cap-forks-wanted");
+    std::fs::write(wanted.path().join("docs/readme.md"), "written by writer 0").expect("write");
+    std::fs::write(wanted.path().join("docs/deep/secret.txt"), "written by writer 1").expect("write");
+    assert_eq!(merged, import(&mut catalog, wanted.path(), &importer()), "both writes, merged");
+    publish(&mut catalog, &vault, &published, &merged).expect("publish");
+    let after = read(&held(&mut catalog), &live, &|_| Vec::new()).expect("read");
+    assert_eq!((after.plain, after.forked), (merged.clone(), 0));
+
+    // Write taken from the first: it's listed so, what it wrote stands, and
+    // what it writes after counts for nothing
+    let first_writer = caps[0].writer().id();
+    let stands = take_write(&mut catalog, &vault, &published, &first_writer).expect("take write");
+    assert_eq!(stands, vec![written[0].set_cid()]);
+    assert!(take_write(&mut catalog, &vault, &published, &first_writer).is_err(), "taken already");
+    let listed = writers(&catalog, &vault, &published).expect("writers");
+    let listed_first = listed.iter().find(|writer| writer.key == first_writer).expect("listed");
+    assert!(!listed_first.writes);
+    assert!(listed.iter().any(|writer| writer.this_machine && writer.writes));
+    assert!(listed.iter().any(|writer| writer.key == caps[1].writer().id() && writer.writes));
+    let base = after.base.expect("base");
+    let mut theirs = Catalog::open_repo(&repo.path().join("writer-0")).expect("catalog");
+    let late_tree = tree("cap-forks-late");
+    std::fs::write(late_tree.path().join("empty"), "too late").expect("write");
+    let late_value = import(&mut theirs, late_tree.path(), &importer());
+    let late = write(&mut theirs, &caps[0], &base, &late_value).expect("write");
+    for block in late.all() {
+        catalog.put_block(&block, crate::cid::CidVersion::V1).expect("put");
+    }
+    assert!(take_in(&mut catalog, &vault).expect("take in").is_empty(), "not taken in");
+    assert_eq!(catalog.anchor_value(&anchor).expect("value"), Some(merged));
+}

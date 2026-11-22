@@ -570,6 +570,14 @@ scenario_door() {
     on one hk cap take /tmp/written.car >/dev/null 2>&1 || fail "one didn't take in what the outsider wrote"
     [ "$(on one hk anchor show "$anchor" | tail -1 | cut -f2)" = "$written" ] || fail "one's anchor isn't what the outsider wrote"
     wait_for "the outsider to read what it wrote, as one publishes it" sh_on outsider "test \"\$(hk cap import '$cap' 2>/dev/null)\" = 'root $written'"
+    # Its write taken away, the door turns the outsider away
+    local writer late
+    writer=$(on one hk cap writers "$anchor" | grep -v "this machine" | cut -f1)
+    [ -n "$writer" ] || fail "one doesn't list the outsider's writer"
+    on one hk cap revoke "$anchor" "$writer" 2>/dev/null || fail "one couldn't take the outsider's write away"
+    on one hk cap writers "$anchor" | grep -q "^$writer	taken away" || fail "one doesn't list the writer's write as taken away"
+    late=$(sh_on outsider 'echo "too late" | hk add -q -')
+    ! on outsider hk cap write "$wcap" "$late" >/dev/null 2>&1 || fail "the door took a write from a writer whose write's taken away"
     on one hk cap unpublish "$anchor" 2>/dev/null
     ! on one hk cap ls | grep -q "^$anchor	" || fail "one still lists it, unpublished"
 

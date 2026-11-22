@@ -1159,9 +1159,20 @@ pub fn publish(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault,
     let writer = writer_key(&secret, &nonce, catalog.signer().map(crate::keys::Key::id).as_ref());
     let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
     let after = last.map(|head| head.sets).unwrap_or_default();
+    // The heads it's after, their signs and head blocks, kept with it, as
+    // a writer's are only once taken in
+    let mut prior = Vec::new();
+    for (cid, data) in claims_about(catalog, &published.view)? {
+        match crate::claim::Claim::parse(&data) {
+            Some(crate::claim::Claim::Set(set)) if after.contains(&cid) => prior.extend([cid, set.value().clone()]),
+            Some(crate::claim::Claim::Sign(sign)) if sign.signs().iter().any(|signed| after.contains(signed)) => prior.push(cid),
+            _ => {},
+        }
+    }
     let set = crate::claim::Claim::Set(crate::claim::Set::new([published.anchor.clone()], head_cid, at).ok_or_else(|| invalid("a set of nothing"))?.after(Some(after)));
     as_vault(catalog, vault, |catalog| catalog.batch(|catalog| {
         let mut entries = grant_write(catalog, published, &writer.id())?;
+        entries.extend(prior);
         for block in sealed.blocks.iter().chain([&head, &set.block()]) {
             catalog.put_block(block, crate::cid::CidVersion::V1)?;
             entries.push(AnyCid::V1(block.cid().clone()));
@@ -1215,6 +1226,82 @@ pub fn add_writer(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vau
         Ok(())
     }))?;
     Ok(seed)
+}
+
+/// A key given write on a sealed anchor: whether it may write now, which
+/// of its sets stand if it may not, and whether it's this machine's own
+/// writer key.
+pub struct Writer {
+    pub key: Link,
+    pub writes: bool,
+    pub stands: Vec<Link>,
+    pub this_machine: bool,
+}
+
+/// Claims, by CID, with their bytes.
+type Claims = Vec<(Link, Vec<u8>)>;
+
+/// The claims a catalog holds of a published anchor's sealed view,
+/// gathered, and its grants worked out.
+fn judged(catalog: &crate::store::Catalog, published: &Published) -> Result<(Claims, Judge)> {
+    let claims = claims_about(catalog, &published.view)?;
+    let judge = {
+        let mut gathered = Gathered::default();
+        for (_, data) in &claims {
+            gathered.add(&published.anchor, data);
+        }
+        let sets: BTreeMap<Vec<u8>, crate::claim::Set> = gathered.sets.iter().map(|(cid, (set, _))| (cid.clone(), set.clone())).collect();
+        Judge::of(&published.owner.id(), &published.anchor, gathered.signed_grants(), &sets)?
+    };
+    Ok((claims, judge))
+}
+
+/// Every key a published anchor's owner key has given write on its
+/// sealed anchor: the owner's machines' and capabilities' writers.
+pub fn writers(catalog: &crate::store::Catalog, vault: &crate::vault::Vault, published: &Published) -> Result<Vec<Writer>> {
+    let (_, judge) = judged(catalog, published)?;
+    let nonce = crate::claim::anchor_nonce(&published.of).ok_or_else(|| invalid("not an anchor"))?;
+    let mine = writer_key(&secret(vault), &nonce, catalog.signer().map(crate::keys::Key::id).as_ref()).id();
+    let shares = judge.state.as_ref().map(crate::grants::State::shares).unwrap_or_default();
+    Ok(shares.into_iter().filter(|share| share.owner == published.owner.id() && share.anchor == published.anchor).map(|share| Writer {
+        writes: share.held.iter().any(|held| crate::claim::covers(held, crate::grants::WRITE)),
+        this_machine: share.user == mine,
+        key: share.user,
+        stands: share.stands,
+    }).collect())
+}
+
+/// Take write on a published anchor away from a writer.
+///
+/// Its owner key signs a grant taking `/anchor/write` from it on the
+/// sealed anchor, saying its latest sets there, which no other of its own
+/// replaces, stand, kept by the vault with what's published. Its sets
+/// after don't count, wherever the grant's reached. Returns what stands.
+pub fn take_write(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, published: &Published, writer: &Link) -> Result<Vec<Link>> {
+    let (claims, judge) = judged(catalog, published)?;
+    let owner = published.owner.id();
+    let state = judge.state.as_ref().ok_or_else(|| invalid("no grants of the sealed anchor"))?;
+    if !state.holds_on(&owner, &published.anchor, writer, crate::grants::WRITE) {
+        return Err(invalid(format!("{} can't write {} already", crate::keys::peer_id(writer), published.of)));
+    }
+    let mut gathered = Gathered::default();
+    for (_, data) in &claims {
+        gathered.add(&published.anchor, data);
+    }
+    let theirs: Vec<(&Vec<u8>, &crate::claim::Set)> = gathered.sets.iter().filter(|(cid, _)| gathered.signs.get(*cid).is_some_and(|signs| signs.iter().any(|(by, _)| by == writer))).map(|(cid, (set, _))| (cid, set)).collect();
+    let replaced: std::collections::HashSet<Vec<u8>> = theirs.iter().flat_map(|(_, set)| set.prev().unwrap_or_default().iter().map(CidRef::to_bytes)).collect();
+    let stands: Vec<Link> = theirs.iter().filter(|(cid, _)| !replaced.contains(*cid)).filter_map(|(cid, _)| crate::cid::Cid::decode(cid).ok()).collect();
+    let grant = crate::claim::Grant::new([writer.clone()], Some(published.anchor.clone()), [], [crate::grants::WRITE.to_owned()], stands.clone(), state.heads()).ok_or_else(|| invalid("no grant"))?;
+    let grant = crate::claim::Claim::Grant(grant);
+    as_vault(catalog, vault, |catalog| catalog.batch(|catalog| {
+        let previous = kept_manifests(catalog)?.into_iter().find(|(_, manifest)| manifest.view.as_ref() == Some(&published.view)).map(|(cid, _)| cid);
+        catalog.put_block(&grant.block(), crate::cid::CidVersion::V1)?;
+        let mut entries = vec![grant.cid()];
+        entries.extend(catalog.sign_with_key(&published.owner, [grant.cid()])?);
+        keep_entries(catalog, published, previous.as_ref(), entries)?;
+        Ok(())
+    }))?;
+    Ok(stands)
 }
 
 /// A head a capability's writer made: its sealed tree and head block,
@@ -1379,6 +1466,8 @@ pub struct Read {
     /// block, opened.
     pub set: Link,
     pub block: HeadBlock,
+    /// How many other heads there are, forked from it, not yet merged.
+    pub others: usize,
 }
 
 /// Read a sealed anchor from what's held, as its latest head, judging it
@@ -1408,6 +1497,7 @@ fn read_one<'a>(src: &impl Source, claims: impl IntoIterator<Item = &'a [u8]>, r
         trusted.extend(gathered.add(&anchor, data));
     }
     let heads = heads_among(&gathered, &owner, &anchor, &trusted)?;
+    let others = heads.len().saturating_sub(1);
     let (cid, head, data, sign) = heads.into_iter().next().ok_or_else(|| invalid("no head of the sealed anchor that its owner key, or a writer it let write, signed"))?;
     if !offered.contains(&cid) {
         return Err(Error::Behind);
@@ -1417,7 +1507,7 @@ fn read_one<'a>(src: &impl Source, claims: impl IntoIterator<Item = &'a [u8]>, r
     let (plain, root) = (block.plain.clone(), block.root.clone());
     let set = crate::cid::Cid::decode(&cid).map_err(|_| invalid("a head's set with no CID"))?;
     let (blocks, mounts) = unseal_mounts(src, &Snapshot::new(root, plain.clone(), Zeroizing::new(*live.read)))?;
-    Ok((Read { plain, blocks, head: vec![data.to_vec(), sign.to_vec()], set, block }, mounts))
+    Ok((Read { plain, blocks, head: vec![data.to_vec(), sign.to_vec()], set, block, others }, mounts))
 }
 
 /// The head a reader last read of a sealed anchor.
@@ -1505,6 +1595,9 @@ pub struct Reading {
     /// What a writer of the anchor asked for writes after, if it's a
     /// sealed anchor's (see `write`).
     pub base: Option<Base>,
+    /// How many heads of it beside the one read are forked from it, not
+    /// yet merged: the owner's machines merge them, as they take them in.
+    pub forked: usize,
 }
 
 /// What a writer writes after: the head it read, as its set, its head
@@ -1528,7 +1621,7 @@ pub fn read(src: &(impl Source + Heads), live: &Live, remembered: &dyn Fn(&Link)
     let claims = src.heads_of(live)?;
     let (top, mounts) = read_one(src, claims.iter().map(Vec::as_slice), &remembered(&live.view), live)?;
     let base = Base { set: top.set, block: top.block, mounts: mounts.iter().map(|(_, mount)| mount.clone()).collect() };
-    let mut reading = Reading { plain: top.plain, blocks: top.blocks, heads: vec![(live.view.clone(), top.head)], mounts: Vec::new(), base: Some(base) };
+    let mut reading = Reading { plain: top.plain, blocks: top.blocks, heads: vec![(live.view.clone(), top.head)], mounts: Vec::new(), base: Some(base), forked: top.others };
     let mut seen = std::collections::HashSet::from([live.view.to_bytes()]);
     let mut queue: std::collections::VecDeque<(String, Mount)> = mounts.into();
     while let Some((path, mount)) = queue.pop_front() {

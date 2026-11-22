@@ -530,6 +530,20 @@ enum CapCommand {
         #[arg(long)]
         at: Vec<String>,
     },
+    /// List who may write a published anchor, by key: this account's
+    /// machines and capabilities' writers, whether each still may, and if
+    /// not, how many of its sets stand
+    Writers {
+        /// The anchor, or a path of the soup that's one or a mount point
+        anchor: PathBuf,
+    },
+    /// Take write on a published anchor away from a writer, as `hk cap
+    /// writers` lists it: what it's written stands, and nothing after
+    Revoke {
+        anchor: PathBuf,
+        /// The writer, by peer ID
+        writer: String,
+    },
     /// Take in what writers wrote of anchors this account publishes, from
     /// CARs `hk cap write` wrote: each anchor's set as they wrote it, and
     /// published again. A running node takes in what reaches it by itself
@@ -2387,7 +2401,7 @@ fn read_at_doors(capability: &holokeep::cap::Capability, from: Vec<String>, reme
             let reader = holokeep::net::door::Reader::connect(&door.parse().context("not a multiaddr")?)?;
             Ok(match (capability, capability.live()) {
                 (_, Some(live)) => cap::read(&reader, live, remembered)?,
-                (Capability::Snapshot(snapshot), None) => cap::Reading { plain: snapshot.plain.clone(), blocks: cap::unseal(&reader, snapshot)?, heads: Vec::new(), mounts: Vec::new(), base: None },
+                (Capability::Snapshot(snapshot), None) => cap::Reading { plain: snapshot.plain.clone(), blocks: cap::unseal(&reader, snapshot)?, heads: Vec::new(), mounts: Vec::new(), base: None, forked: 0 },
                 _ => anyhow::bail!("a capability of nothing to read"),
             })
         };
@@ -2478,23 +2492,10 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
             Ok(())
         },
         CapCommand::Import { capability, car, from } => cap_import(repo, &capability, &car, from),
-        CapCommand::Grant { anchor, at } => {
-            let dir = repo_dir(repo)?;
-            let mut repo = open_repo(Some(dir.clone()))?;
-            let anchor = anchor_named(&repo, &anchor)?;
-            let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
-            let published = cap::Published::of(&cap::secret(&vault), &anchor)?;
-            let seed = cap::add_writer(&mut repo, &vault, &published)?;
-            let Capability::Write(write) = published.write_capability(seed, repo.user()?) else {
-                anyhow::bail!("not a write capability");
-            };
-            grant_plaintext_write(&dir, &repo, &anchor, &write.writer().id())?;
-            let write = cap::Write::new(write.live.clone().at(at), write.seed(), write.of.clone(), write.owner);
-            eprintln!("whoever has this capability can write {anchor} and read it, till their write's taken away");
-            out!("{}", Capability::Write(write).encode());
-            Ok(())
-        },
+        CapCommand::Grant { anchor, at } => cap_grant(repo, &anchor, at),
         CapCommand::Take { car } => cap_take(repo, &car),
+        CapCommand::Writers { anchor } => cap_writers(repo, &anchor),
+        CapCommand::Revoke { anchor, writer } => cap_revoke(repo, &anchor, &writer),
         CapCommand::Write { capability, root, output, car, from } => cap_write(repo, &capability, &root, output.as_deref(), &car, from),
     }
 }
@@ -2574,6 +2575,86 @@ fn cap_take(repo: Option<PathBuf>, car: &[PathBuf]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Take write on the plaintext anchor away from a capability's writer
+/// key too, if the mesh has grants: its latest sets there stand.
+#[cfg(feature = "net")]
+fn take_plaintext_write(dir: &Path, repo: &Catalog, anchor: &Link, writer: &Link) -> anyhow::Result<()> {
+    let place = holokeep::net::mesh::Place::main(dir);
+    let Some(genesis) = holokeep::net::daemon::members(&place)?.genesis()? else {
+        return Ok(());
+    };
+    let Some(state) = repo.grant_state(&genesis)? else {
+        return Ok(());
+    };
+    let Some(me) = repo.user()? else {
+        return Ok(());
+    };
+    if !state.holds_on(&me, anchor, writer, holokeep::grants::WRITE) {
+        return Ok(());
+    }
+    let view = holokeep::claim::view(anchor, &me).context("no view of the anchor")?;
+    let stands = repo.latest_sets_by(&view, writer)?;
+    repo.grant_on(&genesis, anchor, std::slice::from_ref(writer), &[], &[holokeep::grants::WRITE.to_owned()], &stands)?;
+    reload(&place)
+}
+
+#[cfg(not(feature = "net"))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn, reason = "the same as with networking, which can fail")]
+fn take_plaintext_write(_: &Path, _: &Catalog, _: &Link, _: &Link) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// `hk cap grant`: mint a writer for a published anchor, and print its
+/// capability.
+fn cap_grant(repo: Option<PathBuf>, anchor: &Path, at: Vec<String>) -> anyhow::Result<()> {
+    use holokeep::cap::{self, Capability};
+    let dir = repo_dir(repo)?;
+    let mut repo = open_repo(Some(dir.clone()))?;
+    let anchor = anchor_named(&repo, anchor)?;
+    let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
+    let published = cap::Published::of(&cap::secret(&vault), &anchor)?;
+    let seed = cap::add_writer(&mut repo, &vault, &published)?;
+    let Capability::Write(write) = published.write_capability(seed, repo.user()?) else {
+        anyhow::bail!("not a write capability");
+    };
+    grant_plaintext_write(&dir, &repo, &anchor, &write.writer().id())?;
+    let write = cap::Write::new(write.live.clone().at(at), write.seed(), write.of.clone(), write.owner);
+    eprintln!("whoever has this capability can write {anchor} and read it, till their write's taken away");
+    out!("{}", Capability::Write(write).encode());
+    Ok(())
+}
+
+/// `hk cap writers`: list who may write a published anchor.
+fn cap_writers(repo: Option<PathBuf>, anchor: &Path) -> anyhow::Result<()> {
+    use holokeep::cap;
+    let dir = repo_dir(repo)?;
+    let repo = open_repo(Some(dir.clone()))?;
+    let anchor = anchor_named(&repo, anchor)?;
+    let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
+    let published = cap::Published::of(&cap::secret(&vault), &anchor)?;
+    for writer in cap::writers(&repo, &vault, &published)? {
+        let may = if writer.writes { "writes".to_owned() } else { format!("taken away, {} sets stand", writer.stands.len()) };
+        let whose = if writer.this_machine { "\tthis machine" } else { "" };
+        out!("{}\t{may}{whose}", holokeep::keys::peer_id(&writer.key));
+    }
+    Ok(())
+}
+
+/// `hk cap revoke`: take a writer's write on a published anchor away.
+fn cap_revoke(repo: Option<PathBuf>, anchor: &Path, writer: &str) -> anyhow::Result<()> {
+    use holokeep::cap;
+    let dir = repo_dir(repo)?;
+    let mut repo = open_repo(Some(dir.clone()))?;
+    let anchor = anchor_named(&repo, anchor)?;
+    let writer = key_named(writer)?;
+    let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
+    let published = cap::Published::of(&cap::secret(&vault), &anchor)?;
+    let stands = cap::take_write(&mut repo, &vault, &published, &writer)?;
+    take_plaintext_write(&dir, &repo, &anchor, &writer)?;
+    eprintln!("{} may write {anchor} no more: {} of its sets stand, and nothing after", holokeep::keys::peer_id(&writer), stands.len());
+    Ok(())
+}
+
 /// `hk cap write`: write a sealed anchor with a write capability, after
 /// its latest head, read from a CAR or at holders' doors, into a CAR.
 fn cap_write(repo: Option<PathBuf>, capability: &str, root: &Link, output: Option<&Path>, car: &[PathBuf], from: Vec<String>) -> anyhow::Result<()> {
@@ -2625,11 +2706,14 @@ fn cap_import(repo: Option<PathBuf>, capability: &str, car: &[PathBuf], from: Ve
     } else {
         let held = held_of(car)?;
         match &capability {
-            Capability::Snapshot(snapshot) => cap::Reading { plain: snapshot.plain.clone(), blocks: cap::unseal(&held, snapshot)?, heads: Vec::new(), mounts: Vec::new(), base: None },
+            Capability::Snapshot(snapshot) => cap::Reading { plain: snapshot.plain.clone(), blocks: cap::unseal(&held, snapshot)?, heads: Vec::new(), mounts: Vec::new(), base: None, forked: 0 },
             Capability::Live(live) | Capability::Write(cap::Write { live, .. }) => cap::read(&held, live, &remembered)?,
         }
     };
-    let cap::Reading { plain, blocks, heads, mounts, .. } = reading;
+    let cap::Reading { plain, blocks, heads, mounts, forked, .. } = reading;
+    if forked > 0 {
+        eprintln!("{forked} other heads, forked from the latest, aren't merged yet: the owner's machines merge them as they take them in");
+    }
     repo.batch_breathing(|repo| {
         for block in &blocks {
             repo.put_block(block, holokeep::cid::CidVersion::V1)?;

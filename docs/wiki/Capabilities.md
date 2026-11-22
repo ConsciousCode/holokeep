@@ -426,6 +426,28 @@ acting for the vault, doesn't.
 - `hk cap import` and `hk cap write` read several CARs as one, as a
   reader of what's published and a writer's CAR beside it needs.
 
+### Taking write away, as it is now
+
+- `hk cap writers <anchor>` lists each key `K` has given write on the
+  sealed anchor, by peer ID: whether it still writes, or if not how many
+  of its sets stand, and which is this machine's own writer key.
+- `hk cap revoke <anchor> <writer>` has `K` sign a grant taking
+  `/anchor/write` from the writer on the sealed anchor, after every
+  grant there, whose `stands` are the writer's latest sets there, those
+  no other of its own names as `prev`. It goes in a new manifest the
+  vault keeps. If the mesh has grants and the writer may write the
+  plaintext anchor as a visitor, that's taken away too, its latest sets
+  in the owner's view standing.
+- Wherever the grant has reached, readers, doors and the owner's
+  machines judge the writer's later sets as counting for nothing: a
+  door turns its writes away, and the owner's node doesn't take them
+  in. Revoking one of the owner's own machines' writer keys lasts only
+  till that machine publishes again, when `K` gives it write anew.
+- Publishing keeps, in its manifest, every head it names as `prev`,
+  their signs and head blocks, so what a writer wrote is kept by the
+  vault once taken in, and holders of the vault hold the heads the
+  latest replaces.
+
 ### Writers' grants
 
 A sealed view's grants are judged as a mesh's are (see [[Grants]]), on
@@ -567,15 +589,28 @@ read. Several writers fork, as plaintext anchors do; nothing is
 refused. Holders can't merge sealed heads, so they show the latest, as
 an anchor whose heads aren't all directories does (see [[Anchors and Names#Forks and merges]]).
 
-Merging takes the read key, not write: any reader can unseal every head
-and their common ancestor and show the merge, without publishing it. A
-writer that reads several heads merges them so, and its next head is
-the merge with its own edits in it, in one set whose `prev` names every
-head it read: never the merge and the edit as two. Two writers merging
-the same heads with no edits of their own make the same tree and the
-same sealed blocks, each in a set of its own; with edits, they fork
-again, and the next writer merges that. Forks converge rather than
-accumulate.
+**As built, the owner's machines merge.** Merging an anchor's heads
+works out each set's conflicts from the sets before it (see
+[[Anchors and Names#Forks and merges]]), so it needs the anchor's
+history of sets and their trees. The owner's machines have it, in
+plaintext; a capability's writer or reader has only the sealed view,
+and would have to unseal every past tree to rebuild it. So:
+
+- A capability's writer writes after the latest head alone, its inner
+  set after the plaintext sets that head says it's of. Writers writing
+  at once fork the sealed view.
+- A reader reads the latest head, and is told how many others are
+  forked from it, not yet merged (`hk cap import` says so).
+- The owner's machines take each writer's head in, with its plaintext
+  set, so the plaintext anchor forks as it would between two of its own
+  devices, and its value is their merge. Their next head names every
+  sealed head as `prev`, closing the fork in the sealed view too. That
+  head's tree is the merge with whatever the owner's machine wrote
+  besides: never the merge and the edit as two.
+
+So forks converge, but only once an owner's machine has taken them in.
+Merging takes the read key, not write, so a reader could show the merge
+itself, given the sealed history; that's not built.
 
 Writing takes reading: a writer unseals to merge, and seals under the
 current read key. A write needs `prev`, so a blind write can't be a
@@ -651,11 +686,11 @@ In order, each of use alone:
 3. **Mount points.** Done: sealed `mounts`, publishing what's mounted,
    reading through mount points, making a folder an anchor to share it,
    and capabilities on mounted anchors.
-4. **Writing.** Begun: the owner's machines write with writer keys `K`
+4. **Writing.** Done: the owner's machines write with writer keys `K`
    lets write, judged by `K`'s grants alone; write capabilities write
-   heads to a door or a CAR; and the owner's machines take them in. To
-   come: merging several heads on reading
-   and writing, and taking write away.
+   heads to a door or a CAR; the owner's machines take them in and merge
+   them; and write is taken away. Writers and readers don't merge forks
+   themselves: the owner's machines do (see [[#Writing]]).
 5. **Revoking read.** New read keys, `keys` and `past`, sealed boxes for
    read grants, and sealing everything again when asked.
 6. **The vault as a capability**: a sealed root anchor only its owner
