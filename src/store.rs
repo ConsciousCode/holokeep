@@ -492,6 +492,9 @@ pub struct Catalog {
     /// Anchors' states, by the sets they're of, and how they're shown.
     states: std::cell::RefCell<std::collections::HashMap<Vec<u8>, merge::State>>,
     views: std::cell::RefCell<std::collections::HashMap<Vec<u8>, merge::View>>,
+    /// Each anchor's value and overlay marks as last looked up, with the
+    /// database's version then: see `anchor_state`.
+    anchor_states: std::cell::RefCell<std::collections::HashMap<Vec<u8>, overlay::AnchorState>>,
     /// Asks a running node for blocks that aren't here, if this fetches
     /// through one.
     fetcher: Option<Fetcher>,
@@ -725,6 +728,8 @@ impl Catalog {
         let (signer, quota) = (self.signer.take(), self.quota.take());
         self.guest = Some((user.clone(), shared));
         claims.act_as(Some(user));
+        // What anchors were is as whoever was acting saw them
+        self.anchor_states.borrow_mut().clear();
         let seen = f(self);
         self.guest = None;
         self.signer = signer;
@@ -874,6 +879,8 @@ impl Catalog {
 
     /// See what counts for the account's user.
     fn refresh_acting(&self) -> Result<()> {
+        // What anchors were is as whoever was acting saw them
+        self.anchor_states.borrow_mut().clear();
         if let Some(claims) = &self.claims {
             let account = claims.account(self.uid)?;
             claims.act_as(account.as_ref().and_then(claims::Account::acts_for));
@@ -1424,7 +1431,7 @@ impl Catalog {
         if let Some(&(v, s)) = placement.iter().find(|&&(v, s)| volumes.get(v).is_none_or(|volume| volume.stores().get(s).is_none())) {
             return Err(Error::UnknownStore(format!("volume {v}, store {s}")));
         }
-        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, breathing: std::cell::Cell::new(None), lost_asked: std::cell::RefCell::default(), states: std::cell::RefCell::default(), views: std::cell::RefCell::default(), fetcher: None, missed: std::cell::RefCell::default(), commits: std::cell::RefCell::default(), guest: None };
+        let mut catalog = Self { db, volumes: Vec::new(), ids: Vec::new(), placement, offsets: None, shards: None, claims: None, signer: None, uid: rustix::process::getuid().as_raw(), quota: None, unsigned: std::cell::RefCell::default(), batching: 0, breathing: std::cell::Cell::new(None), lost_asked: std::cell::RefCell::default(), states: std::cell::RefCell::default(), views: std::cell::RefCell::default(), anchor_states: std::cell::RefCell::default(), fetcher: None, missed: std::cell::RefCell::default(), commits: std::cell::RefCell::default(), guest: None };
         for volume in volumes {
             catalog.attach(volume)?;
         }

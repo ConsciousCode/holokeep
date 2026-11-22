@@ -40,6 +40,10 @@ pub type Marks = BTreeMap<PathBuf, Mark>;
 /// A directory's entries, by name: blocks, with the sizes their links say.
 pub type Entries = BTreeMap<Vec<u8>, (Link, Option<u64>)>;
 
+/// An anchor's value and marks as looked up, with the database's version
+/// then, as `data_version` and `total_changes`: see `Catalog::anchor_state`.
+pub type AnchorState = ((i64, u64), Option<Link>, std::rc::Rc<Marks>);
+
 /// What's at a path of what an anchor is, as far as it's from the soup:
 /// a block, with the size a link to it says, if that's known.
 pub type Base = Option<(Link, Option<u64>)>;
@@ -58,10 +62,7 @@ pub fn resolve(src: &impl Fetch, root: Option<Link>, rel: &Path, marks: &Marks) 
         here = match marks.get(&path) {
             Some(mark) => mark.clone().map(|(cid, size)| (cid, Some(size))),
             None => match here {
-                Some((dir, _)) if is_dir(src, &dir)? => export::list(src, &dir)?
-                    .into_iter()
-                    .find(|entry| entry.name == name.as_bytes())
-                    .map(|entry| (entry.cid, entry.size)),
+                Some((dir, _)) if src.is_dir(&dir)? => src.entry(&dir, name.as_bytes())?,
                 _ => None,
             },
         };
@@ -84,7 +85,7 @@ fn is_dir(src: &impl Fetch, cid: &Link) -> io::Result<bool> {
 pub fn base_entries(src: &impl Fetch, root: Option<Link>, rel: &Path, marks: &Marks) -> io::Result<Entries> {
     let mut entries = BTreeMap::new();
     if let Some((dir, _)) = resolve(src, root, rel, marks)?
-        && is_dir(src, &dir)?
+        && src.is_dir(&dir)?
     {
         for entry in export::list(src, &dir)? {
             entries.insert(entry.name, (entry.cid, entry.size));
@@ -286,6 +287,30 @@ impl Catalog {
     fn anchor_now(&self, anchor: &Link) -> Result<Option<(Link, Vec<Link>)>> {
         let sets: Vec<Link> = self.anchor_heads(anchor)?.into_iter().map(|(set, ..)| set).collect();
         Ok(self.anchor_view(anchor)?.map(|view| (view.value, sets)))
+    }
+
+    /// What an anchor's shown as now and its overlay marks, looked up
+    /// again only once the database has changed: by another connection
+    /// (`data_version`) or this one (`total_changes`). A mount asks this for
+    /// every path it resolves, and the anchor's heads are an expensive view.
+    pub fn anchor_state(&self, anchor: &Link) -> Result<(Option<Link>, std::rc::Rc<Marks>)> {
+        let conn = self.db.conn();
+        let version = (conn.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?, conn.total_changes());
+        let key = anchor.to_bytes();
+        if let Some((at, value, marks)) = self.anchor_states.borrow().get(&key)
+            && *at == version
+        {
+            return Ok((value.clone(), std::rc::Rc::clone(marks)));
+        }
+        let marks = std::rc::Rc::new(self.overlay_marks(anchor)?);
+        let value = self.anchor_shown(anchor)?;
+        // Working those out may have written, as a merge's view does, which
+        // is in them; but what another connection wrote meanwhile may not be,
+        // so they're then noted as of before, to be worked out again
+        let after = (conn.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))?, conn.total_changes());
+        let version = if after.0 == version.0 { after } else { version };
+        self.anchor_states.borrow_mut().insert(key, (version, value.clone(), std::rc::Rc::clone(&marks)));
+        Ok((value, marks))
     }
 
     /// What an anchor's shown as now, if anything.

@@ -236,6 +236,89 @@ impl Inodes {
     }
 }
 
+/// Structure blocks (directories, file roots) by CID, and how many bytes
+/// they are.
+type Blocks = (HashMap<Vec<u8>, Arc<[u8]>>, usize);
+
+/// A directory's entries by name: each one's block, and the size it's said
+/// to be.
+type Named = Arc<HashMap<Vec<u8>, (Link, Option<u64>)>>;
+
+/// Structure blocks, as fetched: what a path's resolved through again and
+/// again. A CID's block never changes, so nothing here is ever stale; it's
+/// only bounded.
+static STRUCTURE: std::sync::LazyLock<Mutex<Blocks>> = std::sync::LazyLock::new(|| Mutex::new((HashMap::new(), 0)));
+
+/// How many bytes of structure blocks are kept.
+const STRUCTURE_BYTES: usize = 64 << 20;
+
+/// Directories' entries by name, by CID, as `Cached::entry` found them.
+static DIRECTORIES: std::sync::LazyLock<Mutex<HashMap<Vec<u8>, Named>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How many directories' entries are kept.
+const DIRECTORIES_MOST: usize = 4096;
+
+/// A catalog, what paths are resolved through cached.
+struct Cached<'a>(&'a Catalog);
+
+impl Cached<'_> {
+    fn dir(cid: &Link) -> Option<Named> {
+        DIRECTORIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&cid.to_bytes()).cloned()
+    }
+}
+
+impl export::Fetch for Cached<'_> {
+    fn fetch(&self, cid: &Link) -> io::Result<Vec<u8>> {
+        if cid.codec() == crate::cid::RAW_CODEC {
+            return self.0.fetch(cid);
+        }
+        let key = cid.to_bytes();
+        if let Some(block) = STRUCTURE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0.get(&key) {
+            return Ok(block.to_vec());
+        }
+        let block = self.0.fetch(cid)?;
+        let kept: Arc<[u8]> = Arc::from(block.as_slice());
+        let mut cache = STRUCTURE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.1.saturating_add(block.len()) > STRUCTURE_BYTES {
+            cache.0.clear();
+            cache.1 = 0;
+        }
+        cache.1 = cache.1.saturating_add(block.len());
+        cache.0.insert(key, kept);
+        drop(cache);
+        Ok(block)
+    }
+
+    fn prefetch(&self, cids: &[Link]) {
+        self.0.prefetch(cids);
+    }
+
+    fn is_dir(&self, cid: &Link) -> io::Result<bool> {
+        if cid.codec() == crate::cid::RAW_CODEC {
+            return Ok(false);
+        }
+        if Self::dir(cid).is_some() {
+            return Ok(true);
+        }
+        Ok(export::stat(self, cid)? == Kind::Directory)
+    }
+
+    fn entry(&self, dir: &Link, name: &[u8]) -> io::Result<Option<(Link, Option<u64>)>> {
+        if let Some(entries) = Self::dir(dir) {
+            return Ok(entries.get(name).cloned());
+        }
+        let entries: Named = Arc::new(export::list(self, dir)?.into_iter().map(|entry| (entry.name, (entry.cid, entry.size))).collect());
+        let found = entries.get(name).cloned();
+        let mut cache = DIRECTORIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= DIRECTORIES_MOST {
+            cache.clear();
+        }
+        cache.insert(dir.to_bytes(), entries);
+        drop(cache);
+        Ok(found)
+    }
+}
+
 /// An entry of a directory: its name, inode number and type.
 pub type Entry = (Vec<u8>, u64, FileType);
 
@@ -665,11 +748,11 @@ impl Soup {
             Inode::Node(cid, _) if cid.codec() == crate::cid::RAW_CODEC => {
                 let said = self.sizes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&cid.to_bytes()).copied();
                 said.map_or_else(
-                    || export::stat(catalog, cid).map_err(|e| errno(&e)),
+                    || export::stat(&Cached(catalog), cid).map_err(|e| errno(&e)),
                     |size| Ok(Kind::File(size)),
                 )
             },
-            Inode::Node(cid, _) => export::stat(catalog, cid).map_err(|e| errno(&e)),
+            Inode::Node(cid, _) => export::stat(&Cached(catalog), cid).map_err(|e| errno(&e)),
             Inode::Path(anchor, rel, _) => match self.at(catalog, anchor, rel)?.ok_or(Errno::ENOENT)? {
                 At::Work(meta) => work_kind(&self.work_path(anchor, rel).unwrap_or_default(), &meta),
                 At::Base(cid, size) => {
@@ -715,21 +798,19 @@ impl Soup {
     /// What the anchor had at a path, after marks, whatever's in the work
     /// directory.
     fn base_at(catalog: &Catalog, anchor: &Link, rel: &Path) -> Result<overlay::Base, Errno> {
-        let marks = catalog.overlay_marks(anchor).map_err(store_errno)?;
-        let root = Self::anchor_root(catalog, anchor)?;
-        overlay::resolve(catalog, root, rel, &marks).map_err(|e| errno(&e))
+        let (root, marks) = catalog.anchor_state(anchor).map_err(store_errno)?;
+        overlay::resolve(&Cached(catalog), root, rel, &marks).map_err(|e| errno(&e))
     }
 
     /// A directory of an anchor's entries: its work directory's over what
     /// the anchor had there.
     fn overlay_entries(&self, catalog: &Catalog, anchor: &Link, rel: &Path, via: &Via) -> Result<Vec<(Vec<u8>, Inode)>, Errno> {
-        let marks = catalog.overlay_marks(anchor).map_err(store_errno)?;
-        let root = Self::anchor_root(catalog, anchor)?;
+        let (root, marks) = catalog.anchor_state(anchor).map_err(store_errno)?;
         let mut names: BTreeSet<Vec<u8>> = BTreeSet::new();
         // Under a file in the work directory, the anchor's had nothing
         let shadowed = self.work_path(anchor, rel).is_some_and(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_dir()));
         if !shadowed {
-            let entries = overlay::base_entries(catalog, root, rel, &marks).map_err(|e| errno(&e))?;
+            let entries = overlay::base_entries(&Cached(catalog), root, rel, &marks).map_err(|e| errno(&e))?;
             let listed: Vec<export::Listed> = entries.iter().map(|(name, (cid, size))| export::Listed { name: name.clone(), cid: cid.clone(), size: *size }).collect();
             self.note_sizes(&listed);
             names.extend(entries.into_keys());
