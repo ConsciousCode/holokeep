@@ -181,8 +181,7 @@ aren't UTF-8 aren't sealed as mount points.
   from the same CAR or door, at its own latest head, each sealed view
   once, and remembers each head read (see [[#Remembered heads]]). A
   mounted anchor that can't be read, or is behind, is said so, and the
-  rest is read: only the anchor the capability names must be. `hk cap
-  import` prints `mount <path>\t<plaintext root>` for each read, the path
+  rest is read: only the anchor the capability names must be. `hk cap import` prints `mount <path>\t<plaintext root>` for each read, the path
   `/`-separated from the root of the capability's anchor. A capability
   on the mounted anchor reads it and nothing above.
 
@@ -380,8 +379,7 @@ offered.
 
 ## Doors
 
-Implemented. A holder may open a **door** (`hk node run --door
-[<addr>]`, port 4013 by default): a libp2p swarm of its own, apart from
+Implemented. A holder may open a **door** (`hk node run --door [<addr>]`, port 4013 by default): a libp2p swarm of its own, apart from
 the mesh's, over TCP with noise and yamux and no private network, as
 the node's key, which lets anyone in, to ask `/holokeep/cap/1.0.0` and
 nothing else. Whoever's let in there never reaches the mesh's swarm. It
@@ -465,16 +463,30 @@ sets the plaintext anchor's value, seals the path to each change under
 the current read key, and makes a head whose `prev` names the heads it
 read. Several writers fork, as plaintext anchors do; nothing is
 refused. Holders can't merge sealed heads, so they show the latest, as
-an anchor whose heads aren't all directories does (see [[Anchors and Names#Forks and merges]]). A writer that reads several heads unseals
-them and their common ancestor, merges the plaintext as any anchor's
-heads merge, and seals the result when it next writes. Two writers
-sealing the same plaintext make the same blocks.
+an anchor whose heads aren't all directories does (see [[Anchors and Names#Forks and merges]]).
+
+Merging takes the read key, not write: any reader can unseal every head
+and their common ancestor and show the merge, without publishing it. A
+writer that reads several heads merges them so, and its next head is
+the merge with its own edits in it, in one set whose `prev` names every
+head it read: never the merge and the edit as two. Two writers merging
+the same heads with no edits of their own make the same tree and the
+same sealed blocks, each in a set of its own; with edits, they fork
+again, and the next writer merges that. Forks converge rather than
+accumulate.
+
+Writing takes reading: a writer unseals to merge, and seals under the
+current read key. A write needs `prev`, so a blind write can't be a
+head; something that only appends events, unread, is a different thing
+from an anchor (see [[#Open questions]]).
 
 What's lost, beside a single authority as Peergos has in each user's
 home server:
 
-- Atomic commits across anchors. A move between two is an add and a
-  remove.
+- Atomic commits across anchors. A move between two is an add, then a
+  remove, as `mv` across a mount point is (`EXDEV`): a crash between
+  them leaves the same blocks in both places, never in neither. A move
+  within one anchor is one set, so atomic.
 - Writes taken away take effect wherever the grant has arrived, not at
   once. A set a revoked writer made before then stops counting
   wherever the grant reaches, as `stands` says, and a holder keeping
@@ -502,8 +514,7 @@ whoever held the keys can read whatever they fetched.
   `/anchor/read` to a key on a sealed anchor comes to.
 - **Everything, at once.** Sealing every entry again under the new key,
   and forgetting the old ciphertext (`hk anchor forget`), is explicit,
-  as letting go of the past always is (see [[Replication and
-  Retention]]).
+  as letting go of the past always is (see [[Replication and Retention]]).
 - **The anchor itself.** A revoked reader still knows the sealed view,
   so can watch when heads are made and how big. Cutting that off is a
   new sealed anchor, with a new `K`.
@@ -547,6 +558,26 @@ In order, each of use alone:
    can read, if one scheme for both is wanted.
 
 ## Open questions
+
+- **Moves across anchors.** Anchors cut the soup into pieces each with
+  its own history, so a move across them is an add and a remove, not
+  one event. A compromise, not yet built: the add's inner set says
+  where it moved from, and the remove's where to, inside the sealed
+  inner set, so holders don't learn that two sealed anchors are
+  related. Sequencing a file's many moves needn't rest on `at`: an add
+  naming, by CID, the set of the source anchor it read is after it by
+  construction, so a file's moves chain causally, as a Merkle clock
+  does. The cost is a reference from one anchor's history into
+  another's: whether it keeps that history (see
+  [[Replication and Retention]]), and what it says to whoever can read
+  only one side. Something deeper, one history across anchors with no
+  cut between them, is a goal, not a design.
+- **Blind writes.** Something that only appends, unable to read, such
+  as an event or telemetry: not a head, which needs `prev`. Claims are
+  already written without reading what they're about, judged where
+  they're gathered, so perhaps an anchor's server or door gathers them
+  into its heads, recording what it was given as it goes. That needs a
+  transport to whoever can read, which holders aren't.
 
 - Head lookups prove the read key, so a reader whose read key's been
   changed can't watch new heads through a door, but one who kept the old
