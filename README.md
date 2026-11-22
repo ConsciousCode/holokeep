@@ -423,7 +423,7 @@ Checklist:
   - [x] Files imported in place as mounts on anchors, kept through them, and imported again as they change; the path is known only to the node with the file (`hk add --nocopy`)
   - [ ] Kademlia provider records, once broadcast wants don't scale
   - [x] Measuring how far apart members' clocks are, advisorily (`hk node clocks`)
-  - [ ] Configuration beyond the command line: a node's tunables, such as how often it pings and how long it waits, so tests can run them short and nodes in one mesh can differ
+  - [x] Configuration beyond the command line: a node's tunables, such as how often it pings and how long it waits, so tests can run them short and nodes in one mesh can differ; and the mounts a node keeps, so it runs as a service (`config.toml`, `hk config`, `hk node service`)
 - [ ] Public Amino DHT
 - [ ] BitTorrent bridging
 - [ ] User ownership model

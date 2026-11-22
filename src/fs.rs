@@ -31,7 +31,7 @@ fn user(what: impl Into<String>) -> Error {
 
 /// Where holokeep is mounted, from the kernel's list of this process's
 /// mounts: FUSE mounts whose source is `holokeep`.
-fn mount_points() -> Vec<PathBuf> {
+pub fn mount_points() -> Vec<PathBuf> {
     let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return Vec::new();
     };

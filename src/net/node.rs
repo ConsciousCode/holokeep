@@ -71,6 +71,23 @@ const IDLE: Duration = Duration::from_hours(1);
 /// dialled again wherever it is now.
 const PING: Duration = Duration::from_secs(10);
 
+/// What's tunable of a node's connections (`ping` and `idle` in
+/// `config.toml`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tunables {
+    /// How often a connection's pinged, and how long an answer's waited
+    /// for.
+    pub ping: Duration,
+    /// How long a connection with nothing going on is kept open.
+    pub idle: Duration,
+}
+
+impl Default for Tunables {
+    fn default() -> Self {
+        Self { ping: PING, idle: IDLE }
+    }
+}
+
 /// The members one node knows of, as it tells another.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Roster {
@@ -375,18 +392,18 @@ pub struct Node {
 impl Node {
     /// A node over TCP, finding members on the LAN by mDNS; or a client's,
     /// with no private network, finding its member where it was told.
-    pub fn tcp(key: &Keypair, swarm_key: PreSharedKey, catalog: Catalog, members: Members) -> Result<Self> {
+    pub fn tcp(key: &Keypair, swarm_key: PreSharedKey, catalog: Catalog, members: Members, tunables: Tunables) -> Result<Self> {
         let base = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
         if members.client_of()?.is_some() {
-            return Self::new(super::clients::client_transport(base, key)?, key, catalog, members, false, Ports::default());
+            return Self::new(super::clients::client_transport(base, key)?, key, catalog, members, false, Ports::default(), tunables);
         }
         let ports = Ports::default();
-        Self::new(transport(base, key, swarm_key, ports.clone())?, key, catalog, members, true, ports)
+        Self::new(transport(base, key, swarm_key, ports.clone())?, key, catalog, members, true, ports, tunables)
     }
 
     /// A node over a transport, with or without mDNS, its transport
     /// leaving the private network out on `ports`, where clients connect.
-    pub fn new(transport: Boxed<(PeerId, StreamMuxerBox)>, key: &Keypair, catalog: Catalog, members: Members, lan: bool, ports: Ports) -> Result<Self> {
+    pub fn new(transport: Boxed<(PeerId, StreamMuxerBox)>, key: &Keypair, catalog: Catalog, members: Members, lan: bool, ports: Ports, tunables: Tunables) -> Result<Self> {
         let peer = key.public().to_peer_id();
         let client_of = members.client_of()?;
         let mdns = if lan && client_of.is_none() { Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer)?) } else { None };
@@ -397,7 +414,7 @@ impl Node {
             allowed: allow_block_list::Behaviour::default(),
             gate: Gate::new(ports.clone()),
             identify: identify::Behaviour::new(identify::Config::new(IDENTIFY.into(), key.public())),
-            ping: ping::Behaviour::new(ping::Config::new().with_interval(PING).with_timeout(PING)),
+            ping: ping::Behaviour::new(ping::Config::new().with_interval(tunables.ping).with_timeout(tunables.ping)),
             mdns: mdns.into(),
             kad,
             members: exchange(MEMBERS, request_response::Config::default()),
@@ -413,7 +430,7 @@ impl Node {
             asks: exchange(super::thin::PROTOCOL, request_response::Config::default().with_request_timeout(super::thin::ANSWER)),
             clock: exchange(clock::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_secs(10))),
         };
-        let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(IDLE);
+        let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(tunables.idle);
         let swarm = Swarm::new(transport, behaviour, peer, config);
         let sightings = Sightings::open(catalog.db().clone())?;
         let cursors = Cursors::open(catalog.db().clone(), members.mesh())?;

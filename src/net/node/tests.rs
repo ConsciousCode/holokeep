@@ -11,7 +11,7 @@ async fn node(swarm_key: PreSharedKey) -> Node {
     let ports = Ports::default();
     let transport = transport(MemoryTransport::default(), &key, swarm_key, ports.clone()).expect("transport");
     let catalog = Catalog::standard(Db::memory().expect("db")).expect("catalog");
-    let mut node = Node::new(transport, &key, catalog, members, false, ports).expect("node");
+    let mut node = Node::new(transport, &key, catalog, members, false, ports, Tunables::default()).expect("node");
     node.listen(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
     loop {
         if let Event::Listening(_) = node.next().await.expect("event") {
@@ -1193,7 +1193,7 @@ async fn node_in_file(swarm_key: PreSharedKey, path: &std::path::Path) -> (Node,
     let transport = transport(MemoryTransport::default(), &key, swarm_key, Ports::default()).expect("transport");
     let catalog = Catalog::standard(Db::open(path).expect("db")).expect("catalog");
     catalog.wait_for_writers(Duration::from_millis(20)).expect("wait");
-    let mut node = Node::new(transport, &key, catalog, members, false, Ports::default()).expect("node");
+    let mut node = Node::new(transport, &key, catalog, members, false, Ports::default(), Tunables::default()).expect("node");
     node.listen(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
     loop {
         if let Event::Listening(_) = node.next().await.expect("event") {
@@ -1463,7 +1463,7 @@ fn client_of(member: &Node, device: &crate::keys::Key, at: Option<Vec<Multiaddr>
     members.set_client_of(&member.peer_id()).expect("client of");
     let transport = crate::net::clients::client_transport(MemoryTransport::default(), &key).expect("transport");
     let catalog = Catalog::standard(Db::memory().expect("db")).expect("catalog");
-    let mut client = Node::new(transport, &key, catalog, members, false, Ports::default()).expect("node");
+    let mut client = Node::new(transport, &key, catalog, members, false, Ports::default(), Tunables::default()).expect("node");
     client.catalog_mut().set_signer(device.clone()).expect("signer");
     client
 }

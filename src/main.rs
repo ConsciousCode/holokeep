@@ -126,6 +126,11 @@ enum Command {
     /// Keep copies of blocks on other volumes, such as other drives
     #[command(subcommand)]
     Volume(VolumeCommand),
+    /// The repo's configuration, `config.toml` in its directory: what its
+    /// nodes are tuned to and what they mount, so a service runs with no
+    /// flags
+    #[command(subcommand)]
+    Config(ConfigCommand),
     /// Link this repo's machines into a private mesh
     #[cfg(feature = "net")]
     Node(NodeArgs),
@@ -137,8 +142,9 @@ enum Command {
     /// an anchor mounts it.
     #[cfg(feature = "fuse")]
     Mount {
-        /// An empty directory to mount it on
-        dir: PathBuf,
+        /// An empty directory to mount it on [default: the one `[[mount]]`
+        /// of `config.toml`, as it says]
+        dir: Option<PathBuf>,
         /// Anchors too are read-only
         #[arg(long)]
         read_only: bool,
@@ -226,51 +232,16 @@ enum NodeCommand {
     },
     /// List the meshes this node is in, and whose each is
     Meshes,
-    /// Run this node in the mesh until interrupted
-    Run {
-        /// Where to listen [default: port 4011 for the main mesh, any
-        /// other port for another]
-        #[arg(long)]
-        listen: Option<String>,
-        /// Copy blocks to other members until it would take this many
-        /// failures to lose each, counting risks, auditing a few at a time
-        #[arg(short, long, default_value_t = 2)]
-        copies: usize,
-        /// When free space falls below this, let go of copies the mesh can
-        /// spare (bytes, or with K, M, G, T)
-        #[arg(long, default_value = "2G", value_parser = holokeep::net::daemon::parse_size)]
-        low_water: u64,
-        /// ...until it's back above this; nor take others' copies past it
-        #[arg(long, default_value = "4G", value_parser = holokeep::net::daemon::parse_size)]
-        high_water: u64,
-        /// Don't collect garbage. Otherwise leaves nothing keeps are let go
-        /// of a week after they're condemned, once every member's said it
-        /// doesn't keep them
-        #[arg(long)]
-        no_collect: bool,
-        /// Don't look once a day for what's gone without being let go of,
-        /// reporting what no member has as lost, as `hk lost scan` does
-        #[arg(long)]
-        no_lost_scan: bool,
-        /// Let the host's other users connect, to keep and tag things here
-        /// as accounts of their own, which this repo signs for with keys of
-        /// their own (the repo's directory must let them reach the socket)
-        #[arg(long)]
-        shared: bool,
-        /// Listen for clients too, those `hk node invite --client` let in,
-        /// here [default: port 4012]. Clients connect without the mesh's
-        /// key, so this is open to anyone who can reach it, though only
-        /// the clients' keys get in
-        #[arg(long, num_args = 0..=1, default_missing_value = holokeep::net::daemon::LISTEN_CLIENTS)]
-        clients: Option<String>,
-        /// Open a door too, here [default: port 4013]: where anyone, in no
-        /// mesh, may read the sealed anchors this repo holds by capability
-        /// (`hk cap import --from`), proving for each block they know its
-        /// keys, and nothing else. It's a swarm of its own, apart from the
-        /// mesh's, which no one let in there reaches
-        #[arg(long, num_args = 0..=1, default_missing_value = holokeep::net::daemon::LISTEN_DOOR)]
-        door: Option<String>,
-    },
+    /// Print a systemd user unit running this node, and the main mesh's
+    /// mounts, as a service: save it as
+    /// `~/.config/systemd/user/<name>.service`, then `systemctl --user
+    /// enable --now <name>`. Its flags are `config.toml`'s to say
+    Service,
+    /// Run this node in the mesh until interrupted or terminated, and keep
+    /// the main mesh's mounts while it runs. Each flag says over the
+    /// repo's `config.toml` (see `hk config`), which says over the
+    /// defaults
+    Run(RunArgs),
     /// Let go now of every copy here the mesh can spare, short of space or
     /// not
     Trim,
@@ -442,6 +413,63 @@ enum KeepCommand {
     },
     /// List what's kept
     Ls,
+}
+
+#[cfg(feature = "net")]
+#[derive(clap::Args, Debug)]
+struct RunArgs {
+    /// Where to listen [default: port 4011 for the main mesh, any
+    /// other port for another]
+    #[arg(long)]
+    listen: Option<String>,
+    /// Copy blocks to other members until it would take this many
+    /// failures to lose each, counting risks, auditing a few at a time
+    /// [default: 2]
+    #[arg(short, long)]
+    copies: Option<usize>,
+    /// When free space falls below this, let go of copies the mesh can
+    /// spare (bytes, or with K, M, G, T) [default: 2G]
+    #[arg(long, value_parser = holokeep::net::daemon::parse_size)]
+    low_water: Option<u64>,
+    /// ...until it's back above this; nor take others' copies past it
+    /// [default: 4G]
+    #[arg(long, value_parser = holokeep::net::daemon::parse_size)]
+    high_water: Option<u64>,
+    /// Don't collect garbage. Otherwise leaves nothing keeps are let go
+    /// of a week after they're condemned, once every member's said it
+    /// doesn't keep them
+    #[arg(long)]
+    no_collect: bool,
+    /// Don't look once a day for what's gone without being let go of,
+    /// reporting what no member has as lost, as `hk lost scan` does
+    #[arg(long)]
+    no_lost_scan: bool,
+    /// Let the host's other users connect, to keep and tag things here
+    /// as accounts of their own, which this repo signs for with keys of
+    /// their own (the repo's directory must let them reach the socket)
+    #[arg(long)]
+    shared: bool,
+    /// Listen for clients too, those `hk node invite --client` let in,
+    /// here [default: port 4012]. Clients connect without the mesh's
+    /// key, so this is open to anyone who can reach it, though only
+    /// the clients' keys get in
+    #[arg(long, num_args = 0..=1, default_missing_value = holokeep::net::daemon::LISTEN_CLIENTS)]
+    clients: Option<String>,
+    /// Open a door too, here [default: port 4013]: where anyone, in no
+    /// mesh, may read the sealed anchors this repo holds by capability
+    /// (`hk cap import --from`), proving for each block they know its
+    /// keys, and nothing else. It's a swarm of its own, apart from the
+    /// mesh's, which no one let in there reaches
+    #[arg(long, num_args = 0..=1, default_missing_value = holokeep::net::daemon::LISTEN_DOOR)]
+    door: Option<String>,
+}
+
+#[derive(Subcommand, Debug, Clone, Copy)]
+enum ConfigCommand {
+    /// Print where the configuration is, whether or not it's there yet
+    Path,
+    /// Print the configuration as it's understood, or why it isn't
+    Show,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1314,7 +1342,10 @@ fn run(args: Args) -> anyhow::Result<()> {
         },
         Command::Volume(command) => volume(open_repo(args.repo)?, command),
         #[cfg(feature = "fuse")]
-        Command::Mount { dir, read_only } => mount(repo_dir(args.repo)?, &dir, read_only),
+        Command::Mount { dir: Some(dir), read_only } => mount(repo_dir(args.repo)?, &dir, read_only),
+        #[cfg(feature = "fuse")]
+        Command::Mount { dir: None, read_only } => mount_configured(repo_dir(args.repo)?, read_only),
+        Command::Config(command) => config(&repo_dir(args.repo)?, command),
         #[cfg(feature = "net")]
         Command::Node(NodeArgs { mesh, command }) => node(&holokeep::net::mesh::Place::new(&repo_dir(args.repo)?, &mesh), command),
     }
@@ -1327,6 +1358,30 @@ fn reload(place: &holokeep::net::mesh::Place) -> anyhow::Result<()> {
     let joined = holokeep::net::daemon::ask(place, "reload")?.is_some_and(|lines| lines.iter().any(|line| line == "joined"));
     if joined {
         eprintln!("the running node, which was in no mesh, is in this one now");
+    }
+    Ok(())
+}
+
+/// Mount the soup where the config's one mount says.
+#[cfg(feature = "fuse")]
+fn mount_configured(repo: PathBuf, read_only: bool) -> anyhow::Result<()> {
+    let config = holokeep::config::Config::load(&repo)?;
+    let [only] = config.mount.as_slice() else {
+        anyhow::bail!("name a directory to mount on: config.toml has {} mounts, not one", config.mount.len());
+    };
+    mount(repo, &only.dir(), read_only || only.read_only)
+}
+
+fn config(repo: &Path, command: ConfigCommand) -> anyhow::Result<()> {
+    match command {
+        ConfigCommand::Path => out!("{}", repo.join(holokeep::config::FILE).display()),
+        ConfigCommand::Show => {
+            let config = holokeep::config::Config::load(repo)?;
+            if config == holokeep::config::Config::default() {
+                eprintln!("nothing's configured: the defaults throughout");
+            }
+            out!("{}", toml::to_string(&config)?.trim_end());
+        },
     }
     Ok(())
 }
@@ -1827,6 +1882,7 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
     match command {
         NodeCommand::Id { account: None } => out!("{}", mesh::node_key(dir)?.public().to_peer_id()),
         NodeCommand::Id { account: Some(uid) } => out!("{}", holokeep::keys::peer_id(&holokeep::keys::account_key(dir, uid)?.id())),
+        NodeCommand::Service => node_service(place)?,
         NodeCommand::Meshes => {
             let members = daemon::members(place)?;
             if mesh::swarm_key(dir)?.is_some() {
@@ -1845,19 +1901,7 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
         NodeCommand::Invite { .. } => anyhow::bail!("--quota is for a protected mesh, which is a friend's, not an account's"),
         NodeCommand::Join { ticket, thin: true, .. } => thin_join(place, &ticket)?,
         NodeCommand::Join { ticket, account, thin: false } => join(place, &ticket, account)?,
-        NodeCommand::Run { listen, copies, low_water, high_water, no_collect, no_lost_scan, shared, clients, door } => {
-            let listen = listen.as_deref().unwrap_or_else(|| if place.is_main() { daemon::LISTEN } else { "/ip4/0.0.0.0/tcp/0" });
-            anyhow::ensure!(clients.is_none() || place.is_main(), "clients are of the main mesh");
-            let listen = daemon::Listen {
-                members: listen.parse().context("not a multiaddr")?,
-                clients: clients.map(|addr| addr.parse()).transpose().context("not a multiaddr")?,
-            };
-            if let Some(door) = door {
-                holokeep::net::door::open(&place.repo, &holokeep::net::mesh::node_key(&place.repo)?, door.parse().context("not a multiaddr")?)?;
-            }
-            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            runtime.block_on(daemon::run(place, listen, copies, (low_water, high_water), !no_collect, !no_lost_scan, shared))?;
-        },
+        NodeCommand::Run(args) => node_run(place, args)?,
         NodeCommand::Collect => {
             let report = daemon::collect(place)?.context("this node isn't running: start `hk node run`")?;
             out!(
@@ -1892,6 +1936,68 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
         NodeCommand::Peers => peers(place)?,
         NodeCommand::Grant { command } => grant(place, command)?,
     }
+    Ok(())
+}
+
+/// Run a node, tuned as the flags say, over the config, and keep the
+/// config's mounts while it runs, if it's the main mesh's.
+#[cfg(feature = "net")]
+fn node_run(place: &holokeep::net::mesh::Place, args: RunArgs) -> anyhow::Result<()> {
+    use holokeep::net::daemon;
+    let RunArgs { listen, copies, low_water, high_water, no_collect, no_lost_scan, shared, clients, door } = args;
+    let config = holokeep::config::Config::load(&place.repo)?;
+    let tuned = config.node(&place.mesh);
+    let listen = listen.or(tuned.listen).unwrap_or_else(|| if place.is_main() { daemon::LISTEN } else { "/ip4/0.0.0.0/tcp/0" }.to_owned());
+    let clients = clients.or_else(|| tuned.clients.and_then(|clients| clients.at(daemon::LISTEN_CLIENTS)));
+    let door = door.or_else(|| tuned.door.and_then(|door| door.at(daemon::LISTEN_DOOR)));
+    anyhow::ensure!(clients.is_none() || place.is_main(), "clients are of the main mesh");
+    let listen = daemon::Listen {
+        members: listen.parse().context("not a multiaddr")?,
+        clients: clients.map(|addr| addr.parse()).transpose().context("not a multiaddr")?,
+    };
+    if let Some(door) = door {
+        holokeep::net::door::open(&place.repo, &holokeep::net::mesh::node_key(&place.repo)?, door.parse().context("not a multiaddr")?)?;
+    }
+    let copies = copies.or(tuned.copies).unwrap_or(2);
+    let water = (low_water.or(tuned.low_water).unwrap_or(2 << 30), high_water.or(tuned.high_water).unwrap_or(4 << 30));
+    let collect = !no_collect && tuned.collect.unwrap_or(true);
+    let lost_scan = !no_lost_scan && tuned.lost_scan.unwrap_or(true);
+    let shared = shared || tuned.shared.unwrap_or(false);
+    #[cfg(feature = "fuse")]
+    let mounts = if place.is_main() { Some(holokeep::mounts::Mounts::start(&place.repo, &config.mount)?) } else { None };
+    #[cfg(not(feature = "fuse"))]
+    if !config.mount.is_empty() {
+        eprintln!("this build has no mount, so the config's mounts aren't kept");
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let ran = runtime.block_on(daemon::run(place, listen, copies, water, collect, lost_scan, shared));
+    #[cfg(feature = "fuse")]
+    if let Some(mounts) = mounts {
+        mounts.stop();
+    }
+    ran?;
+    Ok(())
+}
+
+/// Print a systemd user unit running a node.
+#[cfg(feature = "net")]
+fn node_service(place: &holokeep::net::mesh::Place) -> anyhow::Result<()> {
+    let program = std::env::current_exe()?;
+    let mesh = if place.is_main() { String::new() } else { format!(" --mesh {}", place.mesh) };
+    let repo = std::path::absolute(&place.repo)?;
+    out!("[Unit]");
+    out!("Description=holokeep node{}, of {}", if place.is_main() { String::new() } else { format!(" in mesh {}", place.mesh) }, repo.display());
+    out!("");
+    out!("[Service]");
+    out!("ExecStart={} node run --repo {}{mesh}", program.display(), repo.display());
+    out!("Restart=on-failure");
+    out!("RestartSec=5");
+    // The node's to stop its mounts, which it interrupts to unmount
+    out!("KillMode=mixed");
+    out!("TimeoutStopSec=30");
+    out!("");
+    out!("[Install]");
+    out!("WantedBy=default.target");
     Ok(())
 }
 

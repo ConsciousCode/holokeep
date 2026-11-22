@@ -184,22 +184,7 @@ enum Waiter {
 
 /// Parse a size: bytes, or with a K, M, G or T suffix, in powers of two.
 pub fn parse_size(text: &str) -> std::result::Result<u64, String> {
-    let text = text.trim();
-    let (number, shift) = match text.char_indices().last() {
-        Some((at, unit)) if unit.is_ascii_alphabetic() => {
-            let shift = match unit.to_ascii_uppercase() {
-                'K' => 10,
-                'M' => 20,
-                'G' => 30,
-                'T' => 40,
-                _ => return Err(format!("unknown unit in {text:?}")),
-            };
-            (text.get(..at).unwrap_or_default(), shift)
-        },
-        _ => (text, 0),
-    };
-    let number: u64 = number.trim().parse().map_err(|_| format!("not a size: {text:?}"))?;
-    number.checked_shl(shift).filter(|size| size >> shift == number).ok_or_else(|| format!("too large: {text:?}"))
+    crate::config::parse_size(text)
 }
 
 /// The members of the repo's mesh, as this node knows them.
@@ -428,7 +413,10 @@ fn open_node(place: &Place) -> Result<(Node, bool)> {
     if let Some(quota) = members.protected()? {
         catalog.set_quota(quota);
     }
-    let mut node = Node::tcp(&key, swarm_key, catalog, members)?;
+    let tuned = crate::config::Config::load(dir).map_err(|e| Error::Invalid(e.to_string()))?.node(&place.mesh);
+    let defaults = super::node::Tunables::default();
+    let tunables = super::node::Tunables { ping: tuned.ping.unwrap_or(defaults.ping), idle: tuned.idle.unwrap_or(defaults.idle) };
+    let mut node = Node::tcp(&key, swarm_key, catalog, members, tunables)?;
     serve_accounts(&mut node, dir)?;
     Ok((node, alone))
 }
@@ -557,13 +545,21 @@ fn join_now(node: &mut Node, alone: &mut bool, place: &Place, listen: &Listen, m
 /// Free space is kept between watermarks, `(low, high)`: below the low,
 /// the node lets go of copies the mesh can spare until it's above the
 /// high. If `collecting`, garbage is collected too, a sample at a time.
+/// Once interrupted, or terminated, as a service is stopped.
+async fn stopped(terminate: &mut tokio::signal::unix::Signal) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = terminate.recv() => {},
+    }
+}
+
 pub async fn run(place: &Place, listen: Listen, copies: usize, (low, high): (u64, u64), collecting: bool, scanning: bool, shared: bool) -> Result<()> {
     let (mut node, mut alone) = open_node(place)?;
     node.set_watermarks(low, high);
     start(&mut node, place, &listen, alone)?;
     // What a client holds is a cache: what's lost is its member's to say
     let scanning = scanning && node.client_of().is_none();
-    let control = control_socket(place, shared)?;
+    let (control, mut terminate) = (control_socket(place, shared)?, tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?);
     let mut redial = tokio::time::interval(REDIAL);
     let later = |delay| tokio::time::Instant::now().checked_add(delay).unwrap_or_else(tokio::time::Instant::now);
     let mut trickle = later(SETTLE);
@@ -659,7 +655,7 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, (low, high): (u64
             },
             Some(path) = changes.recv() => notice_change(&mut node, &mut remounts, path, &mut changed_again)?,
             Some((mount, root)) = remounted.recv() => remounts.finished(&mount, &root),
-            _ = tokio::signal::ctrl_c() => break Ok(()),
+            () = stopped(&mut terminate) => break Ok(()),
         }
     };
     std::fs::remove_file(socket(place))?;

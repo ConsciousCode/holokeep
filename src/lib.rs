@@ -6,6 +6,7 @@
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::must_use_candidate)]
 
 pub mod cid;
+pub mod config;
 pub mod cap;
 pub mod car;
 pub mod claim;
@@ -29,6 +30,8 @@ pub mod export;
 pub mod fs;
 #[cfg(feature = "fuse")]
 pub mod mount;
+#[cfg(feature = "fuse")]
+pub mod mounts;
 pub mod model;
 pub mod store;
 #[cfg(feature = "net")]
