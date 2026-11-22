@@ -2958,7 +2958,8 @@ impl Catalog {
     }
 
     /// What isn't here of the DAG under a root: each block linked to,
-    /// the root included, which isn't held or can't be read. What's
+    /// the root included, which isn't held or can't be read (a raw block,
+    /// which links nothing, if it isn't placed: it's not read). What's
     /// missing isn't walked into, so it's only the edge of what's here;
     /// nor is what a keep walked through has beyond its frontier.
     ///
@@ -2975,6 +2976,14 @@ impl Catalog {
             }
             let data = if cid.hashcode() == IDENTITY {
                 self.holds(&cid)?.then(|| cid.digest_ref().to_vec())
+            }
+            // A raw block links nothing, so it's enough that it's placed:
+            // reading every leaf would read every byte under the root
+            else if cid.codec() == crate::cid::RAW_CODEC {
+                if self.placements(cid.multihash())?.is_empty() {
+                    missing.push(cid);
+                }
+                continue;
             }
             else {
                 self.get_block(&cid).ok().flatten().map(|block| block.data().to_vec())
