@@ -594,6 +594,9 @@ scenario_door() {
     on one hk cap unread "$anchor" "$gone" 2>/dev/null || fail "one couldn't take a reader's read away"
     ! on outsider hk cap import "$goes" >/dev/null 2>&1 || fail "a reader read with its read taken away"
     on outsider hk cap import "$stays" 2>/dev/null | grep -q "^root " || fail "the reader that stays didn't read on through the new key"
+    # Sealed again whole, its past let go of: the reader still reads
+    on one hk cap reseal "$anchor" --forget 2>/dev/null || fail "one couldn't seal it again and forget"
+    on outsider hk cap import "$stays" 2>/dev/null | grep -q "^root " || fail "the reader didn't read what was sealed again"
     on one hk cap unpublish "$anchor" 2>/dev/null
     ! on one hk cap ls | grep -q "^$anchor	" || fail "one still lists it, unpublished"
 

@@ -318,7 +318,13 @@ pub enum MountKeys<'a> {
 /// entries as `mounts` says (see `Mount`). Returns the anchors mount
 /// points name in what was sealed, which is only what's new.
 fn seal_tree(src: &impl Fetch, root: &Link, read: &[u8; 32], before: Option<(Link, Link, Key)>, mounts: MountKeys<'_>) -> Result<(Sealed, Vec<Link>)> {
-    let mut sealing = Sealing { src, mounts, mounted: Vec::new(), done: HashMap::new(), blocks: Vec::new() };
+    seal_forcing(src, root, read, before, mounts, std::collections::HashSet::new())
+}
+
+/// Seal a DAG as `seal_tree` does, sealing again the plaintext nodes
+/// given, by CID bytes, though they're unchanged.
+fn seal_forcing(src: &impl Fetch, root: &Link, read: &[u8; 32], before: Option<(Link, Link, Key)>, mounts: MountKeys<'_>, force: std::collections::HashSet<Vec<u8>>) -> Result<(Sealed, Vec<Link>)> {
+    let mut sealing = Sealing { src, force, mounts, mounted: Vec::new(), done: HashMap::new(), blocks: Vec::new() };
     let before = before.map(|(plain, sealed, was_read)| Before { plain, sealed, key: root_key(&was_read), within: None });
     let root = sealing.seal(root, &root_key(read), None, before)?;
     Ok((Sealed { root, blocks: sealing.blocks }, sealing.mounted))
@@ -326,6 +332,9 @@ fn seal_tree(src: &impl Fetch, root: &Link, read: &[u8; 32], before: Option<(Lin
 
 struct Sealing<'a, F> {
     src: &'a F,
+    /// Plaintext nodes to seal again even if unchanged: the directories
+    /// down to a mount point whose sealed anchor's read key changed.
+    force: std::collections::HashSet<Vec<u8>>,
     mounts: MountKeys<'a>,
     /// The anchors mount points sealed name, each once.
     mounted: Vec<Link>,
@@ -350,6 +359,7 @@ impl<F: Fetch> Sealing<'_, F> {
         if let Some(before) = &before
             && before.plain == *cid
             && *before.key == **key
+            && !self.force.contains(&cid.to_bytes())
         {
             self.done.insert(done, before.sealed.clone());
             return Ok(before.sealed.clone());
@@ -440,7 +450,10 @@ impl<F: Fetch> Sealing<'_, F> {
             // A key it kept from before, if it said one
             let kept = child.entry.as_deref().and_then(|entry| std::str::from_utf8(entry).ok()).and_then(|entry| node.keys.get(entry));
             let key = kept.map_or(child.key, |kept| Zeroizing::new(**kept));
-            self.done.insert((child.cid.to_bytes(), *key), sealed.clone());
+            // What's to be sealed again isn't sealed already
+            if !self.force.contains(&child.cid.to_bytes()) {
+                self.done.insert((child.cid.to_bytes(), *key), sealed.clone());
+            }
             if let Some(place) = child.place {
                 places.insert(place, Before { plain: child.cid, sealed, key, within: child.within });
             }
@@ -1259,16 +1272,36 @@ pub struct Publication {
 /// holds every head published. Nothing new is made if the last head's
 /// already of it.
 pub fn publish(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, published: &Published, value: &Link) -> Result<Publication> {
+    publish_sealing(catalog, vault, published, value, Sealed_::After)
+}
+
+/// How publishing seals: after the owner's last head; after it, sealing
+/// these plaintext nodes again though they're unchanged; or whole.
+enum Sealed_ {
+    After,
+    Forcing(std::collections::HashSet<Vec<u8>>),
+    Whole,
+}
+
+/// Publish as `publish` does, sealing as said: anything but after the
+/// last head publishes anew, though nothing's changed.
+fn publish_sealing(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, published: &Published, value: &Link, sealing: Sealed_) -> Result<Publication> {
     let secret = secret(vault);
     let last = last_head(catalog, published)?;
     let ours = last.as_ref().and_then(|head| head.ours.as_ref()).map(|(ours, key)| (ours.plain.clone(), ours.root.clone(), key.clone()));
     let epochs: HashMap<Vec<u8>, u32> = epochs(catalog, vault)?.into_iter().filter(|(_, epoch)| *epoch > 0).map(|(anchor, epoch)| (anchor.to_bytes(), epoch)).collect();
-    let (sealed, mounted) = seal_tree(catalog, value, &published.read, ours, MountKeys::Secret(&secret, &epochs))?;
+    let mounts = MountKeys::Secret(&secret, &epochs);
+    let anew = !matches!(sealing, Sealed_::After);
+    let (sealed, mounted) = match sealing {
+        Sealed_::After => seal_tree(catalog, value, &published.read, ours, mounts)?,
+        Sealed_::Forcing(force) => seal_forcing(catalog, value, &published.read, ours, mounts, force)?,
+        Sealed_::Whole => seal_tree(catalog, value, &published.read, None, mounts)?,
+    };
     let previous = as_vault(catalog, vault, |catalog| Ok(kept_manifests(catalog)?.into_iter().find(|(_, manifest)| manifest.view.as_ref() == Some(&published.view)).map(|(cid, _)| cid)))?;
     let mut sets: Vec<Link> = catalog.anchor_heads(&published.of)?.into_iter().map(|(set, ..)| set).collect();
     sets.sort_by_key(CidRef::to_bytes);
     // Nothing new: one head, of this, saying it's of the sets there are
-    if let (Some(last), Some(previous)) = (&last, &previous)
+    if let (Some(last), Some(previous), false) = (&last, &previous, anew)
         && last.block.plain == *value
         && last.block.sets == sets
         && last.sets.len() == 1
@@ -1497,6 +1530,42 @@ pub fn write(catalog: &mut crate::store::Catalog, cap: &Write, base: &Base, valu
     Ok(Written { blocks, set: set.block(), sign: block_here(catalog, &sign)? })
 }
 
+/// The plaintext nodes of a tree down to each mount point of an anchor,
+/// by CID bytes: its directories and HAMT shards on the way, and the
+/// one naming it. Only directories are walked; a file's read no further
+/// than its root.
+fn mounting(src: &impl Fetch, root: &Link, anchor: &Link) -> Result<std::collections::HashSet<Vec<u8>>> {
+    /// Whether a node holds a mount point of the anchor, however deep,
+    /// each node worked out once.
+    fn walk(src: &impl Fetch, cid: &Link, anchor: &Link, holds: &mut HashMap<Vec<u8>, bool>) -> Result<bool> {
+        if cid.codec() != DAG_PB_CODEC || cid.hashcode() == IDENTITY {
+            return Ok(false);
+        }
+        if let Some(&known) = holds.get(&cid.to_bytes()) {
+            return Ok(known);
+        }
+        holds.insert(cid.to_bytes(), false);
+        let data = src.fetch(cid)?;
+        let kind = PbNode::decode(&data).ok().and_then(|node| node.data.and_then(|data| DataBuf::decode(data).ok())).map(|unixfs| unixfs.data_type);
+        if !matches!(kind, Some(DataType::Directory | DataType::HAMTShard)) {
+            return Ok(false);
+        }
+        let mut found = false;
+        for child in children(cid, &data, &[0u8; 32], None)? {
+            let small = child.size.is_none_or(|size| size <= MOUNT_MAX) && child.cid.codec() == DAG_PB_CODEC && child.cid.hashcode() != IDENTITY;
+            let names_it = child.entry.is_some() && small && mount_target(&src.fetch(&child.cid)?).as_ref() == Some(anchor);
+            if names_it || walk(src, &child.cid, anchor, holds)? {
+                found = true;
+            }
+        }
+        holds.insert(cid.to_bytes(), found);
+        Ok(found)
+    }
+    let mut holds = HashMap::new();
+    walk(src, root, anchor, &mut holds)?;
+    Ok(holds.into_iter().filter(|(_, found)| *found).map(|(cid, _)| cid).collect())
+}
+
 /// Change a published anchor's read key, publishing what it is now as
 /// the next epoch's (see `Published::at`).
 ///
@@ -1523,7 +1592,89 @@ fn rekey_with(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, 
     next.readers = readers;
     publish(catalog, vault, &next, &value)?;
     keep_keyring(catalog, vault, &next)?;
+    // What mounts it says its read key in `mounts`: sealed again down to
+    // each mount point, and nothing else
+    for said in published_at(catalog, vault)? {
+        if said.anchor == current.of {
+            continue;
+        }
+        let Some(value) = catalog.anchor_value(&said.anchor)? else {
+            continue;
+        };
+        let force = mounting(catalog, &value, &current.of)?;
+        if !force.is_empty() {
+            let parent = Published::current(catalog, vault, &said.anchor)?;
+            publish_sealing(catalog, vault, &parent, &value, Sealed_::Forcing(force))?;
+        }
+    }
     Ok(next)
+}
+
+/// Seal a published anchor again whole, under its read key.
+///
+/// Nothing sealed under a key before is kept. If it's to forget, it lets
+/// go of everything published of it before too, so the old ciphertext's
+/// collected in time, wherever only the vault kept it.
+///
+/// Forgetting keeps the latest head, every grant on the sealed anchor and
+/// its latest keyring, in a manifest the vault keeps alone, after none:
+/// its writers and readers go on, but what was published before can't be
+/// read back. Letting go of the past is always asked for.
+pub fn reseal(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, anchor: &Link, forget: bool) -> Result<Publication> {
+    let published = Published::current(catalog, vault, anchor)?;
+    if !epochs(catalog, vault)?.iter().any(|(of, _)| of == anchor) {
+        return Err(invalid(format!("{anchor} isn't published")));
+    }
+    let value = catalog.anchor_value(anchor)?.ok_or_else(|| invalid(format!("{anchor} is nothing yet")))?;
+    let publication = publish_sealing(catalog, vault, &published, &value, Sealed_::Whole)?;
+    if !forget {
+        return Ok(publication);
+    }
+    let mut keep = Vec::new();
+    for (cid, data) in claims_about(catalog, &published.view)? {
+        if matches!(crate::claim::Claim::parse(&data), Some(crate::claim::Claim::Grant(_))) || claims_signing_grants(&data, catalog, &published.view)? {
+            keep.push(cid);
+        }
+    }
+    keep.extend(keyring_held(catalog, &published.view)?.into_iter().map(|(cid, _)| cid));
+    let manifest = as_vault(catalog, vault, |catalog| catalog.batch(|catalog| {
+        let Some(latest) = catalog.get_block(&publication.manifest)?.and_then(|block| Manifest::parse(block.data())) else {
+            return Err(invalid("the manifest just kept isn't here"));
+        };
+        let mut blocks = latest.blocks;
+        for part in &latest.parts {
+            blocks.extend(catalog.get_block(part)?.and_then(|block| Manifest::parse(block.data())).map(|part| part.blocks).unwrap_or_default());
+        }
+        blocks.extend(keep);
+        blocks.sort_by_key(CidRef::to_bytes);
+        blocks.dedup();
+        let manifest = keep_entries(catalog, &published, None, blocks)?;
+        // The manifest just kept named it; parts go with it
+        for (cid, said) in kept_manifests(catalog)? {
+            if said.view.as_ref() == Some(&published.view) && cid != manifest {
+                catalog.unkeep(&cid)?;
+            }
+        }
+        Ok(manifest)
+    }))?;
+    Ok(Publication { manifest, ..publication })
+}
+
+/// Whether a claim is a sign of a grant on a sealed view's anchor.
+fn claims_signing_grants(data: &[u8], catalog: &crate::store::Catalog, view: &Link) -> Result<bool> {
+    let Some(crate::claim::Claim::Sign(sign)) = crate::claim::Claim::parse(data) else {
+        return Ok(false);
+    };
+    let (anchor, _) = crate::claim::viewed(view).ok_or_else(|| invalid("not a sealed view"))?;
+    for signed in sign.signs() {
+        if let Some(block) = catalog.get_block(signed)?
+            && let Some(crate::claim::Claim::Grant(grant)) = crate::claim::Claim::parse(block.data())
+            && grant.on() == Some(&anchor)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Keep a published anchor's keyring as it is now, for its readers, its

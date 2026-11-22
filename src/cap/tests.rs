@@ -877,3 +877,81 @@ fn readers_read_through_new_read_keys_till_their_read_is_taken_away() {
     assert!(read(&now, &bob_reads, &|_| Vec::new()).is_err(), "nor does the key he had read what's new");
 }
 
+
+#[test]
+fn a_mounted_anchors_new_read_key_reaches_what_mounts_it() {
+    let repo = Scratch::new("cap-rekey-mount-repo");
+    let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
+    let vault = crate::vault::Vault::open(repo.path(), catalog.uid()).expect("vault");
+    catalog.set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
+    let (outer, inner) = (catalog.new_anchor().expect("anchor"), catalog.new_anchor().expect("anchor"));
+    let t = tree("cap-rekey-mount-inner");
+    let inner_value = import(&mut catalog, t.path(), &importer());
+    catalog.set_anchor(&inner, &inner_value).expect("set");
+    let top = Scratch::new("cap-rekey-mount-outer");
+    std::fs::create_dir_all(top.path().join("deep/er")).expect("mkdir");
+    std::fs::write(top.path().join("beside.txt"), "beside").expect("write");
+    std::os::unix::fs::symlink(format!("/anchors/{inner}"), top.path().join("deep/er/inner")).expect("symlink");
+    let outer_value = import(&mut catalog, top.path(), &importer());
+    catalog.set_anchor(&outer, &outer_value).expect("set");
+    publish_mounted(&mut catalog, &vault, &outer, &outer_value).expect("publish");
+    assert_eq!(mounting(&catalog, &outer_value, &inner).expect("walk").len(), 3, "the root, deep and er");
+
+    rekey(&mut catalog, &vault, &inner).expect("rekey");
+    let mut held = Held::default();
+    for (_, manifest) in published_list(&mut catalog, &vault) {
+        for block in published_blocks(&catalog, &manifest).expect("blocks") {
+            held.insert(block);
+        }
+    }
+    let Capability::Live(live) = Published::current(&mut catalog, &vault, &outer).expect("published").capability() else {
+        panic!("not live");
+    };
+    let reading = read(&held, &live, &|_| Vec::new()).expect("read");
+    let mounts: Vec<_> = reading.mounts.iter().map(|mounted| (mounted.path.as_str(), mounted.read.clone().ok())).collect();
+    assert_eq!(mounts, vec![("deep/er/inner", Some(inner_value))], "read through to the mounted anchor's new key");
+}
+
+#[test]
+fn sealing_again_and_forgetting_keeps_the_latest_and_who_may_but_not_the_past() {
+    let t = tree("cap-forget");
+    let repo = Scratch::new("cap-forget-repo");
+    let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
+    let vault = crate::vault::Vault::open(repo.path(), catalog.uid()).expect("vault");
+    catalog.set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
+    let anchor = catalog.new_anchor().expect("anchor");
+    let first = import(&mut catalog, t.path(), &importer());
+    catalog.set_anchor(&anchor, &first).expect("set");
+    let published = Published::current(&mut catalog, &vault, &anchor).expect("published");
+    let one = publish(&mut catalog, &vault, &published, &first).expect("publish");
+    std::fs::write(t.path().join("docs/readme.md"), "the second").expect("write");
+    let second = import(&mut catalog, t.path(), &importer());
+    catalog.set_anchor(&anchor, &second).expect("set");
+    publish(&mut catalog, &vault, &published, &second).expect("publish");
+    let seed = add_writer(&mut catalog, &vault, &published).expect("writer");
+    let (_, reader) = add_reader(&mut catalog, &vault, &anchor).expect("reader");
+    let unpublished = catalog.new_anchor().expect("anchor");
+    assert!(reseal(&mut catalog, &vault, &unpublished, true).is_err(), "not published");
+
+    let forgot = reseal(&mut catalog, &vault, &anchor, true).expect("reseal");
+    let kept = published_list(&mut catalog, &vault);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].1, forgot.manifest);
+    let blocks = published_blocks(&catalog, &forgot.manifest).expect("blocks");
+    let cids: HashSet<Vec<u8>> = blocks.iter().map(|block| AnyCid::V1(block.cid().clone()).to_bytes()).collect();
+    assert!(!cids.contains(&one.set.to_bytes()), "the first head's let go of");
+    // What's kept reads as it is, to its reader through the keyring, and
+    // still knows its writer
+    let held = held_of(&blocks);
+    let live = open_keyring(&published.view, &reader, held.all()).expect("open");
+    let reading = read(&held, &live, &|_| Vec::new()).expect("read");
+    assert_eq!((reading.plain, reading.forked), (second, 0));
+    let writer = crate::keys::Key::from_seed(&seed).id();
+    assert!(writers(&catalog, &vault, &published).expect("writers").iter().any(|listed| listed.key == writer && listed.writes));
+    let mut gathered = Gathered::default();
+    for data in held.all() {
+        gathered.add(&published.anchor, data);
+    }
+    let judge = Judge::of(&published.owner.id(), &published.anchor, gathered.signed_grants(), &BTreeMap::new()).expect("judge");
+    assert!(judge.state.expect("grants").holds_on(&published.owner.id(), &published.anchor, &writer, crate::grants::WRITE), "its grant's kept with it");
+}

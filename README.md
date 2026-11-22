@@ -459,7 +459,7 @@ Checklist:
   - [x] Sealed anchors, read-only: owner keys, heads, views judged by their own keys, sealing what's changed, manifests the vault keeps, kept current by the node, held by friends' protected meshes, read from a CAR or at a holder's door by anyone with the capability, who remembers the head it read and refuses an older one offered as the latest (`hk cap publish/unpublish/ls`, `hk node run --door`, `hk cap import --from`)
   - [x] Mount points: sealed `mounts`, publishing and reading through what's mounted, and sharing a folder makes it an anchor (`hk cap publish <folder>`)
   - [x] Writing by capability: writer keys judged by the owner key's grants, write capabilities writing at a door or to a CAR, the owner's machines taking writes in and merging forks, and taking write away (`hk cap grant/write/take/writers/revoke`)
-  - [ ] Revoking read: new read keys
+  - [x] Revoking read: new read keys by epoch, unchanged entries keeping their ciphertext with their keys said, readers by keyring of sealed boxes, and sealing again and forgetting the past (`hk cap rekey/reader/readers/unread/reseal`)
 
 ## Open questions
 

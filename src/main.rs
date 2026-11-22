@@ -540,6 +540,16 @@ enum CapCommand {
         #[arg(long)]
         at: Vec<String>,
     },
+    /// Seal a published anchor again whole, under its read key, keeping
+    /// nothing sealed under an old one. With --forget, let go of all that
+    /// was published of it before too, so the old ciphertext's collected
+    /// in time: its writers and readers go on, but its past can't be read
+    /// back
+    Reseal {
+        anchor: PathBuf,
+        #[arg(long)]
+        forget: bool,
+    },
     /// Let a new reader read a published anchor: a reader key of its own,
     /// whose box in the anchor's keyring has its read key, so it goes on
     /// reading as the read key changes, till it's taken away (`hk cap
@@ -2523,21 +2533,8 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
         CapCommand::Grant { anchor, at } => cap_grant(repo, &anchor, at),
         CapCommand::Take { car } => cap_take(repo, &car),
         CapCommand::Writers { anchor } => cap_writers(repo, &anchor),
+        command @ (CapCommand::Rekey { .. } | CapCommand::Reseal { .. }) => cap_keys(repo, command),
         command @ (CapCommand::Reader { .. } | CapCommand::Readers { .. } | CapCommand::Unread { .. }) => cap_readers(repo, command),
-        CapCommand::Rekey { anchor, at } => {
-            let dir = repo_dir(repo)?;
-            let mut repo = open_repo(Some(dir.clone()))?;
-            let anchor = anchor_named(&repo, &anchor)?;
-            let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
-            let published = cap::rekey(&mut repo, &vault, &anchor)?;
-            eprintln!("{anchor} has a new read key, its epoch {}: older capabilities read nothing new", published.epoch);
-            let capability = match published.capability() {
-                Capability::Live(live) => Capability::Live(live.at(at)),
-                other => other,
-            };
-            out!("{}", capability.encode());
-            Ok(())
-        },
         CapCommand::Revoke { anchor, writer } => cap_revoke(repo, &anchor, &writer),
         CapCommand::Write { capability, root, output, car, from } => cap_write(repo, &capability, &root, output.as_deref(), &car, from),
     }
@@ -2734,6 +2731,42 @@ fn cap_readers(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()>
         _ => anyhow::bail!("not a command on readers"),
     }
     Ok(())
+}
+
+/// `hk cap rekey` and `reseal`: a published anchor's read key, and what's
+/// sealed under it.
+fn cap_keys(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
+    use holokeep::cap::{self, Capability};
+    match command {
+        CapCommand::Rekey { anchor, at } => {
+            let dir = repo_dir(repo)?;
+            let mut repo = open_repo(Some(dir.clone()))?;
+            let anchor = anchor_named(&repo, &anchor)?;
+            let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
+            let published = cap::rekey(&mut repo, &vault, &anchor)?;
+            eprintln!("{anchor} has a new read key, its epoch {}: older capabilities read nothing new", published.epoch);
+            let capability = match published.capability() {
+                Capability::Live(live) => Capability::Live(live.at(at)),
+                other => other,
+            };
+            out!("{}", capability.encode());
+            Ok(())
+        },
+        CapCommand::Reseal { anchor, forget } => {
+            let dir = repo_dir(repo)?;
+            let mut repo = open_repo(Some(dir.clone()))?;
+            let anchor = anchor_named(&repo, &anchor)?;
+            let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
+            let publication = cap::reseal(&mut repo, &vault, &anchor, forget)?;
+            if forget {
+                eprintln!("sealed {anchor} again whole, and let go of what was published of it before: {}", publication.manifest);
+            } else {
+                eprintln!("sealed {anchor} again whole: {}", publication.manifest);
+            }
+            Ok(())
+        },
+        _ => anyhow::bail!("not a command on read keys"),
+    }
 }
 
 /// `hk cap writers`: list who may write a published anchor.

@@ -236,17 +236,17 @@ head nonce = derive(read key, "head nonce", inner set CID bytes)[0..24]
 A capability is dag-cbor in multibase, base32, as a ticket is (see
 [[Mesh#Joining]]), starting `hkcap`:
 
-| Key     | Type          | Meaning                                                                                                                                 |
-| ------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `view`  | Link          | The sealed view, which names `K`. Omitted for a snapshot.                                                                               |
-| `root`  | Link          | A fixed sealed root: a snapshot, with no heads. Omitted otherwise.                                                                      |
-| `plain` | Link          | A snapshot's plaintext root, which its root block's key and nonce are derived with. Omitted otherwise, as a head says it.               |
-| `read`  | bytes         | The read key.                                                                                                                           |
-| `write` | bytes         | An ed25519 seed `K` has given `/anchor/write`, for a capability that writes (omitted for one that reads).                               |
-| `of`    | Link          | The plaintext anchor, which the plaintext sets it writes are of (with `write` only).                                                    |
-| `for`   | Link          | The user whose view of the plaintext anchor those sets are for, its owner (with `write` only; omitted if the owner's repo has no user). |
-| `reader` | bytes | An X25519 seed whose public key the keyring boxes the read key to, for a reader's capability, in place of `read` (see [[#Keyrings]]). |
-| `at`    | `[Multiaddr]` | Where some holders of the ciphertext listen (omitted if found otherwise).                                                               |
+| Key      | Type          | Meaning                                                                                                                                 |
+| -------- | ------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `view`   | Link          | The sealed view, which names `K`. Omitted for a snapshot.                                                                               |
+| `root`   | Link          | A fixed sealed root: a snapshot, with no heads. Omitted otherwise.                                                                      |
+| `plain`  | Link          | A snapshot's plaintext root, which its root block's key and nonce are derived with. Omitted otherwise, as a head says it.               |
+| `read`   | bytes         | The read key.                                                                                                                           |
+| `write`  | bytes         | An ed25519 seed `K` has given `/anchor/write`, for a capability that writes (omitted for one that reads).                               |
+| `of`     | Link          | The plaintext anchor, which the plaintext sets it writes are of (with `write` only).                                                    |
+| `for`    | Link          | The user whose view of the plaintext anchor those sets are for, its owner (with `write` only; omitted if the owner's repo has no user). |
+| `reader` | bytes         | An X25519 seed whose public key the keyring boxes the read key to, for a reader's capability, in place of `read` (see [[#Keyrings]]).   |
+| `at`     | `[Multiaddr]` | Where some holders of the ciphertext listen (omitted if found otherwise).                                                               |
 
 Each write capability has a writer of its own, so each has a sign chain
 of its own, and taking one's write away leaves the others'. A write
@@ -456,13 +456,24 @@ acting for the vault, doesn't.
   read before, and what's kept unchanged since, it can still unseal
   from blocks it gets: revoking makes a key useless for what's new, not
   for what it had.
-- **Not yet.** A mounted anchor's new key reaches the `mounts` of what
-  mounts it only when the directory holding the mount point is sealed
-  again; till then readers of the parent can't read the mount, and are
-  told so. Readers with a reader's capability read on through new keys
-  (see [[#Keyrings]]); those given a read key need a new capability.
-  Sealing everything again, forgetting the old ciphertext, is still to
-  come.
+- **What mounts it.** A new read key changes the `mounts` entry of
+  every mount point of the anchor. So `rekey` then walks each other
+  anchor the vault publishes, its directories and HAMT shards only, no
+  file further than its root, for mount points of it, and publishes each
+  that has one again, sealing again the directories and shards down to
+  them, though unchanged, and nothing else: their new `mounts` say the
+  new key.
+- Readers with a reader's capability read on through new keys (see
+  [[#Keyrings]]); those given a read key need a new capability.
+- **Sealing again, and forgetting.** `hk cap reseal <anchor>` seals the
+  whole tree again under the current read key, keeping nothing sealed
+  under an old one, and publishes it. With `--forget`, the vault then
+  keeps one manifest of it, after none: every block of the head just
+  made, every grant on the sealed anchor and its sign, and the latest
+  keyring and its sign; and lets go of every manifest before. So the old
+  ciphertext, and the heads before, are collected in time wherever only
+  the vault kept them: writers and readers go on, but its past can't be
+  read back from the vault. Readers who kept blocks keep them.
 
 ### Keyrings
 
@@ -787,8 +798,9 @@ In order, each of use alone:
    heads to a door or a CAR; the owner's machines take them in and merge
    them; write is taken away; readers and writers merge forks; and a
    friend's door keeps writes for the owner while it's away.
-5. **Revoking read.** Begun: new read keys by epoch, `keys` and `past`,
-   and readers by keyring. To come: sealing everything again when asked.
+5. **Revoking read.** Done: new read keys by epoch, `keys` and `past`,
+   readers by keyring, what mounts a rekeyed anchor sealed again, and
+   sealing everything again and forgetting the past when asked.
 6. **The vault as a capability**: a sealed root anchor only its owner
    can read, if one scheme for both is wanted.
 
