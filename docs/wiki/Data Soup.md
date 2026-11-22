@@ -26,6 +26,7 @@ the holokeep repository; this wiki is the reference.
 - [[Capabilities]]: sharing by key, from ciphertext no member guards (snapshots implemented; the rest a design).
 - [[Mount]]: the FUSE filesystem and writing through it.
 - [[Rules]]: `.souprules`, what's made through the mount becomes.
+- [[Configuration]]: `config.toml`, a node's tunables and mounts, and running it as a service.
 - [[Git]]: git objects as `git-raw` blocks, and importing repositories.
 - [[Style Guide]]: how these pages are written.
 
