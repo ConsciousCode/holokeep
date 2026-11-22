@@ -676,6 +676,24 @@ fn writers_forking_are_merged_by_the_owner_and_write_taken_away_stops_one() {
         both.insert(block);
     }
     assert_eq!(read(&both, &live, &|_| Vec::new()).expect("read").forked, 1, "a fork, not yet merged");
+    let wanted = tree("cap-forks-wanted");
+    std::fs::write(wanted.path().join("docs/readme.md"), "written by writer 0").expect("write");
+    std::fs::write(wanted.path().join("docs/deep/secret.txt"), "written by writer 1").expect("write");
+    let wanted = import(&mut Catalog::open_repo(&repo.path().join("wanted")).expect("catalog"), wanted.path(), &importer());
+
+    // A reader merges the fork itself, as the owner will; a writer that
+    // read so writes after both heads, which closes the fork
+    let reader = Catalog::open_repo(&repo.path().join("reader")).expect("catalog");
+    let merging = read_into(&reader, &both, &live, &|_| Vec::new()).expect("read");
+    assert_eq!((&merging.plain, merging.forked), (&wanted, 1));
+    let mut reader = reader;
+    let after_both = write(&mut reader, &caps[1], merging.base.as_ref().expect("base"), &merging.plain).expect("write");
+    let mut closed = held(&mut catalog);
+    for block in written.iter().flat_map(Written::all).chain(after_both.all()) {
+        closed.insert(block);
+    }
+    let closed = read(&closed, &live, &|_| Vec::new()).expect("read");
+    assert_eq!((closed.plain, closed.forked), (wanted.clone(), 0));
 
     // The owner takes both in and merges them, in one head after both
     for block in written.iter().flat_map(Written::all) {
@@ -683,10 +701,7 @@ fn writers_forking_are_merged_by_the_owner_and_write_taken_away_stops_one() {
     }
     assert_eq!(take_in(&mut catalog, &vault).expect("take in").len(), 2);
     let merged = catalog.anchor_value(&anchor).expect("value").expect("a value");
-    let wanted = tree("cap-forks-wanted");
-    std::fs::write(wanted.path().join("docs/readme.md"), "written by writer 0").expect("write");
-    std::fs::write(wanted.path().join("docs/deep/secret.txt"), "written by writer 1").expect("write");
-    assert_eq!(merged, import(&mut catalog, wanted.path(), &importer()), "both writes, merged");
+    assert_eq!(merged, wanted, "both writes, merged");
     publish(&mut catalog, &vault, &published, &merged).expect("publish");
     let after = read(&held(&mut catalog), &live, &|_| Vec::new()).expect("read");
     assert_eq!((after.plain, after.forked), (merged.clone(), 0));

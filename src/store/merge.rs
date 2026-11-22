@@ -256,6 +256,21 @@ impl Catalog {
         Ok(state)
     }
 
+    /// What a history of sets given, not the catalog's, merges to as of
+    /// these of them: as `state_of` does an anchor's, with nothing said
+    /// to be written, whose trees the catalog has. A set whose `prev` names
+    /// none here starts the history: as a sealed anchor's reader merges its
+    /// heads, from what they have in common (see `crate::cap`).
+    pub fn merge_history(&self, sets: &[SetOf], heads: &[Link]) -> Result<State> {
+        let index: BTreeMap<Vec<u8>, usize> = sets.iter().enumerate().map(|(i, (set, ..))| (set.to_bytes(), i)).collect();
+        let sets = Sets { all: sets, index, wrote: HashMap::new(), listed: RefCell::default() };
+        let mut from: Vec<usize> = heads.iter().map(|head| sets.index.get(&head.to_bytes()).copied().ok_or_else(|| super::Error::User(format!("{head} isn't among the sets")))).collect::<Result<_>>()?;
+        from.sort_unstable();
+        from.dedup();
+        self.settle(&sets)?;
+        Ok(self.merged(&sets, &from)?)
+    }
+
     /// What an anchor's shown as, as of these of its sets: their state,
     /// with each version in conflict beside the latest.
     pub fn view_of(&self, anchor: &Link, heads: &[Link]) -> Result<View> {

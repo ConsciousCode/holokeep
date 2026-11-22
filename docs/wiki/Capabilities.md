@@ -536,8 +536,18 @@ each time, keeping no state between them. Each block's checked against
 its CID and put in the repo; with the last, the set and sign too, so
 they're only there once all else is, and what takes them in finds them
 whole. The owner's node takes them in as it keeps what's published
-current (see [[#Writing, as it is now]]). Any other holder keeps them
-only as any block it's given and doesn't keep, till they're collected.
+current (see [[#Writing, as it is now]]).
+
+A **friend's door** keeps them: with the last request taken, the door
+acts, in turn, for each account of its repo with a key there besides its
+own, and any that keeps a manifest of the sealed view, as a friend's
+account holding the vault does, keeps a manifest of the write's blocks,
+`{blocks}` with no `view`, which it's taken over every request of it.
+So the vault's protected meshes hold the write, and carry it to the
+owner's machines, which take it in when they're next up. A friend never
+unseals it: it's no read key, and holds ciphertext only. Readers at a
+friend's door read the write meanwhile, merging it with whatever else
+is new.
 
 ## Judging a sealed view
 
@@ -589,28 +599,36 @@ read. Several writers fork, as plaintext anchors do; nothing is
 refused. Holders can't merge sealed heads, so they show the latest, as
 an anchor whose heads aren't all directories does (see [[Anchors and Names#Forks and merges]]).
 
-**As built, the owner's machines merge.** Merging an anchor's heads
-works out each set's conflicts from the sets before it (see
-[[Anchors and Names#Forks and merges]]), so it needs the anchor's
-history of sets and their trees. The owner's machines have it, in
-plaintext; a capability's writer or reader has only the sealed view,
-and would have to unseal every past tree to rebuild it. So:
+**Merging.** Merging an anchor's heads works out each set's conflicts
+from the sets before it (see [[Anchors and Names#Forks and merges]]).
+A sealed view is a history of sets of its own, each valued a plaintext
+tree, so a reader or writer merges over it, as `Catalog::merge_history`
+does any history it's given:
 
-- A capability's writer writes after the latest head alone, its inner
-  set after the plaintext sets that head says it's of. Writers writing
-  at once fork the sealed view.
-- A reader reads the latest head, and is told how many others are
-  forked from it, not yet merged (`hk cap import` says so).
-- The owner's machines take each writer's head in, with its plaintext
-  set, so the plaintext anchor forks as it would between two of its own
-  devices, and its value is their merge. Their next head names every
-  sealed head as `prev`, closing the fork in the sealed view too. That
-  head's tree is the merge with whatever the owner's machine wrote
-  besides: never the merge and the edit as two.
+- `hk cap import` and `hk cap write` read every head, and if there's
+  more than one, merge them in the repo, from the latest sets the heads
+  have in common: only the trees from there on are unsealed, every head
+  block at once and every tree's blocks once however many share them.
+  The heads in common are taken to start the history, so what was in
+  conflict before them isn't carried: the owner's machines, which have
+  the whole plaintext history, would carry it.
+- A writer that read so writes after every head: its sealed set names
+  them all as `prev`, and its inner set every plaintext set they say
+  they're of. So a writer's head after a fork closes it, without the
+  owner's machines; its tree is the merge with the writer's edits in
+  it, never the two as two writes.
+- `hk cap import` says how many heads it merged. `read`, without a
+  repo to merge in, reads the latest head, and says how many others are
+  forked from it.
+- The owner's machines merge too, as they take writers' heads in: the
+  plaintext anchor forks as between two of its own devices, its value
+  is their merge, and their next head names every sealed head as
+  `prev`.
 
-So forks converge, but only once an owner's machine has taken them in.
-Merging takes the read key, not write, so a reader could show the merge
-itself, given the sealed history; that's not built.
+Two writers merging the same heads with no edits of their own make the
+same tree and the same sealed blocks, each in a set of its own; with
+edits, they fork again, and the next writer merges that. Forks converge
+rather than accumulate.
 
 Writing takes reading: a writer unseals to merge, and seals under the
 current read key. A write needs `prev`, so a blind write can't be a
@@ -689,8 +707,8 @@ In order, each of use alone:
 4. **Writing.** Done: the owner's machines write with writer keys `K`
    lets write, judged by `K`'s grants alone; write capabilities write
    heads to a door or a CAR; the owner's machines take them in and merge
-   them; and write is taken away. Writers and readers don't merge forks
-   themselves: the owner's machines do (see [[#Writing]]).
+   them; write is taken away; readers and writers merge forks; and a
+   friend's door keeps writes for the owner while it's away.
 5. **Revoking read.** New read keys, `keys` and `past`, sealed boxes for
    read grants, and sealing everything again when asked.
 6. **The vault as a capability**: a sealed root anchor only its owner

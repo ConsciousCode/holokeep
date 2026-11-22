@@ -2387,7 +2387,7 @@ fn anchor_or_folder(repo: &mut Catalog, named: &Path) -> anyhow::Result<Link> {
 /// it, and isn't behind the head read before: those given, or else those
 /// it says.
 #[cfg(feature = "net")]
-fn read_at_doors(capability: &holokeep::cap::Capability, from: Vec<String>, remembered: &dyn Fn(&Link) -> Vec<Vec<u8>>) -> anyhow::Result<holokeep::cap::Reading> {
+fn read_at_doors(repo: &Catalog, capability: &holokeep::cap::Capability, from: Vec<String>, remembered: &dyn Fn(&Link) -> Vec<Vec<u8>>) -> anyhow::Result<holokeep::cap::Reading> {
     use holokeep::cap::{self, Capability};
     let doors = if from.is_empty() {
         capability.live().map(|live| live.at.clone()).unwrap_or_default()
@@ -2400,7 +2400,7 @@ fn read_at_doors(capability: &holokeep::cap::Capability, from: Vec<String>, reme
         let read = || -> anyhow::Result<cap::Reading> {
             let reader = holokeep::net::door::Reader::connect(&door.parse().context("not a multiaddr")?)?;
             Ok(match (capability, capability.live()) {
-                (_, Some(live)) => cap::read(&reader, live, remembered)?,
+                (_, Some(live)) => cap::read_into(repo, &reader, live, remembered)?,
                 (Capability::Snapshot(snapshot), None) => cap::Reading { plain: snapshot.plain.clone(), blocks: cap::unseal(&reader, snapshot)?, heads: Vec::new(), mounts: Vec::new(), base: None, forked: 0 },
                 _ => anyhow::bail!("a capability of nothing to read"),
             })
@@ -2414,7 +2414,7 @@ fn read_at_doors(capability: &holokeep::cap::Capability, from: Vec<String>, reme
 }
 
 #[cfg(not(feature = "net"))]
-fn read_at_doors(_: &holokeep::cap::Capability, _: Vec<String>, _: &dyn Fn(&Link) -> Vec<Vec<u8>>) -> anyhow::Result<holokeep::cap::Reading> {
+fn read_at_doors(_: &Catalog, _: &holokeep::cap::Capability, _: Vec<String>, _: &dyn Fn(&Link) -> Vec<Vec<u8>>) -> anyhow::Result<holokeep::cap::Reading> {
     anyhow::bail!("this hk reads from a CAR alone: it's built without networking")
 }
 
@@ -2669,9 +2669,9 @@ fn cap_write(repo: Option<PathBuf>, capability: &str, root: &Link, output: Optio
     let remembered = |view: &Link| cap::Remembered::of(&dir, uid, view).claims().unwrap_or_default();
     let doors = if from.is_empty() { write.live.at.clone() } else { from };
     let reading = if car.is_empty() {
-        read_at_doors(&capability, doors.clone(), &remembered)?
+        read_at_doors(&repo, &capability, doors.clone(), &remembered)?
     } else {
-        cap::read(&held_of(car)?, &write.live, &remembered)?
+        cap::read_into(&repo, &held_of(car)?, &write.live, &remembered)?
     };
     let base = reading.base.context("nothing to write after")?;
     let written = cap::write(&mut repo, write, &base, root)?;
@@ -2702,17 +2702,17 @@ fn cap_import(repo: Option<PathBuf>, capability: &str, car: &[PathBuf], from: Ve
         Vec::new()
     });
     let reading = if car.is_empty() {
-        read_at_doors(&capability, from, &remembered)?
+        read_at_doors(&repo, &capability, from, &remembered)?
     } else {
         let held = held_of(car)?;
         match &capability {
             Capability::Snapshot(snapshot) => cap::Reading { plain: snapshot.plain.clone(), blocks: cap::unseal(&held, snapshot)?, heads: Vec::new(), mounts: Vec::new(), base: None, forked: 0 },
-            Capability::Live(live) | Capability::Write(cap::Write { live, .. }) => cap::read(&held, live, &remembered)?,
+            Capability::Live(live) | Capability::Write(cap::Write { live, .. }) => cap::read_into(&repo, &held, live, &remembered)?,
         }
     };
     let cap::Reading { plain, blocks, heads, mounts, forked, .. } = reading;
     if forked > 0 {
-        eprintln!("{forked} other heads, forked from the latest, aren't merged yet: the owner's machines merge them as they take them in");
+        eprintln!("merged {} heads, forked: as the owner's machines will, once they take them in", forked.saturating_add(1));
     }
     repo.batch_breathing(|repo| {
         for block in &blocks {

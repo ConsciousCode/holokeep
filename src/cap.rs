@@ -462,10 +462,16 @@ type MountsAt = Vec<(String, Mount)>;
 /// Unseal a DAG as `unseal` does, returning too the sealed anchor each
 /// mount point in it is, by its path from the root, `/`-separated.
 fn unseal_mounts(src: &impl Source, cap: &Snapshot) -> Result<(Vec<Block>, MountsAt)> {
+    unseal_all(src, std::slice::from_ref(cap))
+}
+
+/// Unseal several DAGs as `unseal_mounts` does one, each block once
+/// however many share it, as the trees of a sealed anchor's sets do.
+fn unseal_all(src: &impl Source, caps: &[Snapshot]) -> Result<(Vec<Block>, MountsAt)> {
     let mut out = Vec::new();
     let mut mounts = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut level = vec![(cap.plain.clone(), cap.root.clone(), root_key(&cap.read), None::<Key>, String::new())];
+    let mut level: Vec<_> = caps.iter().map(|cap| (cap.plain.clone(), cap.root.clone(), root_key(&cap.read), None::<Key>, String::new())).collect();
     while !level.is_empty() {
         level.retain(|(plain, _, key, ..)| plain.hashcode() != IDENTITY && seen.insert((plain.to_bytes(), **key)));
         let wanted: Vec<(Link, [u8; 32])> = level.iter().map(|(plain, sealed, key, ..)| (sealed.clone(), node_bat(key, plain))).collect();
@@ -960,6 +966,23 @@ pub fn may_write(catalog: &crate::store::Catalog, view: &Link, set: &[u8], sign:
     Ok(gathered.signs.get(&cid).is_some_and(|signs| signs.iter().any(|(by, data)| *data == sign && judge.counts(&cid, by))))
 }
 
+/// Keep what a writer wrote of a sealed view, as the account a catalog
+/// acts for, if it keeps a manifest of that view.
+///
+/// It's a manifest of only those blocks, kept, so wherever that account's
+/// kept things go, they go, as a friend's node holding a vault sends them
+/// to the vault's other machines, the owner's among them. Whether it kept
+/// them.
+pub fn keep_written(catalog: &crate::store::Catalog, view: &Link, blocks: &[Link]) -> Result<bool> {
+    if !kept_manifests(catalog)?.iter().any(|(_, manifest)| manifest.view.as_ref() == Some(view)) {
+        return Ok(false);
+    }
+    let part = Manifest { view: None, blocks: blocks.to_vec(), parts: Vec::new(), next: None, sealed: None }.block()?;
+    catalog.put_block(&part, crate::cid::CidVersion::V1)?;
+    catalog.keep(&AnyCid::V1(part.cid().clone()))?;
+    Ok(true)
+}
+
 /// What a writer's head took in carried: the plaintext anchor, and the
 /// plaintext set, now here.
 pub struct Taken {
@@ -1340,9 +1363,12 @@ pub fn write(catalog: &mut crate::store::Catalog, cap: &Write, base: &Base, valu
     let (sealed, _) = seal_tree(catalog, value, &cap.live.read, None, MountKeys::Known(&base.mounts))?;
     let writer = cap.writer();
     let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
-    let mut prev = base.block.sets.clone();
-    if let Some(set) = base.block.set.as_deref().and_then(crate::claim::Claim::parse) {
-        prev.push(set.cid());
+    let mut prev = Vec::new();
+    for block in std::iter::once(&base.block).chain(base.others.iter().map(|(_, block)| block)) {
+        prev.extend(block.sets.iter().cloned());
+        if let Some(set) = block.set.as_deref().and_then(crate::claim::Claim::parse) {
+            prev.push(set.cid());
+        }
     }
     let inner = crate::claim::Set::new([cap.of.clone()], value.clone(), at).ok_or_else(|| invalid("a set of nothing"))?.after(Some(prev)).for_view(cap.owner.clone());
     let inner = crate::claim::Claim::Set(inner);
@@ -1351,7 +1377,7 @@ pub fn write(catalog: &mut crate::store::Catalog, cap: &Write, base: &Base, valu
     block.set = Some(inner.block().into_data().into_vec());
     block.sign = Some(block_here(catalog, &inner_sign)?.into_data().into_vec());
     let head = seal_head(&cap.live.read, &block)?;
-    let set = crate::claim::Set::new([anchor], AnyCid::V1(head.cid().clone()), at).ok_or_else(|| invalid("a set of nothing"))?.after(Some(vec![base.set.clone()]));
+    let set = crate::claim::Set::new([anchor], AnyCid::V1(head.cid().clone()), at).ok_or_else(|| invalid("a set of nothing"))?.after(Some(std::iter::once(base.set.clone()).chain(base.others.iter().map(|(set, _)| set.clone())).collect()));
     let set = crate::claim::Claim::Set(set);
     catalog.put_block(&set.block(), crate::cid::CidVersion::V1)?;
     let sign = catalog.sign_with_key(&writer, [set.cid()])?.ok_or_else(|| invalid("the head's signed already"))?;
@@ -1607,6 +1633,9 @@ pub struct Base {
     pub set: Link,
     pub block: HeadBlock,
     pub mounts: Vec<Mount>,
+    /// The other heads read, merged with it, each as its set and head
+    /// block: what's written is after them too.
+    pub others: Vec<(Link, HeadBlock)>,
 }
 
 /// Read a sealed anchor at its latest head, judged beside the head
@@ -1618,10 +1647,116 @@ pub struct Base {
 /// or is behind, is said so in `mounts`, and the rest read: only the
 /// anchor asked for must be.
 pub fn read(src: &(impl Source + Heads), live: &Live, remembered: &dyn Fn(&Link) -> Vec<Vec<u8>>) -> Result<Reading> {
+    read_with(src, live, remembered, None)
+}
+
+/// Read a sealed anchor as `read` does, merging its heads if it's forked.
+///
+/// The merge is built in a catalog, which every block read is put in: so
+/// it's read as a writer that read every head would write it.
+///
+/// The heads are merged as an anchor's are (see `crate::store::merge`),
+/// over the sealed view's own sets, from the latest they have in common:
+/// only the trees from there on are read. What was in conflict before it
+/// isn't known, so isn't carried, as the owner's machines, which have the
+/// whole plaintext history, would.
+pub fn read_into(catalog: &crate::store::Catalog, src: &(impl Source + Heads), live: &Live, remembered: &dyn Fn(&Link) -> Vec<Vec<u8>>) -> Result<Reading> {
+    read_with(src, live, remembered, Some(catalog))
+}
+
+/// A sealed anchor's heads merged: the merge, the blocks read for it, the
+/// mount points in its trees, and every head beside the latest.
+struct Merged {
+    plain: Link,
+    blocks: Vec<Block>,
+    mounts: MountsAt,
+    others: Vec<(Link, HeadBlock)>,
+}
+
+/// Merge a sealed anchor's heads, among the claims offered and those
+/// remembered, in a catalog (see `read_into`).
+fn merge_forks(catalog: &crate::store::Catalog, src: &impl Source, live: &Live, claims: &[Vec<u8>], remembered: &[Vec<u8>]) -> Result<Merged> {
+    use std::collections::HashSet;
+    let (anchor, owner) = crate::claim::viewed(&live.view).ok_or_else(|| invalid("not a sealed view"))?;
+    let mut gathered = Gathered::default();
+    for data in claims {
+        gathered.add(&anchor, data);
+    }
+    let mut trusted = HashSet::new();
+    for data in remembered {
+        trusted.extend(gathered.add(&anchor, data));
+    }
+    let counting = counting_among(&gathered, &owner, &anchor, &trusted)?;
+    let by: HashMap<Vec<u8>, &crate::claim::Set> = counting.iter().map(|(cid, set, ..)| (cid.clone(), set)).collect();
+    let heads: Vec<Vec<u8>> = heads_among(&gathered, &owner, &anchor, &trusted)?.into_iter().map(|(cid, ..)| cid).collect();
+    let ancestors = |from: &[u8]| -> HashSet<Vec<u8>> {
+        let mut seen = HashSet::new();
+        let mut pending = vec![from.to_vec()];
+        while let Some(cid) = pending.pop() {
+            if let Some(set) = by.get(&cid)
+                && seen.insert(cid)
+            {
+                pending.extend(set.prev().unwrap_or_default().iter().map(CidRef::to_bytes));
+            }
+        }
+        seen
+    };
+    let reach: Vec<HashSet<Vec<u8>>> = heads.iter().map(|head| ancestors(head)).collect();
+    let mut common: HashSet<Vec<u8>> = reach.first().cloned().unwrap_or_default();
+    for other in reach.iter().skip(1) {
+        common.retain(|cid| other.contains(cid));
+    }
+    let older: HashSet<Vec<u8>> = common.iter().flat_map(|cid| ancestors(cid).into_iter().filter(move |before| before != cid)).collect();
+    let latest_common: HashSet<Vec<u8>> = common.iter().filter(|cid| !older.contains(*cid)).cloned().collect();
+    let mut included: Vec<Vec<u8>> = reach.iter().flatten().filter(|cid| !older.contains(*cid)).cloned().collect();
+    included.sort();
+    included.dedup();
+    let wanted: Vec<(Link, [u8; 32])> = included.iter().filter_map(|cid| by.get(cid)).map(|set| (set.value().clone(), head_bat(&live.read))).collect();
+    let fetched = src.sealed(&wanted)?;
+    let opened: Vec<HeadBlock> = fetched.iter().map(|data| open_head(&live.read, data)).collect::<Result<_>>()?;
+    let snapshots: Vec<Snapshot> = opened.iter().map(|block| Snapshot::new(block.root.clone(), block.plain.clone(), Zeroizing::new(*live.read))).collect();
+    let (blocks, mounts) = unseal_all(src, &snapshots)?;
+    for block in &blocks {
+        catalog.put_block(block, crate::cid::CidVersion::V1)?;
+    }
+    let link = |cid: &[u8]| -> Result<Link> { crate::cid::Cid::decode(cid).map_err(|_| invalid("a set with no CID")) };
+    let mut history = Vec::with_capacity(included.len());
+    let mut blocks_of = HashMap::new();
+    for (cid, block) in included.iter().zip(opened) {
+        let set = by.get(cid).ok_or_else(|| invalid("a set gone"))?;
+        let prev = if latest_common.contains(cid) {
+            Vec::new()
+        } else {
+            set.prev().unwrap_or_default().iter().filter(|prev| included.contains(&prev.to_bytes())).cloned().collect()
+        };
+        history.push((link(cid)?, block.plain.clone(), set.at(), Some(prev)));
+        blocks_of.insert(cid.clone(), block);
+    }
+    let head_links: Vec<Link> = heads.iter().map(|cid| link(cid)).collect::<Result<_>>()?;
+    let state = catalog.merge_history(&history, &head_links)?;
+    let others = heads.iter().skip(1).filter_map(|cid| Some((link(cid).ok()?, blocks_of.get(cid)?.clone()))).collect();
+    Ok(Merged { plain: state.value, blocks, mounts, others })
+}
+
+/// Read a sealed anchor as `read` does, merging its heads in a catalog if
+/// one's given (see `read_into`).
+fn read_with(src: &(impl Source + Heads), live: &Live, remembered: &dyn Fn(&Link) -> Vec<Vec<u8>>, merge_in: Option<&crate::store::Catalog>) -> Result<Reading> {
     let claims = src.heads_of(live)?;
-    let (top, mounts) = read_one(src, claims.iter().map(Vec::as_slice), &remembered(&live.view), live)?;
-    let base = Base { set: top.set, block: top.block, mounts: mounts.iter().map(|(_, mount)| mount.clone()).collect() };
-    let mut reading = Reading { plain: top.plain, blocks: top.blocks, heads: vec![(live.view.clone(), top.head)], mounts: Vec::new(), base: Some(base), forked: top.others };
+    let before = remembered(&live.view);
+    let (top, mut mounts) = read_one(src, claims.iter().map(Vec::as_slice), &before, live)?;
+    let mut base = Base { set: top.set, block: top.block, mounts: Vec::new(), others: Vec::new() };
+    let (mut plain, mut blocks) = (top.plain, top.blocks);
+    if let (Some(catalog), true) = (merge_in, top.others > 0) {
+        let merged = merge_forks(catalog, src, live, &claims, &before)?;
+        plain = merged.plain;
+        blocks.extend(merged.blocks);
+        mounts.extend(merged.mounts);
+        base.others = merged.others;
+    }
+    let mut views = std::collections::HashSet::new();
+    mounts.retain(|(path, mount)| views.insert((path.clone(), mount.view.to_bytes())));
+    base.mounts = mounts.iter().map(|(_, mount)| mount.clone()).collect();
+    let mut reading = Reading { plain, blocks, heads: vec![(live.view.clone(), top.head)], mounts: Vec::new(), base: Some(base), forked: top.others };
     let mut seen = std::collections::HashSet::from([live.view.to_bytes()]);
     let mut queue: std::collections::VecDeque<(String, Mount)> = mounts.into();
     while let Some((path, mount)) = queue.pop_front() {

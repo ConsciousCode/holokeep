@@ -707,6 +707,66 @@ async fn a_friend_holding_the_vault_holds_what_its_published_and_it_reads_from_t
 }
 
 #[tokio::test]
+async fn a_write_a_friend_keeps_reaches_the_owner_which_takes_it_in() {
+    use crate::cap::{self, Capability};
+    let scratch = crate::testutil::Scratch::new("node-friend-write");
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    let owner_key = crate::keys::Key::generate().expect("key");
+    a.catalog_mut().set_signer(owner_key.clone()).expect("signer");
+    let owner_uid = a.catalog().uid();
+    let vault = crate::vault::Vault::open(scratch.path(), owner_uid).expect("vault");
+    let friend = 0xC000_0000;
+    b.catalog_mut().act_for(friend, crate::keys::Key::generate().expect("key")).expect("act");
+    b.catalog().claims().expect("claims").set_user(friend, &vault.key().id()).expect("user");
+    b.catalog_mut().act_for(friend, crate::keys::Key::generate().expect("key")).expect("act");
+
+    // The owner publishes a directory and lets a writer write it
+    let anchor = a.catalog_mut().new_anchor().expect("anchor");
+    let dir = crate::testutil::Scratch::new("node-friend-write-files");
+    std::fs::write(dir.path().join("a.txt"), "as published").expect("write");
+    let importer = crate::import::Importer::default();
+    let first = AnyCid::V1(importer.add_path(dir.path(), a.catalog_mut(), &mut |_, _| {}).expect("import").expect("root").cid);
+    a.catalog_mut().set_anchor(&anchor, &first).expect("set");
+    let published = cap::Published::of(&cap::secret(&vault), &anchor).expect("published");
+    cap::publish(a.catalog_mut(), &vault, &published, &first).expect("publish");
+    let seed = cap::add_writer(a.catalog_mut(), &vault, &published).expect("writer");
+    let Capability::Write(write) = published.write_capability(seed, None) else {
+        panic!("not a write capability");
+    };
+    let _ = blocks;
+    // The friend holds what the vault keeps
+    a.catalog_mut().act_for(vault.uid(), vault.key().clone()).expect("act");
+    a.reload().expect("reload");
+    a.announce().expect("announce");
+    let friend_peer = b.peer_id();
+    assert!(until(&mut [&mut a, &mut b], |n| n[0].heard.contains(&friend_peer)).await, "heard");
+    let id = a.audit(2).expect("audit");
+    audited(&mut [&mut a, &mut b], &[(0, id)]).await;
+    let view = published.view.clone();
+    assert!(until(&mut [&mut a, &mut b], |n| !cap::claims_about(n[1].catalog(), &view).expect("claims").is_empty()).await, "the friend holds the sealed view");
+
+    // The writer writes at the friend's, which keeps it as the vault's
+    let base = cap::read(b.catalog(), &write.live, &|_| Vec::new()).expect("read").base.expect("base");
+    let mut theirs = Catalog::open_repo(&scratch.path().join("writer")).expect("catalog");
+    std::fs::write(dir.path().join("a.txt"), "written while the owner's away").expect("write");
+    let edited = AnyCid::V1(importer.add_path(dir.path(), &mut theirs, &mut |_, _| {}).expect("import").expect("root").cid);
+    let written = cap::write(&mut theirs, &write, &base, &edited).expect("write");
+    for block in written.all() {
+        b.catalog().put_block(&block, crate::cid::CidVersion::V1).expect("put");
+    }
+    assert!(cap::keep_written(b.catalog(), &view, &written.all().iter().map(|block| AnyCid::V1(block.cid().clone())).collect::<Vec<_>>()).expect("keep"), "kept as the vault's");
+
+    // It reaches the owner's machine, which takes it in
+    b.reload().expect("reload");
+    let id = b.audit(2).expect("audit");
+    audited(&mut [&mut a, &mut b], &[(1, id)]).await;
+    assert!(until(&mut [&mut a, &mut b], |n| written.all().iter().all(|block| holds(n[0], &AnyCid::V1(block.cid().clone())))).await, "every block written");
+    a.catalog_mut().act_for(owner_uid, owner_key).expect("act");
+    assert_eq!(cap::take_in(a.catalog_mut(), &vault).expect("take in").len(), 1);
+    assert_eq!(a.catalog().anchor_value(&anchor).expect("value"), Some(edited));
+}
+
+#[tokio::test]
 async fn a_keep_noticed_with_its_target_goes_with_it() {
     let (mut a, mut b, blocks) = Box::pin(holding()).await;
     one_user(&mut [&mut a, &mut b]);

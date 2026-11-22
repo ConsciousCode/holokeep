@@ -174,12 +174,51 @@ fn behaviour() -> Behaviour {
 pub struct Door {
     swarm: Swarm<Behaviour>,
     catalog: Catalog,
+    /// The repo, whose accounts' keys a write's kept with.
+    repo: Option<std::path::PathBuf>,
+    /// The blocks of each writer's write taken so far, till its last.
+    writing: std::collections::HashMap<PeerId, Vec<Link>>,
 }
 
 impl Door {
     pub fn new(transport: Boxed<(PeerId, StreamMuxerBox)>, key: &Keypair, catalog: Catalog) -> Self {
         let swarm = Swarm::new(transport, behaviour(), key.public().to_peer_id(), libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(Duration::from_mins(1)));
-        Self { swarm, catalog }
+        Self { swarm, catalog, repo: None, writing: std::collections::HashMap::new() }
+    }
+
+    /// Keep writes taken as whichever of the repo's accounts holds the
+    /// sealed view they're of (see `keep`).
+    #[must_use]
+    pub fn keeping_in(mut self, repo: &std::path::Path) -> Self {
+        self.repo = Some(repo.to_path_buf());
+        self
+    }
+
+    /// Keep a write taken, the last of it here, as each of the repo's
+    /// accounts with a key here that keeps a manifest of its sealed view,
+    /// as a friend's account holding a vault does: so the vault's
+    /// protected meshes hold it, and the owner's machines, which take it
+    /// in. The owner's own machines take it in from here.
+    fn keep(&mut self, view: &Link, blocks: &[Link]) -> Result<()> {
+        let Some(repo) = self.repo.clone() else {
+            return Ok(());
+        };
+        let Some(home) = self.catalog.signer().cloned().map(|key| (self.catalog.uid(), key)) else {
+            return Ok(());
+        };
+        let accounts = self.catalog.claims().map(crate::store::ClaimStore::accounts).transpose()?.unwrap_or_default();
+        for account in accounts.into_iter().filter(|account| account.uid != home.0) {
+            if !repo.join("accounts").join(format!("{}.key", account.uid)).exists() {
+                continue;
+            }
+            self.catalog.act_for(account.uid, crate::keys::account_key(&repo, account.uid)?)?;
+            let kept = crate::cap::keep_written(&self.catalog, view, blocks);
+            self.catalog.act_for(home.0, home.1.clone())?;
+            if kept.map_err(|e| Error::Invalid(e.to_string()))? {
+                eprintln!("kept a write of {view}, as account {}", account.uid);
+            }
+        }
+        Ok(())
     }
 
     pub fn listen(&mut self, addr: Multiaddr) -> Result<()> {
@@ -206,10 +245,30 @@ impl Door {
     /// Answer the next thing asked, if that's what comes.
     pub async fn step(&mut self) {
         if let SwarmEvent::Behaviour(BehaviourEvent::Cap(request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. })) = self.swarm.select_next_some().await {
+            // What a write brings, to keep once its last is taken
+            let writing = match &request {
+                Asked::Write { view, set, sign, blocks, last } => Link::decode(view).ok().map(|view| {
+                    let mut cids: Vec<Link> = blocks.iter().filter_map(|(cid, _)| Link::decode(cid).ok()).collect();
+                    if *last {
+                        cids.extend([set, sign].into_iter().filter_map(|data| crate::claim::Claim::parse(data)).map(|claim| claim.cid()));
+                    }
+                    (view, cids, *last)
+                }),
+                _ => None,
+            };
             let told = answer(&self.catalog, &peer, request, now()).unwrap_or_else(|e| {
                 eprintln!("the door couldn't answer {peer}: {e}");
                 Told::default()
             });
+            if let Some((view, cids, last)) = writing.filter(|_| !told.blocks.is_empty()) {
+                self.writing.entry(peer).or_default().extend(cids);
+                if last {
+                    let cids = self.writing.remove(&peer).unwrap_or_default();
+                    if let Err(e) = self.keep(&view, &cids) {
+                        eprintln!("the door couldn't keep {peer}'s write: {e}");
+                    }
+                }
+            }
             let _ = self.swarm.behaviour_mut().cap.send_response(channel, told);
         }
     }
@@ -227,7 +286,7 @@ pub fn open(repo: &std::path::Path, key: &Keypair, addr: Multiaddr) -> Result<()
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
             runtime.block_on(async {
                 let base = libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default().nodelay(true));
-                let mut door = Door::new(super::clients::client_transport(base, &key)?, &key, Catalog::open_repo(&repo)?);
+                let mut door = Door::new(super::clients::client_transport(base, &key)?, &key, Catalog::open_repo(&repo)?).keeping_in(&repo);
                 door.listen(addr)?;
                 eprintln!("the door's open on {}", door.listening().await);
                 door.run().await;
