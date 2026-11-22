@@ -80,8 +80,7 @@ certifies the new machine; `hk protect restore` brings the data back.
 
 ## Protecting the soup
 
-`hk protect add` copies one DAG into the vault as it is then. `hk
-protect soup` protects the soup as it goes on: it publishes the root
+`hk protect add` copies one DAG into the vault as it is then. `hk protect soup` protects the soup as it goes on: it publishes the root
 anchor, and every anchor mounted in it, as sealed anchors (see
 [[Capabilities]]), with no capability handed out, so no one but the
 account reads them. The vault keeps what's published, so friends

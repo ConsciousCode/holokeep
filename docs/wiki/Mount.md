@@ -210,7 +210,9 @@ it, as the mount would write it there.
 - `hk fs stat <path>…` says the anchor it's in and where (`at`), its
   CID and what it is, the anchor a mount point names and what that is
   now, and its tags. It reads what's committed: what the mount's yet to
-  commit isn't there.
+  commit isn't there. It takes `cid/<cid>/…` and `tags/<tag>/<cid>/…`
+  too, which are in no anchor until they're through a mount point, so
+  only those say one.
 - `hk fs rm <path>…` unlinks each path from the anchor naming it, a
   directory whole, in one set for each anchor, of every head it has.
   It's built as an overlay is, with each path marked gone and no work
