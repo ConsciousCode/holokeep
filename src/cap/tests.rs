@@ -455,17 +455,17 @@ fn a_mounted_anchor_is_published_with_what_mounts_it_and_read_through_it() {
     assert_eq!(below.mounts.iter().map(|mounted| (mounted.path.as_str(), mounted.read.clone().ok())).collect::<Vec<_>>(), vec![("up", Some(outer_value.clone())), ("up/nothing", None)], "up is the outer, as mounted, and what it mounts");
 
     // A snapshot seals mount points as the symlinks they are
-    let snapshot = seal_tree(&catalog, &outer_value, &[3u8; 32], None, None).expect("seal");
+    let snapshot = seal_tree(&catalog, &outer_value, &[3u8; 32], None, MountKeys::None).expect("seal");
     assert!(snapshot.1.is_empty());
 }
 
 #[test]
 fn a_sealed_nodes_mount_points_read_back_and_must_be_views() {
-    let opened = encode(b"block", &[], &BTreeMap::from([("ghost".to_owned(), Mount { view: crate::claim::view(&crate::claim::anchor().expect("anchor"), &crate::keys::Key::generate().expect("key").id()).expect("view"), read: Zeroizing::new([1u8; 32]) })])).expect("encode");
+    let opened = encode(b"block", &[], &BTreeMap::from([("ghost".to_owned(), Mount { view: crate::claim::view(&crate::claim::anchor().expect("anchor"), &crate::keys::Key::generate().expect("key").id()).expect("view"), read: Zeroizing::new([1u8; 32]), of: None })])).expect("encode");
     let decoded = decode(&opened).expect("decode");
     assert_eq!(decoded.mounts.len(), 1);
     // The view must be one
-    let bad = encode(b"block", &[], &BTreeMap::from([("bad".to_owned(), Mount { view: crate::claim::anchor().expect("anchor"), read: Zeroizing::new([1u8; 32]) })])).expect("encode");
+    let bad = encode(b"block", &[], &BTreeMap::from([("bad".to_owned(), Mount { view: crate::claim::anchor().expect("anchor"), read: Zeroizing::new([1u8; 32]), of: None })])).expect("encode");
     assert!(decode(&bad).is_err());
 }
 
@@ -542,4 +542,76 @@ fn each_machine_writes_with_a_key_the_owner_key_lets_write_and_can_have_it_taken
     catalog.put_block(&set.block(), crate::cid::CidVersion::V1).expect("put");
     catalog.sign_with_key(&stranger, [set.cid()]).expect("sign");
     assert_eq!(heads_held(&catalog, &published), vec![one.set]);
+}
+
+#[test]
+fn a_write_capability_writes_a_head_its_readers_read_carrying_the_plaintext_set() {
+    let t = tree("cap-write");
+    let repo = Scratch::new("cap-write-repo");
+    let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
+    let vault = crate::vault::Vault::open(repo.path(), catalog.uid()).expect("vault");
+    catalog.set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
+    let anchor = catalog.new_anchor().expect("anchor");
+    let first = import(&mut catalog, t.path(), &importer());
+    catalog.set_anchor(&anchor, &first).expect("set");
+    let published = Published::of(&secret(&vault), &anchor).expect("published");
+    let owner = crate::keys::Key::generate().expect("key").id();
+    assert!(add_writer(&mut catalog, &vault, &published).is_err(), "not published yet");
+    publish(&mut catalog, &vault, &published, &first).expect("publish");
+    let seed = add_writer(&mut catalog, &vault, &published).expect("writer");
+    let capability = published.write_capability(seed, Some(owner.clone()));
+    let Capability::Write(write_cap) = Capability::decode(&capability.encode()).expect("decode") else {
+        panic!("not a write capability");
+    };
+    assert_eq!((&write_cap.of, write_cap.owner.as_ref()), (&anchor, Some(&owner)));
+    let owners_held = |catalog: &mut Catalog| {
+        let (_, manifest) = published_list(catalog, &vault).into_iter().next().expect("published");
+        let mut held = Held::default();
+        for block in published_blocks(catalog, &manifest).expect("blocks") {
+            held.insert(block);
+        }
+        held
+    };
+
+    // The writer reads, edits, and writes, in a repo of its own
+    let elsewhere = Scratch::new("cap-write-writer");
+    let mut theirs = Catalog::open_repo(elsewhere.path()).expect("catalog");
+    let mut held = owners_held(&mut catalog);
+    let reading = read(&held, &write_cap.live, &|_| Vec::new()).expect("read");
+    assert_eq!(reading.plain, first);
+    std::fs::write(t.path().join("docs/readme.md"), "written by a writer").expect("write");
+    let edited = import(&mut theirs, t.path(), &importer());
+    let base = reading.base.expect("a base");
+    let written = write(&mut theirs, &write_cap, &base, &edited).expect("write");
+    for block in written.blocks.clone() {
+        held.insert(block);
+    }
+
+    // A reader reads what the writer wrote, as the latest head
+    let Capability::Live(live) = published.capability() else {
+        panic!("not live");
+    };
+    let after = read(&held, &live, &|_| Vec::new()).expect("read");
+    assert_eq!(after.plain, edited);
+    assert_eq!(after.base.as_ref().map(|base| &base.set), Some(&written.set));
+    // Its head carries the plaintext set, after the owner's, for the owner's view, signed by the writer
+    let block = after.base.expect("base").block;
+    let Some(crate::claim::Claim::Set(inner)) = block.set.as_deref().and_then(crate::claim::Claim::parse) else {
+        panic!("no plaintext set");
+    };
+    assert_eq!((inner.target(), inner.value(), inner.owner()), ([anchor.clone()].as_slice(), &edited, Some(&owner)));
+    assert_eq!(inner.prev().map(<[Link]>::to_vec), Some(catalog.anchor_heads(&anchor).expect("heads").into_iter().map(|(set, ..)| set).collect()));
+    let Some(crate::claim::Claim::Sign(sign)) = block.sign.as_deref().and_then(crate::claim::Claim::parse) else {
+        panic!("no sign");
+    };
+    assert!(sign.verify() && sign.signs().contains(&crate::claim::Claim::Set(inner).cid()) && *sign.by() == write_cap.writer().id());
+
+    // A writer the owner key never let write writes nothing anyone reads
+    let forged = Write::new(Live::new(live.view.clone(), Zeroizing::new(**live.read())), fresh_key().expect("key"), anchor, None);
+    let mut held = owners_held(&mut catalog);
+    let stranger = write(&mut theirs, &forged, &base, &edited).expect("write");
+    for block in stranger.blocks {
+        held.insert(block);
+    }
+    assert_eq!(read(&held, &live, &|_| Vec::new()).expect("read").plain, first);
 }

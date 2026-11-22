@@ -510,10 +510,41 @@ enum CapCommand {
     /// it's let in by proving it has the capability
     Import {
         capability: String,
-        /// A CAR of its ciphertext
-        car: Option<PathBuf>,
+        /// CARs of its ciphertext, read as one
+        car: Vec<PathBuf>,
         /// A holder's door, as a multiaddr ending in its peer ID [default:
         /// those the capability says]
+        #[arg(long, conflicts_with = "car")]
+        from: Vec<String>,
+    },
+    /// Let a new writer write a published anchor: a writer key of its own,
+    /// which the sealed anchor's owner key gives write, as the mesh's grants
+    /// do on the anchor itself, if the mesh has grants. Print a capability
+    /// that writes it, and reads it
+    Grant {
+        /// The anchor, or a path of the soup that's one or a mount point
+        /// of one (see `hk fs`)
+        anchor: PathBuf,
+        /// Say in the capability where a holder's door is (see `hk cap
+        /// publish --at`)
+        #[arg(long)]
+        at: Vec<String>,
+    },
+    /// Write a sealed anchor with a write capability: a tree here, after
+    /// its latest head, read from a CAR or at a holder's door. Write what's
+    /// sealed of it, the head, and the writer's signs to a `CARv1`, for a
+    /// holder of the anchor to take in
+    Write {
+        capability: String,
+        /// What the anchor is to be: a tree here
+        root: Link,
+        /// Where to write it
+        #[arg(short, long)]
+        output: PathBuf,
+        /// CARs of its ciphertext, read as one, to read its latest head from
+        car: Vec<PathBuf>,
+        /// A holder's door to read its latest head at [default: those the
+        /// capability says]
         #[arg(long, conflicts_with = "car")]
         from: Vec<String>,
     },
@@ -2339,10 +2370,7 @@ fn anchor_or_folder(repo: &mut Catalog, named: &Path) -> anyhow::Result<Link> {
 fn read_at_doors(capability: &holokeep::cap::Capability, from: Vec<String>, remembered: &dyn Fn(&Link) -> Vec<Vec<u8>>) -> anyhow::Result<holokeep::cap::Reading> {
     use holokeep::cap::{self, Capability};
     let doors = if from.is_empty() {
-        match capability {
-            Capability::Live(live) => live.at.clone(),
-            Capability::Snapshot(_) => Vec::new(),
-        }
+        capability.live().map(|live| live.at.clone()).unwrap_or_default()
     } else {
         from
     };
@@ -2351,9 +2379,10 @@ fn read_at_doors(capability: &holokeep::cap::Capability, from: Vec<String>, reme
     for door in doors {
         let read = || -> anyhow::Result<cap::Reading> {
             let reader = holokeep::net::door::Reader::connect(&door.parse().context("not a multiaddr")?)?;
-            Ok(match capability {
-                Capability::Snapshot(snapshot) => cap::Reading { plain: snapshot.plain.clone(), blocks: cap::unseal(&reader, snapshot)?, heads: Vec::new(), mounts: Vec::new() },
-                Capability::Live(live) => cap::read(&reader, live, remembered)?,
+            Ok(match (capability, capability.live()) {
+                (_, Some(live)) => cap::read(&reader, live, remembered)?,
+                (Capability::Snapshot(snapshot), None) => cap::Reading { plain: snapshot.plain.clone(), blocks: cap::unseal(&reader, snapshot)?, heads: Vec::new(), mounts: Vec::new(), base: None },
+                _ => anyhow::bail!("a capability of nothing to read"),
             })
         };
         match read() {
@@ -2417,7 +2446,7 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
             }
             let capability = match published.capability() {
                 Capability::Live(live) => Capability::Live(live.at(at)),
-                snapshot @ Capability::Snapshot(_) => snapshot,
+                other => other,
             };
             out!("{}", capability.encode());
             Ok(())
@@ -2442,14 +2471,87 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
             }
             Ok(())
         },
-        CapCommand::Import { capability, car, from } => cap_import(repo, &capability, car, from),
+        CapCommand::Import { capability, car, from } => cap_import(repo, &capability, &car, from),
+        CapCommand::Grant { anchor, at } => {
+            let dir = repo_dir(repo)?;
+            let mut repo = open_repo(Some(dir.clone()))?;
+            let anchor = anchor_named(&repo, &anchor)?;
+            let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
+            let published = cap::Published::of(&cap::secret(&vault), &anchor)?;
+            let seed = cap::add_writer(&mut repo, &vault, &published)?;
+            let Capability::Write(write) = published.write_capability(seed, repo.user()?) else {
+                anyhow::bail!("not a write capability");
+            };
+            grant_plaintext_write(&dir, &repo, &anchor, &write.writer().id())?;
+            let write = cap::Write::new(write.live.clone().at(at), write.seed(), write.of.clone(), write.owner);
+            eprintln!("whoever has this capability can write {anchor} and read it, till their write's taken away");
+            out!("{}", Capability::Write(write).encode());
+            Ok(())
+        },
+        CapCommand::Write { capability, root, output, car, from } => cap_write(repo, &capability, &root, &output, &car, from),
     }
+}
+
+/// Give a capability's writer key write on the plaintext anchor too, as a
+/// visitor, so what it writes counts in the owner's view once it's taken
+/// in: if the mesh has grants; with none, any set counts.
+#[cfg(feature = "net")]
+fn grant_plaintext_write(dir: &Path, repo: &Catalog, anchor: &Link, writer: &Link) -> anyhow::Result<()> {
+    let place = holokeep::net::mesh::Place::main(dir);
+    let Some(genesis) = holokeep::net::daemon::members(&place)?.genesis()? else {
+        return Ok(());
+    };
+    repo.grant_on(&genesis, anchor, std::slice::from_ref(writer), &[holokeep::grants::WRITE.to_owned()], &[], &[])?;
+    reload(&place)
+}
+
+#[cfg(not(feature = "net"))]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn, reason = "the same as with networking, which can fail")]
+fn grant_plaintext_write(_: &Path, _: &Catalog, _: &Link, _: &Link) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Every block of some CARs, held as one.
+fn held_of(cars: &[PathBuf]) -> anyhow::Result<holokeep::cap::Held> {
+    let mut held = holokeep::cap::Held::default();
+    for car in cars {
+        held.add_car(io::BufReader::new(std::fs::File::open(car).with_context(|| format!("opening {}", car.display()))?))?;
+    }
+    Ok(held)
+}
+
+/// `hk cap write`: write a sealed anchor with a write capability, after
+/// its latest head, read from a CAR or at holders' doors, into a CAR.
+fn cap_write(repo: Option<PathBuf>, capability: &str, root: &Link, output: &Path, car: &[PathBuf], from: Vec<String>) -> anyhow::Result<()> {
+    use holokeep::cap::{self, Capability};
+    let capability = Capability::decode(capability)?;
+    let Capability::Write(write) = &capability else {
+        anyhow::bail!("that capability reads, but doesn't write");
+    };
+    let dir = repo_dir(repo)?;
+    let mut repo = open_repo(Some(dir.clone()))?;
+    let uid = repo.uid();
+    let remembered = |view: &Link| cap::Remembered::of(&dir, uid, view).claims().unwrap_or_default();
+    let reading = if car.is_empty() {
+        read_at_doors(&capability, from, &remembered)?
+    } else {
+        cap::read(&held_of(car)?, &write.live, &remembered)?
+    };
+    let base = reading.base.context("nothing to write after")?;
+    let written = cap::write(&mut repo, write, &base, root)?;
+    let parent = output.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let mut file = io::BufWriter::new(tempfile::NamedTempFile::new_in(parent)?);
+    car::write_blocks(&mut file, std::slice::from_ref(&written.set), &written.blocks)?;
+    file.into_inner().map_err(io::IntoInnerError::into_error)?.persist(output)?;
+    eprintln!("wrote {} as {root}, after the head {}: {} blocks", write.of, base.set, written.blocks.len());
+    out!("{}", written.set);
+    Ok(())
 }
 
 /// `hk cap import`: read what a capability names, from a CAR or at
 /// holders' doors, into the repo, remembering each head read.
-fn cap_import(repo: Option<PathBuf>, capability: &str, car: Option<PathBuf>, from: Vec<String>) -> anyhow::Result<()> {
-    use holokeep::cap::{self, Capability, Held};
+fn cap_import(repo: Option<PathBuf>, capability: &str, car: &[PathBuf], from: Vec<String>) -> anyhow::Result<()> {
+    use holokeep::cap::{self, Capability};
     let capability = Capability::decode(capability)?;
     let dir = repo_dir(repo)?;
     let mut repo = open_repo(Some(dir.clone()))?;
@@ -2458,17 +2560,16 @@ fn cap_import(repo: Option<PathBuf>, capability: &str, car: Option<PathBuf>, fro
         eprintln!("forgetting what was read of {view} before: {e}");
         Vec::new()
     });
-    let reading = match car {
-        Some(car) => {
-            let held = Held::from_car(io::BufReader::new(std::fs::File::open(&car).with_context(|| format!("opening {}", car.display()))?))?;
-            match &capability {
-                Capability::Snapshot(snapshot) => cap::Reading { plain: snapshot.plain.clone(), blocks: cap::unseal(&held, snapshot)?, heads: Vec::new(), mounts: Vec::new() },
-                Capability::Live(live) => cap::read(&held, live, &remembered)?,
-            }
-        },
-        None => read_at_doors(&capability, from, &remembered)?,
+    let reading = if car.is_empty() {
+        read_at_doors(&capability, from, &remembered)?
+    } else {
+        let held = held_of(car)?;
+        match &capability {
+            Capability::Snapshot(snapshot) => cap::Reading { plain: snapshot.plain.clone(), blocks: cap::unseal(&held, snapshot)?, heads: Vec::new(), mounts: Vec::new(), base: None },
+            Capability::Live(live) | Capability::Write(cap::Write { live, .. }) => cap::read(&held, live, &remembered)?,
+        }
     };
-    let cap::Reading { plain, blocks, heads, mounts } = reading;
+    let cap::Reading { plain, blocks, heads, mounts, .. } = reading;
     repo.batch_breathing(|repo| {
         for block in &blocks {
             repo.put_block(block, holokeep::cid::CidVersion::V1)?;

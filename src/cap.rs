@@ -105,9 +105,13 @@ fn encode(block: &[u8], links: &[Link], mounts: &BTreeMap<String, Mount>) -> Res
 
 /// The sealed anchor a mount point is, as its parent's sealed node says:
 /// its sealed view, and its read key.
+#[derive(Clone)]
 pub struct Mount {
     pub view: Link,
     read: Key,
+    /// The plaintext anchor it's of, as its symlink says, once that's
+    /// read: not sealed in `mounts`.
+    pub of: Option<Link>,
 }
 
 impl Mount {
@@ -200,7 +204,7 @@ fn decode(bytes: &[u8]) -> Result<Opened> {
             };
             let read = <[u8; 32]>::try_from(read.as_slice()).map_err(|_| bad())?;
             crate::claim::viewed(&view).ok_or_else(bad)?;
-            Ok((name, Mount { view, read: Zeroizing::new(read) }))
+            Ok((name, Mount { view, read: Zeroizing::new(read), of: None }))
         }).collect::<Result<_>>()?,
         Some(_) => return Err(invalid("a sealed node's mount points that aren't a map")),
     };
@@ -282,23 +286,34 @@ pub fn seal(src: &impl Fetch, root: &Link, read: &[u8; 32]) -> Result<Sealed> {
 /// earlier tree's opened along each path that's changed, to find what's
 /// the same below it.
 pub fn seal_since(src: &impl Fetch, root: &Link, read: &[u8; 32], before: Option<(Link, Link)>) -> Result<Sealed> {
-    seal_tree(src, root, read, before, None).map(|(sealed, _)| sealed)
+    seal_tree(src, root, read, before, MountKeys::None).map(|(sealed, _)| sealed)
 }
 
-/// Seal a DAG as `seal_since` does, and with the capabilities' secret, if
-/// it's given, each mount point among a directory's entries as the
-/// sealed anchor its anchor's published as (see `Mount`). Returns the
-/// anchors mount points name in what was sealed, which is only what's
-/// new.
-fn seal_tree(src: &impl Fetch, root: &Link, read: &[u8; 32], before: Option<(Link, Link)>, secret: Option<&[u8; 32]>) -> Result<(Sealed, Vec<Link>)> {
-    let mut sealing = Sealing { src, secret, mounted: Vec::new(), done: HashMap::new(), blocks: Vec::new() };
+/// How mount points are sealed.
+///
+/// Not at all, as the symlinks they are; as the sealed anchor each
+/// anchor's published as, from the capabilities' secret; or as those
+/// known, by the plaintext anchor each is of, as a writer knows them from
+/// what it read, the rest as symlinks.
+#[derive(Clone, Copy)]
+pub enum MountKeys<'a> {
+    None,
+    Secret(&'a [u8; 32]),
+    Known(&'a [Mount]),
+}
+
+/// Seal a DAG as `seal_since` does, each mount point among a directory's
+/// entries as `mounts` says (see `Mount`). Returns the anchors mount
+/// points name in what was sealed, which is only what's new.
+fn seal_tree(src: &impl Fetch, root: &Link, read: &[u8; 32], before: Option<(Link, Link)>, mounts: MountKeys<'_>) -> Result<(Sealed, Vec<Link>)> {
+    let mut sealing = Sealing { src, mounts, mounted: Vec::new(), done: HashMap::new(), blocks: Vec::new() };
     let root = sealing.seal(root, &root_key(read), None, before)?;
     Ok((Sealed { root, blocks: sealing.blocks }, sealing.mounted))
 }
 
 struct Sealing<'a, F> {
     src: &'a F,
-    secret: Option<&'a [u8; 32]>,
+    mounts: MountKeys<'a>,
     /// The anchors mount points sealed name, each once.
     mounted: Vec<Link>,
     /// What's been sealed, by plaintext CID and key: the same block under
@@ -349,9 +364,12 @@ impl<F: Fetch> Sealing<'_, F> {
     /// The sealed anchor an entry is, if it's a mount point and mount
     /// points are being sealed: by its name.
     fn mount(&mut self, child: &Child) -> Result<Option<(String, Mount)>> {
-        let (Some(secret), Some(entry)) = (self.secret, &child.entry) else {
+        let Some(entry) = &child.entry else {
             return Ok(None);
         };
+        if matches!(self.mounts, MountKeys::None) {
+            return Ok(None);
+        }
         if child.size.is_some_and(|size| size > MOUNT_MAX) || child.cid.codec() != DAG_PB_CODEC || child.cid.hashcode() == IDENTITY {
             return Ok(None);
         }
@@ -361,11 +379,21 @@ impl<F: Fetch> Sealing<'_, F> {
         let Some(anchor) = mount_target(&self.src.fetch(&child.cid)?) else {
             return Ok(None);
         };
-        let published = Published::of(secret, &anchor)?;
+        let mount = match self.mounts {
+            MountKeys::Secret(secret) => {
+                let published = Published::of(secret, &anchor)?;
+                Mount { view: published.view, read: published.read, of: Some(anchor.clone()) }
+            },
+            MountKeys::Known(known) => match known.iter().find(|mount| mount.of.as_ref() == Some(&anchor)) {
+                Some(mount) => mount.clone(),
+                None => return Ok(None),
+            },
+            MountKeys::None => return Ok(None),
+        };
         if !self.mounted.contains(&anchor) {
             self.mounted.push(anchor);
         }
-        Ok(Some((name, Mount { view: published.view, read: published.read })))
+        Ok(Some((name, mount)))
     }
 
     /// What was sealed in a place before, opened: each of its links is
@@ -458,7 +486,7 @@ fn unseal_mounts(src: &impl Source, cap: &Snapshot) -> Result<(Vec<Block>, Mount
                     None => path.clone(),
                 };
                 if let Some(mount) = entry.and_then(|entry| opened.mounts.remove(entry)) {
-                    mounts.push((path.clone(), mount));
+                    mounts.push((path.clone(), mount, child.cid.clone()));
                 }
                 // A key that doesn't derive, kept from an earlier read key
                 let kept = entry.and_then(|entry| opened.keys.get(entry));
@@ -472,6 +500,11 @@ fn unseal_mounts(src: &impl Source, cap: &Snapshot) -> Result<(Vec<Block>, Mount
         }
         level = next;
     }
+    // Which plaintext anchor each is, as its symlink, unsealed, says
+    let mounts = mounts.into_iter().map(|(path, mut mount, cid)| {
+        mount.of = out.iter().find(|block| AnyCid::V1(block.cid().clone()) == cid).and_then(|block| mount_target(block.data()));
+        (path, mount)
+    }).collect();
     Ok((out, mounts))
 }
 
@@ -482,12 +515,18 @@ pub struct Held(HashMap<Vec<u8>, Vec<u8>>);
 impl Held {
     /// Every block of a CAR, each checked against its CID.
     pub fn from_car(reader: impl std::io::Read + 'static) -> Result<Self> {
-        let mut car = crate::car::CarReader::new(reader)?;
         let mut held = Self::default();
-        while let Some((block, _)) = car.next_block()? {
-            held.0.insert(AnyCid::V1(block.cid().clone()).to_bytes(), block.into_data().into_vec());
-        }
+        held.add_car(reader)?;
         Ok(held)
+    }
+
+    /// Every block of another CAR too, each checked against its CID.
+    pub fn add_car(&mut self, reader: impl std::io::Read + 'static) -> Result<()> {
+        let mut car = crate::car::CarReader::new(reader)?;
+        while let Some((block, _)) = car.next_block()? {
+            self.0.insert(AnyCid::V1(block.cid().clone()).to_bytes(), block.into_data().into_vec());
+        }
+        Ok(())
     }
 
     pub fn insert(&mut self, block: Block) {
@@ -576,6 +615,12 @@ impl Published {
         let sealed = crate::claim::anchor_of(sealed)?;
         let view = crate::claim::view(&sealed, &owner.id()).ok_or_else(|| invalid("a sealed anchor with no view"))?;
         Ok(Self { anchor: sealed, view, of: anchor.clone(), owner, read: derive(secret, b"read", &nonce), manifest: derive(secret, b"manifest", b"") })
+    }
+
+    /// What writes it, as a writer whose key's seed is given, for an
+    /// owner's view (see `add_writer`).
+    pub fn write_capability(&self, writer: Key, owner: Option<Link>) -> Capability {
+        Capability::Write(Write::new(Live::new(self.view.clone(), Zeroizing::new(*self.read)), writer, self.of.clone(), owner))
     }
 
     /// What reads it.
@@ -961,7 +1006,7 @@ pub struct Publication {
 pub fn publish(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, published: &Published, value: &Link) -> Result<Publication> {
     let secret = secret(vault);
     let last = last_head(catalog, published)?;
-    let (sealed, mounted) = seal_tree(catalog, value, &published.read, last.as_ref().map(|head| (head.block.plain.clone(), head.block.root.clone())), Some(&secret))?;
+    let (sealed, mounted) = seal_tree(catalog, value, &published.read, last.as_ref().map(|head| (head.block.plain.clone(), head.block.root.clone())), MountKeys::Secret(&secret))?;
     let previous = as_vault(catalog, vault, |catalog| Ok(kept_manifests(catalog)?.into_iter().find(|(_, manifest)| manifest.view.as_ref() == Some(&published.view)).map(|(cid, _)| cid)))?;
     if let (Some(last), Some(previous)) = (&last, &previous)
         && last.block.plain == *value
@@ -979,8 +1024,6 @@ pub fn publish(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault,
     let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
     let after = last.map(|head| head.sets).unwrap_or_default();
     let set = crate::claim::Claim::Set(crate::claim::Set::new([published.anchor.clone()], head_cid, at).ok_or_else(|| invalid("a set of nothing"))?.after(Some(after)));
-    let of = crate::dagcbor::to_vec(&Ipld::Map(BTreeMap::from([("anchor".to_owned(), Ipld::Link(published.of.clone()))]))).map_err(|e| invalid(format!("{e}")))?;
-    let of = crate::vault::seal_bytes(&published.manifest, &of)?.into_data().into_vec();
     as_vault(catalog, vault, |catalog| catalog.batch(|catalog| {
         let mut entries = grant_write(catalog, published, &writer.id())?;
         for block in sealed.blocks.iter().chain([&head, &set.block()]) {
@@ -988,25 +1031,97 @@ pub fn publish(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault,
             entries.push(AnyCid::V1(block.cid().clone()));
         }
         entries.push(catalog.sign_with_key(&writer, [set.cid()])?.ok_or_else(|| invalid("the head's signed already"))?);
-        let mut top = Manifest { view: Some(published.view.clone()), blocks: Vec::new(), parts: Vec::new(), next: previous.clone(), sealed: Some(of) };
-        if entries.len() <= ENTRIES {
-            top.blocks = entries;
-        } else {
-            for chunk in entries.chunks(ENTRIES) {
-                let part = Manifest { view: None, blocks: chunk.to_vec(), parts: Vec::new(), next: None, sealed: None }.block()?;
-                catalog.put_block(&part, crate::cid::CidVersion::V1)?;
-                top.parts.push(AnyCid::V1(part.cid().clone()));
-            }
-        }
-        let top = top.block()?;
-        catalog.put_block(&top, crate::cid::CidVersion::V1)?;
-        let manifest = AnyCid::V1(top.cid().clone());
-        catalog.keep(&manifest)?;
-        if let Some(previous) = &previous {
-            catalog.unkeep(previous)?;
-        }
+        let manifest = keep_entries(catalog, published, previous.as_ref(), entries)?;
         Ok(Publication { set: set.cid(), manifest, fresh: true, mounted })
     }))
+}
+
+/// Keep what's new of a sealed anchor, `entries`, as the vault: a manifest
+/// naming them, in parts if there are many, after the manifest it keeps,
+/// `previous`, which it keeps in that one's place. Returns the manifest.
+fn keep_entries(catalog: &crate::store::Catalog, published: &Published, previous: Option<&Link>, entries: Vec<Link>) -> Result<Link> {
+    let of = crate::dagcbor::to_vec(&Ipld::Map(BTreeMap::from([("anchor".to_owned(), Ipld::Link(published.of.clone()))]))).map_err(|e| invalid(format!("{e}")))?;
+    let of = crate::vault::seal_bytes(&published.manifest, &of)?.into_data().into_vec();
+    let mut top = Manifest { view: Some(published.view.clone()), blocks: Vec::new(), parts: Vec::new(), next: previous.cloned(), sealed: Some(of) };
+    if entries.len() <= ENTRIES {
+        top.blocks = entries;
+    } else {
+        for chunk in entries.chunks(ENTRIES) {
+            let part = Manifest { view: None, blocks: chunk.to_vec(), parts: Vec::new(), next: None, sealed: None }.block()?;
+            catalog.put_block(&part, crate::cid::CidVersion::V1)?;
+            top.parts.push(AnyCid::V1(part.cid().clone()));
+        }
+    }
+    let top = top.block()?;
+    catalog.put_block(&top, crate::cid::CidVersion::V1)?;
+    let manifest = AnyCid::V1(top.cid().clone());
+    catalog.keep(&manifest)?;
+    if let Some(previous) = previous {
+        catalog.unkeep(previous)?;
+    }
+    Ok(manifest)
+}
+
+/// Let a new writer write a published anchor.
+///
+/// It's a fresh writer key, which its owner key gives `/anchor/write` on
+/// the sealed anchor, kept by the vault with what's published of it.
+/// Returns the writer key's seed, for a capability (see
+/// `Published::write_capability`).
+pub fn add_writer(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, published: &Published) -> Result<Key> {
+    let seed = fresh_key()?;
+    let writer = crate::keys::Key::from_seed(&seed);
+    as_vault(catalog, vault, |catalog| catalog.batch(|catalog| {
+        let previous = kept_manifests(catalog)?.into_iter().find(|(_, manifest)| manifest.view.as_ref() == Some(&published.view)).map(|(cid, _)| cid);
+        let previous = previous.ok_or_else(|| invalid(format!("{} isn't published: publish it before letting anyone write it", published.of)))?;
+        let entries = grant_write(catalog, published, &writer.id())?;
+        keep_entries(catalog, published, Some(&previous), entries)?;
+        Ok(())
+    }))?;
+    Ok(seed)
+}
+
+/// A head a capability's writer made: every block of it, sealed tree,
+/// head block, set and signs, and its set.
+pub struct Written {
+    pub blocks: Vec<Block>,
+    pub set: Link,
+}
+
+/// Write a sealed anchor with a write capability: `value`, a plaintext
+/// tree the catalog has, after the head read, `base`.
+///
+/// The tree's sealed whole, which seals what's unchanged as it was, every
+/// mount point it read sealed as it was. The head carries a plaintext set
+/// of the plaintext anchor, for the capability's owner's view, after the
+/// plaintext sets the head read was of, signed by the writer key: what the
+/// owner's machines count in the plaintext (see `crate::grants`, on
+/// visitors). The head's set in the sealed view is after the head read,
+/// signed by the writer key too. The writer's signs are kept in the
+/// catalog, as its chain; the plaintext set isn't.
+pub fn write(catalog: &mut crate::store::Catalog, cap: &Write, base: &Base, value: &Link) -> Result<Written> {
+    let (anchor, _) = crate::claim::viewed(&cap.live.view).ok_or_else(|| invalid("not a sealed view"))?;
+    let (sealed, _) = seal_tree(catalog, value, &cap.live.read, None, MountKeys::Known(&base.mounts))?;
+    let writer = cap.writer();
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    let mut prev = base.block.sets.clone();
+    if let Some(set) = base.block.set.as_deref().and_then(crate::claim::Claim::parse) {
+        prev.push(set.cid());
+    }
+    let inner = crate::claim::Set::new([cap.of.clone()], value.clone(), at).ok_or_else(|| invalid("a set of nothing"))?.after(Some(prev)).for_view(cap.owner.clone());
+    let inner = crate::claim::Claim::Set(inner);
+    let inner_sign = catalog.sign_with_key(&writer, [inner.cid()])?.ok_or_else(|| invalid("the set's signed already"))?;
+    let mut block = HeadBlock::new(value.clone(), sealed.root.clone());
+    block.set = Some(inner.block().into_data().into_vec());
+    block.sign = Some(block_here(catalog, &inner_sign)?.into_data().into_vec());
+    let head = seal_head(&cap.live.read, &block)?;
+    let set = crate::claim::Set::new([anchor], AnyCid::V1(head.cid().clone()), at).ok_or_else(|| invalid("a set of nothing"))?.after(Some(vec![base.set.clone()]));
+    let set = crate::claim::Claim::Set(set);
+    catalog.put_block(&set.block(), crate::cid::CidVersion::V1)?;
+    let sign = catalog.sign_with_key(&writer, [set.cid()])?.ok_or_else(|| invalid("the head's signed already"))?;
+    let mut blocks = sealed.blocks;
+    blocks.extend([head, set.block(), block_here(catalog, &sign)?]);
+    Ok(Written { blocks, set: set.cid() })
 }
 
 /// Publish what an anchor is now, and what's mounted in it.
@@ -1111,6 +1226,10 @@ pub struct Read {
     pub plain: Link,
     pub blocks: Vec<Block>,
     pub head: Vec<Vec<u8>>,
+    /// What a writer writes after: the head read, as its set, and its head
+    /// block, opened.
+    pub set: Link,
+    pub block: HeadBlock,
 }
 
 /// Read a sealed anchor from what's held, as its latest head, judging it
@@ -1145,9 +1264,11 @@ fn read_one<'a>(src: &impl Source, claims: impl IntoIterator<Item = &'a [u8]>, r
         return Err(Error::Behind);
     }
     let fetched = src.sealed(&[(head.value().clone(), head_bat(&live.read))])?;
-    let HeadBlock { plain, root, .. } = open_head(&live.read, fetched.first().ok_or_else(|| invalid("no head"))?)?;
+    let block = open_head(&live.read, fetched.first().ok_or_else(|| invalid("no head"))?)?;
+    let (plain, root) = (block.plain.clone(), block.root.clone());
+    let set = crate::cid::Cid::decode(&cid).map_err(|_| invalid("a head's set with no CID"))?;
     let (blocks, mounts) = unseal_mounts(src, &Snapshot::new(root, plain.clone(), Zeroizing::new(*live.read)))?;
-    Ok((Read { plain, blocks, head: vec![data.to_vec(), sign.to_vec()] }, mounts))
+    Ok((Read { plain, blocks, head: vec![data.to_vec(), sign.to_vec()], set, block }, mounts))
 }
 
 /// The head a reader last read of a sealed anchor.
@@ -1232,6 +1353,18 @@ pub struct Reading {
     pub blocks: Vec<Block>,
     pub heads: Vec<(Link, Vec<Vec<u8>>)>,
     pub mounts: Vec<Mounted>,
+    /// What a writer of the anchor asked for writes after, if it's a
+    /// sealed anchor's (see `write`).
+    pub base: Option<Base>,
+}
+
+/// What a writer writes after: the head it read, as its set, its head
+/// block, and the mount points in its tree, each with the plaintext
+/// anchor it's of.
+pub struct Base {
+    pub set: Link,
+    pub block: HeadBlock,
+    pub mounts: Vec<Mount>,
 }
 
 /// Read a sealed anchor at its latest head, judged beside the head
@@ -1245,7 +1378,8 @@ pub struct Reading {
 pub fn read(src: &(impl Source + Heads), live: &Live, remembered: &dyn Fn(&Link) -> Vec<Vec<u8>>) -> Result<Reading> {
     let claims = src.heads_of(live)?;
     let (top, mounts) = read_one(src, claims.iter().map(Vec::as_slice), &remembered(&live.view), live)?;
-    let mut reading = Reading { plain: top.plain, blocks: top.blocks, heads: vec![(live.view.clone(), top.head)], mounts: Vec::new() };
+    let base = Base { set: top.set, block: top.block, mounts: mounts.iter().map(|(_, mount)| mount.clone()).collect() };
+    let mut reading = Reading { plain: top.plain, blocks: top.blocks, heads: vec![(live.view.clone(), top.head)], mounts: Vec::new(), base: Some(base) };
     let mut seen = std::collections::HashSet::from([live.view.to_bytes()]);
     let mut queue: std::collections::VecDeque<(String, Mount)> = mounts.into();
     while let Some((path, mount)) = queue.pop_front() {
@@ -1296,6 +1430,7 @@ impl Snapshot {
 
 /// What lets whoever holds it read a sealed anchor, as it is whenever
 /// it's read: its sealed view, which names its owner key, and its read key.
+#[derive(Clone)]
 pub struct Live {
     pub view: Link,
     read: Key,
@@ -1321,12 +1456,60 @@ impl Live {
     }
 }
 
+/// What reads a sealed anchor, as a capability's map.
+fn live_map(live: &Live) -> BTreeMap<String, Ipld> {
+    let mut map = BTreeMap::from([("read".to_owned(), Ipld::Bytes(live.read.to_vec())), ("view".to_owned(), Ipld::Link(live.view.clone()))]);
+    if !live.at.is_empty() {
+        map.insert("at".to_owned(), Ipld::List(live.at.iter().cloned().map(Ipld::String).collect()));
+    }
+    map
+}
+
 /// A capability, as it's written: `hkcap`, then dag-cbor in multibase
 /// base32, of `{plain, read, root}` for a snapshot or `{read, view}` for
 /// a sealed anchor.
 pub enum Capability {
     Snapshot(Snapshot),
     Live(Live),
+    Write(Write),
+}
+
+/// What lets whoever holds it write a sealed anchor, and read it.
+///
+/// It's what reads it, the seed of a writer key its owner key's let
+/// write, the plaintext anchor it's of, and the user whose view of that
+/// the sets it carries are for, if it's said.
+pub struct Write {
+    pub live: Live,
+    writer: Key,
+    pub of: Link,
+    pub owner: Option<Link>,
+}
+
+impl Write {
+    pub const fn new(live: Live, writer: Key, of: Link, owner: Option<Link>) -> Self {
+        Self { live, writer, of, owner }
+    }
+
+    /// The writer key's seed.
+    pub fn seed(&self) -> Key {
+        Zeroizing::new(*self.writer)
+    }
+
+    /// The writer key.
+    pub fn writer(&self) -> crate::keys::Key {
+        crate::keys::Key::from_seed(&self.writer)
+    }
+}
+
+impl Capability {
+    /// What reads a sealed anchor, if it's of one.
+    pub const fn live(&self) -> Option<&Live> {
+        match self {
+            Self::Live(live) | Self::Write(Write { live, .. }) => Some(live),
+            Self::Snapshot(_) => None,
+        }
+    }
 }
 
 impl Capability {
@@ -1337,13 +1520,13 @@ impl Capability {
                 ("read".to_owned(), Ipld::Bytes(snapshot.read.to_vec())),
                 ("root".to_owned(), Ipld::Link(snapshot.root.clone())),
             ]),
-            Self::Live(live) => {
-                let mut map = BTreeMap::from([
-                    ("read".to_owned(), Ipld::Bytes(live.read.to_vec())),
-                    ("view".to_owned(), Ipld::Link(live.view.clone())),
-                ]);
-                if !live.at.is_empty() {
-                    map.insert("at".to_owned(), Ipld::List(live.at.iter().cloned().map(Ipld::String).collect()));
+            Self::Live(live) => live_map(live),
+            Self::Write(write) => {
+                let mut map = live_map(&write.live);
+                map.insert("write".to_owned(), Ipld::Bytes(write.writer.to_vec()));
+                map.insert("of".to_owned(), Ipld::Link(write.of.clone()));
+                if let Some(owner) = &write.owner {
+                    map.insert("for".to_owned(), Ipld::Link(owner.clone()));
                 }
                 map
             },
@@ -1373,7 +1556,20 @@ impl Capability {
             Some(_) => return Err(invalid("a capability's doors that aren't a list")),
         };
         let capability = match (map.remove("view"), map.remove("root"), map.remove("plain")) {
-            (Some(Ipld::Link(view)), None, None) if crate::claim::viewed(&view).is_some() => Self::Live(Live { view, read, at }),
+            (Some(Ipld::Link(view)), None, None) if crate::claim::viewed(&view).is_some() => match (map.remove("write"), map.remove("of"), map.remove("for")) {
+                (None, None, None) => Self::Live(Live { view, read, at }),
+                (Some(Ipld::Bytes(writer)), Some(Ipld::Link(of)), owner) => {
+                    let writer = Zeroizing::new(<[u8; 32]>::try_from(writer.as_slice()).map_err(|_| invalid("a capability's writer key isn't 32 bytes"))?);
+                    let owner = match owner {
+                        None => None,
+                        Some(Ipld::Link(owner)) => Some(owner),
+                        Some(_) => return Err(invalid("a capability's owner that isn't a key")),
+                    };
+                    crate::claim::is_anchor(&of).then_some(()).ok_or_else(|| invalid("a capability's plaintext anchor that isn't one"))?;
+                    Self::Write(Write { live: Live { view, read, at }, writer, of, owner })
+                },
+                _ => return Err(invalid("a capability that writes, with no writer key or plaintext anchor")),
+            },
             (None, Some(Ipld::Link(root)), Some(Ipld::Link(plain))) => Self::Snapshot(Snapshot { root, plain, read }),
             _ => return Err(invalid("a capability naming neither a sealed view nor a sealed root and its plaintext")),
         };
