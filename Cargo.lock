@@ -1354,6 +1354,7 @@ dependencies = [
  "tokio",
  "typed_floats",
  "typenum",
+ "x25519-dalek",
  "zeroize",
 ]
 

@@ -808,3 +808,72 @@ fn a_new_read_key_reads_whats_new_and_back_through_the_old_and_the_old_reads_not
     assert!(publish(&mut catalog, &vault, &again, &second).expect("publish").fresh);
     assert_eq!(read(&held(&mut catalog), &new, &|_| Vec::new()).expect("read").plain, second);
 }
+
+#[test]
+fn a_sealed_box_opens_for_its_reader_alone_and_a_keyring_hides_how_many() {
+    let read = Zeroizing::new([8u8; 32]);
+    let (alice, bob) = (fresh_key().expect("key"), fresh_key().expect("key"));
+    let sealed = seal_box(&reader_public(&alice), &read).expect("seal");
+    assert_eq!(sealed.len(), BOX);
+    assert_eq!(open_box(&alice, &sealed).as_deref(), Some(&*read));
+    assert!(open_box(&bob, &sealed).is_none());
+    assert_ne!(seal_box(&reader_public(&alice), &read).expect("seal"), sealed, "each box anew");
+
+    let view = crate::claim::view(&crate::claim::anchor().expect("anchor"), &crate::keys::Key::generate().expect("key").id()).expect("view");
+    for (readers, boxes) in [(0, 4), (1, 4), (4, 4), (5, 8)] {
+        let publics: Vec<[u8; 32]> = (0..readers).map(|_| reader_public(&fresh_key().expect("key"))).collect();
+        let keyring = keyring_block(&view, 3, &read, &publics, None).expect("keyring");
+        let (of, epoch, said) = parse_keyring(keyring.data()).expect("a keyring");
+        assert_eq!((of, epoch, said.len()), (view.clone(), 3, boxes));
+    }
+}
+
+#[test]
+fn readers_read_through_new_read_keys_till_their_read_is_taken_away() {
+    let t = tree("cap-readers");
+    let repo = Scratch::new("cap-readers-repo");
+    let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
+    let vault = crate::vault::Vault::open(repo.path(), catalog.uid()).expect("vault");
+    catalog.set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
+    let anchor = catalog.new_anchor().expect("anchor");
+    let first = import(&mut catalog, t.path(), &importer());
+    catalog.set_anchor(&anchor, &first).expect("set");
+    assert!(add_reader(&mut catalog, &vault, &anchor).is_err(), "not published yet");
+    let published = Published::current(&mut catalog, &vault, &anchor).expect("published");
+    publish(&mut catalog, &vault, &published, &first).expect("publish");
+    let (_, alice) = add_reader(&mut catalog, &vault, &anchor).expect("reader");
+    let (with_both, bob) = add_reader(&mut catalog, &vault, &anchor).expect("reader");
+    assert_eq!(with_both.readers, vec![reader_public(&alice), reader_public(&bob)]);
+    assert_eq!(Published::current(&mut catalog, &vault, &anchor).expect("published").readers.len(), 2, "the vault says so");
+    let Capability::Reader(cap) = Capability::decode(&with_both.reader_capability(alice.clone()).encode()).expect("decode") else {
+        panic!("not a reader's capability");
+    };
+    assert_eq!(**cap.seed(), *alice);
+    let held = |catalog: &mut Catalog| {
+        let (_, manifest) = published_list(catalog, &vault).into_iter().next().expect("published");
+        held_of(&published_blocks(catalog, &manifest).expect("blocks"))
+    };
+
+    // Each reads through its box
+    let now = held(&mut catalog);
+    let alice_reads = open_keyring(&published.view, &alice, now.all()).expect("open");
+    assert_eq!(read(&now, &alice_reads, &|_| Vec::new()).expect("read").plain, first);
+    let bob_reads = open_keyring(&published.view, &bob, now.all()).expect("open");
+    assert!(open_keyring(&published.view, &fresh_key().expect("key"), now.all()).is_err(), "no box for a stranger");
+    // A door finds the keyring held
+    let at_door = keyring_held(&catalog, &published.view).expect("keyring");
+    assert_eq!(at_door.len(), 2, "the keyring and its sign");
+    assert!(open_keyring(&published.view, &alice, at_door.iter().map(|(_, data)| data.as_slice())).is_ok());
+
+    // Bob's read taken away: a new key, which Alice's box has and his doesn't
+    let after = remove_reader(&mut catalog, &vault, &anchor, &reader_public(&bob)).expect("remove");
+    assert_eq!((after.epoch, after.readers), (1, vec![reader_public(&alice)]));
+    assert!(remove_reader(&mut catalog, &vault, &anchor, &reader_public(&bob)).is_err(), "no reader now");
+    let now = held(&mut catalog);
+    let alice_reads = open_keyring(&published.view, &alice, now.all()).expect("open");
+    assert_ne!(alice_reads.read(), bob_reads.read());
+    assert_eq!(read(&now, &alice_reads, &|_| Vec::new()).expect("read").plain, first);
+    assert!(open_keyring(&published.view, &bob, now.all()).is_err(), "no box for him in the latest");
+    assert!(read(&now, &bob_reads, &|_| Vec::new()).is_err(), "nor does the key he had read what's new");
+}
+

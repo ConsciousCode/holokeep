@@ -584,6 +584,16 @@ scenario_door() {
     [ "$rekeyed" != "$cap" ] || fail "the new capability is the old"
     ! on outsider hk cap import "$cap" >/dev/null 2>&1 || fail "the old capability read what's sealed with the new key"
     on outsider hk cap import "$rekeyed" 2>/dev/null | grep -q "^root " || fail "the new capability didn't read it"
+    # Readers by keyring: one stays, one's read is taken away, and the one
+    # that stays reads on through the new key
+    local stays goes gone
+    stays=$(on one hk cap reader "$anchor" --at "/ip4/$one_ip/tcp/4013/p2p/$one_peer" 2>/dev/null) || fail "one couldn't let a reader read"
+    goes=$(on one hk cap reader "$anchor" --at "/ip4/$one_ip/tcp/4013/p2p/$one_peer" 2>/dev/null)
+    on outsider hk cap import "$goes" 2>/dev/null | grep -q "^root " || fail "a reader couldn't read through its keyring"
+    gone=$(on one hk cap readers "$anchor" | tail -1)
+    on one hk cap unread "$anchor" "$gone" 2>/dev/null || fail "one couldn't take a reader's read away"
+    ! on outsider hk cap import "$goes" >/dev/null 2>&1 || fail "a reader read with its read taken away"
+    on outsider hk cap import "$stays" 2>/dev/null | grep -q "^root " || fail "the reader that stays didn't read on through the new key"
     on one hk cap unpublish "$anchor" 2>/dev/null
     ! on one hk cap ls | grep -q "^$anchor	" || fail "one still lists it, unpublished"
 

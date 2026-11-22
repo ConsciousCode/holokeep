@@ -14,6 +14,8 @@
 //!   held.
 //! - **Blocks.** Sealed blocks, each to one who proves they know its
 //!   token, checked against the token the block carries in the clear.
+//! - **Keyrings.** A sealed view's latest keyring, to anyone: its read key
+//!   boxed to each reader, which only they open (see `cap::add_reader`).
 //! - **Writes.** A head a capability's writer wrote, its blocks in as
 //!   many requests as they take, each with the head's set and the
 //!   writer's sign of it, which the claims held of the sealed view must
@@ -68,6 +70,9 @@ pub enum Asked {
     /// the head's set and the writer's sign of it, which say it may; the
     /// last of them says so, and then the set and sign are kept too.
     Write { view: ByteBuf, set: ByteBuf, sign: ByteBuf, blocks: Vec<(ByteBuf, ByteBuf)>, last: bool },
+    /// A sealed view's latest keyring, and its owner key's sign of it: to
+    /// anyone, its boxes saying nothing to whoever isn't a reader.
+    Keyring { view: ByteBuf },
 }
 
 /// The most block bytes a writer sends at once, under the most a request
@@ -133,6 +138,13 @@ pub fn answer(catalog: &Catalog, who: &PeerId, question: Asked, now: u64) -> Res
                 size = size.saturating_add(block.len());
                 told.blocks.push((cid, ByteBuf::from(block.into_data().into_vec())));
             }
+        },
+        Asked::Keyring { view } => {
+            let Ok(view) = Link::decode(&view) else {
+                return Ok(told);
+            };
+            let held = crate::cap::keyring_held(catalog, &view).map_err(|e| Error::Invalid(e.to_string()))?;
+            told.blocks.extend(held.into_iter().map(|(cid, data)| (ByteBuf::from(cid.to_bytes()), ByteBuf::from(data))));
         },
         Asked::Write { view, set, sign, blocks, last } => {
             let Ok(view) = Link::decode(&view) else {
@@ -357,6 +369,12 @@ impl Reader {
             let link = Link::decode(&cid).ok()?;
             crate::block::Block::verify(link.clone().into(), data.into_vec().into_boxed_slice()).ok().map(|block| (link, block.into_data().into_vec()))
         }).collect())
+    }
+
+    /// A sealed view's latest keyring the door holds, and its owner key's
+    /// sign of it, by CID, each checked against it.
+    pub fn keyring(&self, view: &Link) -> Result<Vec<(Link, Vec<u8>)>> {
+        self.ask(Asked::Keyring { view: ByteBuf::from(view.to_bytes()) })
     }
 
     /// Write a head a writer wrote of a sealed view: its blocks, in as

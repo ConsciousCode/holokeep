@@ -245,6 +245,7 @@ A capability is dag-cbor in multibase, base32, as a ticket is (see
 | `write` | bytes         | An ed25519 seed `K` has given `/anchor/write`, for a capability that writes (omitted for one that reads).                               |
 | `of`    | Link          | The plaintext anchor, which the plaintext sets it writes are of (with `write` only).                                                    |
 | `for`   | Link          | The user whose view of the plaintext anchor those sets are for, its owner (with `write` only; omitted if the owner's repo has no user). |
+| `reader` | bytes | An X25519 seed whose public key the keyring boxes the read key to, for a reader's capability, in place of `read` (see [[#Keyrings]]). |
 | `at`    | `[Multiaddr]` | Where some holders of the ciphertext listen (omitted if found otherwise).                                                               |
 
 Each write capability has a writer of its own, so each has a sign chain
@@ -458,9 +459,49 @@ acting for the vault, doesn't.
 - **Not yet.** A mounted anchor's new key reaches the `mounts` of what
   mounts it only when the directory holding the mount point is sealed
   again; till then readers of the parent can't read the mount, and are
-  told so. Remaining readers get the new key in a new capability, not a
-  sealed box to their key; and sealing everything again, forgetting the
-  old ciphertext, is still to come.
+  told so. Readers with a reader's capability read on through new keys
+  (see [[#Keyrings]]); those given a read key need a new capability.
+  Sealing everything again, forgetting the old ciphertext, is still to
+  come.
+
+### Keyrings
+
+A reader's capability is `{view, reader, at?}`: no read key, but the
+seed of a reader key, X25519. Each epoch's read key is in the sealed
+view's **keyring**, boxed to each reader's public key:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `keyring` | string | `"holokeep-keyring-1"`. |
+| `view` | Link | The sealed view. |
+| `epoch` | uint | The epoch whose read key it boxes. |
+| `boxes` | `[bytes]` | The read key in a sealed box to each reader, and boxes of random bytes beside them, to a power of two and no fewer than four, sorted. |
+| `prev` | Link | The keyring it replaces (omitted for the first). |
+
+- A **box** is 80 bytes: an ephemeral X25519 public key, then the read
+  key under XChaCha20-Poly1305 with a nonce of zeros, keyed by
+  `derive(shared secret, "box", ephemeral public || reader public)`,
+  unique to the ephemeral key. Anyone can see how many boxes there
+  are, roughly how many readers, and when the keyring changes; not whose
+  any box is.
+- `K` signs each keyring. The latest is the one of the highest epoch,
+  then the one no other names as `prev`, then the latest signed: two
+  keyrings the same second are still in order.
+- A reader opens the latest keyring `K` signed, tries each box, and with
+  the read key reads as any capability does; it keeps nothing of its own
+  beyond the seed, so reads on through every new key it's boxed.
+  `hk cap import` does this from CARs, or by asking a door
+  `{Keyring: {view}}`, which answers anyone with the latest keyring it
+  holds and its sign, found through `K`'s chain of signs, since a hashed
+  block's link to the view, an identity CID, isn't indexed.
+- `hk cap reader <anchor>` mints a reader: a fresh seed, its public key
+  added to the readers the vault's manifest says (`readers`, beside
+  `anchor` and `epoch`), and a new keyring with a box for it kept in a
+  manifest. `hk cap readers <anchor>` lists them, by public key in
+  base32. `hk cap unread <anchor> <reader>` takes one away: a new epoch,
+  as `hk cap rekey` makes, whose keyring boxes the new key to every
+  reader but it. A capability with a read key in it, not a reader's, is
+  cut off by that as by any new key.
 
 ### Taking write away, as it is now
 
@@ -543,6 +584,7 @@ Requests are serde CBOR:
 | `{Heads: {view: CID bytes, at: uint, proof: bytes}}` | The sets of the sealed view's anchor, their signs, and the head blocks they set it to. |
 | `{Blocks: {wanted: [[CID bytes, proof]], at: uint}}` | Each block whose proof holds, to about 4 MiB; the rest are asked again. |
 | `{Write: {view: CID bytes, set: bytes, sign: bytes, blocks: [[CID bytes, data]], last: bool}}` | `[[view, empty]]` if it's taken; nothing if not. |
+| `{Keyring: {view: CID bytes}}` | The latest keyring held of the view, and `K`'s sign of it, to anyone (see [[#Keyrings]]). |
 
 The answer is `{blocks: [[CID bytes, data]]}`, nothing for what isn't
 proved or held. A proof is that of [[Protected Meshes#Block access
@@ -745,9 +787,8 @@ In order, each of use alone:
    heads to a door or a CAR; the owner's machines take them in and merge
    them; write is taken away; readers and writers merge forks; and a
    friend's door keeps writes for the owner while it's away.
-5. **Revoking read.** Begun: new read keys by epoch, `keys` and `past`.
-   To come: sealed boxes for read grants, and sealing everything again
-   when asked.
+5. **Revoking read.** Begun: new read keys by epoch, `keys` and `past`,
+   and readers by keyring. To come: sealing everything again when asked.
 6. **The vault as a capability**: a sealed root anchor only its owner
    can read, if one scheme for both is wanted.
 

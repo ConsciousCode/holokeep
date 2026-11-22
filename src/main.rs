@@ -540,6 +540,25 @@ enum CapCommand {
         #[arg(long)]
         at: Vec<String>,
     },
+    /// Let a new reader read a published anchor: a reader key of its own,
+    /// whose box in the anchor's keyring has its read key, so it goes on
+    /// reading as the read key changes, till it's taken away (`hk cap
+    /// unread`). Print its capability
+    Reader {
+        anchor: PathBuf,
+        #[arg(long)]
+        at: Vec<String>,
+    },
+    /// List a published anchor's readers, by public key
+    Readers { anchor: PathBuf },
+    /// Take read away from a reader: a new read key, boxed to every other
+    /// reader. Whoever has a capability with a read key in it needs a new
+    /// one, as after `hk cap rekey`
+    Unread {
+        anchor: PathBuf,
+        /// The reader, by public key, as `hk cap readers` lists it
+        reader: String,
+    },
     /// List who may write a published anchor, by key: this account's
     /// machines and capabilities' writers, whether each still may, and if
     /// not, how many of its sets stand
@@ -2504,6 +2523,7 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
         CapCommand::Grant { anchor, at } => cap_grant(repo, &anchor, at),
         CapCommand::Take { car } => cap_take(repo, &car),
         CapCommand::Writers { anchor } => cap_writers(repo, &anchor),
+        command @ (CapCommand::Reader { .. } | CapCommand::Readers { .. } | CapCommand::Unread { .. }) => cap_readers(repo, command),
         CapCommand::Rekey { anchor, at } => {
             let dir = repo_dir(repo)?;
             let mut repo = open_repo(Some(dir.clone()))?;
@@ -2563,6 +2583,39 @@ fn write_at_doors(live: &holokeep::cap::Live, written: &holokeep::cap::Written, 
 #[cfg(not(feature = "net"))]
 fn write_at_doors(_: &holokeep::cap::Live, _: &holokeep::cap::Written, _: Vec<String>) -> anyhow::Result<()> {
     anyhow::bail!("this hk writes to a CAR alone: it's built without networking")
+}
+
+/// What reads a sealed anchor, for a reader's capability: the read key
+/// out of its box in the latest keyring, from CARs, or at a holder's door
+/// (those given, or else those it says).
+fn reader_live(reader: &holokeep::cap::ReaderCap, car: &[PathBuf], from: &[String]) -> anyhow::Result<holokeep::cap::Live> {
+    if !car.is_empty() {
+        let held = held_of(car)?;
+        return Ok(holokeep::cap::open_keyring(&reader.view, reader.seed(), held.all())?.at(reader.at.clone()));
+    }
+    let doors = if from.is_empty() { reader.at.clone() } else { from.to_vec() };
+    anyhow::ensure!(!doors.is_empty(), "say where to read it from: a CAR, or a holder's door with --from");
+    let mut errors = Vec::new();
+    for door in &doors {
+        match keyring_at(door, reader) {
+            Ok(live) => return Ok(live.at(reader.at.clone())),
+            Err(e) => errors.push(format!("{door}: {e}")),
+        }
+    }
+    anyhow::bail!("no door had its keyring: {}", errors.join("; "))
+}
+
+/// A reader's read key, out of its box in the keyring at a door.
+#[cfg(feature = "net")]
+fn keyring_at(door: &str, reader: &holokeep::cap::ReaderCap) -> anyhow::Result<holokeep::cap::Live> {
+    let at = holokeep::net::door::Reader::connect(&door.parse().context("not a multiaddr")?)?;
+    let blocks = at.keyring(&reader.view)?;
+    Ok(holokeep::cap::open_keyring(&reader.view, reader.seed(), blocks.iter().map(|(_, data)| data.as_slice()))?)
+}
+
+#[cfg(not(feature = "net"))]
+fn keyring_at(_: &str, _: &holokeep::cap::ReaderCap) -> anyhow::Result<holokeep::cap::Live> {
+    anyhow::bail!("this hk reads from a CAR alone: it's built without networking")
 }
 
 /// Every block of some CARs, held as one.
@@ -2647,6 +2700,42 @@ fn cap_grant(repo: Option<PathBuf>, anchor: &Path, at: Vec<String>) -> anyhow::R
     Ok(())
 }
 
+/// `hk cap reader`, `readers` and `unread`: a published anchor's readers.
+fn cap_readers(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
+    use holokeep::cap;
+    let dir = repo_dir(repo)?;
+    let mut repo = open_repo(Some(dir.clone()))?;
+    let vault = holokeep::vault::Vault::open(&dir, repo.uid())?;
+    let reader_id = |public: &[u8; 32]| multibase::encode(multibase::Base::Base32Lower, public);
+    match command {
+        CapCommand::Reader { anchor, at } => {
+            let anchor = anchor_named(&repo, &anchor)?;
+            let (published, seed) = cap::add_reader(&mut repo, &vault, &anchor)?;
+            let capability = match published.reader_capability(seed) {
+                cap::Capability::Reader(reader) => cap::Capability::Reader(reader.at(at)),
+                other => other,
+            };
+            eprintln!("whoever has this capability reads {anchor}, as its read key changes, till their read's taken away");
+            out!("{}", capability.encode());
+        },
+        CapCommand::Readers { anchor } => {
+            let anchor = anchor_named(&repo, &anchor)?;
+            for reader in cap::Published::current(&mut repo, &vault, &anchor)?.readers {
+                out!("{}", reader_id(&reader));
+            }
+        },
+        CapCommand::Unread { anchor, reader } => {
+            let anchor = anchor_named(&repo, &anchor)?;
+            let (_, bytes) = multibase::decode(&reader).context("not a reader's public key")?;
+            let reader = <[u8; 32]>::try_from(bytes.as_slice()).ok().context("not a reader's public key")?;
+            let published = cap::remove_reader(&mut repo, &vault, &anchor, &reader)?;
+            eprintln!("{} reads {anchor} no more: its read key's new, epoch {}, boxed to its {} other readers", reader_id(&reader), published.epoch, published.readers.len());
+        },
+        _ => anyhow::bail!("not a command on readers"),
+    }
+    Ok(())
+}
+
 /// `hk cap writers`: list who may write a published anchor.
 fn cap_writers(repo: Option<PathBuf>, anchor: &Path) -> anyhow::Result<()> {
     use holokeep::cap;
@@ -2716,7 +2805,10 @@ fn cap_write(repo: Option<PathBuf>, capability: &str, root: &Link, output: Optio
 /// holders' doors, into the repo, remembering each head read.
 fn cap_import(repo: Option<PathBuf>, capability: &str, car: &[PathBuf], from: Vec<String>) -> anyhow::Result<()> {
     use holokeep::cap::{self, Capability};
-    let capability = Capability::decode(capability)?;
+    let capability = match Capability::decode(capability)? {
+        Capability::Reader(reader) => Capability::Live(reader_live(&reader, car, &from)?),
+        other => other,
+    };
     let dir = repo_dir(repo)?;
     let mut repo = open_repo(Some(dir.clone()))?;
     let uid = repo.uid();
@@ -2731,6 +2823,7 @@ fn cap_import(repo: Option<PathBuf>, capability: &str, car: &[PathBuf], from: Ve
         match &capability {
             Capability::Snapshot(snapshot) => cap::Reading { plain: snapshot.plain.clone(), blocks: cap::unseal(&held, snapshot)?, heads: Vec::new(), mounts: Vec::new(), base: None, forked: 0 },
             Capability::Live(live) | Capability::Write(cap::Write { live, .. }) => cap::read_into(&repo, &held, live, &remembered)?,
+            Capability::Reader(_) => anyhow::bail!("a reader's capability, its keyring unopened"),
         }
     };
     let cap::Reading { plain, blocks, heads, mounts, forked, .. } = reading;

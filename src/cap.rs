@@ -657,6 +657,9 @@ pub struct Published {
     pub epoch: u32,
     /// Every read key it's been on before, the latest first.
     pasts: Vec<Key>,
+    /// Its readers' public keys, whose keyring boxes its read key to each
+    /// (see `add_reader`), as the vault's manifest says.
+    pub readers: Vec<[u8; 32]>,
     /// What its manifests seal which plaintext anchor it is with.
     manifest: Key,
 }
@@ -685,14 +688,16 @@ impl Published {
         let sealed = crate::claim::anchor_of(sealed)?;
         let view = crate::claim::view(&sealed, &owner.id()).ok_or_else(|| invalid("a sealed anchor with no view"))?;
         let pasts = (0..epoch).rev().map(|before| read_key(secret, &nonce, before)).collect();
-        Ok(Self { anchor: sealed, view, of: anchor.clone(), owner, read: read_key(secret, &nonce, epoch), epoch, pasts, manifest: derive(secret, b"manifest", b"") })
+        Ok(Self { anchor: sealed, view, of: anchor.clone(), owner, read: read_key(secret, &nonce, epoch), epoch, pasts, readers: Vec::new(), manifest: derive(secret, b"manifest", b"") })
     }
 
     /// An anchor as published now, on the read key the vault's manifest of
     /// it says: the first, if it's not published.
     pub fn current(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, anchor: &Link) -> Result<Self> {
-        let epoch = epochs(catalog, vault)?.into_iter().find(|(of, _)| of == anchor).map_or(0, |(_, epoch)| epoch);
-        Self::at(&secret(vault), anchor, epoch)
+        let said = published_at(catalog, vault)?.into_iter().find(|said| said.anchor == *anchor);
+        let mut published = Self::at(&secret(vault), anchor, said.as_ref().map_or(0, |said| said.epoch))?;
+        published.readers = said.map(|said| said.readers).unwrap_or_default();
+        Ok(published)
     }
 
     /// Every read key it's been on, this one first.
@@ -704,6 +709,12 @@ impl Published {
     /// owner's view (see `add_writer`).
     pub fn write_capability(&self, writer: Key, owner: Option<Link>) -> Capability {
         Capability::Write(Write::new(Live::new(self.view.clone(), Zeroizing::new(*self.read)), writer, self.of.clone(), owner))
+    }
+
+    /// What reads it, as a reader whose key's seed is given: through its
+    /// box in the keyring (see `add_reader`).
+    pub fn reader_capability(&self, reader: Key) -> Capability {
+        Capability::Reader(ReaderCap { view: self.view.clone(), reader, at: Vec::new() })
     }
 
     /// What reads it.
@@ -1092,7 +1103,7 @@ pub struct Taken {
 pub fn take_in(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault) -> Result<Vec<Taken>> {
     let secret = secret(vault);
     let mut taken = Vec::new();
-    for (anchor, _, epoch) in published_at(catalog, vault)? {
+    for Said { anchor, epoch, .. } in published_at(catalog, vault)? {
         let published = Published::at(&secret, &anchor, epoch)?;
         let claims = claims_about(catalog, &published.view)?;
         let mut gathered = Gathered::default();
@@ -1307,6 +1318,9 @@ fn keep_entries(catalog: &crate::store::Catalog, published: &Published, previous
     if published.epoch > 0 {
         of.insert("epoch".to_owned(), Ipld::Integer(i128::from(published.epoch)));
     }
+    if !published.readers.is_empty() {
+        of.insert("readers".to_owned(), Ipld::List(published.readers.iter().map(|reader| Ipld::Bytes(reader.to_vec())).collect()));
+    }
     let of = crate::dagcbor::to_vec(&Ipld::Map(of)).map_err(|e| invalid(format!("{e}")))?;
     let of = crate::vault::seal_bytes(&published.manifest, &of)?.into_data().into_vec();
     let mut top = Manifest { view: Some(published.view.clone()), blocks: Vec::new(), parts: Vec::new(), next: previous.cloned(), sealed: Some(of) };
@@ -1497,11 +1511,66 @@ pub fn rekey(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, a
     if !epochs(catalog, vault)?.iter().any(|(of, _)| of == anchor) {
         return Err(invalid(format!("{anchor} isn't published")));
     }
-    let value = catalog.anchor_value(anchor)?.ok_or_else(|| invalid(format!("{anchor} is nothing yet")))?;
+    rekey_with(catalog, vault, &current, current.readers.clone())
+}
+
+/// Change a published anchor's read key, as `rekey` does, its readers
+/// those given, its keyring boxing the new key to each.
+fn rekey_with(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, current: &Published, readers: Vec<[u8; 32]>) -> Result<Published> {
+    let value = catalog.anchor_value(&current.of)?.ok_or_else(|| invalid(format!("{} is nothing yet", current.of)))?;
     let epoch = current.epoch.checked_add(1).ok_or_else(|| invalid("no epoch after"))?;
-    let next = Published::at(&secret(vault), anchor, epoch)?;
+    let mut next = Published::at(&secret(vault), &current.of, epoch)?;
+    next.readers = readers;
     publish(catalog, vault, &next, &value)?;
+    keep_keyring(catalog, vault, &next)?;
     Ok(next)
+}
+
+/// Keep a published anchor's keyring as it is now, for its readers, its
+/// owner key's sign of it, in a manifest the vault keeps: nothing, if it
+/// has no readers.
+fn keep_keyring(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, published: &Published) -> Result<()> {
+    if published.readers.is_empty() {
+        return Ok(());
+    }
+    let prev = keyring_held(catalog, &published.view)?.into_iter().next().map(|(cid, _)| cid);
+    let keyring = keyring_block(&published.view, published.epoch, &published.read, &published.readers, prev.as_ref())?;
+    as_vault(catalog, vault, |catalog| catalog.batch(|catalog| {
+        let previous = kept_manifests(catalog)?.into_iter().find(|(_, manifest)| manifest.view.as_ref() == Some(&published.view)).map(|(cid, _)| cid);
+        catalog.put_block(&keyring, crate::cid::CidVersion::V1)?;
+        let cid = AnyCid::V1(keyring.cid().clone());
+        let mut entries = vec![cid.clone()];
+        entries.extend(catalog.sign_with_key(&published.owner, [cid])?);
+        keep_entries(catalog, published, previous.as_ref(), entries)?;
+        Ok(())
+    }))
+}
+
+/// Let a new reader read a published anchor.
+///
+/// It's a fresh reader key, whose public key's added to its readers, and
+/// its keyring kept anew with a box for it. Returns the reader key's
+/// seed, for a capability (see `Published::reader_capability`).
+pub fn add_reader(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, anchor: &Link) -> Result<(Published, Key)> {
+    let mut published = Published::current(catalog, vault, anchor)?;
+    if !epochs(catalog, vault)?.iter().any(|(of, _)| of == anchor) {
+        return Err(invalid(format!("{anchor} isn't published: publish it before letting anyone read it")));
+    }
+    let seed = fresh_key()?;
+    published.readers.push(reader_public(&seed));
+    keep_keyring(catalog, vault, &published)?;
+    Ok((published, seed))
+}
+
+/// Take read away from a reader of a published anchor, by its public key:
+/// a new read key, as `rekey` makes, boxed to every reader but it.
+pub fn remove_reader(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault, anchor: &Link, reader: &[u8; 32]) -> Result<Published> {
+    let current = Published::current(catalog, vault, anchor)?;
+    if !current.readers.contains(reader) {
+        return Err(invalid(format!("that's no reader of {anchor}")));
+    }
+    let readers = current.readers.iter().filter(|other| *other != reader).copied().collect();
+    rekey_with(catalog, vault, &current, readers)
 }
 
 /// Publish what an anchor is now, and what's mounted in it.
@@ -1532,12 +1601,21 @@ pub fn publish_mounted(catalog: &mut crate::store::Catalog, vault: &crate::vault
 
 /// The anchors the vault keeps published, each with its manifest.
 pub fn published(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault) -> Result<Vec<(Link, Link)>> {
-    Ok(published_at(catalog, vault)?.into_iter().map(|(anchor, manifest, _)| (anchor, manifest)).collect())
+    Ok(published_at(catalog, vault)?.into_iter().map(|said| (said.anchor, said.manifest)).collect())
 }
 
-/// The anchors the vault keeps published, each with its manifest and the
-/// epoch of the read key it's on.
-fn published_at(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault) -> Result<Vec<(Link, Link, u32)>> {
+/// What a vault's manifest of a published anchor says, sealed: the anchor,
+/// the epoch of the read key it's on, and its readers' public keys; and
+/// the manifest.
+struct Said {
+    anchor: Link,
+    manifest: Link,
+    epoch: u32,
+    readers: Vec<[u8; 32]>,
+}
+
+/// The anchors the vault keeps published, as their manifests say.
+fn published_at(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault) -> Result<Vec<Said>> {
     let key = derive(&secret(vault), b"manifest", b"");
     let manifests = as_vault(catalog, vault, |catalog| kept_manifests(catalog))?;
     Ok(manifests.into_iter().filter_map(|(cid, manifest)| {
@@ -1549,8 +1627,15 @@ fn published_at(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault
             Some(Ipld::Integer(epoch)) => u32::try_from(epoch).ok()?,
             _ => 0,
         };
+        let readers = match map.remove("readers") {
+            Some(Ipld::List(readers)) => readers.into_iter().filter_map(|reader| match reader {
+                Ipld::Bytes(reader) => <[u8; 32]>::try_from(reader.as_slice()).ok(),
+                _ => None,
+            }).collect(),
+            _ => Vec::new(),
+        };
         match map.remove("anchor") {
-            Some(Ipld::Link(anchor)) => Some((anchor, cid, epoch)),
+            Some(Ipld::Link(anchor)) => Some(Said { anchor, manifest: cid, epoch, readers }),
             _ => None,
         }
     }).collect())
@@ -1558,7 +1643,7 @@ fn published_at(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault
 
 /// Each anchor the vault keeps published, with the epoch of its read key.
 fn epochs(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault) -> Result<Vec<(Link, u32)>> {
-    Ok(published_at(catalog, vault)?.into_iter().map(|(anchor, _, epoch)| (anchor, epoch)).collect())
+    Ok(published_at(catalog, vault)?.into_iter().map(|said| (said.anchor, said.epoch)).collect())
 }
 
 /// Stop keeping a sealed anchor published.
@@ -1935,6 +2020,195 @@ fn read_with(src: &(impl Source + Heads), live: &Live, remembered: &dyn Fn(&Link
     Ok(reading)
 }
 
+/// A reader's public key, from its key's seed: X25519.
+pub fn reader_public(seed: &[u8; 32]) -> [u8; 32] {
+    x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*seed)).to_bytes()
+}
+
+/// How long a sealed box is: an ephemeral public key, then the read key
+/// sealed, with its tag.
+const BOX: usize = 32 + 32 + 16;
+
+/// A read key in an anonymous sealed box to a reader's public key: an
+/// ephemeral X25519 key, and the read key under XChaCha20-Poly1305 with
+/// the key `derive(shared secret, "box", ephemeral || reader)`, unique to
+/// the ephemeral key, so with a nonce of zeros.
+fn seal_box(to: &[u8; 32], read: &[u8; 32]) -> Result<Vec<u8>> {
+    use chacha20poly1305::aead::Aead as _;
+    use chacha20poly1305::KeyInit as _;
+    let ephemeral = x25519_dalek::StaticSecret::from(*fresh_key()?);
+    let public = x25519_dalek::PublicKey::from(&ephemeral);
+    let shared = ephemeral.diffie_hellman(&x25519_dalek::PublicKey::from(*to));
+    let key = derive(shared.as_bytes(), b"box", &[public.as_bytes().as_slice(), to].concat());
+    let cipher = chacha20poly1305::XChaCha20Poly1305::new_from_slice(key.as_slice()).map_err(|e| invalid(e.to_string()))?;
+    let sealed = cipher.encrypt(&chacha20poly1305::XNonce::default(), read.as_slice()).map_err(|e| invalid(e.to_string()))?;
+    Ok([public.as_bytes().as_slice(), &sealed].concat())
+}
+
+/// A read key out of a sealed box, if it's to the reader whose key's seed
+/// this is.
+fn open_box(seed: &[u8; 32], sealed: &[u8]) -> Option<Key> {
+    use chacha20poly1305::aead::Aead as _;
+    use chacha20poly1305::KeyInit as _;
+    let (public, sealed) = sealed.split_first_chunk::<32>()?;
+    let mine = x25519_dalek::StaticSecret::from(*seed);
+    let shared = mine.diffie_hellman(&x25519_dalek::PublicKey::from(*public));
+    let key = derive(shared.as_bytes(), b"box", &[public.as_slice(), x25519_dalek::PublicKey::from(&mine).as_bytes()].concat());
+    let cipher = chacha20poly1305::XChaCha20Poly1305::new_from_slice(key.as_slice()).ok()?;
+    let read = Zeroizing::new(cipher.decrypt(&chacha20poly1305::XNonce::default(), sealed).ok()?);
+    <[u8; 32]>::try_from(read.as_slice()).ok().map(Zeroizing::new)
+}
+
+/// A dag-cbor block of these bytes, hashed with SHA-256.
+fn dag_cbor_block(bytes: Vec<u8>) -> Block {
+    Block::hash(crate::cid::Cidv1Spec::new(crate::cid::DAG_CBOR_CODEC, crate::multihash::MultihashFunc::Sha2_256), bytes.into())
+}
+
+/// What a keyring says it is.
+const KEYRING: &str = "holokeep-keyring-1";
+
+/// A sealed anchor's keyring for an epoch: its read key in a sealed box to
+/// each reader's public key, beside boxes of random bytes, to a power of
+/// two and no fewer than four, sorted, so how many readers there are is
+/// said only roughly, and which box is whose not at all.
+fn keyring_block(view: &Link, epoch: u32, read: &[u8; 32], readers: &[[u8; 32]], prev: Option<&Link>) -> Result<Block> {
+    let mut boxes = readers.iter().map(|reader| seal_box(reader, read)).collect::<Result<Vec<_>>>()?;
+    let room = boxes.len().max(4).next_power_of_two();
+    while boxes.len() < room {
+        let mut dummy = vec![0u8; BOX];
+        getrandom::getrandom(&mut dummy).map_err(std::io::Error::other)?;
+        boxes.push(dummy);
+    }
+    boxes.sort();
+    let map = BTreeMap::from([
+        ("keyring".to_owned(), Ipld::String(KEYRING.to_owned())),
+        ("view".to_owned(), Ipld::Link(view.clone())),
+        ("epoch".to_owned(), Ipld::Integer(i128::from(epoch))),
+        ("boxes".to_owned(), Ipld::List(boxes.into_iter().map(Ipld::Bytes).collect())),
+    ]);
+    let mut map = map;
+    if let Some(prev) = prev {
+        map.insert("prev".to_owned(), Ipld::Link(prev.clone()));
+    }
+    let bytes = crate::dagcbor::to_vec(&Ipld::Map(map)).map_err(|e| invalid(format!("{e}")))?;
+    Ok(dag_cbor_block(bytes))
+}
+
+/// What a keyring says: its sealed view, its epoch, and its boxes.
+#[cfg(test)]
+fn parse_keyring(data: &[u8]) -> Option<(Link, u32, Vec<Vec<u8>>)> {
+    parse_keyring_after(data).map(|(view, epoch, boxes, _)| (view, epoch, boxes))
+}
+
+/// What a keyring says: its sealed view, its epoch, its boxes, and the
+/// keyring it replaces, if it says.
+type Keyring = (Link, u32, Vec<Vec<u8>>, Option<Link>);
+
+/// A keyring as the latest's chosen: its CID's bytes, its epoch, the CID
+/// bytes of the keyring it replaces, and when it was signed.
+type KeyringOrder = (Vec<u8>, u32, Option<Vec<u8>>, u64);
+
+/// What a keyring says, as `parse_keyring` has it, and the keyring it
+/// replaces, if it says.
+fn parse_keyring_after(data: &[u8]) -> Option<Keyring> {
+    let Ok(Ipld::Map(mut map)) = crate::dagcbor::from_slice(data) else {
+        return None;
+    };
+    let prev = match map.remove("prev") {
+        None => None,
+        Some(Ipld::Link(prev)) => Some(prev),
+        Some(_) => return None,
+    };
+    let (Some(Ipld::String(kind)), Some(Ipld::Link(view)), Some(Ipld::Integer(epoch)), Some(Ipld::List(boxes))) = (map.remove("keyring"), map.remove("view"), map.remove("epoch"), map.remove("boxes")) else {
+        return None;
+    };
+    (kind == KEYRING && map.is_empty()).then_some(())?;
+    let boxes = boxes.into_iter().map(|sealed| match sealed {
+        Ipld::Bytes(sealed) => Some(sealed),
+        _ => None,
+    }).collect::<Option<_>>()?;
+    Some((view, u32::try_from(epoch).ok()?, boxes, prev))
+}
+
+/// The latest of a sealed view's keyrings its owner key signed: the
+/// highest epoch, and of those, the one no other names as `prev`, then
+/// the latest signed, then by CID. Each is (CID bytes, epoch, prev, when
+/// signed).
+fn latest_keyring(keyrings: &[KeyringOrder]) -> Option<usize> {
+    let replaced: std::collections::HashSet<&Vec<u8>> = keyrings.iter().filter_map(|(.., prev, _)| prev.as_ref()).collect();
+    keyrings.iter().enumerate().max_by(|(_, (a, x, _, at_x)), (_, (b, y, _, at_y))| {
+        x.cmp(y).then_with(|| replaced.contains(b).cmp(&replaced.contains(a))).then_with(|| at_x.cmp(at_y)).then_with(|| a.cmp(b))
+    }).map(|(i, _)| i)
+}
+
+/// The latest keyring of a sealed view among blocks, its owner key's sign
+/// of which verifies: its epoch, and its boxes. The latest is the highest
+/// epoch, then the latest sign.
+fn keyring_among<'a>(view: &Link, blocks: impl IntoIterator<Item = &'a [u8]>) -> Option<(u32, Vec<Vec<u8>>)> {
+    let (_, owner) = crate::claim::viewed(view)?;
+    let mut keyrings = Vec::new();
+    let mut signed = HashMap::new();
+    for data in blocks {
+        if let Some((of, epoch, boxes, prev)) = parse_keyring_after(data) {
+            if of == *view {
+                keyrings.push((AnyCid::V1(dag_cbor_block(data.to_vec()).cid().clone()).to_bytes(), epoch, boxes, prev.map(|prev| prev.to_bytes())));
+            }
+        } else if let Some(crate::claim::Claim::Sign(sign)) = crate::claim::Claim::parse(data)
+            && *sign.by() == owner
+            && sign.verify()
+        {
+            for target in sign.signs() {
+                let at = signed.entry(target.to_bytes()).or_insert(0u64);
+                *at = (*at).max(sign.at());
+            }
+        }
+    }
+    keyrings.retain(|(cid, ..)| signed.contains_key(cid));
+    let order: Vec<KeyringOrder> = keyrings.iter().map(|(cid, epoch, _, prev)| (cid.clone(), *epoch, prev.clone(), signed.get(cid).copied().unwrap_or(0))).collect();
+    let latest = latest_keyring(&order)?;
+    keyrings.into_iter().nth(latest).map(|(_, epoch, boxes, _)| (epoch, boxes))
+}
+
+/// The latest keyring a catalog holds of a sealed view, with its owner
+/// key's sign of it, as blocks: found through that key's chain of signs,
+/// as nothing else links it. Nothing, if it holds none.
+pub fn keyring_held(catalog: &crate::store::Catalog, view: &Link) -> Result<Vec<(Link, Vec<u8>)>> {
+    let (_, owner) = crate::claim::viewed(view).ok_or_else(|| invalid("not a sealed view"))?;
+    let Some(claims) = catalog.claims() else {
+        return Ok(Vec::new());
+    };
+    let mut found = Vec::new();
+    let mut order = Vec::new();
+    for signed in claims.signs_by(&owner)? {
+        let Some(sign) = catalog.get_block(&signed.sign)? else {
+            continue;
+        };
+        let Some(crate::claim::Claim::Sign(said)) = crate::claim::Claim::parse(sign.data()) else {
+            continue;
+        };
+        for target in said.signs() {
+            let Some(keyring) = catalog.get_block(target)? else {
+                continue;
+            };
+            if let Some((of, epoch, _, prev)) = parse_keyring_after(keyring.data())
+                && of == *view
+            {
+                order.push((target.to_bytes(), epoch, prev.map(|prev| prev.to_bytes()), signed.at));
+                found.push(vec![(target.clone(), keyring.into_data().into_vec()), (signed.sign.clone(), sign.data().to_vec())]);
+            }
+        }
+    }
+    Ok(latest_keyring(&order).and_then(|latest| found.into_iter().nth(latest)).unwrap_or_default())
+}
+
+/// What reads a sealed anchor, for a reader: the read key out of its box
+/// in the latest keyring among blocks.
+pub fn open_keyring<'a>(view: &Link, seed: &[u8; 32], blocks: impl IntoIterator<Item = &'a [u8]>) -> Result<Live> {
+    let (_, boxes) = keyring_among(view, blocks).ok_or_else(|| invalid("no keyring of the sealed anchor its owner key signed"))?;
+    let read = boxes.iter().find_map(|sealed| open_box(seed, sealed)).ok_or_else(|| invalid("no box in its keyring for this reader: its read's been taken away, or it was never given"))?;
+    Ok(Live::new(view.clone(), read))
+}
+
 /// A fresh read key, random.
 pub fn fresh_key() -> Result<Key> {
     let mut read = Zeroizing::new([0u8; 32]);
@@ -2005,6 +2279,29 @@ pub enum Capability {
     Snapshot(Snapshot),
     Live(Live),
     Write(Write),
+    Reader(ReaderCap),
+}
+
+/// What lets a reader read a sealed anchor through its keyring: its sealed
+/// view, the seed of the reader's key, and where holders' doors are.
+pub struct ReaderCap {
+    pub view: Link,
+    reader: Key,
+    pub at: Vec<String>,
+}
+
+impl ReaderCap {
+    /// The reader key's seed.
+    pub const fn seed(&self) -> &Key {
+        &self.reader
+    }
+
+    /// The same, saying where holders' doors are.
+    #[must_use]
+    pub fn at(mut self, at: Vec<String>) -> Self {
+        self.at = at;
+        self
+    }
 }
 
 /// What lets whoever holds it write a sealed anchor, and read it.
@@ -2040,7 +2337,7 @@ impl Capability {
     pub const fn live(&self) -> Option<&Live> {
         match self {
             Self::Live(live) | Self::Write(Write { live, .. }) => Some(live),
-            Self::Snapshot(_) => None,
+            Self::Snapshot(_) | Self::Reader(_) => None,
         }
     }
 }
@@ -2054,6 +2351,13 @@ impl Capability {
                 ("root".to_owned(), Ipld::Link(snapshot.root.clone())),
             ]),
             Self::Live(live) => live_map(live),
+            Self::Reader(reader) => {
+                let mut map = BTreeMap::from([("reader".to_owned(), Ipld::Bytes(reader.reader.to_vec())), ("view".to_owned(), Ipld::Link(reader.view.clone()))]);
+                if !reader.at.is_empty() {
+                    map.insert("at".to_owned(), Ipld::List(reader.at.iter().cloned().map(Ipld::String).collect()));
+                }
+                map
+            },
             Self::Write(write) => {
                 let mut map = live_map(&write.live);
                 map.insert("write".to_owned(), Ipld::Bytes(write.writer.to_vec()));
@@ -2076,6 +2380,24 @@ impl Capability {
         let Ok(Ipld::Map(mut map)) = crate::dagcbor::from_slice(&bytes) else {
             return Err(not());
         };
+        if let Some(Ipld::Bytes(reader)) = map.remove("reader") {
+            let reader = Zeroizing::new(<[u8; 32]>::try_from(reader.as_slice()).map_err(|_| invalid("a capability's reader key isn't 32 bytes"))?);
+            let at = match map.remove("at") {
+                None => Vec::new(),
+                Some(Ipld::List(at)) => at.into_iter().map(|addr| match addr {
+                    Ipld::String(addr) => Ok(addr),
+                    _ => Err(invalid("a capability's door that isn't a multiaddr")),
+                }).collect::<Result<_>>()?,
+                Some(_) => return Err(invalid("a capability's doors that aren't a list")),
+            };
+            let Some(Ipld::Link(view)) = map.remove("view").filter(|view| matches!(view, Ipld::Link(view) if crate::claim::viewed(view).is_some())) else {
+                return Err(invalid("a reader's capability with no sealed view"));
+            };
+            if let Some(other) = map.keys().next() {
+                return Err(invalid(format!("a capability with `{other}` in it, which this doesn't read yet")));
+            }
+            return Ok(Self::Reader(ReaderCap { view, reader, at }));
+        }
         let Some(Ipld::Bytes(read)) = map.remove("read") else {
             return Err(invalid("a capability with no read key"));
         };
