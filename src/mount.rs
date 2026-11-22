@@ -600,9 +600,9 @@ impl Soup {
 
     /// What's at a name in a directory, as it's shown there. A link to an
     /// anchor is a mount point: the anchor, as a directory (or file) of
-    /// that place's own, unless the anchor's already above it, or isn't
-    /// anything here, when it's the link. A directory is one of that
-    /// place's own too.
+    /// that place's own (an empty directory, if it's nothing yet), unless
+    /// the anchor's already above it, or what it is isn't here, when it's
+    /// the link. A directory is one of that place's own too.
     fn placed(&self, catalog: &Catalog, dir: u64, name: &[u8], inode: Inode) -> Result<(Inode, Kind), Errno> {
         let via = Some((dir, name.to_vec()));
         match self.kind_kept(catalog, &inode)? {
@@ -631,7 +631,8 @@ impl Soup {
     }
 
     /// What a link in `dir` mounts, if it's to an anchor itself (not into
-    /// one), which is something here and isn't above `dir`.
+    /// one), which is nothing yet or something here, and isn't above
+    /// `dir`.
     ///
     /// Within another user's view of an anchor, a link to an anchor is to
     /// their view of it, as they see it, not this user's own.
@@ -646,10 +647,12 @@ impl Soup {
         {
             anchor = theirs;
         }
-        let Some(value) = Self::anchor_root(catalog, &anchor)? else {
+        if let Some(value) = Self::anchor_root(catalog, &anchor)?
+            && !self.reachable(catalog, &value)?
+        {
             return Ok(None);
-        };
-        if !self.reachable(catalog, &value)? || self.above(catalog, dir)?.contains(&anchor) {
+        }
+        if self.above(catalog, dir)?.contains(&anchor) {
             return Ok(None);
         }
         Ok(Some(Inode::Path(anchor, PathBuf::new(), via)))
@@ -776,9 +779,12 @@ impl Soup {
                 )
             },
             Inode::Node(cid, _) => export::stat(&Cached(catalog), cid).map_err(|e| errno(&e)),
-            Inode::Path(anchor, rel, _) => match self.at(catalog, anchor, rel)?.ok_or(Errno::ENOENT)? {
-                At::Work(meta) => work_kind(&self.work_path(anchor, rel).unwrap_or_default(), &meta),
-                At::Base(cid, size) => {
+            Inode::Path(anchor, rel, _) => match self.at(catalog, anchor, rel)? {
+                // An anchor that's nothing yet is an empty directory
+                None if rel.as_os_str().is_empty() => Ok(Kind::Directory),
+                None => Err(Errno::ENOENT),
+                Some(At::Work(meta)) => work_kind(&self.work_path(anchor, rel).unwrap_or_default(), &meta),
+                Some(At::Base(cid, size)) => {
                     if let Some(size) = size.filter(|_| cid.codec() == crate::cid::RAW_CODEC) {
                         return Ok(Kind::File(size));
                     }
@@ -928,9 +934,12 @@ impl Soup {
                 }
                 Inode::Node(cid, None)
             },
-            Inode::Anchors => match cid(name).ok().map(|anchor| Ok::<_, Errno>((Self::anchor_root(&catalog, &anchor)?, anchor))).transpose()? {
-                Some((Some(value), anchor)) => {
-                    if !self.reachable(&catalog, &value)? {
+            Inode::Anchors => match cid(name).ok().filter(crate::claim::is_anchor).map(|anchor| Ok::<_, Errno>((Self::anchor_root(&catalog, &anchor)?, anchor))).transpose()? {
+                // One that's nothing yet is an empty directory
+                Some((value, anchor)) => {
+                    if let Some(value) = value
+                        && !self.reachable(&catalog, &value)?
+                    {
                         return Err(Errno::ENOENT);
                     }
                     Inode::Path(anchor, PathBuf::new(), None)
@@ -2524,6 +2533,30 @@ mod tests {
         let by_cid = ino(&soup, &format!("cid/{root}/a")).expect("a");
         assert_eq!(soup.open(by_cid.ino.0, true, false).err(), Some(Errno::EROFS));
         assert_eq!(by_cid.perm, 0o444);
+    }
+
+    #[test]
+    fn an_anchor_thats_nothing_yet_is_an_empty_directory_to_fill() {
+        let scratch = Scratch::new("mount-blank");
+        let (soup, _, repo) = writable(&scratch);
+        let soup = soup.at_dir(PathBuf::from("/mnt/soup"));
+        let blank = Catalog::open_repo(&repo).expect("catalog").new_anchor().expect("anchor");
+        let by_anchors = format!("anchors/{blank}");
+        assert_eq!(ino(&soup, &by_anchors).expect("anchor").kind, FileType::Directory);
+        assert!(names(&soup, &by_anchors).is_empty());
+        assert_eq!(ino(&soup, &format!("{by_anchors}/nothing")).err(), Some(Errno::ENOENT));
+
+        // A link made to it mounts it, as `hk anchor new` and `ln -s` would
+        soup.symlink(ROOT, OsStr::new("School"), Path::new(&format!("/anchors/{blank}"))).expect("symlink");
+        let school = ino(&soup, "School").expect("mounted");
+        assert_eq!(school.kind, FileType::Directory);
+        assert!(names(&soup, "School").is_empty());
+        let (_, fh) = soup.create(school.ino.0, OsStr::new("term.md")).expect("create");
+        soup.write(fh, 0, b"fall").expect("write");
+        soup.release(fh);
+        soup.commit();
+        assert_eq!(value(&repo, &blank), expect_tree(&scratch, &[("term.md", b"fall")]));
+        assert_eq!(read(&soup, &format!("{by_anchors}/term.md")), b"fall");
     }
 
     #[test]
