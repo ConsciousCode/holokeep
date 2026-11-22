@@ -447,7 +447,9 @@ enum KeepCommand {
 #[derive(Subcommand, Debug)]
 enum FsCommand {
     /// Say what's at each path: its CID and what it is, the anchor it's
-    /// in and where, the anchor a mount point names, and its tags
+    /// in and where (if any: one under `cid/` or `tags/` is in none until
+    /// it's through a mount point), the anchor a mount point names, and its
+    /// tags
     Stat {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
@@ -2395,16 +2397,18 @@ fn soup_fs(repo: Option<PathBuf>, command: FsCommand) -> anyhow::Result<()> {
     match command {
         FsCommand::Stat { paths } => {
             for (i, path) in paths.iter().enumerate() {
-                let located = locate(&repo, path)?;
+                let located = fs::find(&repo, &fs::soup_path(path))?;
                 if i > 0 {
                     out!("");
                 }
                 if paths.len() > 1 {
                     out!("path\t{}", path.display());
                 }
-                out!("anchor\t{}", located.anchor);
-                if !located.rel.as_os_str().is_empty() {
-                    out!("at\t{}", located.rel.display());
+                if let Some(anchor) = &located.anchor {
+                    out!("anchor\t{anchor}");
+                    if !located.rel.as_os_str().is_empty() {
+                        out!("at\t{}", located.rel.display());
+                    }
                 }
                 let Some(cid) = located.at else {
                     out!("cid\tnone: the anchor's nothing yet");

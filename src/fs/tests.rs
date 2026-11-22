@@ -58,6 +58,38 @@ fn a_path_is_found_through_mount_points_in_the_anchor_naming_it() {
 }
 
 #[test]
+fn a_path_under_cid_or_tags_is_found_too_in_no_anchor_until_a_mount_point() {
+    let scratch = Scratch::new("fs-find");
+    let (catalog, vault, _) = soup(&scratch);
+    let root = catalog.anchor_value(&catalog.root_anchor().expect("root").expect("a root")).expect("value").expect("set");
+    let value = catalog.anchor_value(&vault).expect("value").expect("set");
+    let school = locate(&catalog, Path::new("/vault/School")).expect("locate").at;
+
+    // What's under a CID is of no anchor, but changes nothing to stat
+    let found = find(&catalog, &Path::new("cid").join(value.to_string()).join("School")).expect("find");
+    assert_eq!((found.anchor, found.at), (None, school.clone()));
+    let found = find(&catalog, &Path::new("cid").join(value.to_string())).expect("find");
+    assert_eq!((found.anchor, found.at), (None, Some(value.clone())));
+    assert!(locate(&catalog, &Path::new("cid").join(value.to_string()).join("School")).is_err(), "nothing to change");
+    // Through a mount point it's in that anchor
+    let found = find(&catalog, &Path::new("cid").join(root.to_string()).join("vault/School")).expect("find");
+    assert_eq!((found.anchor, found.rel.as_path(), found.at), (Some(vault), Path::new("School"), school.clone()));
+
+    // A tagged CID by the tag's name, or the tag's CID
+    let tag = crate::claim::tag("term").expect("tag");
+    assert!(find(&catalog, &Path::new("tags/term").join(value.to_string())).is_err(), "not tagged yet");
+    catalog.tag(&value, &tag).expect("tag");
+    for named in ["term".to_owned(), tag.to_string()] {
+        let found = find(&catalog, &Path::new("tags").join(named).join(value.to_string()).join("School")).expect("find");
+        assert_eq!((found.anchor, found.at), (None, school.clone()));
+    }
+    assert!(find(&catalog, &Path::new("tags/term").join(root.to_string())).is_err(), "not tagged");
+    for nothing in ["cid", "cid/nonsense", "tags", "tags/term"] {
+        assert!(find(&catalog, Path::new(nothing)).is_err(), "{nothing}");
+    }
+}
+
+#[test]
 fn a_directory_is_unlinked_in_one_set_and_every_other_name_kept() {
     let scratch = Scratch::new("fs-remove");
     let (mut catalog, vault, files) = soup(&scratch);

@@ -98,8 +98,29 @@ pub fn mount_point(catalog: &Catalog, cid: &Link) -> Result<Option<Link>> {
         .filter(crate::claim::is_anchor))
 }
 
+/// What's at a path of the soup, which needn't be of an anchor: one
+/// under `cid/` or `tags/` is of none until it's through a mount point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    /// The anchor whose value has it, and where in that value, if any
+    pub anchor: Option<Link>,
+    pub rel: PathBuf,
+    /// What's there, and the size the directory naming it says, if that's
+    /// anything. None if the anchor's nothing yet.
+    pub at: Option<Link>,
+    pub size: Option<u64>,
+}
+
 /// Find what's at a path of the soup, following mount points.
 pub fn locate(catalog: &Catalog, path: &Path) -> Result<Located> {
+    let found = find(catalog, path)?;
+    let anchor = found.anchor.ok_or_else(|| user(format!("{}: not of an anchor, so nothing to change", path.display())))?;
+    Ok(Located { anchor, rel: found.rel, at: found.at, size: found.size })
+}
+
+/// Find what's at any path of the soup, following mount points: one of an
+/// anchor, or one under `cid/<cid>` or `tags/<tag>/<cid>`.
+pub fn find(catalog: &Catalog, path: &Path) -> Result<Found> {
     let mut names = Vec::new();
     for component in path.components() {
         match component {
@@ -108,16 +129,38 @@ pub fn locate(catalog: &Catalog, path: &Path) -> Result<Located> {
             Component::ParentDir | Component::Prefix(_) => return Err(user(format!("{}: say the path without `..`", path.display()))),
         }
     }
-    let (mut anchor, rest) = match names.first().map(Vec::as_slice) {
+    let named_cid = |name: &[u8]| std::str::from_utf8(name).ok().and_then(|name| name.parse::<Link>().ok());
+    let (mut anchor, mut node, rest) = match names.first().map(Vec::as_slice) {
         Some(b"anchors") => {
             let name = names.get(1).ok_or_else(|| user("anchors/ itself isn't of an anchor: name one"))?;
-            let anchor = std::str::from_utf8(name).ok().and_then(|name| name.parse::<Link>().ok()).filter(crate::claim::is_anchor);
-            (anchor.ok_or_else(|| user(format!("{}: not an anchor", String::from_utf8_lossy(name))))?, names.get(2..).unwrap_or_default())
+            let anchor = named_cid(name).filter(crate::claim::is_anchor).ok_or_else(|| user(format!("{}: not an anchor", String::from_utf8_lossy(name))))?;
+            (Some(anchor.clone()), catalog.anchor_value(&anchor)?, names.get(2..).unwrap_or_default())
         },
-        Some(b"cid" | b"tags") => return Err(user(format!("{}: not of an anchor, so nothing to change", path.display()))),
-        _ => (catalog.root_anchor()?.ok_or_else(|| user("this account has no root anchor yet"))?, names.as_slice()),
+        Some(b"cid") => {
+            let name = names.get(1).ok_or_else(|| user("cid/ itself is nothing: name a CID under it"))?;
+            let cid = named_cid(name).ok_or_else(|| user(format!("{}: not a CID", String::from_utf8_lossy(name))))?;
+            (None, Some(cid), names.get(2..).unwrap_or_default())
+        },
+        Some(b"tags") => {
+            let (Some(tag), Some(name)) = (names.get(1), names.get(2)) else {
+                return Err(user(format!("{}: name a tag and a CID tagged with it", path.display())));
+            };
+            let tag = std::str::from_utf8(tag).ok().and_then(crate::claim::tag).filter(|tag| catalog.claims().is_some_and(|claims| claims.tagged(tag.multihash()).is_ok_and(|tagged| !tagged.is_empty()))).or_else(|| named_cid(tag));
+            let cid = named_cid(name).ok_or_else(|| user(format!("{}: not a CID", String::from_utf8_lossy(name))))?;
+            let tagged = match (&tag, catalog.claims()) {
+                (Some(tag), Some(claims)) => claims.tagged(tag.multihash())?.contains(&cid),
+                _ => false,
+            };
+            if !tagged {
+                return Err(user(format!("{}: not there", path.display())));
+            }
+            (None, Some(cid), names.get(3..).unwrap_or_default())
+        },
+        _ => {
+            let root = catalog.root_anchor()?.ok_or_else(|| user("this account has no root anchor yet"))?;
+            (Some(root.clone()), catalog.anchor_value(&root)?, names.as_slice())
+        },
     };
-    let mut node = catalog.anchor_value(&anchor)?;
     let mut rel = PathBuf::new();
     for (i, name) in rest.iter().enumerate() {
         let dir = node.ok_or_else(|| user(format!("{}: not there", path.display())))?;
@@ -128,18 +171,18 @@ pub fn locate(catalog: &Catalog, path: &Path) -> Result<Located> {
             .ok_or_else(|| user(format!("{}: not there", path.display())))?;
         rel.push(OsStr::from_bytes(name));
         if i.saturating_add(1) == rest.len() {
-            return Ok(Located { anchor, rel, at: Some(entry.cid), size: entry.size });
+            return Ok(Found { anchor, rel, at: Some(entry.cid), size: entry.size });
         }
         match mount_point(catalog, &entry.cid)? {
             Some(mounted) => {
                 node = catalog.anchor_value(&mounted)?;
-                anchor = mounted;
+                anchor = Some(mounted);
                 rel = PathBuf::new();
             },
             None => node = Some(entry.cid),
         }
     }
-    Ok(Located { anchor, rel, at: node, size: None })
+    Ok(Found { anchor, rel, at: node, size: None })
 }
 
 /// Set each anchor to what it is with marks over it: one set each, of
