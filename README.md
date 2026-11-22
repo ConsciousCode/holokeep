@@ -454,12 +454,13 @@ Checklist:
   - [x] Claims noticed before what they're about: a notice's blocks are wanted together, so a keep noticed with what it keeps goes with it, and any push takes what links to it along after; a signature is noticed by what it signs, not its key or chain
   - [x] Recovering from the passphrase alone: the vault and root sealed where friends hold them, brought back by a friend's re-invite
 - [ ] Peergos BAT with friends
-- [ ] Capabilities: sharing by key, from ciphertext no member guards (see the wiki's Capabilities page)
+- [x] Capabilities: sharing by key, from ciphertext no member guards (see the wiki's Capabilities page)
   - [x] Snapshots: a sealed tree, keys derived down it, padded, and a capability on its root (`hk cap export/import`)
   - [x] Sealed anchors, read-only: owner keys, heads, views judged by their own keys, sealing what's changed, manifests the vault keeps, kept current by the node, held by friends' protected meshes, read from a CAR or at a holder's door by anyone with the capability, who remembers the head it read and refuses an older one offered as the latest (`hk cap publish/unpublish/ls`, `hk node run --door`, `hk cap import --from`)
   - [x] Mount points: sealed `mounts`, publishing and reading through what's mounted, and sharing a folder makes it an anchor (`hk cap publish <folder>`)
   - [x] Writing by capability: writer keys judged by the owner key's grants, write capabilities writing at a door or to a CAR, the owner's machines taking writes in and merging forks, and taking write away (`hk cap grant/write/take/writers/revoke`)
   - [x] Revoking read: new read keys by epoch, unchanged entries keeping their ciphertext with their keys said, readers by keyring of sealed boxes, and sealing again and forgetting the past (`hk cap rekey/reader/readers/unread/reseal`)
+  - [x] The vault as a capability: the soup protected as sealed anchors only its owner reads, kept current, and read back after a recovery (`hk protect soup/recover`)
 
 ## Open questions
 

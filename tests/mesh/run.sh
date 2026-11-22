@@ -537,7 +537,7 @@ scenario_door() {
     one_peer=$(on one hk node id)
     one_ip=$(podman inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$run-one")
     cap=$(on one hk cap publish "$anchor" --at "/ip4/$one_ip/tcp/4013/p2p/$one_peer" 2>/dev/null)
-    on one hk cap ls | grep -q "^$anchor	" || fail "one doesn't list what it published"
+    grep -q "^$anchor	" <<<"$(on one hk cap ls)" || fail "one doesn't list what it published"
     machine outsider
     [ "$(on outsider hk cap import "$cap" 2>/dev/null)" = "root $note" ] || fail "the outsider couldn't read it at the door"
     [ "$(on outsider hk cat "$note")" = "read at the door" ] || fail "what the outsider read isn't what was published"
@@ -598,7 +598,7 @@ scenario_door() {
     on one hk cap reseal "$anchor" --forget 2>/dev/null || fail "one couldn't seal it again and forget"
     on outsider hk cap import "$stays" 2>/dev/null | grep -q "^root " || fail "the reader didn't read what was sealed again"
     on one hk cap unpublish "$anchor" 2>/dev/null
-    ! on one hk cap ls | grep -q "^$anchor	" || fail "one still lists it, unpublished"
+    ! grep -q "^$anchor	" <<<"$(on one hk cap ls)" || fail "one still lists it, unpublished"
 
     # A folder published is made an anchor, and read through what mounts it
     local tree folder_cap whole_cap read inside
@@ -614,6 +614,20 @@ scenario_door() {
     read=$(on outsider hk cap import "$whole_cap" 2>/dev/null)
     grep -q "^mount shared	$inside$" <<<"$read" || fail "the outsider didn't read the folder through what mounts it: $read"
     [ "$(on outsider hk cat "$(sh_on one 'hk add -q --no-keep /tmp/tree/shared/inside.txt')")" = "in the folder" ] || fail "what the outsider read through the mount point isn't the folder"
+    # The soup protected: the root anchor published for no one else, and
+    # read back as what it is
+    local root
+    root=$(on one hk anchor root | sed -n 1p)
+    # Alone, as when this scenario's run by itself, it's something to protect
+    if ! on one hk anchor show "$root" | grep -q "	"; then
+        local kept
+        kept=$(sh_on one 'mkdir -p /tmp/kept && echo "kept safe" > /tmp/kept/note && hk add -q --no-keep /tmp/kept | tail -1')
+        on one hk anchor set "$root" "$kept" >/dev/null
+    fi
+    local protected
+    protected=$(on one hk protect soup 2>&1) || fail "one couldn't protect the soup: $protected"
+    grep -q "^$root	" <<<"$(on one hk cap ls)" || fail "the root anchor isn't published: $protected"
+    grep -q "^$root	.*	already$" <<<"$(on one hk protect recover 2>/dev/null)" || fail "the root anchor doesn't read back as it is"
 }
 
 scenario_expiry() {

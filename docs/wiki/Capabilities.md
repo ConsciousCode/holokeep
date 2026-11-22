@@ -801,8 +801,12 @@ In order, each of use alone:
 5. **Revoking read.** Done: new read keys by epoch, `keys` and `past`,
    readers by keyring, what mounts a rekeyed anchor sealed again, and
    sealing everything again and forgetting the past when asked.
-6. **The vault as a capability**: a sealed root anchor only its owner
-   can read, if one scheme for both is wanted.
+6. **The vault as a capability.** Done, beside the vault's own scheme:
+   `hk protect soup` publishes the root anchor and what's mounted in it
+   for its owner alone, and `hk protect recover` reads every anchor the
+   vault publishes back after a recovery (see [[Protected
+   Meshes#Protecting the soup]]). `hk protect add` stays, for one DAG as
+   it is.
 
 ## Open questions
 

@@ -955,3 +955,55 @@ fn sealing_again_and_forgetting_keeps_the_latest_and_who_may_but_not_the_past() 
     let judge = Judge::of(&published.owner.id(), &published.anchor, gathered.signed_grants(), &BTreeMap::new()).expect("judge");
     assert!(judge.state.expect("grants").holds_on(&published.owner.id(), &published.anchor, &writer, crate::grants::WRITE), "its grant's kept with it");
 }
+
+#[test]
+fn a_repo_with_only_the_vault_reads_back_every_anchor_it_publishes() {
+    let repo = Scratch::new("cap-recover-repo");
+    let mut catalog = Catalog::open_repo(repo.path()).expect("catalog");
+    let vault = crate::vault::Vault::open(repo.path(), catalog.uid()).expect("vault");
+    catalog.set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
+    let (outer, inner) = (catalog.new_anchor().expect("anchor"), catalog.new_anchor().expect("anchor"));
+    let t = tree("cap-recover-inner");
+    let inner_value = import(&mut catalog, t.path(), &importer());
+    catalog.set_anchor(&inner, &inner_value).expect("set");
+    let top = Scratch::new("cap-recover-outer");
+    std::fs::write(top.path().join("note.txt"), "the top").expect("write");
+    std::os::unix::fs::symlink(format!("/anchors/{inner}"), top.path().join("inner")).expect("symlink");
+    let outer_value = import(&mut catalog, top.path(), &importer());
+    catalog.set_anchor(&outer, &outer_value).expect("set");
+    publish_mounted(&mut catalog, &vault, &outer, &outer_value).expect("publish");
+    rekey(&mut catalog, &vault, &inner).expect("rekey");
+    // Here, everything's here already
+    let here = recover(&mut catalog, &vault).expect("recover");
+    assert!(here.iter().all(|recovered| recovered.outcome == Recovery::Already), "nothing to set");
+
+    // A repo that's lost everything but the vault, and what holds it holds
+    let fresh = Scratch::new("cap-recover-fresh");
+    std::fs::create_dir_all(fresh.path().join("accounts")).expect("mkdir");
+    for name in [format!("{}.secret", vault.uid()), format!("{}.key", vault.uid())] {
+        std::fs::copy(repo.path().join("accounts").join(&name), fresh.path().join("accounts").join(&name)).expect("copy");
+    }
+    let mut again = Catalog::open_repo(fresh.path()).expect("catalog");
+    again.set_signer(crate::keys::Key::generate().expect("key")).expect("signer");
+    let vault_again = crate::vault::Vault::open(fresh.path(), again.uid()).expect("vault");
+    assert_eq!(vault_again.key().id(), vault.key().id());
+    let manifests = published_list(&mut catalog, &vault);
+    for (_, manifest) in &manifests {
+        for block in published_blocks(&catalog, manifest).expect("blocks") {
+            again.put_block(&block, crate::cid::CidVersion::V1).expect("put");
+        }
+    }
+    as_vault(&mut again, &vault_again, |again| {
+        for (_, manifest) in &manifests {
+            again.keep(manifest)?;
+        }
+        Ok(())
+    }).expect("keep");
+    assert_eq!(vault_keeps(&mut again, &vault_again).expect("keeps").len(), manifests.len());
+    let recovered = recover(&mut again, &vault_again).expect("recover");
+    assert_eq!(recovered.len(), 2);
+    assert!(recovered.iter().all(|recovered| recovered.outcome == Recovery::Set));
+    assert_eq!(again.anchor_value(&outer).expect("value"), Some(outer_value.clone()));
+    assert_eq!(again.anchor_value(&inner).expect("value"), Some(inner_value), "the mounted one too, on its new key");
+    assert_eq!(again.fetch(&outer_value).ok().map(|data| data.len()), catalog.fetch(&outer_value).ok().map(|data| data.len()), "its tree's here");
+}

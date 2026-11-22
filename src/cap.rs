@@ -1797,6 +1797,66 @@ fn epochs(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault) -> R
     Ok(published_at(catalog, vault)?.into_iter().map(|said| (said.anchor, said.epoch)).collect())
 }
 
+/// What the vault keeps: its manifests among them, of what it protects
+/// and publishes, to fetch before reading them back (see `recover`).
+pub fn vault_keeps(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault) -> Result<Vec<Link>> {
+    as_vault(catalog, vault, |catalog| Ok(catalog.claims().map(crate::store::ClaimStore::keeps).transpose()?.unwrap_or_default()))
+}
+
+/// What reading back a published anchor came to: the anchor, what it is
+/// sealed, and whether it's set to that here, or was already, or is
+/// something else here, which isn't touched.
+pub struct Recovered {
+    pub anchor: Link,
+    pub value: Link,
+    pub outcome: Recovery,
+}
+
+/// Whether an anchor was set from what's sealed of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    Set,
+    Already,
+    Otherwise,
+}
+
+/// Read back every anchor the vault publishes, as its owner.
+///
+/// Each is read from its sealed anchor as the catalog holds it, with the
+/// read keys derived from the vault: so a repo that's lost everything but
+/// the passphrase, and its friends' holding the vault, gets back its root
+/// anchor, published with `hk protect soup`, and everything mounted in
+/// it, and whatever else it published.
+///
+/// Each one's latest heads are merged (see `read_into`) and its tree put
+/// in the catalog. An anchor that's nothing here is set to it; one that's
+/// something else here is left be, and said so.
+pub fn recover(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault) -> Result<Vec<Recovered>> {
+    let secret = secret(vault);
+    let mut out = Vec::new();
+    for said in published_at(catalog, vault)? {
+        let published = Published::at(&secret, &said.anchor, said.epoch)?;
+        let live = Live::new(published.view.clone(), Zeroizing::new(*published.read));
+        let reading = read_into(catalog, &*catalog, &live, &|_| Vec::new())?;
+        catalog.batch(|catalog| {
+            for block in &reading.blocks {
+                catalog.put_block(block, crate::cid::CidVersion::V1)?;
+            }
+            Ok::<_, Error>(())
+        })?;
+        let outcome = match catalog.anchor_value(&said.anchor)? {
+            None => {
+                catalog.set_anchor(&said.anchor, &reading.plain)?;
+                Recovery::Set
+            },
+            Some(here) if here == reading.plain => Recovery::Already,
+            Some(_) => Recovery::Otherwise,
+        };
+        out.push(Recovered { anchor: said.anchor, value: reading.plain, outcome });
+    }
+    Ok(out)
+}
+
 /// Stop keeping a sealed anchor published.
 ///
 /// The vault lets go of its manifest, so what's only its is collected in time, wherever it's held.

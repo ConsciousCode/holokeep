@@ -78,6 +78,32 @@ invite, which carries those sealed blocks and the manifests. Joining
 with it and the passphrase restores the vault and the user, whose root
 certifies the new machine; `hk protect restore` brings the data back.
 
+## Protecting the soup
+
+`hk protect add` copies one DAG into the vault as it is then. `hk
+protect soup` protects the soup as it goes on: it publishes the root
+anchor, and every anchor mounted in it, as sealed anchors (see
+[[Capabilities]]), with no capability handed out, so no one but the
+account reads them. The vault keeps what's published, so friends
+holding the vault hold it, and the node publishes it again as the
+anchors change, sealing only what's changed. It seals the vault with
+the passphrase too, if `hk protect add` hasn't yet.
+
+Unlike a protected DAG, what's published this way keeps its history as
+heads, follows mount points, and is read through its keys down the
+tree; what a holder learns is the same: how many blocks and how big,
+padded, not how they link or what's in them.
+
+`hk protect recover`, after the vault's recovered with the passphrase
+(see [[#Recovery from the passphrase]]), fetches whatever the vault
+keeps through its protected meshes, then reads back every anchor the
+vault publishes, as its owner, with the read keys derived from the
+vault secret: each one's heads merged and its tree put in the repo. An
+anchor that's nothing here is set to it; one that's something else is
+left be, and said so. It prints each anchor, its value, and `set`,
+`already` or `otherwise here: left be`. So the passphrase and a friend
+bring back the soup itself, not only DAGs protected one by one.
+
 ## Block access tokens
 
 A proof of knowing a block's BAT, to ask for it:
@@ -91,4 +117,4 @@ It's good for that block, that asker, and 300 seconds either side of
 members can reach a mesh, so sharing beyond it waits on a way in for
 non-members.
 
-Source: `src/vault.rs`.
+Source: `src/vault.rs`, `src/cap.rs` (`recover`), `src/main.rs`.

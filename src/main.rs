@@ -622,6 +622,15 @@ enum ProtectCommand {
     /// Bring a DAG back from its manifest, fetching what isn't here
     /// through the vault's protected meshes, and keep it; prints its root
     Restore { manifest: Link },
+    /// Protect the soup: publish the root anchor, and every anchor mounted
+    /// in it, sealed, for no one but this account to read, kept current by
+    /// the node as it changes and held by friends holding the vault
+    Soup,
+    /// Read back every anchor the vault publishes, after recovering it with
+    /// the passphrase: fetch what it keeps through its protected meshes,
+    /// and set each anchor that's nothing here to what it is sealed. Prints
+    /// each anchor, its value, and whether it was set
+    Recover,
 }
 
 #[derive(Subcommand, Debug)]
@@ -974,19 +983,36 @@ fn protect(dir: &Path, command: ProtectCommand) -> anyhow::Result<()> {
         ProtectCommand::Add { cid } => {
             let mut repo = Catalog::open_repo(dir)?;
             out!("{}", vault::protect(&mut repo, dir, &cid)?);
-            // The vault, sealed with the user's passphrase, goes where it does,
-            // so the passphrase alone recovers it
-            if !vault::is_sealed(&mut repo, dir)? {
-                let passphrase = if repo.user()?.is_some() {
-                    let passphrase = passphrase(false)?;
-                    repo.root(passphrase.as_bytes()).context("the vault is sealed with the user's passphrase")?;
-                    passphrase
-                } else {
-                    passphrase(true)?
-                };
-                vault::seal(&mut repo, dir, passphrase.as_bytes(), holokeep::keys::Cost::RECOMMENDED)?;
-                eprintln!("sealed the vault with the passphrase: friends holding it hold what it takes to recover it");
+            seal_vault(&mut repo, dir)?;
+        },
+        ProtectCommand::Soup => {
+            let mut repo = Catalog::open_repo(dir)?;
+            let root = repo.root_anchor()?.context("this account has no root anchor yet")?;
+            let value = repo.anchor_value(&root)?.with_context(|| format!("the root anchor, {root}, is nothing yet"))?;
+            fetch_first(Some(&dir.to_path_buf()), &value)?;
+            let vault = vault::Vault::open(dir, me)?;
+            let publications = holokeep::cap::publish_mounted(&mut repo, &vault, &root, &value)?;
+            seal_vault(&mut repo, dir)?;
+            eprintln!("protected the root anchor and {} anchors mounted in it: no one but this account reads them, and the node keeps them current", publications.len().saturating_sub(1));
+            out!("{root}");
+        },
+        ProtectCommand::Recover => {
+            let mut repo = Catalog::open_repo(dir)?;
+            let vault = vault::Vault::open(dir, me)?;
+            #[cfg(feature = "net")]
+            for cid in holokeep::cap::vault_keeps(&mut repo, &vault)? {
+                fetch_protected(dir, me, &cid)?;
             }
+            let recovered = holokeep::cap::recover(&mut repo, &vault)?;
+            for recovered in &recovered {
+                let outcome = match recovered.outcome {
+                    holokeep::cap::Recovery::Set => "set",
+                    holokeep::cap::Recovery::Already => "already",
+                    holokeep::cap::Recovery::Otherwise => "otherwise here: left be",
+                };
+                out!("{}\t{}\t{outcome}", recovered.anchor, recovered.value);
+            }
+            anyhow::ensure!(!recovered.is_empty(), "the vault publishes nothing here: is it recovered, and are its friends' nodes reachable?");
         },
         ProtectCommand::Ls => {
             let mut repo = Catalog::open_repo(dir)?;
@@ -996,23 +1022,47 @@ fn protect(dir: &Path, command: ProtectCommand) -> anyhow::Result<()> {
         },
         ProtectCommand::Restore { manifest } => {
             #[cfg(feature = "net")]
-            {
-                use holokeep::net::{daemon, mesh};
-                let uid = vault::vault_of(me);
-                for (name, _) in daemon::members(&mesh::Place::main(dir))?.meshes()?.into_iter().filter(|&(_, account)| account == uid) {
-                    if let Some((_, missing)) = daemon::fetch(&mesh::Place::new(dir, &name), &manifest)?
-                        && missing.is_empty()
-                    {
-                        break;
-                    }
-                }
-            }
+            fetch_protected(dir, me, &manifest)?;
             let mut repo = Catalog::open_repo(dir)?;
             let (root, blocks) = vault::restore(&mut repo, dir, &manifest)?;
             eprintln!("restored {blocks} blocks");
             out!("{root}");
         },
     }
+    Ok(())
+}
+
+/// Fetch a DAG of the vault's that isn't all here through its protected
+/// meshes, the first that has it all.
+#[cfg(feature = "net")]
+fn fetch_protected(dir: &Path, me: u32, cid: &Link) -> anyhow::Result<()> {
+    use holokeep::net::{daemon, mesh};
+    let uid = holokeep::vault::vault_of(me);
+    for (name, _) in daemon::members(&mesh::Place::main(dir))?.meshes()?.into_iter().filter(|&(_, account)| account == uid) {
+        if let Some((_, missing)) = daemon::fetch(&mesh::Place::new(dir, &name), cid)?
+            && missing.is_empty()
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Seal the vault with the user's passphrase, if it isn't yet, to go where
+/// it does, so the passphrase alone recovers it.
+fn seal_vault(repo: &mut Catalog, dir: &Path) -> anyhow::Result<()> {
+    if holokeep::vault::is_sealed(repo, dir)? {
+        return Ok(());
+    }
+    let passphrase = if repo.user()?.is_some() {
+        let passphrase = passphrase(false)?;
+        repo.root(passphrase.as_bytes()).context("the vault is sealed with the user's passphrase")?;
+        passphrase
+    } else {
+        passphrase(true)?
+    };
+    holokeep::vault::seal(repo, dir, passphrase.as_bytes(), holokeep::keys::Cost::RECOMMENDED)?;
+    eprintln!("sealed the vault with the passphrase: friends holding it hold what it takes to recover it");
     Ok(())
 }
 
