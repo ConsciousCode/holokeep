@@ -200,6 +200,29 @@ impl Inodes {
         }
     }
 
+    /// The inode number of the directory an inode's in, as `..` lists it:
+    /// where it was reached through, or for a path of an anchor, the path
+    /// above it, or where the anchor's mounted. The top's is itself.
+    fn parent(&mut self, ino: u64) -> u64 {
+        match self.get(ino) {
+            None | Some(Inode::Root | Inode::Cids | Inode::Anchors | Inode::Tags) => ROOT,
+            Some(Inode::Tag(_)) => 4,
+            Some(Inode::Loose(_)) => 3,
+            Some(Inode::Node(_, via)) => via.map_or(2, |(dir, _)| dir),
+            Some(Inode::Path(anchor, rel, via)) => match rel.parent() {
+                Some(above) if !rel.as_os_str().is_empty() && !above.as_os_str().is_empty() => self.of(Inode::Path(anchor, above.to_path_buf(), via)),
+                // The anchor's top level, or what's right under it at the
+                // top, where the root anchor is
+                Some(_) | None => match (rel.as_os_str().is_empty(), via) {
+                    (false, Some((ROOT, name))) if name.is_empty() => ROOT,
+                    (false, via) => self.of(Inode::Path(anchor, PathBuf::new(), via)),
+                    (true, Some((dir, _))) => dir,
+                    (true, None) => 3,
+                },
+            },
+        }
+    }
+
     fn key(inode: &Inode) -> Vec<u8> {
         match inode {
             Inode::Tag(tag) => [b"t".as_slice(), &tag.to_bytes()].concat(),
@@ -1265,7 +1288,8 @@ impl Filesystem for Soup {
             reply.error(Errno::EBADF);
             return;
         };
-        let dots = [(b".".to_vec(), ino.0, FileType::Directory), (b"..".to_vec(), ino.0, FileType::Directory)];
+        let parent = self.inodes().parent(ino.0);
+        let dots = [(b".".to_vec(), ino.0, FileType::Directory), (b"..".to_vec(), parent, FileType::Directory)];
         for (i, (name, child, kind)) in dots.iter().chain(entries.iter()).enumerate().skip(usize::try_from(offset).unwrap_or(usize::MAX)) {
             if reply.add(INodeNo(*child), u64::try_from(i).unwrap_or(u64::MAX).saturating_add(1), *kind, OsStr::from_bytes(name)) {
                 break;
@@ -1455,6 +1479,41 @@ mod tests {
         let opened = repo.clone();
         let soup = Soup::new(Box::new(move || Catalog::open_repo(&opened)), None).writable(repo.join("work"));
         (soup, anchor, repo)
+    }
+
+    #[test]
+    fn dot_dot_is_the_directory_each_is_in() {
+        let scratch = Scratch::new("mount-dotdot");
+        let (soup, anchor, repo) = writable(&scratch);
+        // Another anchor, mounting the first as `m`
+        let outer_tree = scratch.path().join("outer");
+        std::fs::create_dir_all(&outer_tree).expect("mkdir");
+        std::os::unix::fs::symlink(format!("/anchors/{anchor}"), outer_tree.join("m")).expect("symlink");
+        let mut catalog = Catalog::open_repo(&repo).expect("catalog");
+        let importer = Importer { hidden: true, ..Importer::default() };
+        let value = AnyCid::V1(importer.add_path(&outer_tree, &mut catalog, &mut |_, _| {}).expect("import").expect("root").cid);
+        let outer = catalog.new_anchor().expect("anchor");
+        catalog.set_anchor(&outer, &value).expect("set");
+        drop(catalog);
+        let parent = |path: &str| {
+            let at = ino(&soup, path).expect("path").ino.0;
+            soup.inodes().parent(at)
+        };
+        let at = |path: &str| ino(&soup, path).expect("path").ino.0;
+
+        let top = format!("anchors/{anchor}");
+        assert_eq!(parent(&format!("{top}/dir/deep")), at(&format!("{top}/dir")));
+        assert_eq!(parent(&format!("{top}/dir")), at(&top));
+        assert_eq!(parent(&top), at("anchors"));
+        assert_eq!(parent("anchors"), ROOT);
+        let top_parent = soup.inodes().parent(ROOT);
+        assert_eq!(top_parent, ROOT);
+        // Through a mount point, what's in it is in it, and it's in its directory
+        let mounted = format!("anchors/{outer}/m");
+        assert_eq!(parent(&format!("{mounted}/dir/deep")), at(&format!("{mounted}/dir")));
+        assert_eq!(parent(&format!("{mounted}/dir")), at(&mounted));
+        assert_eq!(parent(&mounted), at(&format!("anchors/{outer}")));
+        assert_ne!(at(&format!("{mounted}/dir")), at(&format!("{top}/dir")), "one directory for each place it's reached");
     }
 
     /// What the anchor is now, imported from scratch for comparing.
