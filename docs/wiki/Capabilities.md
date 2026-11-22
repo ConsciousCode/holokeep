@@ -384,9 +384,9 @@ acting for the vault, doesn't.
   `/anchor/write` on the plaintext anchor, as a visitor (see
   [[Mesh#Visitors]]), so what it writes can count in the owner's view.
   It prints the write capability.
-- `hk cap write <capability> <root> -o <car>` reads the latest head,
-  from CARs or at a holder's door, as `hk cap import` does, and writes
-  `root`, a tree in the writer's repo, after it:
+- `hk cap write <capability> <root>` reads the latest head, from CARs
+  or at a holder's door, as `hk cap import` does, and writes `root`, a
+  tree in the writer's repo, after it:
   - The tree is sealed whole. Sealing is deterministic, so what's
     unchanged seals as it was. Each mount point it read is sealed as it
     was, by the plaintext anchor its symlink names; one it didn't read
@@ -398,7 +398,9 @@ acting for the vault, doesn't.
     writer's catalog beside the sign, which is on the writer's chain.
   - The head's set in the sealed view is after the head read, signed by
     the writer key.
-  - Sealed blocks, head block, set and sign go to the CAR.
+  - Sealed blocks, head block, set and sign go to the first of the
+    doors (`--from`, or those the capability says) that takes them (see
+    [[#Doors]]), or with `-o <car>`, to a CAR.
 - **Taking in.** The owner's node, as it keeps what's published
   current, and `hk cap take <car>...`, which puts a writer's CARs in
   the repo first, take in each set that counts in a sealed view the
@@ -421,7 +423,6 @@ acting for the vault, doesn't.
     same, goes in the vault's manifest; and it publishes again when the
     plaintext sets the latest head says it's of aren't the anchor's
     heads, even if the value is the same.
-- Pushing a write to a holder's door comes next (4c).
 - `hk cap import` and `hk cap write` read several CARs as one, as a
   reader of what's published and a writer's CAR beside it needs.
 
@@ -483,6 +484,7 @@ Requests are serde CBOR:
 |---|---|
 | `{Heads: {view: CID bytes, at: uint, proof: bytes}}` | The sets of the sealed view's anchor, their signs, and the head blocks they set it to. |
 | `{Blocks: {wanted: [[CID bytes, proof]], at: uint}}` | Each block whose proof holds, to about 4 MiB; the rest are asked again. |
+| `{Write: {view: CID bytes, set: bytes, sign: bytes, blocks: [[CID bytes, data]], last: bool}}` | `[[view, empty]]` if it's taken; nothing if not. |
 
 The answer is `{blocks: [[CID bytes, data]]}`, nothing for what isn't
 proved or held. A proof is that of [[Protected Meshes#Block access
@@ -501,6 +503,19 @@ clock:
 
 A reader checks every block it's given against its CID, and judges the
 heads as it would from anywhere (see [[#Publishing, as it is now]]).
+
+**Writes** are taken from whoever sends a head's set and its sign that
+the claims the door holds of the sealed view judge one a writer may
+make: of the sealed anchor, signed by `K` or a key `K` lets write (see
+[[#Writers' grants]]). A door holding nothing of the view takes
+nothing. Requests are at most 1 MiB, so a writer sends its blocks about
+768 KiB at a time, the set and sign with each, which the door checks
+each time, keeping no state between them. Each block's checked against
+its CID and put in the repo; with the last, the set and sign too, so
+they're only there once all else is, and what takes them in finds them
+whole. The owner's node takes them in as it keeps what's published
+current (see [[#Writing, as it is now]]). Any other holder keeps them
+only as any block it's given and doesn't keep, till they're collected.
 
 ## Judging a sealed view
 
@@ -638,8 +653,8 @@ In order, each of use alone:
    and capabilities on mounted anchors.
 4. **Writing.** Begun: the owner's machines write with writer keys `K`
    lets write, judged by `K`'s grants alone; write capabilities write
-   heads to a CAR; and the owner's machines take them in. To come:
-   pushing writes to doors, merging several heads on reading
+   heads to a door or a CAR; and the owner's machines take them in. To
+   come: merging several heads on reading
    and writing, and taking write away.
 5. **Revoking read.** New read keys, `keys` and `past`, sealed boxes for
    read grants, and sealing everything again when asked.

@@ -97,3 +97,42 @@ fn rand_port() -> u64 {
     getrandom::getrandom(&mut bytes).expect("random");
     u64::from(u32::from_le_bytes(bytes)) | 1 << 40
 }
+
+#[test]
+fn the_door_takes_a_write_only_from_a_writer_the_owner_key_let_write() {
+    use crate::cap::{self, Capability};
+    let scratch = crate::testutil::Scratch::new("door-write");
+    let (mut catalog, published, live, _) = published(scratch.path());
+    let vault = crate::vault::Vault::open(scratch.path(), catalog.uid()).expect("vault");
+    let seed = cap::add_writer(&mut catalog, &vault, &published).expect("writer");
+    let Capability::Write(write) = published.write_capability(seed, None) else {
+        panic!("not a write capability");
+    };
+    let base = cap::read(&catalog, &write.live, &|_| Vec::new()).expect("read").base.expect("base");
+    // The writer edits in a repo of its own
+    let mut theirs = Catalog::open_repo(&scratch.path().join("theirs")).expect("catalog");
+    let files = scratch.path().join("files");
+    std::fs::write(files.join("b.md"), "written through the door").expect("write");
+    let edited = AnyCid::V1(crate::import::Importer::default().add_path(&files, &mut theirs, &mut |_, _| {}).expect("import").expect("root").cid);
+    let asked = |written: &cap::Written| Asked::Write {
+        view: ByteBuf::from(live.view.to_bytes()),
+        set: ByteBuf::from(written.set.data().to_vec()),
+        sign: ByteBuf::from(written.sign.data().to_vec()),
+        blocks: written.blocks.iter().map(|block| (ByteBuf::from(AnyCid::V1(block.cid().clone()).to_bytes()), ByteBuf::from(block.data().to_vec()))).collect(),
+        last: true,
+    };
+    let peer = PeerId::random();
+
+    // A key the owner key never let write is turned away, and nothing's kept
+    let forged = cap::Write::new(live.clone(), cap::fresh_key().expect("key"), published.of.clone(), None);
+    let forgery = cap::write(&mut theirs, &forged, &base, &edited).expect("write");
+    assert!(answer(&catalog, &peer, asked(&forgery), 1).expect("answer").blocks.is_empty());
+    assert!(catalog.get_block(&forgery.set_cid()).expect("get").is_none());
+
+    // The writer's taken, and its owner takes it in
+    let written = cap::write(&mut theirs, &write, &base, &edited).expect("write");
+    assert!(!answer(&catalog, &peer, asked(&written), 1).expect("answer").blocks.is_empty());
+    let taken = cap::take_in(&mut catalog, &vault).expect("take in");
+    assert_eq!(taken.len(), 1);
+    assert_eq!(catalog.anchor_value(&published.of).expect("value"), Some(edited));
+}

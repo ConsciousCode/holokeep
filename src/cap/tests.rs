@@ -584,7 +584,7 @@ fn a_write_capability_writes_a_head_its_readers_read_carrying_the_plaintext_set(
     let edited = import(&mut theirs, t.path(), &importer());
     let base = reading.base.expect("a base");
     let written = write(&mut theirs, &write_cap, &base, &edited).expect("write");
-    for block in written.blocks.clone() {
+    for block in written.all() {
         held.insert(block);
     }
 
@@ -594,7 +594,7 @@ fn a_write_capability_writes_a_head_its_readers_read_carrying_the_plaintext_set(
     };
     let after = read(&held, &live, &|_| Vec::new()).expect("read");
     assert_eq!(after.plain, edited);
-    assert_eq!(after.base.as_ref().map(|base| &base.set), Some(&written.set));
+    assert_eq!(after.base.as_ref().map(|base| &base.set), Some(&written.set_cid()));
     // Its head carries the plaintext set, after the owner's, for the owner's view, signed by the writer
     let block = after.base.expect("base").block;
     let Some(crate::claim::Claim::Set(inner)) = block.set.as_deref().and_then(crate::claim::Claim::parse) else {
@@ -609,7 +609,7 @@ fn a_write_capability_writes_a_head_its_readers_read_carrying_the_plaintext_set(
 
     // The owner takes it in, once: the plaintext anchor is what was written,
     // after what it was, and it's published again as that
-    for block in &written.blocks {
+    for block in &written.all() {
         catalog.put_block(block, crate::cid::CidVersion::V1).expect("put");
     }
     let taken = take_in(&mut catalog, &vault).expect("take in");
@@ -628,7 +628,7 @@ fn a_write_capability_writes_a_head_its_readers_read_carrying_the_plaintext_set(
     std::fs::write(t.path().join("docs/readme.md"), "forged").expect("write");
     let forgery = import(&mut theirs, t.path(), &importer());
     let stranger = write(&mut theirs, &forged, &base, &forgery).expect("write");
-    for block in stranger.blocks {
+    for block in stranger.all() {
         held.insert(block);
     }
     assert_eq!(read(&held, &live, &|_| Vec::new()).expect("read").plain, edited);

@@ -935,6 +935,31 @@ fn counting_among<'a>(gathered: &Gathered<'a>, owner: &Link, anchor: &Link, trus
     }).collect())
 }
 
+/// Whether a set of a sealed view, with a sign of it, is one a writer may
+/// make, as the claims a catalog holds of the view judge it.
+///
+/// The set must be of the sealed anchor, for no other view, and the sign,
+/// verifying, by its owner key or a key it's let write. False if the
+/// catalog holds nothing of the view, as a holder that isn't one.
+pub fn may_write(catalog: &crate::store::Catalog, view: &Link, set: &[u8], sign: &[u8]) -> Result<bool> {
+    let (anchor, owner) = crate::claim::viewed(view).ok_or_else(|| invalid("not a sealed view"))?;
+    let claims = claims_about(catalog, view)?;
+    if claims.is_empty() {
+        return Ok(false);
+    }
+    let mut gathered = Gathered::default();
+    for (_, data) in &claims {
+        gathered.add(&anchor, data);
+    }
+    let Some(cid) = gathered.add(&anchor, set) else {
+        return Ok(false);
+    };
+    gathered.add(&anchor, sign);
+    let sets: BTreeMap<Vec<u8>, crate::claim::Set> = gathered.sets.iter().map(|(cid, (set, _))| (cid.clone(), set.clone())).collect();
+    let judge = Judge::of(&owner, &anchor, gathered.signed_grants(), &sets)?;
+    Ok(gathered.signs.get(&cid).is_some_and(|signs| signs.iter().any(|(by, data)| *data == sign && judge.counts(&cid, by))))
+}
+
 /// What a writer's head took in carried: the plaintext anchor, and the
 /// plaintext set, now here.
 pub struct Taken {
@@ -986,7 +1011,15 @@ pub fn take_in(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vault)
             if catalog.claims().map(|claims| claims.signed_by(&inner_cid, signed.by())).transpose()?.unwrap_or(false) {
                 continue;
             }
-            let blocks = unseal(catalog, &Snapshot::new(head.root.clone(), head.plain.clone(), Zeroizing::new(*published.read)))?;
+            // Not all here yet, as while it's still arriving: next time
+            let blocks = match unseal(catalog, &Snapshot::new(head.root.clone(), head.plain.clone(), Zeroizing::new(*published.read))) {
+                Ok(blocks) => blocks,
+                Err(Error::Store(e)) if e.is_busy() => return Err(Error::Store(e)),
+                Err(e) => {
+                    eprintln!("what a writer wrote of {anchor} can't be taken in yet: {e}");
+                    continue;
+                },
+            };
             let prev: Vec<Link> = said.prev().unwrap_or_default().iter().cloned().chain([inner_cid.clone()]).collect();
             let value = said.value().clone();
             catalog.batch(|catalog| {
@@ -1184,11 +1217,24 @@ pub fn add_writer(catalog: &mut crate::store::Catalog, vault: &crate::vault::Vau
     Ok(seed)
 }
 
-/// A head a capability's writer made: every block of it, sealed tree,
-/// head block, set and signs, and its set.
+/// A head a capability's writer made: its sealed tree and head block,
+/// its set, and the writer's sign of that.
 pub struct Written {
     pub blocks: Vec<Block>,
-    pub set: Link,
+    pub set: Block,
+    pub sign: Block,
+}
+
+impl Written {
+    /// Its set's CID.
+    pub fn set_cid(&self) -> Link {
+        AnyCid::V1(self.set.cid().clone())
+    }
+
+    /// Every block of it.
+    pub fn all(&self) -> Vec<Block> {
+        self.blocks.iter().chain([&self.set, &self.sign]).cloned().collect()
+    }
 }
 
 /// Write a sealed anchor with a write capability: `value`, a plaintext
@@ -1223,8 +1269,8 @@ pub fn write(catalog: &mut crate::store::Catalog, cap: &Write, base: &Base, valu
     catalog.put_block(&set.block(), crate::cid::CidVersion::V1)?;
     let sign = catalog.sign_with_key(&writer, [set.cid()])?.ok_or_else(|| invalid("the head's signed already"))?;
     let mut blocks = sealed.blocks;
-    blocks.extend([head, set.block(), block_here(catalog, &sign)?]);
-    Ok(Written { blocks, set: set.cid() })
+    blocks.push(head);
+    Ok(Written { blocks, set: set.block(), sign: block_here(catalog, &sign)? })
 }
 
 /// Publish what an anchor is now, and what's mounted in it.

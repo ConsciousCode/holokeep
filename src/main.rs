@@ -537,20 +537,20 @@ enum CapCommand {
         car: Vec<PathBuf>,
     },
     /// Write a sealed anchor with a write capability: a tree here, after
-    /// its latest head, read from a CAR or at a holder's door. Write what's
-    /// sealed of it, the head, and the writer's signs to a `CARv1`, for a
-    /// holder of the anchor to take in
+    /// its latest head, read from a CAR or at a holder's door. What's sealed
+    /// of it, the head, and the writer's signs go to the first door that
+    /// takes them, for the owner's node to take in, or to a `CARv1`
     Write {
         capability: String,
         /// What the anchor is to be: a tree here
         root: Link,
-        /// Where to write it
+        /// Write it to a CAR, here, rather than to a holder's door
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
         /// CARs of its ciphertext, read as one, to read its latest head from
         car: Vec<PathBuf>,
-        /// A holder's door to read its latest head at [default: those the
-        /// capability says]
+        /// A holder's door to read its latest head at, and write to [default:
+        /// those the capability says]
         #[arg(long, conflicts_with = "car")]
         from: Vec<String>,
     },
@@ -2495,7 +2495,7 @@ fn cap(repo: Option<PathBuf>, command: CapCommand) -> anyhow::Result<()> {
             Ok(())
         },
         CapCommand::Take { car } => cap_take(repo, &car),
-        CapCommand::Write { capability, root, output, car, from } => cap_write(repo, &capability, &root, &output, &car, from),
+        CapCommand::Write { capability, root, output, car, from } => cap_write(repo, &capability, &root, output.as_deref(), &car, from),
     }
 }
 
@@ -2516,6 +2516,29 @@ fn grant_plaintext_write(dir: &Path, repo: &Catalog, anchor: &Link, writer: &Lin
 #[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn, reason = "the same as with networking, which can fail")]
 fn grant_plaintext_write(_: &Path, _: &Catalog, _: &Link, _: &Link) -> anyhow::Result<()> {
     Ok(())
+}
+
+/// Write a head a writer wrote at the first holder's door that takes it.
+#[cfg(feature = "net")]
+fn write_at_doors(live: &holokeep::cap::Live, written: &holokeep::cap::Written, doors: Vec<String>) -> anyhow::Result<()> {
+    anyhow::ensure!(!doors.is_empty(), "say where to write it: a holder's door with --from, or a CAR with -o");
+    let mut errors = Vec::new();
+    for door in doors {
+        let write = || -> anyhow::Result<()> {
+            let reader = holokeep::net::door::Reader::connect(&door.parse().context("not a multiaddr")?)?;
+            Ok(reader.write(&live.view, &written.set, &written.sign, &written.blocks)?)
+        };
+        match write() {
+            Ok(()) => return Ok(()),
+            Err(e) => errors.push(format!("{door}: {e}")),
+        }
+    }
+    anyhow::bail!("no door took it: {}", errors.join("; "))
+}
+
+#[cfg(not(feature = "net"))]
+fn write_at_doors(_: &holokeep::cap::Live, _: &holokeep::cap::Written, _: Vec<String>) -> anyhow::Result<()> {
+    anyhow::bail!("this hk writes to a CAR alone: it's built without networking")
 }
 
 /// Every block of some CARs, held as one.
@@ -2553,7 +2576,7 @@ fn cap_take(repo: Option<PathBuf>, car: &[PathBuf]) -> anyhow::Result<()> {
 
 /// `hk cap write`: write a sealed anchor with a write capability, after
 /// its latest head, read from a CAR or at holders' doors, into a CAR.
-fn cap_write(repo: Option<PathBuf>, capability: &str, root: &Link, output: &Path, car: &[PathBuf], from: Vec<String>) -> anyhow::Result<()> {
+fn cap_write(repo: Option<PathBuf>, capability: &str, root: &Link, output: Option<&Path>, car: &[PathBuf], from: Vec<String>) -> anyhow::Result<()> {
     use holokeep::cap::{self, Capability};
     let capability = Capability::decode(capability)?;
     let Capability::Write(write) = &capability else {
@@ -2563,19 +2586,25 @@ fn cap_write(repo: Option<PathBuf>, capability: &str, root: &Link, output: &Path
     let mut repo = open_repo(Some(dir.clone()))?;
     let uid = repo.uid();
     let remembered = |view: &Link| cap::Remembered::of(&dir, uid, view).claims().unwrap_or_default();
+    let doors = if from.is_empty() { write.live.at.clone() } else { from };
     let reading = if car.is_empty() {
-        read_at_doors(&capability, from, &remembered)?
+        read_at_doors(&capability, doors.clone(), &remembered)?
     } else {
         cap::read(&held_of(car)?, &write.live, &remembered)?
     };
     let base = reading.base.context("nothing to write after")?;
     let written = cap::write(&mut repo, write, &base, root)?;
-    let parent = output.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let mut file = io::BufWriter::new(tempfile::NamedTempFile::new_in(parent)?);
-    car::write_blocks(&mut file, std::slice::from_ref(&written.set), &written.blocks)?;
-    file.into_inner().map_err(io::IntoInnerError::into_error)?.persist(output)?;
-    eprintln!("wrote {} as {root}, after the head {}: {} blocks", write.of, base.set, written.blocks.len());
-    out!("{}", written.set);
+    match output {
+        Some(output) => {
+            let parent = output.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+            let mut file = io::BufWriter::new(tempfile::NamedTempFile::new_in(parent)?);
+            car::write_blocks(&mut file, &[written.set_cid()], &written.all())?;
+            file.into_inner().map_err(io::IntoInnerError::into_error)?.persist(output)?;
+        },
+        None => write_at_doors(&write.live, &written, doors)?,
+    }
+    eprintln!("wrote {} as {root}, after the head {}: {} blocks", write.of, base.set, written.blocks.len().saturating_add(2));
+    out!("{}", written.set_cid());
     Ok(())
 }
 

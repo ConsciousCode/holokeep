@@ -1,5 +1,5 @@
 //! The door: where someone outside a holder's meshes reads a sealed
-//! anchor it holds, by capability: `/holokeep/cap/1.0.0`.
+//! anchor it holds, or writes it, by capability: `/holokeep/cap/1.0.0`.
 //!
 //! It's a swarm of its own, apart from the member's (`hk node run
 //! --door`), with no private network, letting in anyone, who may ask this
@@ -14,6 +14,12 @@
 //!   held.
 //! - **Blocks.** Sealed blocks, each to one who proves they know its
 //!   token, checked against the token the block carries in the clear.
+//! - **Writes.** A head a capability's writer wrote, its blocks in as
+//!   many requests as they take, each with the head's set and the
+//!   writer's sign of it, which the claims held of the sealed view must
+//!   judge one a writer may make (see `cap::may_write`). The set and sign
+//!   are kept with the last, once all else is here, for the owner's node
+//!   to take in.
 //!
 //! A proof is `vault::prove` of the token, over the CID asked for (the
 //! sealed view, for heads), the asker's peer ID, and when, so it's no use
@@ -58,7 +64,15 @@ pub enum Asked {
     Heads { view: ByteBuf, at: u64, proof: ByteBuf },
     /// Sealed blocks, each with its proof, all as of when.
     Blocks { wanted: Vec<(ByteBuf, ByteBuf)>, at: u64 },
+    /// Some blocks of a head a writer wrote of a sealed view, by CID, with
+    /// the head's set and the writer's sign of it, which say it may; the
+    /// last of them says so, and then the set and sign are kept too.
+    Write { view: ByteBuf, set: ByteBuf, sign: ByteBuf, blocks: Vec<(ByteBuf, ByteBuf)>, last: bool },
 }
+
+/// The most block bytes a writer sends at once, under the most a request
+/// may be.
+const WRITE_BUDGET: usize = 768 << 10;
 
 /// What the door says: blocks, by CID. Nothing, for what isn't proved or
 /// isn't here.
@@ -119,6 +133,28 @@ pub fn answer(catalog: &Catalog, who: &PeerId, question: Asked, now: u64) -> Res
                 size = size.saturating_add(block.len());
                 told.blocks.push((cid, ByteBuf::from(block.into_data().into_vec())));
             }
+        },
+        Asked::Write { view, set, sign, blocks, last } => {
+            let Ok(view) = Link::decode(&view) else {
+                return Ok(told);
+            };
+            if !crate::cap::may_write(catalog, &view, &set, &sign).map_err(|e| Error::Invalid(e.to_string()))? {
+                return Ok(told);
+            }
+            let mut put = Vec::with_capacity(blocks.len().saturating_add(2));
+            for (cid, data) in blocks {
+                let block = Link::decode(&cid).ok().and_then(|link| crate::block::Block::verify(link.into(), data.into_vec().into_boxed_slice()).ok());
+                put.push(block.ok_or_else(|| Error::Invalid("a block that isn't its CID's".into()))?);
+            }
+            // The set and sign last, once all else is here: what takes it in
+            // looks for them
+            if last {
+                put.extend([&set, &sign].into_iter().filter_map(|data| crate::claim::Claim::parse(data)).map(|claim| claim.block()));
+            }
+            for block in &put {
+                catalog.put_block(block, crate::cid::CidVersion::V1)?;
+            }
+            told.blocks.push((ByteBuf::from(view.to_bytes()), ByteBuf::new()));
         },
     }
     Ok(told)
@@ -256,6 +292,49 @@ impl Reader {
     }
 
     fn ask(&self, asked: Asked) -> Result<Vec<(Link, Vec<u8>)>> {
+        let told = self.told(asked)?;
+        // Each checked against its CID: a door may be wrong, or lie
+        Ok(told.blocks.into_iter().filter_map(|(cid, data)| {
+            let link = Link::decode(&cid).ok()?;
+            crate::block::Block::verify(link.clone().into(), data.into_vec().into_boxed_slice()).ok().map(|block| (link, block.into_data().into_vec()))
+        }).collect())
+    }
+
+    /// Write a head a writer wrote of a sealed view: its blocks, in as
+    /// many requests as it takes, the set and sign with each, which say it
+    /// may, and the head block among the last.
+    pub fn write(&self, view: &Link, set: &crate::block::Block, sign: &crate::block::Block, blocks: &[crate::block::Block]) -> Result<()> {
+        let mut batches: Vec<Vec<(ByteBuf, ByteBuf)>> = vec![Vec::new()];
+        let mut size = 0usize;
+        for block in blocks {
+            let len = block.data().len();
+            if size.saturating_add(len) > WRITE_BUDGET && batches.last().is_some_and(|batch| !batch.is_empty()) {
+                batches.push(Vec::new());
+                size = 0;
+            }
+            size = size.saturating_add(len);
+            if let Some(batch) = batches.last_mut() {
+                batch.push((ByteBuf::from(crate::cid::AnyCid::V1(block.cid().clone()).to_bytes()), ByteBuf::from(block.data().to_vec())));
+            }
+        }
+        let n = batches.len();
+        for (i, blocks) in batches.into_iter().enumerate() {
+            let asked = Asked::Write {
+                view: ByteBuf::from(view.to_bytes()),
+                set: ByteBuf::from(set.data().to_vec()),
+                sign: ByteBuf::from(sign.data().to_vec()),
+                blocks,
+                last: i.saturating_add(1) == n,
+            };
+            if self.told(asked)?.blocks.is_empty() {
+                return Err(Error::Invalid("the door won't take it: it doesn't hold the anchor, or the capability's write was taken away".into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// What the door tells, as it tells it.
+    fn told(&self, asked: Asked) -> Result<Told> {
         let mut swarm = self.swarm.borrow_mut();
         let door = self.door;
         let told = self.runtime.block_on(async {
@@ -269,11 +348,7 @@ impl Reader {
                 }
             }
         })?;
-        // Each checked against its CID: a door may be wrong, or lie
-        Ok(told.blocks.into_iter().filter_map(|(cid, data)| {
-            let link = Link::decode(&cid).ok()?;
-            crate::block::Block::verify(link.clone().into(), data.into_vec().into_boxed_slice()).ok().map(|block| (link, block.into_data().into_vec()))
-        }).collect())
+        Ok(told)
     }
 
     /// The claims the door holds of a sealed anchor, and the heads they

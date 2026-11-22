@@ -559,6 +559,11 @@ scenario_door() {
     # A writer outside: reads at the door, writes to a CAR, which one takes in
     local wcap written
     wcap=$(on one hk cap grant "$anchor" --at "/ip4/$one_ip/tcp/4013/p2p/$one_peer" 2>/dev/null) || fail "one couldn't let a writer write"
+    written=$(sh_on outsider 'echo "written at the door" | hk add -q -')
+    on outsider hk cap write "$wcap" "$written" >/dev/null 2>&1 || fail "the outsider couldn't write at the door"
+    wait_for "one's node to take in what the outsider wrote at the door" sh_on one "hk anchor show $anchor | tail -1 | grep -q '	$written\$'"
+    wait_for "the outsider to read what it wrote at the door" sh_on outsider "test \"\$(hk cap import '$cap' 2>/dev/null)\" = 'root $written'"
+    # And again by CAR, which one takes in itself
     written=$(sh_on outsider 'echo "written from outside" | hk add -q -')
     on outsider hk cap write "$wcap" "$written" -o /tmp/written.car >/dev/null 2>&1 || fail "the outsider couldn't write"
     on outsider cat /tmp/written.car | podman exec -i "$run-one" sh -c 'cat > /tmp/written.car' || fail "couldn't give one the CAR"
