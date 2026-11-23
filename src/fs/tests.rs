@@ -138,3 +138,69 @@ fn mountinfo_paths_are_unescaped() {
     assert_eq!(unescape(r"/plain"), PathBuf::from("/plain"));
     assert_eq!(unescape(r"/odd\0"), PathBuf::from(r"/odd\0"));
 }
+
+/// Write a file into an anchor's value at a path, in a set after these
+/// of its sets (every head, if none are said): returning the set and
+/// what the file is.
+fn put(catalog: &mut Catalog, scratch: &Scratch, anchor: &Link, rel: &str, data: &str, after: Option<Vec<Link>>) -> (Link, Link) {
+    let file = scratch.path().join("put");
+    write(&file, data);
+    let cid = add(catalog, &file);
+    let base = after.as_ref().map_or_else(
+        || catalog.anchor_value(anchor).expect("value"),
+        |after| after.first().map(|set| catalog.sets_of(anchor).expect("sets").into_iter().find(|(s, ..)| s == set).expect("set").1),
+    );
+    let value = catalog.edit_value(base, &Marks::from([(PathBuf::from(rel), Some((cid.clone(), u64::try_from(data.len()).expect("len"))))])).expect("edit");
+    let set = after.map_or_else(|| catalog.set_anchor(anchor, &value), |after| catalog.set_anchor_after(anchor, &value, after));
+    (set.expect("set"), cid)
+}
+
+fn changes(versions: &[Version]) -> Vec<(Change, Option<Link>)> {
+    versions.iter().map(|version| (version.change, if let Was::There(cid, _) = &version.was { Some(cid.clone()) } else { None })).collect()
+}
+
+#[test]
+fn a_paths_log_is_the_sets_that_changed_it_whatever_else_they_changed() {
+    let scratch = Scratch::new("fs-log");
+    let (mut catalog, vault, _) = soup(&scratch);
+    let first = locate(&catalog, Path::new("/vault/notes/a.md")).expect("locate").at;
+    let (_, second) = put(&mut catalog, &scratch, &vault, "notes/a.md", "a2", None);
+    put(&mut catalog, &scratch, &vault, "notes/b.md", "b2", None);
+    let a = locate(&catalog, Path::new("/vault/notes/a.md")).expect("locate");
+    remove(&mut catalog, &[a]).expect("remove");
+    // Gone, it's still logged, by its directory
+    assert_eq!(logged(&catalog, Path::new("/vault/notes/a.md")).expect("logged"), (vault.clone(), PathBuf::from("notes/a.md")));
+    let (_, third) = put(&mut catalog, &scratch, &vault, "notes/a.md", "a3", None);
+
+    let (anchor, rel) = logged(&catalog, Path::new("/vault/notes/a.md")).expect("logged");
+    let versions = log(&catalog, &anchor, &rel).expect("log");
+    assert_eq!(changes(&versions), [(Change::Added, first), (Change::Changed, Some(second)), (Change::Removed, None), (Change::Added, Some(third))]);
+    assert!(versions.windows(2).all(|pair| pair.first().map(|v| v.at) < pair.get(1).map(|v| v.at)), "oldest first");
+    assert_eq!(versions.iter().map(|version| version.head).collect::<Vec<_>>(), [false, false, false, true]);
+
+    // A mount point's is its anchor's, every set that changed it at all
+    let (anchor, rel) = logged(&catalog, Path::new("/vault")).expect("logged");
+    assert_eq!((&anchor, rel.as_os_str().is_empty()), (&vault, true));
+    assert_eq!(log(&catalog, &anchor, &rel).expect("log").len(), 5);
+    assert!(log(&catalog, &vault, Path::new("notes/never.md")).expect("log").is_empty());
+}
+
+#[test]
+fn a_fork_logs_each_side_that_changed_it_and_not_the_merge_taking_one() {
+    let scratch = Scratch::new("fs-log-fork");
+    let (mut catalog, vault, _) = soup(&scratch);
+    let base: Vec<Link> = catalog.anchor_heads(&vault).expect("heads").into_iter().map(|(set, ..)| set).collect();
+    let (ours, a) = put(&mut catalog, &scratch, &vault, "notes/a.md", "ours", Some(base.clone()));
+    let (theirs, _) = put(&mut catalog, &scratch, &vault, "notes/b.md", "theirs", Some(base));
+    assert_eq!(catalog.anchor_heads(&vault).expect("heads").len(), 2, "forked");
+    let versions = log(&catalog, &vault, Path::new("notes/a.md")).expect("log");
+    assert_eq!(versions.iter().map(|version| (&version.set, version.head)).collect::<Vec<_>>(), [(&versions.first().expect("first").set, false), (&ours, true)]);
+    assert!(versions.iter().all(|version| version.set != theirs), "their side left it be");
+
+    // Setting what the merge is, a.md as ours had it, changes nothing of it
+    let merged = catalog.anchor_value(&vault).expect("value");
+    let merge = catalog.set_anchor(&vault, merged.as_ref().expect("merged")).expect("set");
+    let versions = log(&catalog, &vault, Path::new("notes/a.md")).expect("log");
+    assert_eq!(changes(&versions).last(), Some(&(Change::Changed, Some(a))));
+    assert!(versions.iter().all(|version| version.set != merge && !version.head));
+}

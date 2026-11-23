@@ -529,6 +529,12 @@ enum FsCommand {
     /// Make what's at a path an anchor of its own, mounted where it was,
     /// so it's versioned, kept and shared on its own; print the anchor
     Anchor { path: PathBuf },
+    /// List each version of what's at a path, oldest first: each set of
+    /// the anchor naming it that changed it, when, by whom, and what it
+    /// was then, which `hk cat` reads. A mount point's is its anchor's
+    /// whole history. A file moved within the anchor is a removal and an
+    /// addition
+    Log { path: PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2592,6 +2598,28 @@ fn soup_fs(repo: Option<PathBuf>, command: FsCommand) -> anyhow::Result<()> {
         FsCommand::Anchor { path } => {
             let located = locate(&repo, &path)?;
             out!("{}", fs::promote(&mut repo, &located)?);
+        },
+        FsCommand::Log { path } => {
+            let (anchor, rel) = fs::logged(&repo, &fs::soup_path(&path))?;
+            out!("anchor\t{anchor}");
+            if !rel.as_os_str().is_empty() {
+                out!("in\t{}", rel.display());
+            }
+            let versions = fs::log(&repo, &anchor, &rel)?;
+            let now = health::now();
+            for version in &versions {
+                let (cid, size) = match &version.was {
+                    fs::Was::There(cid, size) => (cid.to_string(), size.map_or_else(|| "-".to_owned(), health::bytes)),
+                    fs::Was::Absent | fs::Was::NotHere => ("-".to_owned(), "-".to_owned()),
+                };
+                let by: Vec<String> = version.by.iter().map(holokeep::keys::peer_id).collect();
+                let by = if by.is_empty() { "unsigned".to_owned() } else { by.join(",") };
+                let at = i64::try_from(version.at).unwrap_or(i64::MAX);
+                out!("{}\t{}\t{}\t{cid}\t{size}\tby {by}\tset {}{}", version.at, health::ago(at, now), version.change.word(), version.set, if version.head { "\thead" } else { "" });
+            }
+            if versions.is_empty() {
+                eprintln!("no version of it: nothing's been there");
+            }
         },
     }
     Ok(())

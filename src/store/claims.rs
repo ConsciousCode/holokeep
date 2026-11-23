@@ -963,6 +963,18 @@ impl ClaimStore {
             .exists([claim.multihash().to_bytes(), key.multihash().to_bytes()])?)
     }
 
+    /// The keys that have signed a claim, by the claim's CID.
+    pub fn signers(&self, claim: &Link) -> Result<Vec<Link>> {
+        let keys: Vec<Vec<u8>> = self.db.conn()
+            .prepare_cached(
+                "SELECT DISTINCT b.multihash FROM multihashes c JOIN claim_targets st ON st.target = c.id JOIN sign_claims sg ON sg.id = st.claim
+                 JOIN multihashes b ON b.id = sg.by WHERE c.multihash = ?1 ORDER BY b.multihash",
+            )?
+            .query_map([claim.multihash().to_bytes()], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        keys.iter().map(|key| link(&KEY_PREFIX, key)).collect()
+    }
+
     fn sign(&self, id: Id) -> Result<crate::claim::Sign> {
         let (by, at, sig, prev): (Vec<u8>, i64, Vec<u8>, Option<Vec<u8>>) = self.db.conn()
             .prepare_cached(

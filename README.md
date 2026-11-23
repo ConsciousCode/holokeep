@@ -398,6 +398,7 @@ Checklist:
   - [x] Rules (`.souprules`, gitignore-like, per directory and at the top of the root): detaching application state (`.obsidian/`, `.git/`) into anchors of its own as it's made, a least pace, by name, path or application
   - [x] Rules for value: how many copies, by keeps that say (`hk keep add --copies`, `copies=` in rules), the nearest keep on each path deciding and the most of any path winning, for audits and trims alike
   - [x] Paths from outside the mount: what's at one, its CID, anchor and tags; unlinking a directory whole in one set, reading nothing under it; making a path an anchor of its own (`hk fs stat/rm/anchor`)
+  - [x] A path's history: each set of the anchor naming it that changed what's there, forks and all (`hk fs log`)
   - [ ] What's at a path through the mount itself, as extended attributes
   - [ ] `copies=0`: caches the mesh may drop whole under pressure
   - [ ] Detaching files, not only directories
@@ -513,6 +514,7 @@ $hk keep add --shallow <cid>...     # keep as much as can be had, short of what 
 $hk anchor new                      # an empty identity to hang claims on
 $hk anchor set <anchor> <cid>       # say what an anchor is now
 $hk anchor show <anchor>            # what it is, and its history
+$hk fs log <path>                   # each version of what's at a path, as the mount shows it
 $hk anchor root                     # this account's root anchor, the top of hk mount
 $hk keep ls                         # what's kept
 $hk tag rm <name> <cid>...          # untag blocks, with tombs

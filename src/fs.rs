@@ -19,11 +19,11 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 
-use crate::cid::CidRef as _;
+use crate::cid::{BaseCid as _, CidRef as _};
 use crate::export::{self, Kind};
 use crate::model::Link;
 use crate::store::overlay::Marks;
-use crate::store::{Catalog, Error, Result};
+use crate::store::{BlockIndex as _, Catalog, Error, Result};
 
 fn user(what: impl Into<String>) -> Error {
     Error::User(what.into())
@@ -183,6 +183,136 @@ pub fn find(catalog: &Catalog, path: &Path) -> Result<Found> {
         }
     }
     Ok(Found { anchor, rel, at: node, size: None })
+}
+
+/// What a version of an anchor has at a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Was {
+    /// Something, and the size the directory naming it says, if any.
+    There(Link, Option<u64>),
+    /// Nothing.
+    Absent,
+    /// Who knows: the version isn't here to read.
+    NotHere,
+}
+
+/// How a set changed what's at a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    Added,
+    Changed,
+    Removed,
+    /// Its version isn't here to say.
+    Unknown,
+}
+
+impl Change {
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Changed => "changed",
+            Self::Removed => "removed",
+            Self::Unknown => "not here",
+        }
+    }
+}
+
+/// A set of an anchor that changed what's at a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Version {
+    pub set: Link,
+    /// When, by the setter's clock, in seconds since the epoch.
+    pub at: u64,
+    /// The keys that signed it.
+    pub by: Vec<Link>,
+    pub change: Change,
+    pub was: Was,
+    /// Whether it's a head: what the anchor is, or among what's merged.
+    pub head: bool,
+}
+
+/// What's at a path in a value of an anchor, reading only what's here.
+fn was_at(catalog: &Catalog, value: &Link, rel: &Path) -> Was {
+    let here = |cid: &Link| cid.hashcode() == crate::block::IDENTITY || catalog.has(cid.multihash()).unwrap_or(false);
+    let (mut node, mut size) = (value.clone(), None);
+    for name in rel.components() {
+        if !here(&node) {
+            return Was::NotHere;
+        }
+        // What isn't a directory has nothing under it
+        let Some(entry) = export::list(catalog, &node).ok().and_then(|entries| entries.into_iter().find(|entry| entry.name == name.as_os_str().as_bytes())) else {
+            return Was::Absent;
+        };
+        (node, size) = (entry.cid, entry.size);
+    }
+    Was::There(node, size)
+}
+
+/// The anchor whose history a path's is, and where in its value: that
+/// of the anchor a mount point names, for one; else of the anchor naming
+/// it, as `locate` finds, or, gone, that of its directory.
+pub fn logged(catalog: &Catalog, path: &Path) -> Result<(Link, PathBuf)> {
+    let mounted = |located: &Located| -> Result<Option<Link>> { located.at.as_ref().map_or(Ok(None), |at| mount_point(catalog, at)) };
+    match locate(catalog, path) {
+        Ok(located) => Ok(match mounted(&located)? {
+            Some(anchor) => (anchor, PathBuf::new()),
+            None => (located.anchor, located.rel),
+        }),
+        Err(gone) => {
+            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                return Err(gone);
+            };
+            let Ok(dir) = locate(catalog, parent) else {
+                return Err(gone);
+            };
+            Ok(match mounted(&dir)? {
+                Some(anchor) => (anchor, PathBuf::from(name)),
+                None => (dir.anchor, dir.rel.join(name)),
+            })
+        },
+    }
+}
+
+/// The history of what's at a path of an anchor: each set of it, oldest
+/// first, that changed what's there from what it came after.
+///
+/// A set
+/// that names what it replaces (`prev`) came after those, one taking
+/// either side of a fork changing nothing, and one with nothing before
+/// it, after nothing; one of an older build, after the set before it.
+/// A version not here is listed, as it can't be compared.
+pub fn log(catalog: &Catalog, anchor: &Link, rel: &Path) -> Result<Vec<Version>> {
+    let claims = catalog.claims().ok_or(Error::NoClaims)?;
+    let heads: std::collections::HashSet<Vec<u8>> = catalog.anchor_heads(anchor)?.into_iter().map(|(set, ..)| set.to_bytes()).collect();
+    let sets = catalog.sets_of(anchor)?;
+    // What each had there, first, as a set may be listed before what it
+    // replaced, by a clock behind
+    let mut by_value: std::collections::HashMap<Vec<u8>, Was> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashMap<Vec<u8>, Was> = std::collections::HashMap::new();
+    let mut wases = Vec::with_capacity(sets.len());
+    for (set, value, ..) in &sets {
+        let was = by_value.entry(value.to_bytes()).or_insert_with(|| was_at(catalog, value, rel)).clone();
+        seen.insert(set.to_bytes(), was.clone());
+        wases.push(was);
+    }
+    let mut versions = Vec::new();
+    let mut last: Option<&Was> = None;
+    for ((set, _, at, prev), was) in sets.iter().zip(&wases) {
+        let before: Vec<&Was> = prev.as_ref().map_or_else(|| last.into_iter().collect(), |prev| prev.iter().filter_map(|set| seen.get(&set.to_bytes())).collect());
+        let change = match was {
+            Was::NotHere => Some(Change::Unknown),
+            _ if before.contains(&was) => None,
+            Was::Absent if before.is_empty() => None,
+            Was::Absent => Some(Change::Removed),
+            Was::There(..) if before.iter().all(|before| **before == Was::Absent) => Some(Change::Added),
+            Was::There(..) => Some(Change::Changed),
+        };
+        if let Some(change) = change {
+            versions.push(Version { by: claims.signers(set)?, head: heads.contains(&set.to_bytes()), set: set.clone(), at: *at, change, was: was.clone() });
+        }
+        last = Some(was);
+    }
+    Ok(versions)
 }
 
 /// Set each anchor to what it is with marks over it: one set each, of
