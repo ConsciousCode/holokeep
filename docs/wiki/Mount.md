@@ -231,6 +231,21 @@ it, as the mount would write it there.
 - `hk fs anchor <path>` makes what's at a path an anchor of its own, set
   to it, and puts a mount point to it where it was, so it's versioned,
   kept and shared on its own. It prints the new anchor.
+- `hk fs log <path>` lists each version of what's at a path, oldest
+  first: each set of the anchor naming it that changed what's there,
+  added, changed or removed, with when, the keys that signed it, what it
+  was then (a CID `hk cat` reads) and its size, marking the heads. A set
+  that changed only other names isn't listed. A set came after those it
+  names as replaced (`prev`), so one taking either side of a fork, as a
+  merge's set does, changes nothing; an older build's, after the set
+  before it. A path that's gone is logged by its directory, and a mount
+  point's log is its anchor's: every set that changed it at all. Only
+  the anchor naming the path is read, as a mount point binds a name to
+  an anchor, not to what it is, so editing a file sets only the anchor
+  it's in: what's above changes what the path means only when a mount
+  point's moved. A version that isn't here, as one never fetched or
+  collected, is listed as `not here`, and a file moved within the
+  anchor is a removal and an addition.
 
 The mount follows these as it follows any set made elsewhere (see
 [[#In step with what's set elsewhere]]): an anchor it has nothing of
