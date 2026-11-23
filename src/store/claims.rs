@@ -1245,22 +1245,45 @@ impl ClaimStore {
     /// An anchor's heads: the sets that count which no other replaces, as
     /// (set, value, at), by `at`, the value's multihash, and the set's. More than
     /// one is a fork, to be merged.
+    ///
+    /// Which count is asked once a set, and which are replaced worked out
+    /// here, as `anchor_values` says: asking the view whether each set's
+    /// replaced asks again whether each that might replace it counts.
     fn heads_here(&self, anchor: Key<'_>) -> Result<Vec<(Link, Link, u64)>> {
-        let mut stmt = self.db.conn().prepare_cached(
-            "SELECT k.multihash, a.prefix, v.multihash, a.at FROM multihashes m
-             JOIN anchor_values a ON a.anchor = m.id
-             JOIN multihashes v ON v.id = a.value
-             JOIN claim_keys ck ON ck.claim = a.claim
-             JOIN multihashes k ON k.id = ck.key
-             WHERE m.multihash = ?1
-             ORDER BY a.at, v.multihash, k.multihash",
-        )?;
-        let rows = stmt.query_map([anchor.to_bytes()], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, i64>(3)?)))?;
-        rows.map(|row| {
-            let (key, prefix, value, at) = row?;
-            Ok((claim_link(&key)?, link(&prefix, &value)?, u64::try_from(at).unwrap_or_default()))
-        })
-        .collect()
+        type Row = (Id, Id, Vec<u8>, Vec<u8>, Vec<u8>, i64, bool);
+        let counting: Vec<Row> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT c.id, ck.key, k.multihash, s.value_prefix, v.multihash, s.at, s.after FROM multihashes m
+                 JOIN claim_targets t ON t.target = m.id
+                 JOIN claims c ON c.id = t.claim
+                 JOIN set_claims s ON s.id = c.id
+                 JOIN multihashes v ON v.id = s.value
+                 JOIN claim_keys ck ON ck.claim = c.id
+                 JOIN multihashes k ON k.id = ck.key
+                 WHERE m.multihash = ?1 AND {}
+                 ORDER BY s.at, v.multihash, k.multihash",
+                here("c", "s", "t"),
+            ))?
+            .query_map([anchor.to_bytes()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let ids: std::collections::HashSet<Id> = counting.iter().map(|row| row.0).collect();
+        // What the sets that count say they replace, by the replaced's key
+        let replaced: std::collections::HashSet<Id> = self.db.conn()
+            .prepare_cached(
+                "SELECT p.claim, p.prev FROM multihashes m JOIN claim_targets t ON t.target = m.id JOIN set_prev p ON p.claim = t.claim
+                 WHERE m.multihash = ?1",
+            )?
+            .query_map([anchor.to_bytes()], |row| Ok((row.get::<_, Id>(0)?, row.get::<_, Id>(1)?)))?
+            .filter_map(|row| row.map(|(claim, prev)| ids.contains(&claim).then_some(prev)).transpose())
+            .collect::<rusqlite::Result<_>>()?;
+        // An older build's set replaces every set before it, by `at` and
+        // then the value's multihash: so whatever's before the latest
+        let latest_older = counting.iter().filter(|row| !row.6).map(|row| (row.5, &row.4)).max();
+        counting
+            .iter()
+            .filter(|row| !replaced.contains(&row.1) && latest_older.is_none_or(|latest| latest <= (row.5, &row.4)))
+            .map(|(_, _, key, prefix, value, at, _)| Ok((claim_link(key)?, link(prefix, value)?, u64::try_from(*at).unwrap_or_default())))
+            .collect()
     }
 
     /// Every set of an anchor that counts, as (set, value, at, prev), by

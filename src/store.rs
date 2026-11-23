@@ -270,18 +270,39 @@ const CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_millis(250)
 #[derive(Clone)]
 pub struct Db(Rc<Connection>);
 
+/// Before `SQLite`'s first connection: no count of all it allocates,
+/// which every allocation, on any connection, would take one lock for,
+/// so a mount's threads, each with its own, would wait on each other.
+fn configure() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: every connection's opened through `Db`, after this, so
+        // nothing else is using SQLite yet; if something did open one
+        // first, it's refused, harmlessly, as SQLite's started
+        unsafe {
+            rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0);
+        }
+    });
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
+        configure();
         Self::init(Connection::open(path)?)
     }
 
     /// A private in-memory database, for tests.
     #[cfg(test)]
     pub fn memory() -> Result<Self> {
+        configure();
         Self::init(Connection::open_in_memory()?)
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        // Plans that don't hang on what's bound: else a statement whose plan
+        // might is compiled again each time it's taken from the cache, which
+        // clears its bindings, and the claims' are big
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG, true)?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
