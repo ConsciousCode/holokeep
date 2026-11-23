@@ -61,6 +61,39 @@ tick that makes copies halves the interval (down to 2 s); a calm one
 stretches it by a quarter (up to a minute); membership changes snap it
 back. Intervals are jittered by a fifth.
 
+## Checking
+
+`hk block where <cid>…` says where each block's copies are: each copy
+here, with its volume's risks; each copy on another member, with when
+it was seen and its risks; its target and whether a keep sets it; and
+its tolerance, naming the risks every copy shares when one failure would
+lose them all.
+
+`hk dag health <cid>` sums up the DAG under a CID, walked as keeping
+walks it (anchors to what they are now, keeps to their targets, nothing
+that isn't here): blocks and bytes, the targets, the least and most
+tolerance, what's below its target, what has no copy here or none
+anywhere known, and, for each set of risks that one failure would lose
+blocks to, how many and how much. `hk fs stat --copies <path>` adds the
+same for what's at a path (see [[Mount]]).
+
+What other members hold comes from the running node. By default it's
+what they've been seen holding, so nothing's asked. `--ask` has the node
+ask each connected member hosting the account about the blocks it hasn't
+been seen with lately (in the second half of a sighting's life), and
+`--ask-all` about all of them. The question is an advert, which a member
+answers with what it holds and does nothing else for, so a member of an
+older build answers too. Answers become sightings, both ways, of what
+this node holds, and only "has it" is cached: a member without a block
+could get it any time, by any means, so it's asked again next time.
+Members not connected are shown from their sightings. Without a node
+running, only copies here are counted, and asking is refused. A client's
+own copies are a cache, so they don't count.
+
+A copy's being held is all this says. Whether its bytes are still whole
+depends on the storage: a mirror looks after itself, and the audits'
+sampling catches the rest in time.
+
 ## Trimming surplus
 
 When free space falls below `--low-water` (2G), a node lets go of copies
@@ -155,4 +188,4 @@ member trims. Keeping again what was tombed takes a new keep (`n` + 1).
 `hk node collect` condemns everything unreferenced now and lets go of
 what's due; `--no-collect` turns collection off.
 
-Source: `src/net/durability.rs`, `src/net/trim.rs`, `src/net/collect.rs`.
+Source: `src/net/durability.rs`, `src/net/check.rs`, `src/health.rs`, `src/net/trim.rs`, `src/net/collect.rs`.
