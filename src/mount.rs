@@ -604,8 +604,14 @@ impl Soup {
     /// the anchor's already above it, or what it is isn't here, when it's
     /// the link. A directory is one of that place's own too.
     fn placed(&self, catalog: &Catalog, dir: u64, name: &[u8], inode: Inode) -> Result<(Inode, Kind), Errno> {
+        let kind = self.kind_kept(catalog, &inode)?;
+        self.placed_as(catalog, dir, name, inode, kind)
+    }
+
+    /// As `placed`, of an inode whose kind, as it's kept, is known.
+    fn placed_as(&self, catalog: &Catalog, dir: u64, name: &[u8], inode: Inode, kind: Kind) -> Result<(Inode, Kind), Errno> {
         let via = Some((dir, name.to_vec()));
-        match self.kind_kept(catalog, &inode)? {
+        match kind {
             Kind::Symlink(target) => match self.mount_point(catalog, dir, &target, via)? {
                 Some(mounted) => {
                     if let Inode::Path(anchor, _, _) = &mounted
@@ -779,24 +785,30 @@ impl Soup {
                 )
             },
             Inode::Node(cid, _) => export::stat(&Cached(catalog), cid).map_err(|e| errno(&e)),
-            Inode::Path(anchor, rel, _) => match self.at(catalog, anchor, rel)? {
-                // An anchor that's nothing yet is an empty directory
-                None if rel.as_os_str().is_empty() => Ok(Kind::Directory),
-                None => Err(Errno::ENOENT),
-                Some(At::Work(meta)) => work_kind(&self.work_path(anchor, rel).unwrap_or_default(), &meta),
-                Some(At::Base(cid, size)) => {
-                    if let Some(size) = size.filter(|_| cid.codec() == crate::cid::RAW_CODEC) {
-                        return Ok(Kind::File(size));
-                    }
-                    self.kind_kept(catalog, &Inode::Node(cid, None))
-                },
-            },
+            Inode::Path(anchor, rel, _) => self.kind_at(catalog, anchor, rel, self.at(catalog, anchor, rel)?),
             Inode::Loose(name) => {
                 let path = self.loose_path(name).ok_or(Errno::ENOENT)?;
                 let meta = std::fs::symlink_metadata(&path).map_err(|e| errno(&e))?;
                 work_kind(&path, &meta)
             },
             _ => Ok(Kind::Directory),
+        }
+    }
+
+    /// What's at a path of an anchor is, as it's kept, from what `at` says
+    /// is there.
+    fn kind_at(&self, catalog: &Catalog, anchor: &Link, rel: &Path, at: Option<At>) -> Result<Kind, Errno> {
+        match at {
+            // An anchor that's nothing yet is an empty directory
+            None if rel.as_os_str().is_empty() => Ok(Kind::Directory),
+            None => Err(Errno::ENOENT),
+            Some(At::Work(meta)) => work_kind(&self.work_path(anchor, rel).unwrap_or_default(), &meta),
+            Some(At::Base(cid, size)) => {
+                if let Some(size) = size.filter(|_| cid.codec() == crate::cid::RAW_CODEC) {
+                    return Ok(Kind::File(size));
+                }
+                self.kind_kept(catalog, &Inode::Node(cid, None))
+            },
         }
     }
 
@@ -916,6 +928,9 @@ impl Soup {
         let parent = self.inode(parent)?;
         let catalog = self.catalog()?;
         let cid = |name: &OsStr| name.to_str().and_then(|name| name.parse::<Link>().ok()).ok_or(Errno::ENOENT);
+        // What a path of an anchor is, as it's kept, once it's looked up to
+        // see it's there, so it's not looked up again
+        let mut known = None;
         let parent = match parent {
             Inode::Root => {
                 if let Some(&(_, ino)) = TOP.iter().find(|(top, _)| OsStr::new(top) == name) {
@@ -950,9 +965,8 @@ impl Soup {
             Inode::Loose(_) => return Err(Errno::ENOTDIR),
             Inode::Path(anchor, rel, via) => {
                 let child = rel.join(name);
-                if self.at(&catalog, &anchor, &child)?.is_none() {
-                    return Err(Errno::ENOENT);
-                }
+                let at = self.at(&catalog, &anchor, &child)?.ok_or(Errno::ENOENT)?;
+                known = Some(self.kind_at(&catalog, &anchor, &child, Some(at))?);
                 Inode::Path(anchor, child, via)
             },
             Inode::Tags => {
@@ -978,7 +992,19 @@ impl Soup {
                 Inode::Node(entry.cid, None)
             },
         };
-        let (inode, kind) = if place { self.placed(&catalog, dir, name.as_bytes(), inode)? } else { (inode.clone(), self.kind(&catalog, &inode)?) };
+        let kind = match known {
+            Some(kind) => kind,
+            None => self.kind_kept(&catalog, &inode)?,
+        };
+        let (inode, kind) = if place {
+            self.placed_as(&catalog, dir, name.as_bytes(), inode, kind)?
+        } else {
+            let shown = match kind {
+                Kind::Symlink(target) => Kind::Symlink(self.shown(target)),
+                kind => kind,
+            };
+            (inode, shown)
+        };
         drop(catalog);
         let writable = self.writes(&inode);
         let ino = self.inodes().of(inode);
