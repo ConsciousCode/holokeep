@@ -1,4 +1,5 @@
 use super::*;
+use crate::net::check::Asking;
 use crate::net::mesh::{self, Ticket, unless_busy};
 use crate::store::Db;
 use libp2p::core::transport::MemoryTransport;
@@ -2032,4 +2033,58 @@ async fn a_visitor_let_in_for_a_while_is_shut_out_after() {
     assert!(!member.is_visitor(&thin.peer_id()));
     assert!(member.catalog().guest_claims(&visitor.id()).expect("claims").is_empty());
     assert!(serving(&mut [&mut member], thin.ask(vec!["shared".to_owned()])).await.is_err());
+}
+
+/// Drive both nodes until the first's check is done, and say what it
+/// found.
+async fn checked(a: &mut Node, b: &mut Node, id: CheckId) -> crate::health::Known {
+    let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(10)).expect("deadline");
+    loop {
+        let event = tokio::time::timeout_at(deadline, async {
+            tokio::select! {
+                event = a.next() => event,
+                event = b.next() => event,
+            }
+        });
+        if let Event::Checked { id: done, known } = event.await.expect("in time").expect("event")
+            && done == id
+        {
+            return known;
+        }
+    }
+}
+
+/// Who a check found holding a block.
+fn holders(known: &crate::health::Known, block: &Block) -> Vec<String> {
+    known.elsewhere.get(&block.cid().multihash().to_bytes()).map(|copies| copies.iter().map(|copy| copy.peer.clone()).collect()).unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_check_asks_members_only_of_what_it_hasnt_sighted_unless_told_to() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    let leaf = blocks.get(2).expect("leaf");
+    b.catalog().put_block(leaf, CidVersion::V1).expect("put");
+    let all = keys(&blocks);
+    // Going by sightings alone, there are none yet, and no one's asked
+    let id = a.check(&all, Asking::No).expect("check");
+    let known = checked(&mut a, &mut b, id).await;
+    assert!(known.node && known.asked.is_empty() && known.elsewhere.values().all(Vec::is_empty), "{known:?}");
+    // Asked, b says it holds the leaf, and nothing else
+    let id = a.check(&all, Asking::Unsighted).expect("check");
+    let known = checked(&mut a, &mut b, id).await;
+    assert_eq!(known.asked.iter().collect::<Vec<_>>(), [&b.peer_id().to_string()]);
+    assert_eq!(holders(&known, leaf), [b.peer_id().to_string()]);
+    assert!(blocks.iter().filter(|block| *block != leaf).all(|block| holders(&known, block).is_empty()));
+    // Which is sighted now, so it's not asked about again, though b's let
+    // it go without saying
+    b.catalog().drop_copies(leaf.cid().multihash()).expect("drop");
+    let id = a.check(&keys(std::slice::from_ref(leaf)), Asking::Unsighted).expect("check");
+    let known = checked(&mut a, &mut b, id).await;
+    assert!(known.asked.is_empty());
+    assert_eq!(holders(&known, leaf), [b.peer_id().to_string()]);
+    // Asking about everything finds it gone, and the sighting's forgotten
+    let id = a.check(&all, Asking::All).expect("check");
+    let known = checked(&mut a, &mut b, id).await;
+    assert!(holders(&known, leaf).is_empty());
+    assert!(a.sightings().of(leaf.cid().multihash()).expect("sighted").is_empty());
 }

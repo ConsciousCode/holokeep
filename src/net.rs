@@ -6,6 +6,7 @@
 #![allow(clippy::future_not_send)]
 
 pub mod blocks;
+pub mod check;
 pub mod clients;
 pub mod clock;
 pub mod collect;

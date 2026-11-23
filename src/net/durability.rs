@@ -51,7 +51,7 @@ pub const ADVERTS: StreamProtocol = StreamProtocol::new("/holokeep/adverts/1.0.0
 pub const PUSH: StreamProtocol = StreamProtocol::new("/holokeep/push/1.0.0");
 
 /// The most blocks in one advert.
-const ADVERT_BATCH: usize = 512;
+pub(crate) const ADVERT_BATCH: usize = 512;
 
 /// About the most block data in one push, which always carries at least
 /// one block.
@@ -74,12 +74,32 @@ pub struct Advert {
 
 super::hosts::for_user!(Advert);
 
+impl Advert {
+    /// An advert naming these blocks, each with the copies held here: to
+    /// ask who holds them, as answering one does nothing else.
+    pub(crate) const fn naming(blocks: Vec<(ByteBuf, Vec<Replica>)>) -> Self {
+        Self { blocks, user: None }
+    }
+
+    /// The multihashes it names.
+    pub(crate) fn keys(&self) -> Vec<Vec<u8>> {
+        self.blocks.iter().map(|(key, _)| key.to_vec()).collect()
+    }
+}
+
 /// An answer to an advert: the copies this node holds of the blocks, and
 /// where it would keep one it's sent.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Haves {
     held: Vec<(ByteBuf, Vec<Replica>)>,
     offer: Option<Offer>,
+}
+
+impl Haves {
+    /// The copies it holds, of each block it holds.
+    pub(crate) fn into_held(self) -> Vec<(ByteBuf, Vec<Replica>)> {
+        self.held
+    }
 }
 
 /// Blocks sent to be kept, as (CID, bytes), and the copies the sender
@@ -351,6 +371,20 @@ impl Sightings {
 
     /// The copies of a block still believed in, and who holds each.
     pub fn of(&self, key: Key<'_>) -> Result<Vec<(PeerId, Replica)>> {
+        Ok(self.sighted(key)?.into_iter().map(|(peer, replica, _)| (peer, replica)).collect())
+    }
+
+    /// Whether a sighting made then is fresh: within half its time, or
+    /// vouched for by the peer's having stayed connected since, as it
+    /// would have said if it had let go of the copy.
+    pub fn fresh(&self, peer: &PeerId, seen: i64) -> bool {
+        let half = i64::try_from(self.ttl.as_secs() / 2).unwrap_or(i64::MAX);
+        seen >= now().saturating_sub(half) || self.live.borrow().get(peer).is_some_and(|&since| since <= seen)
+    }
+
+    /// The copies of a block still believed in, who holds each, and when
+    /// it was seen.
+    pub fn sighted(&self, key: Key<'_>) -> Result<Vec<(PeerId, Replica, i64)>> {
         let Some(block) = self.db.lookup(key)? else {
             return Ok(Vec::new());
         };
@@ -363,7 +397,7 @@ impl Sightings {
             if let Ok(peer) = PeerId::from_str(&peer)
                 && self.believed(&peer, seen, cutoff)
             {
-                sighted.push((peer, Replica { label, risks: risks.split('\n').filter(|risk| !risk.is_empty()).map(str::to_owned).collect() }));
+                sighted.push((peer, Replica { label, risks: risks.split('\n').filter(|risk| !risk.is_empty()).map(str::to_owned).collect() }, seen));
             }
         }
         Ok(sighted)

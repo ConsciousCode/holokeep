@@ -602,6 +602,10 @@ pub struct CopyReport {
     pub claims: usize,
 }
 
+/// What `Catalog::walk_under` calls with each block: its CID, its size if
+/// known, and whether it's here.
+pub type Visit<'a> = dyn FnMut(&Link, Option<u64>, bool) -> Result<()> + 'a;
+
 /// A copy of a block, as other nodes are told of it: the volume it's on,
 /// by label, and what that volume risks, itself included.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2967,9 +2971,24 @@ impl Catalog {
     /// collecting what a keep links to, the keeper's copy survives, and
     /// is replicated again from there.
     pub fn missing_under(&self, root: &Link) -> Result<Vec<Link>> {
+        let mut missing = Vec::new();
+        self.walk_under(root, &mut |cid, _, here| {
+            if !here {
+                missing.push(cid.clone());
+            }
+            Ok(())
+        })?;
+        Ok(missing)
+    }
+
+    /// Visit each block of the DAG under a root once, the root included,
+    /// as `missing_under` walks it: following anchors to what they are now
+    /// and keeps to what they target, short of their frontiers, and not
+    /// into what isn't here. Each comes with its size, if it's known (a
+    /// raw block's, as a link to it says), and whether it's here.
+    pub fn walk_under(&self, root: &Link, visit: &mut Visit<'_>) -> Result<()> {
         let mut seen = std::collections::BTreeSet::new();
         let mut queue = vec![root.clone()];
-        let mut missing = Vec::new();
         while let Some(cid) = queue.pop() {
             if !seen.insert(cid.to_bytes()) {
                 continue;
@@ -2980,18 +2999,19 @@ impl Catalog {
             // A raw block links nothing, so it's enough that it's placed:
             // reading every leaf would read every byte under the root
             else if cid.codec() == crate::cid::RAW_CODEC {
-                if self.placements(cid.multihash())?.is_empty() {
-                    missing.push(cid);
-                }
+                visit(&cid, self.linked_size(cid.multihash())?, !self.placements(cid.multihash())?.is_empty())?;
                 continue;
             }
             else {
                 self.get_block(&cid).ok().flatten().map(|block| block.data().to_vec())
             };
             let Some(data) = data else {
-                missing.push(cid);
+                visit(&cid, None, false)?;
                 continue;
             };
+            if cid.hashcode() != IDENTITY {
+                visit(&cid, u64::try_from(data.len()).ok(), true)?;
+            }
             // An anchor is what it is now
             if crate::claim::is_anchor(&cid) {
                 queue.extend(self.anchor_value(&cid)?);
@@ -3006,7 +3026,18 @@ impl Catalog {
             }
             queue.extend(crate::links::links(cid.codec(), &data).unwrap_or_default());
         }
-        Ok(missing)
+        Ok(())
+    }
+
+    /// A raw block's size as a UnixFS link to it says, if one does: a
+    /// file's link to its chunk says it as its block size, a directory's to
+    /// a file of one block as its `Tsize`, all there is under it.
+    fn linked_size(&self, key: Key<'_>) -> Result<Option<u64>> {
+        let Some(id) = self.db.lookup(key)? else {
+            return Ok(None);
+        };
+        let size: Option<i64> = self.db.conn().prepare_cached("SELECT max(coalesce(blocksize, tsize)) FROM unixfs_links WHERE target = ?1")?.query_row([id], |row| row.get(0))?;
+        Ok(size.and_then(|size| u64::try_from(size).ok()))
     }
 
     /// The mount at a path, if there's one.

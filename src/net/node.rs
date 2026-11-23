@@ -42,6 +42,7 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport, identify, kad,
 use serde::{Deserialize, Serialize};
 
 use super::blocks::{self, Blocks, Fetch, Want};
+use super::check::{Asking, Check, CheckId};
 use super::clock::{self, Clocks, Offset, Told};
 use super::clients::{Gate, Ports};
 use super::collect::{self, Condemn, Condemned, Verdict};
@@ -224,6 +225,8 @@ pub enum Event {
     Audited { id: AuditId, report: Report },
     /// A trim finished.
     Trimmed { id: TrimId, report: trim::Report },
+    /// A check of who holds blocks finished.
+    Checked { id: CheckId, known: crate::health::Known },
     /// Garbage was let go of, as members answered.
     Collected { collected: usize },
     /// This machine's clock was found far from the mesh's, or back near
@@ -299,6 +302,9 @@ pub struct Node {
     /// Audits of every account served, made of an audit of each.
     audit_groups: BTreeMap<AuditId, Group<Report>>,
     next_audit: AuditId,
+    /// Checks of who holds blocks, waiting on answers.
+    checks: BTreeMap<CheckId, Check>,
+    next_check: CheckId,
     trickle: Trickle,
     /// Trims, and for which account each is.
     trims: BTreeMap<TrimId, (u32, Trim)>,
@@ -445,6 +451,8 @@ impl Node {
             audits: BTreeMap::new(),
             audit_groups: BTreeMap::new(),
             next_audit: 0,
+            checks: BTreeMap::new(),
+            next_check: 0,
             trickle: Trickle::default(),
             trims: BTreeMap::new(),
             trim_groups: BTreeMap::new(),
@@ -1800,6 +1808,24 @@ impl Node {
 
     fn on_advert(&mut self, event: request_response::Event<Advert, Haves>) -> Result<()> {
         match event {
+            request_response::Event::Message { message: request_response::Message::Response { request_id, response }, .. } if self.check_of(request_id).is_some() => {
+                if let Some(id) = self.check_of(request_id)
+                    && let Some(check) = self.checks.get_mut(&id)
+                {
+                    unless_busy(check.answered(&self.catalog, &self.sightings, request_id, response), "noting what a member has")?;
+                    self.finish_check(id);
+                }
+                return Ok(());
+            },
+            request_response::Event::OutboundFailure { request_id, .. } if self.check_of(request_id).is_some() => {
+                if let Some(id) = self.check_of(request_id)
+                    && let Some(check) = self.checks.get_mut(&id)
+                {
+                    check.failed(request_id);
+                    self.finish_check(id);
+                }
+                return Ok(());
+            },
             request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
                 let haves = match self.serving(&peer, request.user())? {
                     Some(local) => self.catalog.viewing(local.uid, |catalog| durability::answer_advert(catalog, &self.sightings, &peer, &request, &self.marks))??,
@@ -1875,6 +1901,46 @@ impl Node {
             _ => return Ok(()),
         }
         self.drive_audits()
+    }
+
+    /// Find which members hold these blocks of the catalog's own account:
+    /// those sighted, and, as `asking` says, what connected members hosting
+    /// its user answer. It's done when `next` returns `Checked` with the id.
+    pub fn check(&mut self, keys: &[Multihash], asking: Asking) -> Result<CheckId> {
+        let local = self.local(self.catalog.uid())?;
+        let members = self.machines_for(&local);
+        let user = local.user_bytes();
+        let (mut check, adverts) = Check::start(&self.catalog, &self.sightings, self.client_of.is_none(), &members, keys, asking)?;
+        for (peer, advert) in adverts {
+            let advert = advert.for_user(user.as_deref());
+            let request = self.swarm.behaviour_mut().adverts.send_request(&peer, advert.clone());
+            check.sent(request, peer, &advert);
+        }
+        let id = self.next_check;
+        self.next_check = id.wrapping_add(1);
+        self.checks.insert(id, check);
+        self.finish_check(id);
+        Ok(id)
+    }
+
+    /// Finish a check, if it's heard back from everyone asked.
+    fn finish_check(&mut self, id: CheckId) {
+        if self.checks.get(&id).is_some_and(Check::done)
+            && let Some(check) = self.checks.remove(&id)
+        {
+            self.ready.push_back(Event::Checked { id, known: check.known() });
+        }
+    }
+
+    /// The check which sent an advert.
+    fn check_of(&self, request: request_response::OutboundRequestId) -> Option<CheckId> {
+        self.checks.iter().find(|(_, check)| check.asked(request)).map(|(&id, _)| id)
+    }
+
+    /// Whether this node's copies count, as a member's do, and a client's
+    /// don't.
+    pub const fn copies_count(&self) -> bool {
+        self.client_of.is_none()
     }
 
     /// Drive every audit which is no longer waiting.

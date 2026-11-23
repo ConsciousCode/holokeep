@@ -28,6 +28,7 @@ pub mod delta;
 pub mod git;
 pub mod export;
 pub mod fs;
+pub mod health;
 #[cfg(feature = "fuse")]
 pub mod mount;
 #[cfg(feature = "fuse")]

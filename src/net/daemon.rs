@@ -180,6 +180,7 @@ enum Waiter {
     Fetch(FetchId),
     Audit(AuditId),
     Trim(TrimId),
+    Check(super::check::CheckId),
 }
 
 /// Parse a size: bytes, or with a K, M, G or T suffix, in powers of two.
@@ -291,6 +292,91 @@ pub fn audit(place: &Place, copies: Option<usize>) -> Result<Option<Report>> {
         }
     }
     report.map(Some).ok_or_else(|| Error::Invalid("the node hung up without saying what it audited".into()))
+}
+
+/// The most blocks one `copies` asks the daemon about at once.
+const COPIES_BLOCKS: usize = 1024;
+
+/// What the daemon says of who holds blocks.
+#[derive(Debug, Clone, Default)]
+pub struct Copies {
+    /// The copies it runs with, where no keep says.
+    pub copies: usize,
+    /// Whether copies here count: not a client's.
+    pub own: bool,
+    pub known: crate::health::Known,
+}
+
+/// Have the running daemon say who holds these blocks, of the members it
+/// knows of, asking as said; or None if it isn't running.
+pub fn copies(place: &Place, cids: &[crate::model::Link], asking: super::check::Asking) -> Result<Option<Copies>> {
+    let mut all = Copies::default();
+    for chunk in cids.chunks(COPIES_BLOCKS) {
+        let words: Vec<String> = chunk.iter().map(ToString::to_string).collect();
+        let Some(lines) = ask_patiently(place, &format!("copies {} {}", asking.word(), words.join(" ")))? else {
+            return Ok(None);
+        };
+        let mut done = false;
+        for line in lines {
+            let mut fields = line.split('\t');
+            match fields.next() {
+                Some("copies") => all.copies = fields.next().and_then(|n| n.parse().ok()).unwrap_or_default(),
+                Some("own") => all.own = fields.next() == Some("yes"),
+                Some("seen") => {
+                    let (Some(key), Some(peer), Some(seen), Some(label)) = (fields.next(), fields.next(), fields.next(), fields.next()) else {
+                        continue;
+                    };
+                    let (Some(key), Some(label), Ok(seen)) = (crate::health::unhex(key), crate::health::unhex(label), seen.parse()) else {
+                        continue;
+                    };
+                    let replica = crate::store::Replica { label, risks: fields.map(str::to_owned).collect() };
+                    all.known.elsewhere.entry(key).or_default().push(crate::health::Elsewhere { peer: peer.to_owned(), replica, seen });
+                },
+                Some("asked") => all.known.asked.extend(fields.next().map(str::to_owned)),
+                Some("unanswered") => all.known.unanswered.extend(fields.next().map(str::to_owned)),
+                Some("connected") => all.known.connected = all.known.connected.max(fields.next().and_then(|n| n.parse().ok()).unwrap_or_default()),
+                Some("checked") => done = true,
+                _ if line.starts_with("unknown command") => {
+                    return Err(Error::Invalid("the running node is older than this hk: restart `hk node run`".into()));
+                },
+                _ => {
+                    if let Some(e) = line.strip_prefix("error: ") {
+                        return Err(Error::Invalid(e.to_owned()));
+                    }
+                },
+            }
+        }
+        if !done {
+            return Err(Error::Invalid("the node hung up without saying who holds what".into()));
+        }
+    }
+    let unanswered = all.known.unanswered.clone();
+    all.known.asked.retain(|peer| !unanswered.contains(peer));
+    all.known.node = true;
+    Ok(Some(all))
+}
+
+/// What a check found, as the control socket says it.
+fn checked(known: &crate::health::Known) -> String {
+    let mut out = String::new();
+    for (key, copies) in &known.elsewhere {
+        for copy in copies {
+            let _ = write!(out, "seen\t{}\t{}\t{}\t{}", crate::health::hex(key), copy.peer, copy.seen, crate::health::hex(&copy.replica.label));
+            for risk in &copy.replica.risks {
+                let _ = write!(out, "\t{risk}");
+            }
+            out.push('\n');
+        }
+    }
+    for peer in &known.asked {
+        let _ = writeln!(out, "asked\t{peer}");
+    }
+    for peer in &known.unanswered {
+        let _ = writeln!(out, "unanswered\t{peer}");
+    }
+    let _ = writeln!(out, "connected\t{}", known.connected);
+    out.push_str("checked\n");
+    out
 }
 
 /// Have the running daemon let go of whatever the mesh can spare of what's
@@ -710,6 +796,7 @@ struct Waiting {
     fetching: HashMap<FetchId, OwnedWriteHalf>,
     auditing: HashMap<AuditId, OwnedWriteHalf>,
     trimming: HashMap<TrimId, OwnedWriteHalf>,
+    checking: HashMap<super::check::CheckId, OwnedWriteHalf>,
 }
 
 impl Waiting {
@@ -718,6 +805,7 @@ impl Waiting {
             Waiter::Fetch(id) => self.fetching.insert(id, write),
             Waiter::Audit(id) => self.auditing.insert(id, write),
             Waiter::Trim(id) => self.trimming.insert(id, write),
+            Waiter::Check(id) => self.checking.insert(id, write),
         };
     }
 
@@ -738,6 +826,7 @@ impl Waiting {
                 }
                 (self.trimming.remove(&id), format!("trimmed {} {} {}\n", report.considered, report.dropped, report.freed))
             },
+            Event::Checked { id, known } => (self.checking.remove(&id), checked(&known)),
             Event::Fetched { id, fetched, missing } => {
                 let mut out = format!("fetched {fetched}\n");
                 for cid in missing {
@@ -769,7 +858,7 @@ fn report(event: &Event) {
         },
         // Members which are offline fail to be dialed all the time, and
         // audits are reported as they finish
-        Event::Failed(..) | Event::Audited { .. } | Event::Trimmed { .. } => {},
+        Event::Failed(..) | Event::Audited { .. } | Event::Trimmed { .. } | Event::Checked { .. } => {},
         Event::Fetched { fetched, missing, .. } => eprintln!("fetched {fetched} blocks, {} missing", missing.len()),
         Event::Collected { collected } => eprintln!("collected: {collected} let go of"),
         Event::Skewed { ahead, members, far: true } => {
@@ -895,6 +984,25 @@ fn peers(node: &Node) -> Result<String> {
     Ok(out)
 }
 
+/// Answer `copies <asking> <cid>...`: what the node runs with at once, and
+/// who holds the blocks once the check's done.
+async fn check(node: &mut Node, command: &str, copies: usize, mut write: OwnedWriteHalf) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
+    let mut words = command.split_whitespace().skip(1);
+    let asking = words.next().and_then(|word| word.parse::<super::check::Asking>().ok());
+    let cids: std::result::Result<Vec<crate::model::Link>, _> = words.map(str::parse).collect();
+    let said = match (asking, cids) {
+        (Some(asking), Ok(cids)) => {
+            write.write_all(format!("copies\t{copies}\nown\t{}\n", if node.copies_count() { "yes" } else { "no" }).as_bytes()).await?;
+            let keys: Vec<crate::multihash::Multihash> = cids.iter().filter_map(|cid| crate::multihash::Multihash::decode(&cid.multihash().to_bytes()).ok()).collect();
+            return Ok(Some((Waiter::Check(node.check(&keys, asking)?), write)));
+        },
+        (None, _) => format!("error: not sighted, ask or ask-all: {command}\n"),
+        (_, Err(_)) => "error: not a list of CIDs\n".to_owned(),
+    };
+    write.write_all(said.as_bytes()).await?;
+    Ok(None)
+}
+
 /// Answer one command on the control socket, or say which fetch it waits
 /// on, to be answered when that finishes.
 async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, copies: usize, collecting: bool, alone: bool, join: &mut bool) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
@@ -976,6 +1084,7 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
                 },
             }
         },
+        command if command.starts_with("copies ") => return check(node, command, copies, write).await,
         "audit" => return Ok(Some((Waiter::Audit(node.audit(copies)?), write))),
         "trim" => return Ok(Some((Waiter::Trim(node.trim_some(copies, true)?), write))),
         "collect" => {

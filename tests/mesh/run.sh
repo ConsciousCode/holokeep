@@ -146,6 +146,23 @@ scenario_edits() {
     sh_on one '! test -e /soup/wiki/turns.md' || fail "one still shows it"
 }
 
+# Where a block's copies are: here and on the other member, asked or as
+# sighted. Containers share the host's disks, so audits make no copies to
+# raise it; two fetches it, a copy one hears of only by asking
+scenario_copies() {
+    local cid two_peer health
+    two_peer=$(on two hk node id)
+    sh_on one 'echo "kept twice" > /tmp/twice'
+    cid=$(sh_on one 'hk add -q /tmp/twice | tail -1')
+    on two hk dag fetch "$cid" >/dev/null
+    health=$(on one hk dag health --ask-all "$cid") || fail "dag health failed"
+    grep -q "^blocks	1 block" <<<"$health" || fail "it's not one block: $health"
+    grep -q "^asked	.*$two_peer" <<<"$health" || fail "two wasn't asked: $health"
+    sh_on one "hk block where $cid" | grep -q "^$two_peer	" || fail "one doesn't say two holds it"
+    # Sighted freshly, two needn't be asked again
+    ! sh_on one "hk dag health --ask $cid" | grep -q "^asked" || fail "asked again what was sighted"
+}
+
 # A node joining later sees what the root names, and reads it
 scenario_late_joiner() {
     machine three
@@ -691,7 +708,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits late_joiner fork_merge lost forget car restore revoke shared client thin visitor expiry door several)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits copies late_joiner fork_merge lost forget car restore revoke shared client thin visitor expiry door several)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

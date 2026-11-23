@@ -423,6 +423,8 @@ Checklist:
   - [x] Files imported in place as mounts on anchors, kept through them, and imported again as they change; the path is known only to the node with the file (`hk add --nocopy`)
   - [ ] Kademlia provider records, once broadcast wants don't scale
   - [x] Measuring how far apart members' clocks are, advisorily (`hk node clocks`)
+  - [x] Checking how safe blocks are: where each one's copies are and what they risk, against its target, from sightings or asking members (`hk block where`, `hk dag health`, `hk fs stat --copies`, `--ask`)
+  - [ ] Proving copies: members answering a challenge with a hash of the block, for media that don't look after their own integrity
   - [x] Configuration beyond the command line: a node's tunables, such as how often it pings and how long it waits, so tests can run them short and nodes in one mesh can differ; and the mounts a node keeps, so it runs as a service (`config.toml`, `hk config`, `hk node service`)
 - [ ] Public Amino DHT
 - [ ] BitTorrent bridging

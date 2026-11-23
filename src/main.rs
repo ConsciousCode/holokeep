@@ -6,7 +6,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 
-use holokeep::{car, claim, dag, export, links};
+use holokeep::{car, claim, dag, export, health, links};
 use holokeep::chunker::ChunkerType;
 use holokeep::dag::{BalancedLayout, BlockSink, NullSink};
 use holokeep::import::Importer;
@@ -361,6 +361,35 @@ enum BlockCommand {
     Get {
         cid: Link,
     },
+    /// Say where each block's copies are, here and on other members, what
+    /// each risks, and how many failures it would take to lose them all,
+    /// against how many its keeps say it should
+    Where {
+        #[arg(required = true)]
+        cids: Vec<Link>,
+        #[command(flatten)]
+        ask: AskArgs,
+    },
+}
+
+/// Whether to ask other members what they hold, rather than going by
+/// what they've been seen holding (sightings) alone.
+#[derive(clap::Args, Debug, Clone, Copy)]
+struct AskArgs {
+    /// Ask each connected member, through the running node, about what it
+    /// hasn't been seen holding lately
+    #[arg(long)]
+    ask: bool,
+    /// Ask each connected member about everything, whatever it's been seen
+    /// holding
+    #[arg(long, conflicts_with = "ask")]
+    ask_all: bool,
+}
+
+impl AskArgs {
+    const fn any(self) -> bool {
+        self.ask || self.ask_all
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -481,6 +510,14 @@ enum FsCommand {
     Stat {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
+        /// Say too how safe what's at each path is, as `hk dag health`
+        /// does: where the copies of its blocks are, and how many failures
+        /// it would take to lose them
+        #[arg(long)]
+        copies: bool,
+        /// With --copies, implied
+        #[command(flatten)]
+        ask: AskArgs,
     },
     /// Unlink each path from the anchor naming it, a directory whole, in
     /// one set for each anchor, reading nothing under it. What it held is
@@ -836,6 +873,15 @@ enum DagCommand {
     #[cfg(feature = "net")]
     Fetch {
         cid: Link,
+    },
+    /// Say how safe the DAG under a CID is: of its blocks, how many failures
+    /// it would take to lose the least safe, which are short of what their
+    /// keeps say, and which one failure loses, and of what. Following
+    /// anchors and keeps as keeping does, and walking nothing that isn't here
+    Health {
+        cid: Link,
+        #[command(flatten)]
+        ask: AskArgs,
     },
 }
 
@@ -1317,12 +1363,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Fs(command) => soup_fs(args.repo, command),
         Command::Device(command) => device(&repo_dir(args.repo.clone())?, command),
         Command::Anchor(command) => anchor(args.repo.as_ref(), open_repo(args.repo.clone())?, command),
-        Command::Block(BlockCommand::Get { cid }) => {
-            let repo = open_repo(args.repo)?;
-            in_repo(&repo, &cid)?;
-            let block = repo.get_block(&cid)?.with_context(|| format!("block {cid} not found"))?;
-            Ok(io::stdout().lock().write_all(block.data())?)
-        },
+        Command::Block(command) => block(args.repo, command),
         Command::Repo(RepoCommand::Stat) => {
             let repo = open_repo(args.repo)?;
             for (volume, form, blocks) in repo.stats()? {
@@ -2501,7 +2542,7 @@ fn soup_fs(repo: Option<PathBuf>, command: FsCommand) -> anyhow::Result<()> {
     fetch_through_node(&mut repo, &dir);
     let locate = |repo: &Catalog, path: &Path| -> anyhow::Result<fs::Located> { Ok(fs::locate(repo, &fs::soup_path(path))?) };
     match command {
-        FsCommand::Stat { paths } => {
+        FsCommand::Stat { paths, copies, ask } => {
             for (i, path) in paths.iter().enumerate() {
                 let located = fs::find(&repo, &fs::soup_path(path))?;
                 if i > 0 {
@@ -2537,6 +2578,9 @@ fn soup_fs(repo: Option<PathBuf>, command: FsCommand) -> anyhow::Result<()> {
                         out!("tags\t{}", tags.join(" "));
                     }
                 }
+                if copies || ask.any() {
+                    dag_health(&repo, &dir, &cid, ask)?;
+                }
             }
         },
         FsCommand::Rm { paths } => {
@@ -2550,6 +2594,143 @@ fn soup_fs(repo: Option<PathBuf>, command: FsCommand) -> anyhow::Result<()> {
             out!("{}", fs::promote(&mut repo, &located)?);
         },
     }
+    Ok(())
+}
+
+/// What's known of the copies other members hold of these blocks, from
+/// the running node, asking as said; with the copies wanted where no keep
+/// says, and whether copies here count.
+fn copies_known(dir: &Path, cids: &[Link], ask: AskArgs) -> anyhow::Result<(health::Known, usize, bool)> {
+    let copies = holokeep::config::Config::load(dir)?.node("main").copies.unwrap_or(2);
+    #[cfg(feature = "net")]
+    {
+        use holokeep::net::check::Asking;
+        let place = holokeep::net::mesh::Place::main(dir);
+        let asking = if ask.ask_all { Asking::All } else if ask.ask { Asking::Unsighted } else { Asking::No };
+        if let Some(said) = holokeep::net::daemon::copies(&place, cids, asking)? {
+            return Ok((said.known, said.copies, said.own));
+        }
+        anyhow::ensure!(!ask.any(), "asking members needs the running node: start `hk node run`");
+        let own = holokeep::net::daemon::members(&place)?.client_of()?.is_none();
+        Ok((health::Known::default(), copies, own))
+    }
+    #[cfg(not(feature = "net"))]
+    {
+        let _ = cids;
+        anyhow::ensure!(!ask.any(), "asking members needs hk built with the net feature");
+        Ok((health::Known::default(), copies, true))
+    }
+}
+
+/// Say who was asked, and who didn't answer, or that nothing's known of
+/// other members.
+fn say_asked(known: &health::Known, ask: AskArgs) {
+    if !known.node {
+        out!("elsewhere\tunknown: the node isn't running, so only what's here is counted");
+    }
+    else if ask.any() && known.connected == 0 {
+        out!("asked\tno one: no member keeping this account's blocks is connected");
+    }
+    if !known.asked.is_empty() {
+        out!("asked\t{}", known.asked.iter().cloned().collect::<Vec<_>>().join(" "));
+    }
+    if !known.unanswered.is_empty() {
+        out!("unanswered\t{}", known.unanswered.iter().cloned().collect::<Vec<_>>().join(" "));
+    }
+}
+
+fn block(repo: Option<PathBuf>, command: BlockCommand) -> anyhow::Result<()> {
+    match command {
+        BlockCommand::Where { cids, ask } => {
+            let dir = repo_dir(repo)?;
+            block_where(&open_repo(Some(dir.clone()))?, &dir, &cids, ask)
+        },
+        BlockCommand::Get { cid } => {
+            let repo = open_repo(repo)?;
+            in_repo(&repo, &cid)?;
+            let block = repo.get_block(&cid)?.with_context(|| format!("block {cid} not found"))?;
+            Ok(io::stdout().lock().write_all(block.data())?)
+        },
+    }
+}
+
+/// `hk block where`: each block's copies, and how safe it is.
+fn block_where(repo: &Catalog, dir: &Path, cids: &[Link], ask: AskArgs) -> anyhow::Result<()> {
+    let (known, copies, own) = copies_known(dir, cids, ask)?;
+    let now = health::now();
+    for (i, cid) in cids.iter().enumerate() {
+        if i > 0 {
+            out!("");
+        }
+        let health = health::Health::of(repo, cid, None, &known, own, copies)?;
+        out!("cid\t{cid}");
+        if !own {
+            out!("here\tnot counted: this node is a client, whose copies are a cache");
+        }
+        else if health.here.is_empty() {
+            out!("here\tnone");
+        }
+        for replica in &health.here {
+            out!("here\t{}", replica.risks.join(" "));
+        }
+        for copy in &health.elsewhere {
+            out!("{}\t{}\t{}", copy.peer, health::ago(copy.seen, now), copy.replica.risks.join(" "));
+        }
+        out!("target\t{}, {}", health.target, if health.kept { "as its keeps say" } else { "the mesh's" });
+        match health.tolerance {
+            0 => out!("tolerance\t0: no copy is known"),
+            1 if !health.shared.is_empty() => out!("tolerance\t1: every copy is lost if any of {} fails", health.shared.join(" ")),
+            n => out!("tolerance\t{n}"),
+        }
+    }
+    if !cids.is_empty() {
+        say_asked(&known, ask);
+    }
+    Ok(())
+}
+
+/// `hk dag health`: how safe the DAG under a CID is.
+fn dag_health(repo: &Catalog, dir: &Path, root: &Link, ask: AskArgs) -> anyhow::Result<()> {
+    let mut blocks = Vec::new();
+    repo.walk_under(root, &mut |cid, size, _| {
+        blocks.push((cid.clone(), size));
+        Ok(())
+    })?;
+    let cids: Vec<Link> = blocks.iter().map(|(cid, _)| cid.clone()).collect();
+    let (known, copies, own) = copies_known(dir, &cids, ask)?;
+    let mut summary = health::Summary::default();
+    for (cid, size) in &blocks {
+        summary.add(&health::Health::of(repo, cid, *size, &known, own, copies)?, own);
+    }
+    let some = |(count, bytes): (usize, u64)| format!("{count} block{}, {}", if count == 1 { "" } else { "s" }, health::bytes(bytes));
+    let such_as = |example: &Option<Link>| example.as_ref().map_or_else(String::new, |cid| format!(", such as {cid}"));
+    out!("blocks\t{}", some((summary.blocks, summary.bytes)));
+    if let Some((least, most)) = summary.targets {
+        out!("target\t{}", if least == most { least.to_string() } else { format!("{least} to {most}") });
+    }
+    if let (Some(least), Some(most)) = (summary.least, summary.most) {
+        out!("tolerance\t{}", if least == most { least.to_string() } else { format!("least {least}, most {most}") });
+    }
+    let (short, short_bytes, example) = &summary.short;
+    if *short == 0 {
+        out!("short\tnone");
+    }
+    else {
+        out!("short\t{} below target{}", some((*short, *short_bytes)), such_as(example));
+    }
+    if own && summary.not_here.0 > 0 {
+        out!("not here\t{}, and nothing under them is walked", some(summary.not_here));
+    }
+    if summary.none.0 > 0 {
+        let (count, bytes, example) = &summary.none;
+        out!("no copy\t{}{}", some((*count, *bytes)), such_as(example));
+    }
+    let mut one_risk: Vec<(&Vec<String>, &(usize, u64))> = summary.one_risk.iter().collect();
+    one_risk.sort_by(|a, b| b.1.cmp(a.1));
+    for (risks, &counted) in one_risk {
+        out!("one failure\t{}, lost if any of {} fails", some(counted), risks.join(" "));
+    }
+    say_asked(&known, ask);
     Ok(())
 }
 
@@ -3056,6 +3237,10 @@ fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {
             }
             anyhow::ensure!(missing.is_empty(), "{} blocks aren't here or on any connected member", missing.len());
             Ok(())
+        },
+        DagCommand::Health { cid, ask } => {
+            let dir = repo_dir(repo)?;
+            dag_health(&open_repo(Some(dir.clone()))?, &dir, &cid, ask)
         },
         DagCommand::Import { paths } => {
             open_repo(repo)?.batch_breathing(|repo| {
