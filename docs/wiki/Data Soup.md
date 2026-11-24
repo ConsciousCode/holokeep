@@ -25,7 +25,7 @@ the holokeep repository; this wiki is the reference.
 - [[Sharing]]: users sharing machines and data (partly planned).
 - [[Capabilities]]: sharing by key, from ciphertext no member guards (snapshots implemented; the rest a design).
 - [[Mount]]: the FUSE filesystem and writing through it.
-- [[Servers]]: anchors answered live by a process over 9P (a design).
+- [[Servers]]: anchors answered live by a process over 9P (on one machine so far; the rest a design).
 - [[Rules]]: `.souprules`, what's made through the mount becomes.
 - [[Configuration]]: `config.toml`, a node's tunables and mounts, and running it as a service.
 - [[Git]]: git objects as `git-raw` blocks, and importing repositories.

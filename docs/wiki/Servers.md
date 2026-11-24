@@ -1,7 +1,7 @@
-**A design, not yet implemented.** Nothing on this page exists yet. It's
-the plan for servers mounted on anchors, written down to be argued with
-before it's built, and each part says which slice of the work it
-belongs to (see [[#Slices]]).
+**Partly implemented.** The first slice exists: serve claims, `[[serve]]`
+services, and the mount reaching a service of its own node's, live (see
+[[#Slices]] for what's yet to come, which this page describes as the
+plan, saying so where it does).
 
 A **served anchor** is an [[Anchors and Names|anchor]] whose tree a
 process answers live, over 9P, instead of being read from blocks. It
@@ -96,12 +96,21 @@ lies in a directory anyone else may write.
 - Nothing served is cached: entries and attributes have no TTL, and
   files open with direct I/O, so a size that changes, or isn't known, is
   read as it is.
-- Requests to a server time out (10 s), and run on threads of their own,
-  so a slow or absent server can't stall the rest of the mount.
-- A server that can't be reached: a live-only anchor's mount point fails
-  with `ENOTCONN`; a persisted one shows its last set, read-only.
+- Requests to a server time out (10 s), failing `ETIMEDOUT`. Not yet:
+  running them on threads of their own, so a slow server can't hold up
+  the mount's (8) while it's waited on.
+- A server that can't be reached, its socket gone or its connection
+  hung up, fails with `ENOTCONN`, and is connected to again on the next
+  request. Not yet: a persisted anchor showing its last set meanwhile.
+- Renaming between a served anchor and anything else fails `EXDEV`, as
+  across filesystems, so `mv` copies.
+- Only an anchor served by this node is reached so far; one served by
+  another node is shown as an ordinary anchor, from its sets.
 
 ## Persistence
+
+**Not yet implemented**: `persist` is said, and kept, but nothing reads it
+yet.
 
 With `persist` on, the serving node keeps the server's tree as sets, as
 if someone had written it through the mount: its files become blocks, by
@@ -134,9 +143,10 @@ anyone else, without authenticating as them, as sshd doesn't.
 
 ## Slices
 
-1. **On one machine.** The `serve` claim, `[[serve]]` configuration, and
-   a 9P2000.L client in the mount for a socket of the mount's own user.
-   Live only, with the rules of [[#Privilege]] and their tests.
+1. **On one machine** (implemented). The `serve` claim (`hk serve add`,
+   `rm`, `show`), `[[serve]]` configuration, and a 9P2000.L client in the
+   mount for a socket of the mount's own user. Live only, with the rules
+   of [[#Privilege]] and their tests.
 2. **Across the mesh.** A node protocol carrying 9P to the serving node,
    which connects to the service as its user, for whoever grants let in.
 3. **Persistence**, as above.
@@ -144,3 +154,6 @@ anyone else, without authenticating as them, as sshd doesn't.
    clone files, as the authenticated user only, if their device is
    granted a shell on that machine; root only as root's own
    configuration allows, as `/root/.ssh/authorized_keys` does.
+
+Source: `src/claim.rs`, `src/store/claims.rs`, `src/served.rs`,
+`src/ninep.rs`, `src/ninep/client.rs`, `src/mount/served.rs`.
