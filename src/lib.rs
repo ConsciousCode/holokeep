@@ -35,6 +35,7 @@ pub mod mount;
 pub mod mounts;
 pub mod model;
 pub mod ninep;
+pub mod served;
 pub mod store;
 #[cfg(feature = "net")]
 pub mod net;

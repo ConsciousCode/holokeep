@@ -16,6 +16,10 @@
 //!
 //! [[mount]]           # mounted by `hk node run` while it runs
 //! dir = "~/soup"
+//!
+//! [[serve]]           # a service anchors may be served from
+//! name = "notes"
+//! socket = "/run/user/1000/notes.9p"
 //! ```
 
 use std::collections::BTreeMap;
@@ -39,6 +43,34 @@ pub struct Config {
     /// What the main mesh's node mounts while it runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mount: Vec<Mount>,
+    /// The services this node serves anchors from (see `served`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub serve: Vec<Service>,
+}
+
+/// A service anchors are served from: a socket speaking 9P2000.L, which
+/// serve claims name by `name`. It runs as whoever owns this file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Service {
+    pub name: String,
+    /// Where: `~/` is the home directory.
+    pub socket: PathBuf,
+}
+
+impl Service {
+    /// Where its socket is, with `~/` the home directory.
+    pub fn socket(&self) -> PathBuf {
+        home(&self.socket)
+    }
+}
+
+/// A path, with `~/` the home directory.
+fn home(path: &Path) -> PathBuf {
+    match (path.strip_prefix("~"), std::env::var_os("HOME")) {
+        (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// A node's tunables, each as its flag of `hk node run` says, and those
@@ -118,10 +150,7 @@ pub struct Mount {
 impl Mount {
     /// Where, with `~/` the home directory.
     pub fn dir(&self) -> PathBuf {
-        match (self.dir.strip_prefix("~"), std::env::var_os("HOME")) {
-            (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
-            _ => self.dir.clone(),
-        }
+        home(&self.dir)
     }
 }
 
@@ -154,6 +183,12 @@ impl Config {
             }
             if node.clients.is_some() {
                 return Err(format!("[mesh.{name}]: clients are of the main mesh"));
+            }
+        }
+        let mut names = std::collections::HashSet::new();
+        for service in &config.serve {
+            if service.name.is_empty() || !names.insert(service.name.as_str()) {
+                return Err(format!("[[serve]]: each service needs a name of its own, not {:?}", service.name));
             }
         }
         Ok(config)
