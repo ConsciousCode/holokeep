@@ -241,7 +241,7 @@ pub trait Store: BlockIndex + BlockSource + BlockStore {
 /// making it over as it knows it, its views say, would break what the newer
 /// build reads them with, where that's still running. Raise it with any
 /// change to them (and make a repo fixture, `scripts/make-repo-fixture.sh`).
-pub const SCHEMA: i64 = 3;
+pub const SCHEMA: i64 = 4;
 
 pub const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -692,6 +692,11 @@ fn held_since() -> i64 {
 /// Seconds since the epoch.
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs())
+}
+
+/// Milliseconds since the epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn path_from(bytes: &[u8]) -> PathBuf {
@@ -3206,18 +3211,53 @@ impl Catalog {
         let latest = self.anchor_history(anchor)?.last().map_or(0, |&(at, _)| at.saturating_add(1));
         let at = now().max(latest);
         let wrote = wrote.iter().map(|path| path.join(&b'/'));
-        let (of, owner) = match crate::claim::viewed(anchor) {
-            Some((of, owner)) => {
-                if !self.may_write(anchor)? {
-                    return Err(Error::User(format!("{} hasn't let this user write their {of}", crate::keys::peer_id(&owner))));
-                }
-                let own = self.claims.as_ref().and_then(|claims| claims.acting()).is_some_and(|acting| acting == owner.multihash().to_bytes());
-                (of, (!own).then_some(owner))
-            },
-            None => (anchor.clone(), None),
-        };
+        let (of, owner) = self.written_view(anchor)?;
         let set = crate::claim::Set::new([of], value.clone(), at).ok_or(Error::NoClaims)?.after(Some(prev)).wrote(wrote).for_view(owner);
         self.put_claim(&Claim::Set(set))
+    }
+
+    /// What a claim saying what an anchor is targets, and whose view it's
+    /// for, if it isn't the user's own: the anchor a view's of, if it's a
+    /// view this user may write, or the anchor.
+    fn written_view(&self, anchor: &Link) -> Result<(Link, Option<Link>)> {
+        let Some((of, owner)) = crate::claim::viewed(anchor) else {
+            return Ok((anchor.clone(), None));
+        };
+        if !self.may_write(anchor)? {
+            return Err(Error::User(format!("{} hasn't let this user write their {of}", crate::keys::peer_id(&owner))));
+        }
+        let own = self.claims.as_ref().and_then(|claims| claims.acting()).is_some_and(|acting| acting == owner.multihash().to_bytes());
+        Ok((of, (!own).then_some(owner)))
+    }
+
+    /// Bind an anchor, or a user's view of one, to a node's service, as of
+    /// now: see `claim::Serve`. Returns the claim.
+    pub fn serve_anchor(&self, anchor: &Link, node: &[u8], service: &str, persist: bool) -> Result<Link> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let latest = claims.serves(anchor.multihash())?.first().map_or(0, |(_, serve)| serve.at().saturating_add(1));
+        let at = now_ms().max(latest);
+        let (of, owner) = self.written_view(anchor)?;
+        let serve = crate::claim::Serve::new(of, node.to_vec(), service.to_owned(), persist, at)
+            .ok_or_else(|| Error::User("a serve claim needs a node and a service".into()))?
+            .for_view(owner);
+        self.put_claim(&Claim::Serve(serve))
+    }
+
+    /// Who serves an anchor, or a user's view of one, if anyone: the latest
+    /// serve claim that counts.
+    pub fn serving(&self, anchor: &Link) -> Result<Option<crate::claim::Serve>> {
+        self.claims.as_ref().map_or(Ok(None), |claims| claims.serving(anchor.multihash()))
+    }
+
+    /// Stop an anchor, or a user's view of one, being served: a tomb of
+    /// each serve claim that counts. Returns the tombs.
+    pub fn unserve_anchor(&self, anchor: &Link) -> Result<Vec<Link>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let mut tombs = Vec::new();
+        for (serve, _) in claims.serves(anchor.multihash())? {
+            tombs.push(self.put_claim(&Claim::Tomb(Tomb::new([serve]).ok_or(Error::NoClaims)?))?);
+        }
+        Ok(tombs)
     }
 
     /// Whether the user this acts for may set an anchor, or a user's view

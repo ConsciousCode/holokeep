@@ -64,6 +64,8 @@ founder=$(h node grant ls | head -1 | cut -f1)
 other=$(h node grant ls | awk -F'\t' '$2 == "/mesh/user" { print $1 }')
 h anchor share "$anchor" "$other" read write >/dev/null 2>&1
 viewed=$(h anchor view "$anchor" "$founder")
+# Served by this node's service, kept as sets
+h serve add --persist "$anchor" fixture >/dev/null
 
 mkdir -p "$out"
 cp -a "$repo/." "$out/"
@@ -79,6 +81,7 @@ copied $big
 git $git
 lost $lost
 viewed $viewed
+served $anchor
 EXPECT
 echo "made $out"
 du -sh "$out"

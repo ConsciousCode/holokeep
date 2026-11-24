@@ -134,6 +134,12 @@ enum Command {
     /// Link this repo's machines into a private mesh
     #[cfg(feature = "net")]
     Node(NodeArgs),
+    /// Serve anchors live, from a node's services over 9P2000.L, rather
+    /// than from blocks: see the wiki's Servers page. Only the route is
+    /// said here; what a service is, a node's own config says
+    #[cfg(feature = "net")]
+    #[command(subcommand)]
+    Serve(ServeCommand),
     /// Mount the soup as a filesystem until interrupted: the root anchor's
     /// names, beside cid/<cid>, anchors/<anchor> and tags/<tag>/<cid>.
     /// What's written to an anchor is committed, setting it, once it's
@@ -1400,6 +1406,8 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Config(command) => config(&repo_dir(args.repo)?, command),
         #[cfg(feature = "net")]
         Command::Node(NodeArgs { mesh, command }) => node(&holokeep::net::mesh::Place::new(&repo_dir(args.repo)?, &mesh), command),
+        #[cfg(feature = "net")]
+        Command::Serve(command) => serve(&repo_dir(args.repo)?, command),
     }
 }
 
@@ -2058,6 +2066,58 @@ fn key_named(text: &str) -> anyhow::Result<Link> {
     holokeep::keys::from_peer_id(text)
         .or_else(|| text.parse::<Link>().ok().filter(holokeep::keys::is_key))
         .with_context(|| format!("not a key, by peer ID or CID: {text}"))
+}
+
+#[cfg(feature = "net")]
+#[derive(Subcommand, Debug)]
+enum ServeCommand {
+    /// Say an anchor is served by a node's service, this node's unless
+    /// another's named; prints the claim
+    Add {
+        anchor: Link,
+        /// The service's name in the serving node's `[[serve]]` config
+        service: String,
+        /// The serving node, by peer ID [default: this one]
+        #[arg(long)]
+        node: Option<libp2p::PeerId>,
+        /// Keep the server's states as sets, but for what it marks QTTMP
+        #[arg(long)]
+        persist: bool,
+    },
+    /// Say an anchor's no longer served; prints the tombs
+    Rm { anchor: Link },
+    /// Print who serves an anchor, if anyone
+    Show { anchor: Link },
+}
+
+#[cfg(feature = "net")]
+fn serve(dir: &Path, command: ServeCommand) -> anyhow::Result<()> {
+    let repo = open_repo(Some(dir.to_path_buf()))?;
+    match command {
+        ServeCommand::Add { anchor, service, node, persist } => {
+            let node = match node {
+                Some(node) => node,
+                None => holokeep::net::mesh::node_key(dir)?.public().to_peer_id(),
+            };
+            out!("{}", repo.serve_anchor(&anchor, &node.to_bytes(), &service, persist)?);
+        },
+        ServeCommand::Rm { anchor } => {
+            for tomb in repo.unserve_anchor(&anchor)? {
+                out!("{tomb}");
+            }
+        },
+        ServeCommand::Show { anchor } => match repo.serving(&anchor)? {
+            Some(serving) => {
+                let node = libp2p::PeerId::from_bytes(serving.node()).map_or_else(|_| "an unreadable peer ID".to_owned(), |peer| peer.to_string());
+                out!("node\t{node}");
+                out!("service\t{}", serving.service());
+                out!("persist\t{}", if serving.persist() { "yes" } else { "no" });
+                out!("since\t{}", serving.at() / 1000);
+            },
+            None => out!("not served"),
+        },
+    }
+    Ok(())
 }
 
 /// A peer's key.

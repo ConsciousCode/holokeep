@@ -3061,6 +3061,13 @@ fn repos_earlier_builds_made_still_open() {
             assert!(repo.lost_at(lost).expect("lost").is_some(), "{name}: reported lost");
             assert_eq!(repo.lost_blocks().expect("list").len(), 1, "{name}");
         }
+        if let Some(served) = expect.get("served") {
+            let serving = repo.serving(served).expect("serving").unwrap_or_else(|| panic!("{name}: served"));
+            assert_eq!((serving.service(), serving.persist()), ("fixture", true), "{name}");
+        }
+        // And older ones can be served now
+        repo.serve_anchor(&expect["anchor"], b"node", "later", false).expect("serve");
+        assert_eq!(repo.serving(&expect["anchor"]).expect("serving").map(|serve| serve.service().to_owned()).as_deref(), Some("later"), "{name}");
         // Older ones can say so now too
         let reported: Link = raw(name.as_bytes()).cid().clone().into();
         repo.report_lost(&reported).expect("report").expect("a claim");
@@ -3382,6 +3389,44 @@ fn a_mesh_users_devices_are_known_where_they_have_no_account() {
     };
     assert_eq!(there("told", &state.users()), (true, false), "the phone's ezra's, the lost one revoked");
     assert_eq!(there("untold", &[]), (false, false), "nothing says whose the phone is");
+}
+
+/// A serve claim counts as a set of its anchor would: the latest of the
+/// owner's wins, a tomb withdraws it, and one by a user who may not set the
+/// anchor counts for no one but them.
+#[test]
+fn an_anchor_is_served_as_it_may_be_set() {
+    use crate::grants::USER;
+    let scratch = Scratch::new("anchor-served");
+    let mut repo = Catalog::open_repo(&scratch.path().join("repo")).expect("open");
+    let root = repo.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let genesis = repo.found_grants(&root).expect("found");
+    let (owner, me) = (repo.signer().expect("signer").clone(), repo.uid());
+    let bob = me.wrapping_add(1);
+    let (bobs, bob_root) = (crate::keys::Key::generate().expect("key"), crate::keys::Key::generate().expect("key"));
+    repo.certify(&bob_root, &bobs.id()).expect("certify");
+    repo.grant(&genesis, &[bob_root.id()], &[USER.to_owned()], &[]).expect("grant");
+
+    let anchor = repo.new_anchor().expect("anchor");
+    assert_eq!(repo.serving(&anchor).expect("serving"), None);
+    repo.serve_anchor(&anchor, b"node-a", "notes", false).expect("serve");
+    repo.serve_anchor(&anchor, b"node-b", "notes", true).expect("serve");
+    let serving = repo.serving(&anchor).expect("serving").expect("served");
+    assert_eq!((serving.node(), serving.service(), serving.persist()), (b"node-b".as_slice(), "notes", true), "the latest");
+
+    // Bob, who may not set the owner's anchor, can't make it served there
+    repo.act_for(bob, bobs).expect("act");
+    repo.set_user(&bob_root.id()).expect("user");
+    let view = crate::claim::view(&anchor, &root.id()).expect("view");
+    assert!(repo.serve_anchor(&view, b"bobs", "evil", false).is_err());
+    let forged = crate::claim::Serve::new(anchor.clone(), b"bobs".to_vec(), "evil".into(), false, u64::MAX >> 1).expect("serve").for_view(Some(root.id()));
+    repo.put_claim(&Claim::Serve(forged)).expect("put");
+    repo.act_for(me, owner).expect("act");
+    assert_eq!(repo.serving(&anchor).expect("serving").map(|serve| serve.service().to_owned()).as_deref(), Some("notes"), "bob's doesn't count");
+
+    // Withdrawn, every binding that counts goes
+    assert_eq!(repo.unserve_anchor(&anchor).expect("unserve").len(), 2);
+    assert_eq!(repo.serving(&anchor).expect("serving"), None);
 }
 
 /// Two users sharing a repo, one letting the other see, then set, their

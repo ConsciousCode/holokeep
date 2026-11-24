@@ -166,6 +166,25 @@ pub struct Grant {
     until: Option<u64>,
 }
 
+/// "As of `at`, in milliseconds since the epoch, the target, an anchor,
+/// is answered live by the node `node`, as its service `service`."
+///
+/// A route, not a program: which socket a service is, and as whom it
+/// runs, is said only in that node's own configuration, so a serve claim
+/// can't make any node run anything. `persist` says the server's states
+/// are kept as sets. It counts as a set of the anchor would, for the view
+/// `for_` names or its signer's own, and the latest that counts wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Serve {
+    /// The one anchor.
+    target: Vec<Link>,
+    node: Vec<u8>,
+    service: String,
+    persist: bool,
+    at: u64,
+    for_: Option<Link>,
+}
+
 /// Any claim this understands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
@@ -177,6 +196,7 @@ pub enum Claim {
     Device(Device),
     Lost(Lost),
     Grant(Grant),
+    Serve(Serve),
 }
 
 /// Sort links by their bytes and drop repeats, making them a set.
@@ -361,6 +381,37 @@ impl Device {
     pub fn target(&self) -> &[Link] { &self.target }
 }
 
+impl Serve {
+    /// A binding of an anchor to a node's service, if the service is named.
+    pub fn new(anchor: Link, node: Vec<u8>, service: String, persist: bool, at: u64) -> Option<Self> {
+        (!service.is_empty() && !node.is_empty()).then_some(Self { target: vec![anchor], node, service, persist, at, for_: None })
+    }
+
+    /// The same binding, for this user's view of the anchor, or with none,
+    /// its signer's own.
+    #[must_use]
+    pub fn for_view(mut self, owner: Option<Link>) -> Self {
+        self.for_ = owner;
+        self
+    }
+
+    pub fn target(&self) -> &[Link] { &self.target }
+
+    /// The anchor served.
+    pub fn anchor(&self) -> Option<&Link> { self.target.first() }
+
+    /// The serving node's peer ID, as bytes.
+    pub fn node(&self) -> &[u8] { &self.node }
+
+    pub fn service(&self) -> &str { &self.service }
+
+    pub const fn persist(&self) -> bool { self.persist }
+
+    pub const fn at(&self) -> u64 { self.at }
+
+    pub const fn owner(&self) -> Option<&Link> { self.for_.as_ref() }
+}
+
 impl Lost {
     /// A report of the targets lost, if there are any.
     pub fn new(target: impl IntoIterator<Item = Link>, at: u64) -> Option<Self> {
@@ -371,6 +422,27 @@ impl Lost {
     pub fn target(&self) -> &[Link] { &self.target }
 
     pub const fn at(&self) -> u64 { self.at }
+}
+
+/// A serve claim's fields, taken from its map.
+fn parse_serve(map: &mut BTreeMap<String, Ipld>, target: &[Link]) -> Option<Serve> {
+    let (Ipld::Bytes(node), Ipld::String(service), Ipld::Integer(at)) = (map.remove("node")?, map.remove("service")?, map.remove("at")?) else {
+        return None;
+    };
+    let persist = match map.remove("persist") {
+        Some(Ipld::Bool(true)) => true,
+        None => false,
+        Some(_) => return None,
+    };
+    let owner = match map.remove("for") {
+        Some(Ipld::Link(owner)) => Some(owner),
+        Some(_) => return None,
+        None => None,
+    };
+    let [anchor] = target else {
+        return None;
+    };
+    Some(Serve::new(anchor.clone(), node, service, persist, u64::try_from(at).ok()?)?.for_view(owner))
 }
 
 /// Whether a string is a command: `/`, or lower case names, of letters,
@@ -460,6 +532,7 @@ impl Claim {
             Self::Device(device) => device.target(),
             Self::Lost(lost) => lost.target(),
             Self::Grant(grant) => grant.target(),
+            Self::Serve(serve) => serve.target(),
         }
     }
 
@@ -474,6 +547,7 @@ impl Claim {
             Self::Device(_) => "device",
             Self::Lost(_) => "lost",
             Self::Grant(_) => "grant",
+            Self::Serve(_) => "serve",
         }
     }
 
@@ -533,6 +607,20 @@ impl Claim {
                 }
                 ("grant", map)
             },
+            Self::Serve(serve) => {
+                let mut map = BTreeMap::from([
+                    ("node".to_owned(), Ipld::Bytes(serve.node.clone())),
+                    ("service".to_owned(), Ipld::String(serve.service.clone())),
+                    ("at".to_owned(), Ipld::Integer(serve.at.into())),
+                ]);
+                if serve.persist {
+                    map.insert("persist".to_owned(), Ipld::Bool(true));
+                }
+                if let Some(owner) = &serve.for_ {
+                    map.insert("for".to_owned(), Ipld::Link(owner.clone()));
+                }
+                ("serve", map)
+            },
         };
         map.insert("claim".to_owned(), Ipld::String(kind.to_owned()));
         map.insert("target".to_owned(), links(self.target()));
@@ -548,7 +636,7 @@ impl Claim {
     /// is always of all of its target.
     pub fn dissolves(&self) -> bool {
         let bounded = matches!(self, Self::Keep(keep) if !keep.beyond.is_empty());
-        !bounded && !matches!(self, Self::Sign(_) | Self::Grant(_)) && self.target().len() == 1 && self.encode().len() <= IDENTITY_MAX
+        !bounded && !matches!(self, Self::Sign(_) | Self::Grant(_) | Self::Serve(_)) && self.target().len() == 1 && self.encode().len() <= IDENTITY_MAX
     }
 
     /// The claim as a dag-cbor block: an identity block if it dissolves,
@@ -652,6 +740,7 @@ impl Claim {
             },
             "device" => Self::Device(Device::new(target.clone())?),
             "grant" => Self::Grant(parse_grant(&mut map, target.clone())?),
+            "serve" => Self::Serve(parse_serve(&mut map, &target)?),
             _ => return None,
         };
         // Nothing else, sorted and distinct already, and canonical dag-cbor
@@ -877,6 +966,13 @@ mod tests {
 
     #[test]
     fn a_lost_claim_says_when() {
+        let serve = Claim::Serve(Serve::new(cid(b"anchor"), b"peer".to_vec(), "notes".into(), true, 1_793_750_400_000).expect("serve").for_view(Some(cid(b"owner"))));
+        assert_eq!(Claim::parse(serve.block().data()), Some(serve.clone()));
+        assert!(!serve.dissolves(), "a route, kept whole");
+        let bare = Claim::Serve(Serve::new(cid(b"anchor"), b"peer".to_vec(), "notes".into(), false, 1).expect("serve"));
+        assert_eq!(Claim::parse(bare.block().data()), Some(bare));
+        assert!(Serve::new(cid(b"anchor"), b"peer".to_vec(), String::new(), false, 1).is_none(), "a service has a name");
+        assert!(Serve::new(cid(b"anchor"), Vec::new(), "notes".into(), false, 1).is_none(), "and a node");
         let lost = Claim::Lost(Lost::new([cid(b"a")], 1_793_750_400).expect("lost"));
         assert!(lost.dissolves());
         assert_eq!(Claim::parse(lost.block().data()), Some(lost.clone()));

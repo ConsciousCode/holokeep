@@ -352,7 +352,7 @@ const SCHEMA: &str =
          CREATE TABLE IF NOT EXISTS claims (
              id INTEGER PRIMARY KEY,
              claim INTEGER UNIQUE REFERENCES multihashes (id),
-             kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant'))
+             kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant', 'serve'))
          );
          -- Every claim's targets, which every type has.
          CREATE TABLE IF NOT EXISTS claim_targets (
@@ -406,6 +406,14 @@ const SCHEMA: &str =
          CREATE TABLE IF NOT EXISTS grant_claims (
              id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
              data BLOB NOT NULL
+         );
+         -- Serve claims, whole, with when and whose view each is for,
+         -- which is how they count, as sets do.
+         CREATE TABLE IF NOT EXISTS serve_claims (
+             id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
+             data BLOB NOT NULL,
+             at INTEGER NOT NULL,
+             owner INTEGER REFERENCES multihashes (id)
          );
          -- What's particular to each type; a tomb has nothing but targets.
          CREATE TABLE IF NOT EXISTS group_claims (
@@ -1055,6 +1063,12 @@ impl ClaimStore {
                     .filter(|claim| matches!(claim, Claim::Grant(_)))
                     .ok_or_else(|| Error::Invalid { store: NAME, reason: "a grant that isn't one".into() })
             },
+            "serve" => {
+                let data: Vec<u8> = self.db.conn().prepare_cached("SELECT data FROM serve_claims WHERE id = ?1")?.query_row([id], |row| row.get(0))?;
+                Claim::parse(&data)
+                    .filter(|claim| matches!(claim, Claim::Serve(_)))
+                    .ok_or_else(|| Error::Invalid { store: NAME, reason: "a serve claim that isn't one".into() })
+            },
             _ => Err(Error::Invalid { store: NAME, reason: format!("a claim of kind {kind}") }),
         }
     }
@@ -1461,7 +1475,7 @@ impl ClaimStore {
                 }
                 same
             },
-            Claim::Sign(_) | Claim::Grant(_) => None,
+            Claim::Sign(_) | Claim::Grant(_) | Claim::Serve(_) => None,
             Claim::Lost(lost) => self.db.conn()
                 .prepare_cached(
                     "SELECT c.id FROM claims c JOIN lost_claims l ON l.id = c.id JOIN claim_targets t ON t.claim = c.id
@@ -1611,6 +1625,11 @@ impl ClaimStore {
         if let Claim::Grant(_) = claim {
             conn.prepare_cached("INSERT INTO grant_claims (id, data) VALUES (?1, ?2)")?.execute(params![row, claim.block().data()])?;
         }
+        if let Claim::Serve(serve) = claim {
+            let owner = serve.owner().map(|owner| self.db.intern(owner.multihash())).transpose()?;
+            conn.prepare_cached("INSERT INTO serve_claims (id, data, at, owner) VALUES (?1, ?2, ?3, ?4)")?
+                .execute(params![row, claim.block().data(), i64::try_from(serve.at()).unwrap_or(i64::MAX), owner])?;
+        }
         if let Claim::Lost(lost) = claim {
             conn.prepare_cached("INSERT INTO lost_claims (id, at) VALUES (?1, ?2)")?
                 .execute(params![row, i64::try_from(lost.at()).unwrap_or(i64::MAX)])?;
@@ -1658,6 +1677,43 @@ impl ClaimStore {
             ))?
             .query_row([target.to_bytes()], |row| row.get(0))?;
         Ok(at.map(|at| u64::try_from(at).unwrap_or_default()))
+    }
+
+    /// Who serves an anchor, as the latest serve claim that counts in the
+    /// view looked at says, as a set of it would count.
+    pub fn serving(&self, anchor: Key<'_>) -> Result<Option<crate::claim::Serve>> {
+        Ok(self.serves(anchor)?.into_iter().next().map(|(_, serve)| serve))
+    }
+
+    /// The serve claims that count of an anchor, in the view looked at, by
+    /// their CIDs, latest first: what's withdrawn by a tomb.
+    pub fn serves(&self, anchor: Key<'_>) -> Result<Vec<(Link, crate::claim::Serve)>> {
+        self.viewing(anchor, |anchor| self.serves_here(anchor))
+    }
+
+    fn serves_here(&self, anchor: Key<'_>) -> Result<Vec<(Link, crate::claim::Serve)>> {
+        let anchor = super::owned(anchor)?.to_bytes();
+        let rows: Vec<Vec<u8>> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT s.data FROM claim_targets t JOIN multihashes m ON m.id = t.target
+                 JOIN claims c ON c.id = t.claim JOIN serve_claims s ON s.id = c.id
+                 WHERE m.multihash = ?1 AND c.kind = 'serve' AND {here}
+                 ORDER BY s.at DESC, c.id DESC",
+                here = here("c", "s", "t"),
+            ))?
+            .query_map([anchor], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|data| match Claim::parse(&data) {
+                Some(claim @ Claim::Serve(_)) => {
+                    let cid = claim.cid();
+                    let Claim::Serve(serve) = claim else { return None };
+                    Some((cid, serve))
+                },
+                _ => None,
+            })
+            .collect())
     }
 
     /// What lost claims that count say, as (block, when), the latest of each.
@@ -1816,7 +1872,7 @@ impl ClaimStore {
 /// constraint, which doesn't touch how rows are stored, is rewritten in
 /// place, as `SQLite` documents for such changes.
 fn widen_kinds(db: &Db) -> Result<()> {
-    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant'))";
+    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant', 'serve'))";
     let conn = db.conn();
     let sql: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'claims'", [], |row| row.get(0))?;
     if sql.contains(KINDS) {
