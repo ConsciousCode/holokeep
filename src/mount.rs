@@ -2529,6 +2529,73 @@ mod tests {
         }
     }
 
+    /// A big file committed and then moved, removed or written over isn't
+    /// copied: moved, it's what it was where it's moved to, and removed or
+    /// emptied, it's moved into the shards, kept whole. Unless something
+    /// has it open to write, which would write what's kept.
+    #[test]
+    fn whats_committed_is_moved_to_be_kept_not_copied() {
+        let scratch = Scratch::new("mount-keep-whole");
+        let (soup, anchor, repo) = writable(&scratch);
+        let dir = ino(&soup, &format!("anchors/{anchor}")).expect("anchor").ino.0;
+        let big = |seed: u8| -> Vec<u8> {
+            let mut state = u32::from(seed).wrapping_mul(2_654_435_761).wrapping_add(1);
+            (0..3 * 1024 * 1024).map(|_| { state ^= state << 13; state ^= state >> 17; state ^= state << 5; state.to_le_bytes()[0] }).collect()
+        };
+        let write = |name: &str, data: &[u8]| {
+            let (_, fh) = soup.create(dir, OsStr::new(name)).expect("create");
+            soup.write(fh, 0, data).expect("write");
+            soup.release(fh);
+        };
+        let copied = || -> i64 {
+            let db = rusqlite::Connection::open(repo.join("blocks.db")).expect("db");
+            db.query_row("SELECT count(*) FROM delta_blocks", [], |row| row.get(0)).expect("rows")
+        };
+        let kept = || -> usize {
+            fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+                for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) { files(&entry.path(), out) } else { out.push(entry.path()) }
+                }
+            }
+            let mut found = Vec::new();
+            files(&repo.join("shards"), &mut found);
+            found.iter().filter(|path| std::fs::metadata(path).is_ok_and(|meta| meta.len() == 3 * 1024 * 1024)).count()
+        };
+        write("a", &big(1));
+        write("b", &big(2));
+        write("c", &big(3));
+        soup.commit();
+
+        soup.rename(dir, OsStr::new("a"), dir, OsStr::new("moved"), false).expect("rename");
+        soup.commit();
+        assert_eq!((copied(), kept()), (0, 0), "moved as it is");
+        soup.unlink(dir, OsStr::new("moved")).expect("unlink");
+        soup.commit();
+        assert_eq!((copied(), kept()), (0, 1), "kept whole, not copied");
+        let fh = soup.open(ino(&soup, &format!("anchors/{anchor}/b")).expect("b").ino.0, true, true).expect("open");
+        soup.write(fh, 0, b"short").expect("write");
+        soup.release(fh);
+        soup.commit();
+        assert_eq!((copied(), kept()), (0, 2), "what's written over, too");
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/b")), b"short");
+
+        let writing = soup.open(ino(&soup, &format!("anchors/{anchor}/c")).expect("c").ino.0, true, false).expect("open");
+        soup.unlink(dir, OsStr::new("c")).expect("unlink");
+        assert!(copied() > 0, "copied, as what has it open could write it");
+        assert_eq!(kept(), 2);
+        soup.release(writing);
+        soup.commit();
+
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let history = catalog.anchor_history(&anchor).expect("history");
+        let first = &history.iter().find(|(_, value)| crate::export::list(&catalog, value).is_ok_and(|entries| entries.iter().any(|entry| entry.name == b"c") && entries.iter().any(|entry| entry.name == b"a"))).expect("the first commit").1;
+        let out = scratch.path().join("out");
+        crate::export::get(&catalog, first, &out).unwrap_or_else(|e| panic!("{first} isn't whole: {e}"));
+        for (name, seed) in [("a", 1), ("b", 2), ("c", 3)] {
+            assert!(std::fs::read(out.join(name)).expect("read") == big(seed), "{name} as it was");
+        }
+    }
+
     #[test]
     fn every_version_committed_stays_whole() {
         let scratch = Scratch::new("mount-history");

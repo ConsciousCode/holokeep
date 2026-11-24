@@ -370,6 +370,86 @@ impl OffsetStore {
         .collect()
     }
 
+    /// Files imported in place at or under `from`, moved to `to` as they
+    /// are: recorded where they are now. Any that changed on the way are
+    /// left to be noticed as changed. Returns how many moved.
+    pub fn moved_external(&self, from: &Path, to: &Path) -> Result<usize> {
+        let mut moved = 0usize;
+        for file in self.external_under(from)? {
+            let Ok(rest) = file.path.strip_prefix(from) else {
+                continue;
+            };
+            let now = if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) };
+            if Fingerprint::read(&now) != Some(file.fingerprint) {
+                continue;
+            }
+            let Some(blob) = self.db.lookup(file.blob.as_ref())? else {
+                continue;
+            };
+            self.db.conn()
+                .prepare_cached("UPDATE OR REPLACE external_files SET path = ?3 WHERE blob = ?1 AND path = ?2")?
+                .execute(params![blob, path_bytes(&file.path), path_bytes(&now)])?;
+            moved = moved.saturating_add(1);
+        }
+        Ok(moved)
+    }
+
+    /// Whether a blob's whole somewhere other than at or under `path`: kept
+    /// in the repo's shards, or imported in place elsewhere, unchanged.
+    pub fn whole_elsewhere(&self, blob: Key<'_>, path: &Path) -> Result<bool> {
+        let Some(id) = self.db.lookup(blob)? else {
+            return Ok(false);
+        };
+        if let Some(shards) = &self.shards
+            && self.db.conn().prepare_cached("SELECT 1 FROM shard_files WHERE dir = ?1 AND blob = ?2")?.exists([shards.id(), id])?
+        {
+            return Ok(true);
+        }
+        Ok(self.query_external("AND e.blob = ?1", [id])?.iter().any(|file| !file.path.starts_with(path) && !file.changed()))
+    }
+
+    /// A UnixFS file a blob of `size` bytes is all of: one whose leaves
+    /// are the blob's ranges, found up the links from its first.
+    pub fn file_root(&self, blob: Key<'_>, size: u64) -> Result<Option<Multihash>> {
+        let Some(id) = self.db.lookup(blob)? else {
+            return Ok(None);
+        };
+        let conn = self.db.conn();
+        let candidates: Vec<(i64, Vec<u8>)> = conn
+            .prepare_cached(
+                "WITH RECURSIVE up(node) AS (
+                     SELECT l.node FROM offset_ranges r JOIN unixfs_links l ON l.target = r.block AND l.idx = 0
+                     WHERE r.blob = ?1 AND r.offset = 0
+                     UNION SELECT l.node FROM up JOIN unixfs_links l ON l.target = up.node AND l.idx = 0
+                 )
+                 SELECT up.node, m.multihash FROM up
+                 JOIN unixfs_nodes n ON n.block = up.node
+                 JOIN multihashes m ON m.id = up.node
+                 WHERE n.type = ?2 AND n.filesize = ?3",
+            )?
+            .query_map(params![id, i64::try_from(u64::from(crate::unixfs::DataType::File)).unwrap_or_default(), i64::try_from(size).unwrap_or(i64::MAX)], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (node, multihash) in candidates {
+            // Its leaves, those of its descendants without links, are
+            // exactly the blob's ranges
+            let fits: bool = conn
+                .prepare_cached(
+                    "WITH RECURSIVE down(block) AS (
+                         SELECT ?1 UNION SELECT l.target FROM down JOIN unixfs_links l ON l.node = down.block
+                     ),
+                     leaves AS (SELECT block FROM down WHERE NOT EXISTS (SELECT 1 FROM unixfs_links l WHERE l.node = down.block)),
+                     ranges AS (SELECT DISTINCT block FROM offset_ranges WHERE blob = ?2)
+                     SELECT (SELECT count(*) FROM leaves) = (SELECT count(*) FROM ranges)
+                         AND NOT EXISTS (SELECT 1 FROM leaves WHERE block NOT IN ranges)",
+                )?
+                .query_row(params![node, id], |row| row.get(0))?;
+            if fits {
+                return Ok(Some(super::decode_key(NAME, &multihash)?));
+            }
+        }
+        Ok(None)
+    }
+
     /// Forget a file imported in place, as it's gone or changed. Its
     /// ranges go too unless its blob's somewhere else still; returns the
     /// blocks no longer ranges of anything.

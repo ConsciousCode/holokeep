@@ -472,6 +472,24 @@ impl Committer {
         self.fresh().retain(|path| !path.starts_with(dir));
     }
 
+    /// What's at `from` moved to `to`, replacing what was there: it's
+    /// still kept already if it was, and what it replaced is no concern.
+    fn moved(&self, from: &Path, to: &Path) {
+        let mut fresh = self.fresh();
+        fresh.retain(|path| !path.starts_with(to));
+        let was = fresh.iter().any(|path| from.starts_with(path));
+        let under: Vec<PathBuf> = fresh.iter().filter(|path| path.starts_with(from) && path.as_path() != from).cloned().collect();
+        for path in under {
+            fresh.remove(&path);
+            if let Ok(rest) = path.strip_prefix(from) {
+                fresh.insert(to.join(rest));
+            }
+        }
+        if was {
+            fresh.insert(to.to_path_buf());
+        }
+    }
+
     fn written(&self) -> std::sync::MutexGuard<'_, HashMap<Vec<u8>, Written>> {
         self.written.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -647,7 +665,7 @@ impl Committer {
             return Ok(());
         }
         import(catalog, mount, &|| true)?;
-        catalog.preserve_in_place(&mount.path)?;
+        catalog.preserve_in_place(&mount.path, true)?;
         if let (Some(parent), Some(name)) = (mount.path.parent(), mount.path.file_name())
             && fs::symlink_metadata(&mount.path).is_ok()
         {
@@ -832,17 +850,21 @@ impl Soup {
     }
 
     /// Before what's at a path of an anchor's work directory, or under it,
-    /// is changed, moved or removed: what it was committed as, imported in
-    /// place, is kept as blocks of its own, so the anchor's history stays
-    /// whole.
-    fn keep_committed(&self, catalog: &Catalog, anchor: &Link, rel: &Path) -> Result<(), Errno> {
+    /// is changed or removed: what it was committed as, imported in place,
+    /// is kept, so the anchor's history stays whole. What's `leaving` its
+    /// path is moved into the shards whole, unless something has it open to
+    /// write, as that would write what's kept; what's changed where it is
+    /// is copied.
+    fn keep_committed(&self, catalog: &Catalog, anchor: &Link, rel: &Path, leaving: bool) -> Result<(), Errno> {
         let Some(path) = self.work_path(anchor, rel) else {
             return Ok(());
         };
         if self.committer.fresh().iter().any(|fresh| path.starts_with(fresh)) {
             return Ok(());
         }
-        catalog.preserve_in_place(&path).map_err(store_errno)?;
+        let writing = self.handles().values().any(|handle| handle.writable && handle.anchor.as_ref() == Some(anchor) && handle.rel.starts_with(rel));
+        catalog.preserve_in_place(&path, leaving && !writing).map_err(store_errno)?;
+        // Kept whole, a version can't be a delta, which this then skips
         self.committer.revisions().extend(written_over(catalog, anchor, rel));
         self.committer.fresh().insert(path);
         Ok(())
@@ -882,9 +904,13 @@ impl Soup {
         let path = self.work_path(anchor, rel).ok_or(Errno::EROFS)?;
         if fs::symlink_metadata(&path).is_ok() {
             if truncate {
-                self.keep_committed(catalog, anchor, rel)?;
+                // What was there may be kept whole, moved away, so it's
+                // made again as it was, empty
+                let mode = fs::symlink_metadata(&path).map_err(|e| io_errno(&e))?.permissions();
+                self.keep_committed(catalog, anchor, rel, true)?;
                 self.filler.cut(catalog, anchor, rel, 0).map_err(|e| io_errno(&e))?;
-                File::options().write(true).truncate(true).open(&path).map_err(|e| io_errno(&e))?;
+                let file = File::options().write(true).create(true).truncate(true).open(&path).map_err(|e| io_errno(&e))?;
+                file.set_permissions(mode).map_err(|e| io_errno(&e))?;
             }
             return Ok(path);
         }
@@ -1067,7 +1093,7 @@ impl Soup {
         }
         let open = self.handle_of(fh).filter(|open| open.writable).ok_or(Errno::EBADF)?;
         if let Some(anchor) = &open.anchor {
-            self.keep_committed(&*self.catalog()?, anchor, &open.rel)?;
+            self.keep_committed(&*self.catalog()?, anchor, &open.rel, false)?;
         }
         let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
         self.fill_open(&open, offset, data.len(), Some((offset, len)))?;
@@ -1131,7 +1157,7 @@ impl Soup {
         let rel = rel.join(name);
         let catalog = self.catalog()?;
         self.prepare(&catalog, &anchor)?;
-        self.keep_committed(&catalog, &anchor, &rel)?;
+        self.keep_committed(&catalog, &anchor, &rel, true)?;
         let path = self.work_path(&anchor, &rel).ok_or(Errno::EROFS)?;
         Self::parents(&path)?;
         let file = File::options().read(true).write(true).create(true).truncate(true).open(&path).map_err(|e| io_errno(&e))?;
@@ -1233,9 +1259,13 @@ impl Soup {
         match self.at(&catalog, &anchor, &rel)?.ok_or(Errno::ENOENT)? {
             At::Work(meta) if meta.is_dir() => return Err(Errno::EISDIR),
             At::Work(_) => {
-                self.keep_committed(&catalog, &anchor, &rel)?;
+                self.keep_committed(&catalog, &anchor, &rel, true)?;
                 self.moving(&catalog, &anchor, &rel, None, || Ok(()))?;
-                fs::remove_file(self.work_path(&anchor, &rel).ok_or(Errno::EROFS)?).map_err(|e| io_errno(&e))?;
+                // Unless it's been moved away to be kept
+                match fs::remove_file(self.work_path(&anchor, &rel).ok_or(Errno::EROFS)?) {
+                    Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_errno(&e)),
+                    _ => {},
+                }
             },
             At::Base(..) => {},
         }
@@ -1308,9 +1338,9 @@ impl Soup {
             }
         }
         self.prepare(&catalog, &anchor)?;
-        // What's moved and what's replaced leave their paths
-        self.keep_committed(&catalog, &anchor, &from)?;
-        self.keep_committed(&catalog, &anchor, &to)?;
+        // What's replaced leaves its path; what's moved is what it was,
+        // where it's moved to
+        self.keep_committed(&catalog, &anchor, &to, true)?;
         let base = Self::base_at(&catalog, &anchor, &from)?;
         let (work_from, work_to) = (self.work_path(&anchor, &from).ok_or(Errno::EROFS)?, self.work_path(&anchor, &to).ok_or(Errno::EROFS)?);
         // It's exactly what was there: what the anchor had, or nothing
@@ -1340,6 +1370,8 @@ impl Soup {
                 drop(inodes);
                 Ok(())
             })?;
+            catalog.moved_in_place(&work_from, &work_to).map_err(store_errno)?;
+            self.committer.moved(&work_from, &work_to);
             marks()?;
         } else {
             // Only what the anchor had moves: nothing in the work directory
@@ -1393,7 +1425,7 @@ impl Soup {
             }
             let catalog = self.catalog()?;
             let to = self.prepare(&catalog, &anchor)?;
-            self.keep_committed(&catalog, &anchor, &rel)?;
+            self.keep_committed(&catalog, &anchor, &rel, true)?;
             self.moving(&catalog, &anchor, &rel, None, || Ok(()))?;
             drop(catalog);
             Self::parents(&to)?;
@@ -1414,7 +1446,7 @@ impl Soup {
         if let Some(Opened { file, anchor, rel, orphan, .. }) = fh.and_then(|fh| self.handle_of(fh)).filter(|open| open.writable) {
             if let Some(anchor) = &anchor {
                 let catalog = self.catalog()?;
-                self.keep_committed(&catalog, anchor, &rel)?;
+                self.keep_committed(&catalog, anchor, &rel, false)?;
                 self.filler.cut(&catalog, anchor, &rel, size).map_err(|e| io_errno(&e))?;
             }
             if let Some(orphan) = &orphan {
@@ -1436,7 +1468,7 @@ impl Soup {
         }
         let (anchor, rel) = self.overlay_of(ino)?;
         let catalog = self.catalog()?;
-        self.keep_committed(&catalog, &anchor, &rel)?;
+        self.keep_committed(&catalog, &anchor, &rel, false)?;
         let path = self.materialize(&catalog, &anchor, &rel, size == 0)?;
         self.filler.cut(&catalog, &anchor, &rel, size).map_err(|e| io_errno(&e))?;
         File::options().write(true).open(path).and_then(|file| file.set_len(size)).map_err(|e| io_errno(&e))?;

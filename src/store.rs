@@ -2375,9 +2375,14 @@ impl Catalog {
     /// moved or removed, keep what they were imported as, as blocks of
     /// their own, so the DAGs they're of stay whole, and forget them as
     /// imported in place. An overlay mount's work files are imported in
-    /// place as it's committed, and written to again after. Returns how
-    /// many blocks were moved out.
-    pub fn preserve_in_place(&self, path: &Path) -> Result<usize> {
+    /// place as it's committed, and written to again after.
+    ///
+    /// A file `leaving` its path, removed or replaced, isn't copied: it's
+    /// moved into the shards as it is, to be kept whole, where it can be.
+    /// One that's to be changed where it is, and one that can't be moved,
+    /// is copied out, block by block. Nothing is either if it's whole
+    /// somewhere else already. Returns how many blocks were copied.
+    pub fn preserve_in_place(&self, path: &Path, leaving: bool) -> Result<usize> {
         let Some(offsets) = &self.offsets else {
             return Ok(0);
         };
@@ -2391,7 +2396,8 @@ impl Catalog {
             let (gone, here): (Vec<&ExternalFile>, Vec<&ExternalFile>) = files.iter().partition(|file| file.changed());
             let mut moved = 0usize;
             for file in gone.into_iter().chain(here.iter().copied()) {
-                if !file.changed() {
+                let copy = !file.changed() && !offsets.whole_elsewhere(file.blob.as_ref(), path)?;
+                if copy && !(leaving && self.keep_whole(file)?) {
                     for (block, elsewhere) in offsets.ranges_of(file.blob.as_ref())? {
                         if !elsewhere && self.placements(block.as_ref())?.iter().any(|(_, form)| form == "offset") {
                             self.move_out(block.as_ref(), Provenance::Superseded)?;
@@ -2410,6 +2416,36 @@ impl Catalog {
             }
             Ok(moved)
         })
+    }
+
+    /// Keep a file imported in place whole, by moving it into the shards,
+    /// if it's one worth keeping whole, as an import would have, and its
+    /// UnixFS root is known: whether it was.
+    fn keep_whole(&self, file: &ExternalFile) -> Result<bool> {
+        let (Some(shards), Some(offsets)) = (&self.shards, &self.offsets) else {
+            return Ok(false);
+        };
+        let Ok(meta) = std::fs::symlink_metadata(&file.path) else {
+            return Ok(false);
+        };
+        let threshold = shards.threshold.map_or(0, |threshold| u64::try_from(threshold).unwrap_or(u64::MAX));
+        if meta.len() <= threshold || offsets.ranges_of(file.blob.as_ref())?.len() < 2 {
+            return Ok(false);
+        }
+        let Some(root) = offsets.file_root(file.blob.as_ref(), meta.len())? else {
+            return Ok(false);
+        };
+        if !shards.adopt(&file.path, file.blob.as_ref())? {
+            return Ok(false);
+        }
+        shards.record_root(file.blob.as_ref(), root.as_ref())?;
+        Ok(true)
+    }
+
+    /// Files imported in place at or under `from` were moved to `to`:
+    /// they're still what they were, where they are now.
+    pub fn moved_in_place(&self, from: &Path, to: &Path) -> Result<usize> {
+        self.offsets.as_ref().map_or(Ok(0), |offsets| self.db.atomically(|| offsets.moved_external(from, to)))
     }
 
     /// Move a block out of the kept file it's a range of, to be a block of

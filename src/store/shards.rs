@@ -172,6 +172,28 @@ impl ShardStore {
         self.cache(blob, size)
     }
 
+    /// Make a file the blob with this multihash, kept whole, by moving it
+    /// here, as it is, read-only: whether it could be, which it can't from
+    /// another filesystem or over a blob already here. Its roots are for
+    /// the caller to record.
+    pub fn adopt(&self, path: &Path, blob: Key<'_>) -> Result<bool> {
+        let meta = fs::symlink_metadata(path)?;
+        let dest = self.path(blob);
+        let shard = dest.parent().unwrap_or(&self.dir);
+        fs::create_dir_all(shard)?;
+        let mode = meta.permissions();
+        // Only its ctime changes, so as imported in place it's unchanged
+        fs::set_permissions(path, fs::Permissions::from_mode(0o444))?;
+        let cwd = rustix::fs::CWD;
+        if rustix::fs::renameat_with(cwd, path, cwd, &dest, rustix::fs::RenameFlags::NOREPLACE).is_err() {
+            let _ = fs::set_permissions(path, mode);
+            return Ok(false);
+        }
+        File::open(shard)?.sync_all()?;
+        self.cache(blob, meta.len())?;
+        Ok(true)
+    }
+
     fn cache(&self, blob: Key<'_>, size: u64) -> Result<()> {
         let size = i64::try_from(size).map_err(|_| Error::Invalid { store: NAME, reason: "blob too large".into() })?;
         self.db.conn()
