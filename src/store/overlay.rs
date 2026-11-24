@@ -552,6 +552,36 @@ mod tests {
         assert!(catalog.overlay_marks(&anchor).expect("marks").is_empty());
     }
 
+    /// What's written to an overlay all at once is committed as it's
+    /// imported, letting others write between its files, as a big import
+    /// does; the anchor's set once it's all in.
+    #[test]
+    fn a_lot_written_at_once_lets_others_write_as_its_committed() {
+        let scratch = Scratch::new("overlay-breathing");
+        let repo = scratch.path().join("repo");
+        let mut catalog = Catalog::open_repo(&repo).expect("catalog");
+        let other = Catalog::open_repo(&repo).expect("other");
+        let anchor = catalog.new_anchor().expect("anchor");
+        let mount = Mount { anchor: anchor.clone(), path: scratch.path().join("work"), chunk_size: crate::import::CHUNK_SIZE, width: crate::dag::FILE_WIDTH, hidden: true, overlay: true };
+        catalog.mount(&mount).expect("mount");
+        for n in 0..4u8 {
+            write(&mount.path.join(format!("small{n}")), &format!("small {n}"));
+            std::fs::write(mount.path.join(format!("big{n}")), vec![n; 2_000_000]).expect("write");
+        }
+        let first: crate::block::Block = crate::block::Block::hash(crate::cid::Cidv1Spec::default(), b"small 0".as_slice().into());
+        let seen = std::cell::Cell::new(false);
+        let value = catalog
+            .remount_if_every(std::time::Duration::ZERO, &mount, &|| {
+                // Before the anchor's set, what's imported is there for others
+                seen.set(crate::store::BlockIndex::has(&other, first.cid().multihash()).expect("has"));
+                true
+            })
+            .expect("import")
+            .expect("set");
+        assert!(seen.get(), "committed as it went");
+        assert_eq!(other.anchor_value(&anchor).expect("value"), Some(value));
+    }
+
     #[test]
     fn an_anchor_can_be_a_file() {
         let scratch = Scratch::new("overlay-file");

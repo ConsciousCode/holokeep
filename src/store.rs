@@ -307,6 +307,9 @@ impl Db {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
+             -- What a big write grew the WAL to is given back once it's
+             -- checkpointed, not kept for ever
+             PRAGMA journal_size_limit = 67108864;
              -- Every multihash the database knows of, present or not. The
              -- default foreign key action (NO ACTION) means one can't be
              -- deleted while anything refers to it, so ids are never
@@ -3161,14 +3164,23 @@ impl Catalog {
     /// Import an overlay mount again as [`Self::remount`] does, setting
     /// its anchor only if `still()` says nothing was written to it while
     /// it was imported. Returns what it's now, or none if something was.
+    ///
+    /// It breathes as it goes, as a big import does (see
+    /// `batch_breathing`), so a lot written at once doesn't keep everyone
+    /// else waiting till it's all in: the anchor's only set at the end.
     pub fn remount_if(&mut self, mount: &Mount, still: &dyn Fn() -> bool) -> Result<Option<Link>> {
-        self.batch(|catalog| catalog.import_overlay_if(mount, still))
+        self.remount_if_every(BREATHE_EVERY, mount, still)
+    }
+
+    /// As `remount_if`, breathing every so often.
+    pub(crate) fn remount_if_every(&mut self, every: std::time::Duration, mount: &Mount, still: &dyn Fn() -> bool) -> Result<Option<Link>> {
+        self.batch_breathing_every(every, |catalog| catalog.import_overlay_if(mount, still))
     }
 
     /// Import a mount again, as it's changed. Returns what it's now.
     pub fn remount(&mut self, mount: &Mount) -> Result<Link> {
         if mount.overlay {
-            return self.batch(|catalog| catalog.import_overlay(mount));
+            return self.batch_breathing(|catalog| catalog.import_overlay(mount));
         }
         let importer = mount.importer();
         let path = mount.path.clone();
