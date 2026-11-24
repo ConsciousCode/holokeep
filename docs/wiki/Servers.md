@@ -1,5 +1,6 @@
-**Partly implemented.** The first slice exists: serve claims, `[[serve]]`
-services, and the mount reaching a service of its own node's, live (see
+**Partly implemented.** The first two slices exist: serve claims,
+`[[serve]]` services, and the mount reaching an anchor served by its own
+node or, through it, by another of the user's machines, live (see
 [[#Slices]] for what's yet to come, which this page describes as the
 plan, saying so where it does).
 
@@ -106,8 +107,53 @@ lies in a directory anyone else may write.
   request. Not yet: a persisted anchor showing its last set meanwhile.
 - Renaming between a served anchor and anything else fails `EXDEV`, as
   across filesystems, so `mv` copies.
-- Only an anchor served by this node is reached so far; one served by
-  another node is shown as an ordinary anchor, from its sets.
+- An anchor another node serves is reached through this node's (see
+  [[#Across the mesh]]); while this node isn't running, it's
+  `ENOTCONN`.
+
+## Across the mesh
+
+A mount reaches an anchor another node serves through its own node, on
+the repo's `serve.sock` (or, where that path's too long for a socket,
+`$XDG_RUNTIME_DIR/hk-<hash>-serve.sock`; never anywhere others may
+write). Only the node's own user may connect, by the socket's peer
+credentials, and the mount connects only to a socket that's its user's.
+Its first line names what it's for, then it speaks 9P2000.L:
+
+```
+<anchor> <service> <node's peer ID>\n
+```
+
+The node answers `Tversion` itself, and sends every other message to the
+serving node over `/holokeep/serve/1.0.0`, a request each, in a
+*session* of the connection's own, the answer coming back as the
+response. Sessions are numbered from the time the node started, in
+nanoseconds, so one from before a restart isn't taken for a new one.
+
+| Request field | Type        | Meaning                                                  |
+| ------------- | ----------- | -------------------------------------------------------- |
+| `user`        | bytes, opt. | The asking node's user's root key CID, as others say it. |
+| `session`     | integer     | The session.                                             |
+| `anchor`      | bytes       | The anchor's CID.                                        |
+| `service`     | string      | The service, as the serve claim names it.                |
+| `message`     | bytes       | A whole 9P2000.L message; empty ends the session.        |
+
+The response is `{message}`, the answer. Requests time out after 30 s, a
+mount's own wait being 10 s.
+
+The serving node answers `EACCES` unless the asker is a machine hosting
+the user whose anchor it is, as for anything of theirs (see [[Sharing]]),
+of this node's own account, and the anchor's serve claim names this node
+and the service, which its config has. Only messages it decodes as
+9P2000.L's filesystem requests go on, else `EOPNOTSUPP`; and an attach is
+as it says: `uname` the user's root key, `n_uname` none, as they're no
+user of this machine, `aname` the anchor. Each session has a connection
+of its own to the service, made as the node's own user; a session ends
+when its asker says so, its asker disconnects, or its service hangs up,
+whatever's waiting answered `ENOTCONN`.
+
+Not yet: other users reaching what's served, as grants let them, and a
+node serving accounts other than its own.
 
 ## Persistence
 
@@ -149,8 +195,10 @@ anyone else, without authenticating as them, as sshd doesn't.
    `rm`, `show`), `[[serve]]` configuration, and a 9P2000.L client in the
    mount for a socket of the mount's own user. Live only, with the rules
    of [[#Privilege]] and their tests.
-2. **Across the mesh.** A node protocol carrying 9P to the serving node,
-   which connects to the service as its user, for whoever grants let in.
+2. **Across the mesh** (implemented, for the user's own machines). A
+   node protocol carrying 9P to the serving node, which connects to the
+   service as its user (see [[#Across the mesh]]). Not yet: other users,
+   as grants let them in.
 3. **Persistence**, as above.
 4. **A shell**, as a service: sessions in the manner of Plan 9's `/net`
    clone files, as the authenticated user only, if their device is
@@ -158,4 +206,5 @@ anyone else, without authenticating as them, as sshd doesn't.
    configuration allows, as `/root/.ssh/authorized_keys` does.
 
 Source: `src/claim.rs`, `src/store/claims.rs`, `src/served.rs`,
-`src/ninep.rs`, `src/ninep/client.rs`, `src/mount/served.rs`.
+`src/ninep.rs`, `src/ninep/client.rs`, `src/mount/served.rs`,
+`src/net/serve.rs`, `src/net/node/serving.rs`, `src/net/daemon.rs`.

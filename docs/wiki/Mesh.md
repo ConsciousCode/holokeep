@@ -362,6 +362,7 @@ them; omitted otherwise.
 | `/holokeep/condemn/1.0.0` | `{blocks: [key]}` | `{kept: [key]}` | "Does a keep of yours reach these?" |
 | `/holokeep/ask/1.0.0` | `{words: [string]}` | `{lines: [string]}` | A [[#Thin clients\|thin client]]'s command, answered as its account. |
 | `/holokeep/clock/1.0.0` | `{}` | `{got: uint, sent: uint}` | "What's the time?" (see [[#Clocks]]). |
+| `/holokeep/serve/1.0.0` | `{user?, session, anchor, service, message}` | `{message}` | A 9P2000.L message for an anchor the peer serves, in a session; empty ends it (see [[Servers#Across the mesh]]). |
 
 A request or response may be up to 64 MiB. libp2p's CBOR codec allows a
 megabyte a request and ten a response by default, too little for a push
