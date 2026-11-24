@@ -78,14 +78,21 @@ impl Servers {
         Self { repo: Some(repo), node: Some(node), ..Self::none() }
     }
 
-    /// The service of this node's an anchor's served from, if it's served
-    /// by this node.
+    /// How an anchor's reached, if it's served: by the name of a service of
+    /// this node's, or by `@<node>/<service>` for one another node serves,
+    /// reached through this node's.
     pub fn route(&self, catalog: &Catalog, anchor: &Link) -> Result<Option<String>, Errno> {
         let Some(node) = &self.node else {
             return Ok(None);
         };
-        let serving = catalog.serving(anchor).map_err(|_| Errno::EIO)?;
-        Ok(serving.filter(|serve| serve.node() == node.as_slice()).map(|serve| serve.service().to_owned()))
+        let Some(serve) = catalog.serving(anchor).map_err(|_| Errno::EIO)? else {
+            return Ok(None);
+        };
+        Ok(Some(if serve.node() == node.as_slice() {
+            serve.service().to_owned()
+        } else {
+            format!("@{}/{}", multibase::Base::Base58Btc.encode(serve.node()), serve.service())
+        }))
     }
 
     /// Note who's asking, as the catalog says, the first time.
@@ -97,19 +104,30 @@ impl Servers {
         }
     }
 
-    /// The connection to a service, made again if it's gone.
-    fn conn(&self, service: &str) -> Result<Arc<Conn>, Errno> {
+    /// The connection for a served anchor, made again if it's gone: to a
+    /// service of this node's, or for one another node serves, a session
+    /// through this node's of that anchor's own.
+    fn conn(&self, place: &Place<'_>) -> Result<Arc<Conn>, Errno> {
+        let remote = place.service.strip_prefix('@').and_then(|rest| rest.split_once('/'));
+        let key = match remote {
+            Some(_) => format!("{}#{}", place.service, place.anchor),
+            None => place.service.to_owned(),
+        };
         {
             let mut conns = lock(&self.conns);
-            if let Some(conn) = conns.get(service) {
+            if let Some(conn) = conns.get(&key) {
                 if !conn.client.closed() {
                     return Ok(Arc::clone(conn));
                 }
-                conns.remove(service);
+                conns.remove(&key);
             }
         }
         let repo = self.repo.as_deref().ok_or(Errno::ENOTCONN)?;
-        let client = crate::served::service(repo, service).and_then(|service| crate::served::connect(&service)).map_err(|e| {
+        let connected = match remote {
+            Some((node, service)) => crate::served::connect_relay(repo, place.anchor, service, node),
+            None => crate::served::service(repo, place.service).and_then(|service| crate::served::connect(&service)),
+        };
+        let client = connected.map_err(|e| {
             eprintln!("serving: {e}");
             match e {
                 crate::served::Error::Unfit(_) | crate::served::Error::Unknown(_) | crate::served::Error::Config(_) => Errno::EACCES,
@@ -118,12 +136,12 @@ impl Servers {
         })?;
         let conn = Arc::new(Conn { client, roots: Mutex::default() });
         // Another thread may have connected meanwhile: either does
-        Ok(Arc::clone(lock(&self.conns).entry(service.to_owned()).or_insert(conn)))
+        Ok(Arc::clone(lock(&self.conns).entry(key).or_insert(conn)))
     }
 
     /// A fid for a path of a served anchor, which whoever has it clunks.
     pub fn walk(&self, place: &Place<'_>, rel: &Path) -> Result<(Arc<Conn>, u32), Errno> {
-        let conn = self.conn(place.service)?;
+        let conn = self.conn(place)?;
         let root = {
             let key = place.anchor.to_bytes();
             let known = lock(&conn.roots).get(&key).copied();

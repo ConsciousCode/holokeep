@@ -15,6 +15,7 @@ pub mod grants;
 pub mod hosts;
 pub mod mesh;
 pub mod node;
+pub mod serve;
 pub mod structure;
 pub mod thin;
 pub mod trim;

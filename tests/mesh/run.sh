@@ -68,6 +68,7 @@ machine() {
     podman run -d --name "$run-$name" --hostname "$name" --network "$net" \
         --device /dev/fuse --cap-add SYS_ADMIN \
         -v "$PWD/target/release/hk:/usr/local/bin/hk:ro" \
+        -v "$PWD/tests/mesh/tiny9p.py:/usr/local/share/tiny9p.py:ro" \
         -e HK_PASSPHRASE=mesh-test \
         "$image" sleep infinity >/dev/null
     nodes+=("$run-$name")
@@ -124,6 +125,31 @@ scenario_write_read() {
     two_peer=$(on two hk node id)
     wait_for "one to measure two's clock" sh_on one "hk node clocks | grep -q '^$two_peer'"
     sh_on one 'hk node status' | grep -q '^clock	' || fail "one's status doesn't say how far its clock is"
+}
+
+# An anchor two serves from a 9P server is read and written through one's
+# mount, over the mesh, live: only its route is a claim
+scenario_served() {
+    local anchor two_peer
+    podman exec -d "$run-two" sh -c 'exec python3 -I /usr/local/share/tiny9p.py /run/tiny.9p >>/tmp/tiny9p.log 2>&1'
+    wait_for "two's 9P server" sh_on two 'test -S /run/tiny.9p'
+    sh_on two 'printf "[[serve]]\nname = \"tiny\"\nsocket = \"/run/tiny.9p\"\n" >> /root/.holokeep/config.toml && chmod 644 /root/.holokeep/config.toml'
+    anchor=$(on two hk anchor new)
+    on two hk serve add "$anchor" tiny >/dev/null
+    two_peer=$(on two hk node id)
+    wait_for "one to hear two serves it" sh_on one "hk serve show $anchor | grep -q '^node	$two_peer'"
+    wait_for "one to read what two serves" holds one "/soup/anchors/$anchor/hello.txt" "hello from a server"
+    holds one "/soup/anchors/$anchor/dir/inner.txt" "inner" || fail "one didn't read a served directory"
+    # Written through one's mount, it's the server's, and nothing's cached
+    sh_on one "echo 'from one, over the mesh' > /soup/anchors/$anchor/made.txt"
+    holds one "/soup/anchors/$anchor/made.txt" "from one, over the mesh" || fail "what one wrote to two's server isn't there"
+    local first; first=$(sh_on one "cat /soup/anchors/$anchor/clock")
+    sleep 1.2
+    [ "$(sh_on one "cat /soup/anchors/$anchor/clock")" != "$first" ] || fail "the served clock read the same twice: cached"
+    # Its server stopped, it's not connected, rather than as it was
+    sh_on two 'for p in /proc/[0-9]*; do case "$(cat "$p/comm" 2>/dev/null)" in python3*) kill -INT "${p#/proc/}";; esac; done; rm -f /run/tiny.9p; true'
+    wait_for "one to find two's server gone" sh_on one "! cat /soup/anchors/$anchor/hello.txt"
+    on two hk serve rm "$anchor" >/dev/null
 }
 
 # Taking turns at one file, each sees the other's edit, and writing something
@@ -708,7 +734,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read edits copies late_joiner fork_merge lost forget car restore revoke shared client thin visitor expiry door several)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read served edits copies late_joiner fork_merge lost forget car restore revoke shared client thin visitor expiry door several)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

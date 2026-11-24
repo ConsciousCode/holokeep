@@ -1663,14 +1663,17 @@ mod tests {
     }
 
     #[test]
-    fn an_anchor_served_elsewhere_or_by_no_service_here_isnt_reached() {
+    fn an_anchor_served_elsewhere_or_by_no_service_here_isnt_reached_here() {
         let scratch = Scratch::new("mount-served-not");
         let (soup, anchor, shared, _) = served(&scratch, crate::ninep::memfs::MemFs::new());
         let repo = scratch.path().join("repo");
-        // Another node's
+        // Another node's, reached through this node's, which isn't running
         let other = Catalog::open_repo(&repo).expect("catalog").new_anchor().expect("anchor");
         Catalog::open_repo(&repo).expect("catalog").serve_anchor(&other, b"someone else", "notes", false).expect("serve");
-        assert!(soup.served_at(ino(&soup, &format!("anchors/{other}")).map(|attr| attr.ino.0).unwrap_or_default()).is_none(), "not served here");
+        let there = ino(&soup, &format!("anchors/{other}")).expect("a directory, without asking").ino.0;
+        let (_, route, _, _) = soup.served_at(there).expect("served elsewhere");
+        assert!(route.starts_with('@') && route.ends_with("/notes"), "{route}");
+        assert_eq!(soup.list(there).map(|_| ()), Err(Errno::ENOTCONN));
         // A service this node hasn't got
         Catalog::open_repo(&repo).expect("catalog").serve_anchor(&anchor, b"me", "absent", false).expect("serve");
         let top = ino(&soup, &format!("anchors/{anchor}")).expect("a directory, without asking").ino.0;

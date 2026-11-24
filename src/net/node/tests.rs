@@ -2169,3 +2169,114 @@ async fn a_check_asks_members_only_of_what_it_hasnt_sighted_unless_told_to() {
     assert!(holders(&known, leaf).is_empty());
     assert!(a.sightings().of(leaf.cid().multihash()).expect("sighted").is_empty());
 }
+
+//-----------//
+//-[ Serve ]-//
+//-----------//
+
+/// Drive both nodes until the first has an answer for a session.
+async fn served_answer(nodes: &mut [&mut Node], session: u64) -> crate::ninep::Rmsg {
+    let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(10)).expect("deadline");
+    loop {
+        let events = futures::future::select_all(nodes.iter_mut().map(|node| Box::pin(node.next())));
+        let (event, from, _) = tokio::time::timeout_at(deadline, events).await.expect("in time");
+        if let (0, Event::Served { session: of, message }) = (from, event.expect("event"))
+            && of == session
+        {
+            return crate::ninep::Rmsg::decode(&message).expect("an answer").1;
+        }
+    }
+}
+
+/// A node serving an anchor from a filesystem in memory, on a socket its
+/// config names.
+fn serve_memfs(node: &mut Node, scratch: &crate::testutil::Scratch, fs: crate::ninep::memfs::MemFs) -> (Link, crate::ninep::memfs::Shared) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (run, repo) = (scratch.path().join("run"), scratch.path().join("repo"));
+    for dir in [&run, &repo] {
+        std::fs::create_dir_all(dir).expect("mkdir");
+    }
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let socket = run.join("fs.9p");
+    let shared = crate::ninep::memfs::Shared::new(fs);
+    crate::ninep::memfs::listen(shared.clone(), &socket).expect("listen");
+    std::fs::write(repo.join(crate::config::FILE), format!("[[serve]]\nname = \"notes\"\nsocket = {:?}\n", socket.display().to_string())).expect("config");
+    std::fs::set_permissions(repo.join(crate::config::FILE), std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    node.set_repo(repo);
+    let anchor = node.catalog().new_anchor().expect("anchor");
+    node.catalog().serve_anchor(&anchor, &node.peer_id().to_bytes(), "notes", false).expect("serve");
+    (anchor, shared)
+}
+
+#[tokio::test]
+async fn a_member_reaches_an_anchor_another_serves_as_that_node_says() {
+    use crate::ninep::{NOFID, Rmsg, Tmsg};
+    let (mut a, mut b, _) = Box::pin(holding()).await;
+    let scratch = crate::testutil::Scratch::new("node-served");
+    let mut fs = crate::ninep::memfs::MemFs::new();
+    fs.file("hello", b"hello from b");
+    let (anchor, shared) = serve_memfs(&mut b, &scratch, fs);
+    let peer = b.peer_id();
+
+    // As root, of another tree, as a uid of b's: none of which b believes
+    let attach = Tmsg::Attach { fid: 1, afid: NOFID, uname: b"root".to_vec(), aname: b"/".to_vec(), n_uname: 0 }.encode(1).expect("encode");
+    a.ask_served(&peer, 7, &anchor, "notes", attach).expect("ask");
+    assert!(matches!(served_answer(&mut [&mut a, &mut b], 7).await, Rmsg::Attach { .. }));
+    let attached = shared.lock().attached.clone();
+    let first = attached.first().expect("attached");
+    assert_eq!((first.aname.clone(), first.n_uname), (anchor.to_string().into_bytes(), crate::ninep::NONUNAME));
+    assert_ne!(first.uname, b"root");
+
+    // Then whatever it serves
+    let walk = Tmsg::Walk { fid: 1, newfid: 2, names: vec![b"hello".to_vec()] }.encode(2).expect("encode");
+    a.ask_served(&peer, 7, &anchor, "notes", walk).expect("ask");
+    assert!(matches!(served_answer(&mut [&mut a, &mut b], 7).await, Rmsg::Walk { .. }));
+    a.ask_served(&peer, 7, &anchor, "notes", Tmsg::Lopen { fid: 2, flags: 0 }.encode(3).expect("encode")).expect("ask");
+    served_answer(&mut [&mut a, &mut b], 7).await;
+    a.ask_served(&peer, 7, &anchor, "notes", Tmsg::Read { fid: 2, offset: 0, count: 100 }.encode(4).expect("encode")).expect("ask");
+    assert_eq!(served_answer(&mut [&mut a, &mut b], 7).await, Rmsg::Read { data: b"hello from b".to_vec() });
+
+    // An anchor b doesn't serve so, or a service it hasn't, isn't reached
+    let other = b.catalog().new_anchor().expect("anchor");
+    let attach = Tmsg::Attach { fid: 1, afid: NOFID, uname: Vec::new(), aname: Vec::new(), n_uname: 0 }.encode(1).expect("encode");
+    a.ask_served(&peer, 8, &other, "notes", attach.clone()).expect("ask");
+    assert_eq!(served_answer(&mut [&mut a, &mut b], 8).await, Rmsg::Lerror { ecode: 13 });
+    a.ask_served(&peer, 9, &anchor, "other", attach).expect("ask");
+    assert_eq!(served_answer(&mut [&mut a, &mut b], 9).await, Rmsg::Lerror { ecode: 13 });
+    assert_eq!(shared.lock().attached.len(), 1, "nothing connected to for either");
+
+    // An ended session's fids are the service's no more
+    a.end_served(&peer, 7, &anchor, "notes");
+    a.ask_served(&peer, 7, &anchor, "notes", Tmsg::Read { fid: 2, offset: 0, count: 100 }.encode(5).expect("encode")).expect("ask");
+    assert!(matches!(served_answer(&mut [&mut a, &mut b], 7).await, Rmsg::Lerror { .. }), "a new session, with no such fid");
+}
+
+#[tokio::test]
+async fn only_machines_hosting_its_user_reach_what_a_node_serves() {
+    use crate::ninep::{NOFID, Rmsg, Tmsg};
+    let (mut server, mut mine, mut theirs, _, (me, _)) = Box::pin(shared_by()).await;
+    let scratch = crate::testutil::Scratch::new("node-served-users");
+    let (anchor, shared) = serve_memfs(&mut server, &scratch, crate::ninep::memfs::MemFs::new());
+    let peer = server.peer_id();
+    let attach = Tmsg::Attach { fid: 1, afid: NOFID, uname: Vec::new(), aname: Vec::new(), n_uname: 0 }.encode(1).expect("encode");
+
+    // My laptop, as me
+    mine.ask_served(&peer, 1, &anchor, "notes", attach.clone()).expect("ask");
+    assert!(matches!(served_answer(&mut [&mut mine, &mut server, &mut theirs], 1).await, Rmsg::Attach { .. }));
+    assert_eq!(shared.lock().attached.first().map(|attached| attached.uname.clone()), Some(me.id().to_string().into_bytes()), "who's asking, as the server says");
+
+    // Theirs, as them, or saying it's me
+    theirs.ask_served(&peer, 2, &anchor, "notes", attach.clone()).expect("ask");
+    assert_eq!(served_answer(&mut [&mut theirs, &mut server, &mut mine], 2).await, Rmsg::Lerror { ecode: 13 });
+    let forged = crate::net::serve::Asked {
+        user: Some(serde_bytes::ByteBuf::from(me.id().to_bytes())),
+        session: 3,
+        anchor: serde_bytes::ByteBuf::from(anchor.to_bytes()),
+        service: "notes".into(),
+        message: serde_bytes::ByteBuf::from(attach.clone()),
+    };
+    let request = theirs.swarm.behaviour_mut().serve.send_request(&peer, forged);
+    theirs.asking_served.insert(request, (3, attach));
+    assert_eq!(served_answer(&mut [&mut theirs, &mut server, &mut mine], 3).await, Rmsg::Lerror { ecode: 13 });
+    assert_eq!(shared.lock().attached.len(), 1, "theirs never reached it");
+}

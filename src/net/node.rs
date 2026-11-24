@@ -163,6 +163,7 @@ pub struct Behaviour {
     grants: request_response::cbor::Behaviour<Have, Sent>,
     asks: request_response::cbor::Behaviour<super::thin::Ask, super::thin::Answer>,
     clock: request_response::cbor::Behaviour<clock::Asked, Told>,
+    serve: request_response::cbor::Behaviour<super::serve::Asked, super::serve::Answered>,
 }
 
 /// The least and most time between dials of a member that isn't
@@ -233,6 +234,9 @@ pub enum Event {
     /// it: how far ahead the mesh's is, in microseconds, and of how many
     /// members.
     Skewed { ahead: i64, members: usize, far: bool },
+    /// The answer to a message for an anchor another node serves, in a
+    /// session of this node's.
+    Served { session: u64, message: Vec<u8> },
 }
 
 /// A transport for the mesh, over some base transport: the private
@@ -387,6 +391,15 @@ pub struct Node {
     /// ask for the time unanswered was made, by this machine's clock.
     clocks: Clocks,
     clocking: HashMap<request_response::OutboundRequestId, (PeerId, u64)>,
+    /// The sessions of anchors this node serves to others, and what their
+    /// services say, as it's heard.
+    sessions: super::serve::Sessions,
+    services_heard: tokio::sync::mpsc::UnboundedReceiver<super::serve::Heard>,
+    /// Messages for anchors other nodes serve, unanswered: their sessions,
+    /// and the messages, so a failure's answered.
+    asking_served: HashMap<request_response::OutboundRequestId, (u64, Vec<u8>)>,
+    /// The repo's directory, whose config says what this node serves.
+    repo: Option<PathBuf>,
     /// Whether this machine's clock was last found far from the mesh's.
     skewed: bool,
     redial: Redial,
@@ -435,7 +448,10 @@ impl Node {
             grants: exchange(super::grants::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1))),
             asks: exchange(super::thin::PROTOCOL, request_response::Config::default().with_request_timeout(super::thin::ANSWER)),
             clock: exchange(clock::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_secs(10))),
+            // Longer than a mount waits, so it's the mount that gives up
+            serve: exchange(super::serve::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_secs(30))),
         };
+        let (heard_from, heard) = tokio::sync::mpsc::unbounded_channel();
         let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(tunables.idle);
         let swarm = Swarm::new(transport, behaviour, peer, config);
         let sightings = Sightings::open(catalog.db().clone())?;
@@ -489,6 +505,10 @@ impl Node {
             ready: VecDeque::new(),
             clocks: Clocks::default(),
             clocking: HashMap::new(),
+            sessions: super::serve::Sessions::new(heard_from),
+            services_heard: heard,
+            asking_served: HashMap::new(),
+            repo: None,
             skewed: false,
             redial: Redial::default(),
             noticed: 0,
@@ -636,6 +656,7 @@ impl Node {
             BehaviourEvent::Hosts(event) => from(event),
             BehaviourEvent::Grants(event) => from(event),
             BehaviourEvent::Clock(event) => from(event),
+            BehaviourEvent::Serve(event) => from(event),
             _ => None,
         };
         peer.is_some_and(|peer| self.visitors.contains_key(&peer))
@@ -2348,7 +2369,15 @@ impl Node {
             if let Some(event) = self.ready.pop_front() {
                 return Ok(event);
             }
-            let Some(event) = self.swarm.next().await else {
+            let (swarm, heard) = (&mut self.swarm, &mut self.services_heard);
+            let event = tokio::select! {
+                event = swarm.next() => event,
+                Some((peer, session, message)) = heard.recv() => {
+                    self.on_heard(peer, session, message);
+                    continue;
+                },
+            };
+            let Some(event) = event else {
                 return Err(Error::Invalid("the swarm stopped".into()));
             };
             match self.handle(event) {
@@ -2567,6 +2596,7 @@ impl Node {
             },
             SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
                 self.on_disconnected(&peer_id);
+                self.sessions.gone(&peer_id);
                 self.clocks.forget(&peer_id);
                 Some(Event::Disconnected(peer_id))
             },
@@ -2626,10 +2656,13 @@ impl Node {
                 None
             },
             SwarmEvent::Behaviour(BehaviourEvent::Clock(event)) => self.on_clock(event),
+            SwarmEvent::Behaviour(BehaviourEvent::Serve(event)) => self.on_serve(event)?,
             _ => None,
         })
     }
 }
+
+mod serving;
 
 mod asks;
 

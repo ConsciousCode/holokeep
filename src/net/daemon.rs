@@ -642,9 +642,15 @@ async fn stopped(terminate: &mut tokio::signal::unix::Signal) {
     }
 }
 
+#[allow(clippy::too_many_lines, reason = "the daemon's one loop, an arm for each thing it waits on")]
 pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks, collecting: bool, scanning: bool, shared: bool) -> Result<()> {
     let (mut node, mut alone) = open_node(place)?;
     node.set_watermarks(marks);
+    node.set_repo(place.repo.clone());
+    // Mounts reach anchors other nodes serve through the main mesh's node
+    let (relayed, mut relays_heard) = tokio::sync::mpsc::unbounded_channel();
+    let relay = if place.is_main() { relay_socket(place)? } else { None };
+    let mut relays = Relays::default();
     start(&mut node, place, &listen, alone)?;
     // What a client holds is a cache: what's lost is its member's to say
     let scanning = scanning && node.client_of().is_none();
@@ -668,6 +674,7 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks
     let result = loop {
         tokio::select! {
             event = node.next() => match event {
+                Ok(Event::Served { session, message }) => relays.answered(session, message),
                 Ok(event) => {
                     // Still pressed, and a trim helped: again, at once
                     if let Event::Trimmed { report, .. } = &event
@@ -743,12 +750,168 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks
                 lost_scan = later(LOST_SCAN);
             },
             Some(path) = changes.recv() => notice_change(&mut node, &mut remounts, path, &mut changed_again)?,
+            accepted = async { relay.as_ref()?.accept().await.ok() }, if relay.is_some() => {
+                if let Some((stream, _)) = accepted {
+                    relays.open(stream, relayed.clone());
+                }
+            },
+            Some(heard) = relays_heard.recv() => relays.heard(&mut node, heard),
             Some((mount, root)) = remounted.recv() => remounts.finished(&mount, &root),
             () = stopped(&mut terminate) => break Ok(()),
         }
     };
     std::fs::remove_file(socket(place))?;
+    if relay.is_some()
+        && let Some(path) = crate::served::relay_socket(&place.repo)
+    {
+        let _ = std::fs::remove_file(path);
+    }
     result
+}
+
+/// Listen where mounts reach anchors other nodes serve, if there's
+/// somewhere to: only this user may connect.
+fn relay_socket(place: &Place) -> Result<Option<UnixListener>> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(path) = crate::served::relay_socket(&place.repo) else {
+        eprintln!("no runtime directory: anchors other nodes serve can't be reached through this node");
+        return Ok(None);
+    };
+    if path.exists() {
+        if UnixStream::connect(&path).is_ok() {
+            return Err(Error::Invalid(format!("a node is already serving mounts on {}", path.display())));
+        }
+        std::fs::remove_file(&path)?;
+    }
+    let listener = UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(Some(listener))
+}
+
+/// What a mount's connection to the relay socket says: it's opened, for an
+/// anchor, served by a node as a service; a message; or it's gone.
+enum Relayed {
+    Opened(u64, Relay),
+    Message(u64, Vec<u8>),
+    Closed(u64),
+}
+
+/// A mount's session with an anchor another node serves.
+struct Relay {
+    peer: libp2p::PeerId,
+    anchor: crate::model::Link,
+    service: String,
+    /// Where answers are written back to the mount.
+    answers: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+}
+
+/// Mounts' sessions, by number: unique across restarts, so a serving
+/// node's sessions from before one aren't taken for new ones.
+struct Relays {
+    next: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    open: HashMap<u64, Relay>,
+}
+
+impl Default for Relays {
+    fn default() -> Self {
+        let start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |since| u64::try_from(since.as_nanos()).unwrap_or(1));
+        Self { next: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start)), open: HashMap::new() }
+    }
+}
+
+impl Relays {
+    /// Take a mount's connection: this user's only, naming what it's for
+    /// on its first line, then 9P2000.L, `Tversion` answered here.
+    fn open(&self, stream: tokio::net::UnixStream, relayed: tokio::sync::mpsc::UnboundedSender<Relayed>) {
+        let session = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn(async move {
+            let me = rustix::process::geteuid().as_raw();
+            if stream.peer_cred().map(|cred| cred.uid()).ok() != Some(me) {
+                return;
+            }
+            let (read, mut write) = stream.into_split();
+            let mut read = tokio::io::BufReader::new(read);
+            let mut first = String::new();
+            if read.read_line(&mut first).await.is_err() || first.len() > 512 {
+                return;
+            }
+            let mut words = first.split_whitespace();
+            let (Some(Ok(anchor)), Some(service), Some(Ok(peer))) = (words.next().map(str::parse::<crate::model::Link>), words.next(), words.next().map(str::parse::<libp2p::PeerId>)) else {
+                return;
+            };
+            let (answers, mut answered) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            if relayed.send(Relayed::Opened(session, Relay { peer, anchor, service: service.to_owned(), answers: answers.clone() })).is_err() {
+                return;
+            }
+            tokio::spawn(async move {
+                while let Some(answer) = answered.recv().await {
+                    if write.write_all(&answer).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            while let Ok(message) = read_message(&mut read).await {
+                match crate::ninep::Tmsg::decode(&message) {
+                    Ok((tag, crate::ninep::Tmsg::Version { msize, .. })) => {
+                        let version = crate::ninep::Rmsg::Version { msize: msize.min(super::serve::RELAYED), version: crate::ninep::VERSION.to_vec() };
+                        if let Ok(answer) = version.encode(tag) {
+                            let _ = answers.send(answer);
+                        }
+                    },
+                    _ => {
+                        if relayed.send(Relayed::Message(session, message)).is_err() {
+                            return;
+                        }
+                    },
+                }
+            }
+            let _ = relayed.send(Relayed::Closed(session));
+        });
+    }
+
+    /// What a mount's connection said, sent on to the serving node.
+    fn heard(&mut self, node: &mut Node, heard: Relayed) {
+        match heard {
+            Relayed::Opened(session, relay) => {
+                self.open.insert(session, relay);
+            },
+            Relayed::Message(session, message) => {
+                let Some(relay) = self.open.get(&session) else {
+                    return;
+                };
+                if node.ask_served(&relay.peer, session, &relay.anchor, &relay.service, message.clone()).is_err() {
+                    let _ = relay.answers.send(super::serve::error_for(&message, crate::ninep::client::libc_errno::ENOTCONN));
+                }
+            },
+            Relayed::Closed(session) => {
+                if let Some(relay) = self.open.remove(&session) {
+                    node.end_served(&relay.peer, session, &relay.anchor, &relay.service);
+                }
+            },
+        }
+    }
+
+    /// An answer from a serving node, back to its mount.
+    fn answered(&self, session: u64, message: Vec<u8>) {
+        if let Some(relay) = self.open.get(&session) {
+            let _ = relay.answers.send(message);
+        }
+    }
+}
+
+/// One whole 9P message from a mount, no bigger than what's relayed.
+async fn read_message(read: &mut (impl tokio::io::AsyncRead + Unpin)) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+    let mut size = [0u8; 4];
+    read.read_exact(&mut size).await?;
+    let len = u32::from_le_bytes(size);
+    if !(7..=super::serve::RELAYED).contains(&len) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "9P: a message of a size it can't be"));
+    }
+    let mut message = vec![0u8; usize::try_from(len).unwrap_or_default()];
+    message.get_mut(..4).unwrap_or_default().copy_from_slice(&size);
+    read.read_exact(message.get_mut(4..).unwrap_or_default()).await?;
+    Ok(message)
 }
 
 /// Collect a sample of what's here, if it's due.
@@ -861,7 +1024,7 @@ fn report(event: &Event) {
         },
         // Members which are offline fail to be dialed all the time, and
         // audits are reported as they finish
-        Event::Failed(..) | Event::Audited { .. } | Event::Trimmed { .. } | Event::Checked { .. } => {},
+        Event::Failed(..) | Event::Audited { .. } | Event::Trimmed { .. } | Event::Checked { .. } | Event::Served { .. } => {},
         Event::Fetched { fetched, missing, .. } => eprintln!("fetched {fetched} blocks, {} missing", missing.len()),
         Event::Collected { collected } => eprintln!("collected: {collected} let go of"),
         Event::Skewed { ahead, members, far: true } => {
@@ -1111,4 +1274,60 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
     }
     write.write_all(out.as_bytes()).await?;
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ninep::{MSIZE, NOTAG, Rmsg, Tmsg, VERSION};
+    use tokio::io::AsyncReadExt as _;
+
+    async fn answer(stream: &mut tokio::net::UnixStream) -> Rmsg {
+        let mut size = [0u8; 4];
+        stream.read_exact(&mut size).await.expect("size");
+        let mut message = size.to_vec();
+        message.resize(usize::try_from(u32::from_le_bytes(size)).expect("size"), 0);
+        stream.read_exact(message.get_mut(4..).expect("rest")).await.expect("read");
+        Rmsg::decode(&message).expect("decode").1
+    }
+
+    #[tokio::test]
+    async fn a_mounts_connection_names_its_anchor_then_relays_9p() {
+        let relays = Relays::default();
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().expect("pair");
+        let (relayed, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        relays.open(ours, relayed);
+        let anchor = crate::claim::anchor().expect("anchor");
+        let peer = libp2p::PeerId::random();
+        theirs.write_all(format!("{anchor} notes {peer}\n").as_bytes()).await.expect("write");
+        let Some(Relayed::Opened(session, relay)) = heard.recv().await else {
+            panic!("opened");
+        };
+        assert_eq!((relay.peer, relay.anchor.clone(), relay.service.as_str()), (peer, anchor, "notes"));
+
+        // The version's agreed here
+        theirs.write_all(&Tmsg::Version { msize: MSIZE, version: VERSION.to_vec() }.encode(NOTAG).expect("encode")).await.expect("write");
+        assert!(matches!(answer(&mut theirs).await, Rmsg::Version { .. }));
+        // The rest's sent on, and answers come back
+        let clunk = Tmsg::Clunk { fid: 1 }.encode(4).expect("encode");
+        theirs.write_all(&clunk).await.expect("write");
+        let Some(Relayed::Message(of, message)) = heard.recv().await else {
+            panic!("message");
+        };
+        assert_eq!((of, message), (session, clunk));
+        relay.answers.send(Rmsg::Clunk.encode(4).expect("encode")).expect("send");
+        assert_eq!(answer(&mut theirs).await, Rmsg::Clunk);
+        drop(theirs);
+        assert!(matches!(heard.recv().await, Some(Relayed::Closed(of)) if of == session));
+    }
+
+    #[tokio::test]
+    async fn a_connection_naming_nothing_is_dropped() {
+        let relays = Relays::default();
+        let (ours, mut theirs) = tokio::net::UnixStream::pair().expect("pair");
+        let (relayed, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        relays.open(ours, relayed);
+        theirs.write_all(b"not an anchor\n").await.expect("write");
+        assert!(heard.recv().await.is_none(), "nothing opened, and the connection let go of");
+    }
 }

@@ -409,7 +409,8 @@ Checklist:
   - [ ] Live anchors, which are whatever their backing is now, and anchors served by a peer, as 9P mounts
     - [x] Serve claims routing an anchor to a node's service, a 9P2000.L socket its own config names (`hk serve add/rm/show`, `[[serve]]`)
     - [x] The mount reaching an anchor served by its own node, live: nothing cached, `ENOTCONN` while the server's away
-    - [ ] Anchors served by another node, over the mesh
+    - [x] Anchors served by another of the user's machines, over the mesh, through the mount's own node (`/holokeep/serve/1.0.0`)
+    - [ ] Other users reaching what's served, as grants let them
     - [ ] Persisting what's served as sets, but for what's `QTTMP`
     - [ ] A shell, as a service
 - [ ] P2P private mesh

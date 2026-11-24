@@ -65,6 +65,41 @@ pub fn socket_fit(path: &Path, socket: Option<(bool, u32)>, dir: (u32, u32), me:
     }
 }
 
+/// Where a mount reaches anchors other nodes serve, through the repo's
+/// running node.
+///
+/// In the repo, unless the path's too long for a socket, then in the
+/// user's runtime directory, named for the repo; never anywhere others may
+/// write, where another socket could be put first.
+pub fn relay_socket(repo: &Path) -> Option<PathBuf> {
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+    let path = repo.join("serve.sock");
+    if path.as_os_str().len() < 100 {
+        return Some(path);
+    }
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)?;
+    let repo = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let name = sha2::Sha256::digest(repo.as_os_str().as_encoded_bytes()).iter().take(8).fold(String::new(), |mut name, byte| {
+        let _ = write!(name, "{byte:02x}");
+        name
+    });
+    Some(runtime.join(format!("hk-{name}-serve.sock")))
+}
+
+/// Connect to the repo's node, to reach an anchor another node serves, if
+/// its socket's this user's.
+pub fn connect_relay(repo: &Path, anchor: &crate::model::Link, service: &str, node: &str) -> Result<Client, Error> {
+    let path = relay_socket(repo).ok_or_else(|| Error::Unfit("no runtime directory for the node's socket".into()))?;
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| Error::Io(path.clone(), e))?;
+    if !meta.file_type().is_socket() || meta.uid() != me() {
+        return Err(Error::Unfit(format!("{} isn't this user's node's socket", path.display())));
+    }
+    let mut stream = std::os::unix::net::UnixStream::connect(&path).map_err(|e| Error::Io(path.clone(), e))?;
+    std::io::Write::write_all(&mut stream, format!("{anchor} {service} {node}\n").as_bytes()).map_err(|e| Error::Io(path.clone(), e))?;
+    Client::over_unix(stream, crate::ninep::client::TIMEOUT).map_err(|e| Error::Io(path, e))
+}
+
 /// The services a repo's configuration says, if it's fit to say them.
 pub fn services(repo: &Path) -> Result<Vec<Service>, Error> {
     let path = repo.join(config::FILE);
@@ -87,13 +122,19 @@ pub fn service(repo: &Path, name: &str) -> Result<Service, Error> {
 
 /// Connect to a service, if its socket's fit to.
 pub fn connect(service: &Service) -> Result<Client, Error> {
+    let stream = connect_raw(service)?;
+    Client::over_unix(stream, crate::ninep::client::TIMEOUT).map_err(|e| Error::Io(service.socket(), e))
+}
+
+/// Connect to a service's socket, if it's fit to, to speak to it raw.
+pub fn connect_raw(service: &Service) -> Result<std::os::unix::net::UnixStream, Error> {
     let path = service.socket();
     let dir = path.parent().unwrap_or_else(|| Path::new("/"));
     let dir_meta = std::fs::metadata(dir).map_err(|e| Error::Io(dir.to_path_buf(), e))?;
     // None there is a server not running, not one that's unfit
     let meta = std::fs::symlink_metadata(&path).map_err(|e| Error::Io(path.clone(), e))?;
     socket_fit(&path, Some((meta.file_type().is_socket(), meta.uid())), (dir_meta.uid(), dir_meta.mode()), me()).map_err(Error::Unfit)?;
-    Client::connect(&path).map_err(|e| Error::Io(path, e))
+    std::os::unix::net::UnixStream::connect(&path).map_err(|e| Error::Io(path, e))
 }
 
 #[cfg(test)]
