@@ -2547,6 +2547,14 @@ fn refs(repo: &Catalog, cid: &Link, back: bool) -> anyhow::Result<()> {
 
 /// Import, export or fetch whole DAGs.
 fn compact(repo: &Catalog, compact: Compact) -> anyhow::Result<()> {
+    // What the database holds that a kept file would, as big, moved out
+    // first, so what it took is free to give back
+    if !compact.dry_run {
+        let done = repo.rehome(u64::MAX)?;
+        if done.files > 0 {
+            eprintln!("kept {} files whole, {} bytes out of the database", done.files, done.bytes);
+        }
+    }
     let mut refused = Vec::new();
     repo.compact(compact, &mut |done| {
         let outcome = match done.outcome {

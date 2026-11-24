@@ -258,6 +258,20 @@ impl OffsetStore {
         })
     }
 
+    /// A kept blob's ranges, each a block, its offset and its length, as
+    /// it's known to be already, read from wherever the blocks were.
+    pub fn add_ranges(&self, blob: Key<'_>, ranges: &[(Multihash, u64, u64)]) -> Result<()> {
+        let blob = self.db.intern(blob)?;
+        let mut stmt = self.db.conn().prepare_cached("INSERT OR IGNORE INTO offset_ranges (block, blob, offset, len) VALUES (?1, ?2, ?3, ?4)")?;
+        for (block, offset, len) in ranges {
+            let (Ok(offset), Ok(len)) = (i64::try_from(*offset), i64::try_from(*len)) else {
+                return Err(Error::Invalid { store: NAME, reason: "a range too far into its file".into() });
+            };
+            stmt.execute(params![self.db.intern(block.as_ref())?, blob, offset, len])?;
+        }
+        Ok(())
+    }
+
     /// Everywhere a blob may be read, kept first.
     fn places(&self, blob: Key<'_>, kept: bool) -> Result<Vec<Place>> {
         let mut places = Vec::new();

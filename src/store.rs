@@ -40,6 +40,7 @@ mod git;
 mod ipld;
 pub mod merge;
 mod offset;
+pub mod rehome;
 pub mod overlay;
 mod raw;
 mod shards;
@@ -55,6 +56,7 @@ pub use raw::RawStore;
 pub use shards::ShardStore;
 pub use unixfs::UnixfsStore;
 pub use compact::{Compact, Compaction, Outcome, Space};
+pub use rehome::Rehomed;
 pub use git::GitDeltas;
 pub use volume::{Volume, tolerance};
 

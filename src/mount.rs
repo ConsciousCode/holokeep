@@ -2594,6 +2594,15 @@ mod tests {
         for (name, seed) in [("a", 1), ("b", 2), ("c", 3)] {
             assert!(std::fs::read(out.join(name)).expect("read") == big(seed), "{name} as it was");
         }
+
+        // What was copied after all is kept whole later, the same
+        let rehomed = catalog.rehome(u64::MAX).expect("rehome");
+        assert_eq!((rehomed.files, rehomed.bytes), (1, 3 * 1024 * 1024));
+        assert_eq!((copied(), kept()), (0, 3), "c kept whole");
+        assert_eq!(catalog.rehome(u64::MAX).expect("again"), crate::store::Rehomed::default());
+        let again = scratch.path().join("again");
+        crate::export::get(&catalog, first, &again).unwrap_or_else(|e| panic!("{first} isn't whole after: {e}"));
+        assert!(std::fs::read(again.join("c")).expect("read") == big(3), "c as it was");
     }
 
     #[test]

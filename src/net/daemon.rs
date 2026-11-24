@@ -656,6 +656,7 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks
     let persisting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if place.is_main() {
         crate::served::persist::run(place.repo.clone(), node.peer_id().to_bytes(), std::sync::Arc::clone(&persisting));
+        crate::store::rehome::run(place.repo.clone(), std::sync::Arc::clone(&persisting));
     }
     // What a client holds is a cache: what's lost is its member's to say
     let scanning = scanning && node.client_of().is_none();
