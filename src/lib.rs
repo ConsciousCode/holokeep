@@ -34,6 +34,7 @@ pub mod mount;
 #[cfg(feature = "fuse")]
 pub mod mounts;
 pub mod model;
+pub mod ninep;
 pub mod store;
 #[cfg(feature = "net")]
 pub mod net;
