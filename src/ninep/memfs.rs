@@ -338,11 +338,18 @@ impl Handler for MemFs {
 /// A filesystem shared with whoever serves it, to look at as it's used,
 /// as one connection sees it.
 #[derive(Debug, Clone, Default)]
-pub struct Shared(pub Arc<Mutex<MemFs>>, u64);
+pub struct Shared(pub Arc<Mutex<MemFs>>, u64, Arc<Mutex<Vec<UnixStream>>>);
 
 impl Shared {
     pub fn new(fs: MemFs) -> Self {
-        Self(Arc::new(Mutex::new(fs)), 0)
+        Self(Arc::new(Mutex::new(fs)), 0, Arc::default())
+    }
+
+    /// Hang up on every connection, as a server that's stopped.
+    pub fn hang_up(&self) {
+        for stream in self.2.lock().unwrap_or_else(PoisonError::into_inner).drain(..) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
     }
 
     pub fn lock(&self) -> std::sync::MutexGuard<'_, MemFs> {
@@ -353,7 +360,7 @@ impl Shared {
     fn connection(&self) -> Self {
         let mut fs = self.lock();
         fs.conns = fs.conns.saturating_add(1);
-        Self(Arc::clone(&self.0), fs.conns)
+        Self(Arc::clone(&self.0), fs.conns, Arc::clone(&self.2))
     }
 }
 
@@ -393,6 +400,9 @@ pub fn listen(fs: Shared, path: &std::path::Path) -> std::io::Result<()> {
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let mut handler = fs.connection();
+            if let Ok(kept) = stream.try_clone() {
+                fs.2.lock().unwrap_or_else(PoisonError::into_inner).push(kept);
+            }
             std::thread::spawn(move || {
                 if let Ok(mut reader) = stream.try_clone() {
                     let mut writer = stream;

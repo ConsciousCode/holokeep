@@ -225,3 +225,15 @@ fn a_client_connects_to_a_socket_and_sees_what_isnt_to_be_kept() {
     let (_, kept) = client.walk(root, &[b"kept"]).expect("walk");
     assert!(tmp.first().is_some_and(Qid::is_tmp) && !kept.first().is_some_and(Qid::is_tmp));
 }
+
+#[test]
+fn a_server_hanging_up_fails_whats_asked_after() {
+    let scratch = crate::testutil::Scratch::new("ninep-hang-up");
+    let path = scratch.path().join("fs.9p");
+    let shared = Shared::new(MemFs::new());
+    super::memfs::listen(shared.clone(), &path).expect("listen");
+    let client = Client::connect(&path).expect("connect");
+    let (root, _) = client.attach(b"u", b"", NONUNAME).expect("attach");
+    shared.hang_up();
+    assert_eq!(errno(client.getattr(root)), libc_errno::ENOTCONN);
+}

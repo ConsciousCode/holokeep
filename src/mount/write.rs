@@ -1039,6 +1039,9 @@ impl Soup {
 
     /// Read from an open file, if it's one with a handle.
     pub fn read_handle(&self, fh: u64, offset: u64, size: usize) -> Option<Result<Vec<u8>, Errno>> {
+        if let Some(read) = self.served.read(fh, offset, size) {
+            return Some(read);
+        }
         let pinned = self.pins().get(&fh).cloned();
         if let Some(cid) = pinned {
             return Some(self.catalog().and_then(|catalog| export::read_at(&*catalog, &cid, offset, size).map_err(|e| errno(&e))));
@@ -1059,6 +1062,9 @@ impl Soup {
 
     /// Write to an open file.
     pub fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<usize, Errno> {
+        if let Some(written) = self.served.write(fh, offset, data) {
+            return written;
+        }
         let open = self.handle_of(fh).filter(|open| open.writable).ok_or(Errno::EBADF)?;
         if let Some(anchor) = &open.anchor {
             self.keep_committed(&*self.catalog()?, anchor, &open.rel)?;
@@ -1076,6 +1082,9 @@ impl Soup {
     /// Sync an open file, its data alone if `data_only`: what's written
     /// to it is whole, so its anchor can be committed though it's open.
     pub fn fsync(&self, fh: u64, data_only: bool) -> Result<(), Errno> {
+        if let Some(synced) = self.served.fsync(fh, data_only) {
+            return synced;
+        }
         let Some(Opened { file, .. }) = self.handle_of(fh) else {
             // Read straight from the soup: nothing to sync
             return Ok(());
@@ -1090,6 +1099,9 @@ impl Soup {
 
     /// Close a file.
     pub fn release(&self, fh: u64) {
+        if self.served.release(fh) {
+            return;
+        }
         self.pins().remove(&fh);
         if let Some(mut handle) = self.handles().remove(&fh)
             && handle.writable

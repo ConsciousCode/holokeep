@@ -54,6 +54,7 @@ use crate::store::Catalog;
 use crate::store::overlay;
 
 mod rules;
+mod served;
 mod write;
 use write::{Committer, Filler, Handle};
 
@@ -111,6 +112,9 @@ enum Inode {
     /// A file of `anchors/` that's no anchor, as an editor writes to save
     /// over a file anchor.
     Loose(Vec<u8>),
+    /// A path of an anchor served live, by the service of this node's
+    /// that serves it (see `served`), reached where the anchor is.
+    Served(Link, String, PathBuf, Via),
 }
 
 /// The top's inode number.
@@ -209,6 +213,10 @@ impl Inodes {
             Some(Inode::Tag(_)) => 4,
             Some(Inode::Loose(_)) => 3,
             Some(Inode::Node(_, via)) => via.map_or(2, |(dir, _)| dir),
+            Some(Inode::Served(anchor, service, rel, via)) => match rel.parent() {
+                Some(above) if !rel.as_os_str().is_empty() => self.of(Inode::Served(anchor, service, above.to_path_buf(), via)),
+                Some(_) | None => via.map_or(3, |(dir, _)| dir),
+            },
             Some(Inode::Path(anchor, rel, via)) => match rel.parent() {
                 Some(above) if !rel.as_os_str().is_empty() && !above.as_os_str().is_empty() => self.of(Inode::Path(anchor, above.to_path_buf(), via)),
                 // The anchor's top level, or what's right under it at the
@@ -229,6 +237,9 @@ impl Inodes {
             Inode::Node(cid, via) => [b"n".as_slice(), &cid.to_bytes(), &Self::via_key(via)].concat(),
             Inode::Path(anchor, rel, via) => [b"p".as_slice(), &anchor.to_bytes(), &Self::via_key(via), &[0], rel.as_os_str().as_bytes()].concat(),
             Inode::Loose(name) => [b"l".as_slice(), name].concat(),
+            Inode::Served(anchor, service, rel, via) => {
+                [b"s".as_slice(), &anchor.to_bytes(), &Self::via_key(via), service.as_bytes(), &[0], rel.as_os_str().as_bytes()].concat()
+            },
             Inode::Root | Inode::Cids | Inode::Anchors | Inode::Tags => Vec::new(),
         }
     }
@@ -243,7 +254,7 @@ impl Inodes {
 
     fn of(&mut self, inode: Inode) -> u64 {
         let key = match &inode {
-            Inode::Tag(_) | Inode::Node(..) | Inode::Path(..) | Inode::Loose(_) => Self::key(&inode),
+            Inode::Tag(_) | Inode::Node(..) | Inode::Path(..) | Inode::Loose(_) | Inode::Served(..) => Self::key(&inode),
             Inode::Root => return 1,
             Inode::Cids => return 2,
             Inode::Anchors => return 3,
@@ -377,6 +388,8 @@ pub struct Soup {
     at: SystemTime,
     /// Where it's mounted, for symlinks to anchors.
     dir: Option<PathBuf>,
+    /// The services anchors served by this node are reached through.
+    served: served::Servers,
 }
 
 /// A directory's rules file, as read: which it was, and its rules.
@@ -485,7 +498,22 @@ impl Soup {
             gid: rustix::process::getgid().as_raw(),
             at: SystemTime::now(),
             dir: None,
+            served: served::Servers::none(),
         }
+    }
+
+    /// How long the kernel may take what it's told of an inode as still
+    /// so: nothing served, which is as its server says now.
+    fn ttl(&self, ino: u64) -> Duration {
+        if self.is_served(ino) { Duration::ZERO } else { TTL }
+    }
+
+    /// Anchors served by this node, by its peer ID, reached through the
+    /// services `repo`'s configuration says.
+    #[must_use]
+    pub fn serving(mut self, repo: PathBuf, node: Vec<u8>) -> Self {
+        self.served = served::Servers::new(repo, node);
+        self
     }
 
     /// Mounted at `dir`, so symlinks to `/anchors/…` are to anchors there.
@@ -653,6 +681,12 @@ impl Soup {
         {
             anchor = theirs;
         }
+        if let Some(service) = self.served.route(catalog, &anchor)? {
+            if self.above(catalog, dir)?.contains(&anchor) {
+                return Ok(None);
+            }
+            return Ok(Some(Inode::Served(anchor, service, PathBuf::new(), via)));
+        }
         if let Some(value) = Self::anchor_root(catalog, &anchor)?
             && !self.reachable(catalog, &value)?
         {
@@ -791,6 +825,7 @@ impl Soup {
                 let meta = std::fs::symlink_metadata(&path).map_err(|e| errno(&e))?;
                 work_kind(&path, &meta)
             },
+            Inode::Served(anchor, service, rel, _) => self.served_kind(catalog, anchor, service, rel),
             _ => Ok(Kind::Directory),
         }
     }
@@ -903,13 +938,16 @@ impl Soup {
     /// An inode's attributes.
     pub fn attr(&self, ino: u64) -> Result<FileAttr, Errno> {
         let inode = self.inode(ino)?;
+        if let Inode::Served(anchor, service, rel, _) = &inode {
+            return self.served_attr(ino, anchor, service, rel);
+        }
         let kind = self.kind(&*self.catalog()?, &inode)?;
         Ok(self.attr_with(ino, &kind, self.writes(&inode)))
     }
 
     /// Whether an inode can be written to.
     const fn writes(&self, inode: &Inode) -> bool {
-        self.work.is_some() && matches!(inode, Inode::Root | Inode::Path(..) | Inode::Loose(_))
+        matches!(inode, Inode::Served(..)) || self.work.is_some() && matches!(inode, Inode::Root | Inode::Path(..) | Inode::Loose(_))
     }
 
     /// What a name in a directory is, as it's shown there.
@@ -926,6 +964,9 @@ impl Soup {
     fn resolve_with(&self, parent: u64, name: &OsStr, place: bool) -> Result<FileAttr, Errno> {
         let dir = parent;
         let parent = self.inode(parent)?;
+        if let Inode::Served(anchor, service, rel, via) = parent {
+            return self.served_resolve(anchor, service, rel.join(name), via);
+        }
         let catalog = self.catalog()?;
         let cid = |name: &OsStr| name.to_str().and_then(|name| name.parse::<Link>().ok()).ok_or(Errno::ENOENT);
         // What a path of an anchor is, as it's kept, once it's looked up to
@@ -951,6 +992,10 @@ impl Soup {
             },
             Inode::Anchors => match cid(name).ok().filter(crate::claim::is_anchor).map(|anchor| Ok::<_, Errno>((Self::anchor_root(&catalog, &anchor)?, anchor))).transpose()? {
                 // One that's nothing yet is an empty directory
+                Some((_, anchor)) if let Some(service) = self.served.route(&catalog, &anchor)? => {
+                    drop(catalog);
+                    return self.served_resolve(anchor, service, PathBuf::new(), None);
+                },
                 Some((value, anchor)) => {
                     if let Some(value) = value
                         && !self.reachable(&catalog, &value)?
@@ -963,6 +1008,7 @@ impl Soup {
                 _ => return Err(Errno::ENOENT),
             },
             Inode::Loose(_) => return Err(Errno::ENOTDIR),
+            Inode::Served(..) => return Err(Errno::EIO),
             Inode::Path(anchor, rel, via) => {
                 let child = rel.join(name);
                 let at = self.at(&catalog, &anchor, &child)?.ok_or(Errno::ENOENT)?;
@@ -1014,6 +1060,9 @@ impl Soup {
     /// A directory's entries, but `.` and `..`.
     pub fn list(&self, ino: u64) -> Result<Vec<Entry>, Errno> {
         let inode = self.inode(ino)?;
+        if let Inode::Served(anchor, service, rel, via) = inode {
+            return self.served_list(&anchor, &service, &rel, &via);
+        }
         let catalog = self.catalog()?;
         let with_kinds = |names: Vec<(Vec<u8>, Inode)>| -> Result<Vec<(Vec<u8>, Inode, Kind)>, Errno> {
             names.into_iter().map(|(name, inode)| {
@@ -1072,6 +1121,7 @@ impl Soup {
                 with_kinds(entries)?
             },
             Inode::Loose(_) => return Err(Errno::ENOTDIR),
+            Inode::Served(..) => return Err(Errno::EIO),
         };
         drop(catalog);
         let mut inodes = self.inodes();
@@ -1139,14 +1189,14 @@ impl Drop for Soup {
 impl Filesystem for Soup {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match self.resolve(parent.0, name) {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Ok(attr) => reply.entry(&self.ttl(attr.ino.0), &attr, Generation(0)),
             Err(e) => reply.error(e),
         }
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         match self.attr(ino.0) {
-            Ok(attr) => reply.attr(&TTL, &attr),
+            Ok(attr) => reply.attr(&self.ttl(ino.0), &attr),
             Err(e) => reply.error(e),
         }
     }
@@ -1173,6 +1223,14 @@ impl Filesystem for Soup {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        // What's served is read as it is, never from the kernel's cache
+        if let Some(opened) = self.served_open(ino.0, flags.0) {
+            match opened {
+                Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
+                Err(e) => reply.error(e),
+            }
+            return;
+        }
         let write = flags.0 & libc::O_ACCMODE != libc::O_RDONLY;
         let _writing = write.then(|| self.writing());
         match self.open(ino.0, write, write && flags.0 & libc::O_TRUNC != 0) {
@@ -1193,7 +1251,7 @@ impl Filesystem for Soup {
     }
 
     fn write(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64, data: &[u8], _write_flags: WriteFlags, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyWrite) {
-        let _writing = self.writing();
+        let _writing = (!self.served.holds(fh.0)).then(|| self.writing());
         match self.write(fh.0, offset, data) {
             Ok(n) => reply.written(u32::try_from(n).unwrap_or(u32::MAX)),
             Err(e) => reply.error(e),
@@ -1211,14 +1269,21 @@ impl Filesystem for Soup {
     }
 
     fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
-        let _writing = self.writing();
+        let _writing = (!self.served.holds(fh.0)).then(|| self.writing());
         match self.fsync(fh.0, datasync) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
     }
 
-    fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
+    fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, flags: i32, reply: ReplyCreate) {
+        if let Some(created) = self.served_create(parent.0, name, flags, mode & !umask) {
+            match created {
+                Ok((attr, fh)) => reply.created(&Duration::ZERO, &attr, Generation(0), FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
+                Err(e) => reply.error(e),
+            }
+            return;
+        }
         let _writing = self.writing();
         match self.create(parent.0, name) {
             Ok((attr, fh)) => reply.created(&TTL, &attr, Generation(0), FileHandle(fh), FopenFlags::empty()),
@@ -1226,7 +1291,14 @@ impl Filesystem for Soup {
         }
     }
 
-    fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+    fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
+        if let Some(made) = self.served_mkdir(parent.0, name, mode & !umask) {
+            match made {
+                Ok(attr) => reply.entry(&Duration::ZERO, &attr, Generation(0)),
+                Err(e) => reply.error(e),
+            }
+            return;
+        }
         let _writing = self.writing();
         match self.mkdir_by(parent.0, name, rules::app_of(req.pid()).as_deref()) {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
@@ -1235,6 +1307,13 @@ impl Filesystem for Soup {
     }
 
     fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
+        if let Some(made) = self.served_symlink(parent.0, link_name, target) {
+            match made {
+                Ok(attr) => reply.entry(&Duration::ZERO, &attr, Generation(0)),
+                Err(e) => reply.error(e),
+            }
+            return;
+        }
         let _writing = self.writing();
         match self.symlink(parent.0, link_name, target) {
             Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
@@ -1243,6 +1322,13 @@ impl Filesystem for Soup {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if let Some(removed) = self.served_unlink(parent.0, name, false) {
+            match removed {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            }
+            return;
+        }
         let _writing = self.writing();
         match self.unlink(parent.0, name) {
             Ok(()) => reply.ok(),
@@ -1251,6 +1337,13 @@ impl Filesystem for Soup {
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if let Some(removed) = self.served_unlink(parent.0, name, true) {
+            match removed {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            }
+            return;
+        }
         let _writing = self.writing();
         match self.rmdir(parent.0, name) {
             Ok(()) => reply.ok(),
@@ -1261,6 +1354,13 @@ impl Filesystem for Soup {
     fn rename(&self, _req: &Request, parent: INodeNo, name: &OsStr, newparent: INodeNo, newname: &OsStr, flags: RenameFlags, reply: ReplyEmpty) {
         if flags.contains(RenameFlags::RENAME_EXCHANGE) {
             reply.error(Errno::EINVAL);
+            return;
+        }
+        if let Some(renamed) = self.served_rename(parent.0, name, newparent.0, newname) {
+            match renamed {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            }
             return;
         }
         let _writing = self.writing();
@@ -1277,12 +1377,12 @@ impl Filesystem for Soup {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
+        mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
@@ -1291,6 +1391,15 @@ impl Filesystem for Soup {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        if self.is_served(ino.0)
+            && let Some(set) = self.served_setattr(ino.0, served::set_attr(mode, size, atime, mtime))
+        {
+            match set {
+                Ok(attr) => reply.attr(&Duration::ZERO, &attr),
+                Err(e) => reply.error(e),
+            }
+            return;
+        }
         let writing = size.map(|_| self.writing());
         if let Some(size) = size
             && let Err(e) = self.truncate(ino.0, fh.map(|fh| fh.0), size)
@@ -1400,6 +1509,115 @@ mod tests {
     fn read(soup: &Soup, path: &str) -> Vec<u8> {
         let attr = ino(soup, path).expect("path");
         soup.read(attr.ino.0, 0, usize::try_from(attr.size).expect("size")).expect("read")
+    }
+
+    /// A repo with an anchor served by node `me`'s service `notes`, and a
+    /// filesystem in memory serving it on a socket the configuration names,
+    /// in a directory only this user may write.
+    fn served(scratch: &Scratch, fs: crate::ninep::memfs::MemFs) -> (Soup, Link, crate::ninep::memfs::Shared, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let repo = scratch.path().join("repo");
+        let catalog = Catalog::open_repo(&repo).expect("catalog");
+        let anchor = catalog.new_anchor().expect("anchor");
+        catalog.serve_anchor(&anchor, b"me", "notes", false).expect("serve");
+        drop(catalog);
+        let run = scratch.path().join("run");
+        std::fs::create_dir_all(&run).expect("mkdir");
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let socket = run.join("notes.9p");
+        let shared = crate::ninep::memfs::Shared::new(fs);
+        crate::ninep::memfs::listen(shared.clone(), &socket).expect("listen");
+        std::fs::write(repo.join(crate::config::FILE), format!("[[serve]]\nname = \"notes\"\nsocket = {:?}\n", socket.display().to_string())).expect("config");
+        std::fs::set_permissions(repo.join(crate::config::FILE), std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let opened = repo.clone();
+        let soup = Soup::new(Box::new(move || Catalog::open_repo(&opened)), None).serving(repo.clone(), b"me".to_vec()).writable(repo.join("work"));
+        (soup, anchor, shared, socket)
+    }
+
+    #[test]
+    fn a_served_anchor_is_its_servers_tree_as_it_is_now() {
+        let scratch = Scratch::new("mount-served");
+        let mut fs = crate::ninep::memfs::MemFs::new();
+        fs.file("notes/today.md", b"hello");
+        fs.symlink("latest", "notes/today.md");
+        let (soup, anchor, shared, _) = served(&scratch, fs);
+        let top = format!("anchors/{anchor}");
+
+        let dir = ino(&soup, &top).expect("served");
+        assert_eq!(dir.kind, FileType::Directory);
+        assert_eq!(soup.ttl(dir.ino.0), Duration::ZERO, "nothing served is cached");
+        assert_eq!(names(&soup, &top), ["latest", "notes"]);
+        assert_eq!(soup.link(ino(&soup, &format!("{top}/latest")).expect("link").ino.0).expect("readlink"), b"notes/today.md");
+
+        // Who's asking is said by the mount, not the caller
+        let attached = shared.lock().attached.clone();
+        assert_eq!(attached.len(), 1, "one root for the anchor");
+        let first = attached.first().expect("attached");
+        assert_eq!((first.aname.clone(), first.n_uname), (anchor.to_string().into_bytes(), rustix::process::getuid().as_raw()));
+
+        // Reading and writing what's there now, as the server has it
+        let file = ino(&soup, &format!("{top}/notes/today.md")).expect("file");
+        assert_eq!(file.size, 5);
+        let fh = soup.served_open(file.ino.0, libc::O_RDWR).expect("served").expect("open");
+        assert_eq!(soup.read_handle(fh, 0, 100).expect("served").expect("read"), b"hello");
+        assert_eq!(soup.write(fh, 5, b", world").expect("write"), 7);
+        soup.release(fh);
+        assert_eq!(shared.lock().read("notes/today.md").as_deref(), Some(b"hello, world".as_slice()));
+        shared.lock().file("notes/new-there.md", b"made by the server");
+        assert!(names(&soup, &format!("{top}/notes")).contains(&"new-there.md".to_owned()), "listed as it is now");
+
+        // Making, renaming and removing, all the server's
+        let notes = ino(&soup, &format!("{top}/notes")).expect("dir").ino.0;
+        let (made, fh) = soup.served_create(notes, OsStr::new("made.md"), libc::O_RDWR | libc::O_CREAT, 0o644).expect("served").expect("create");
+        assert_eq!(made.kind, FileType::RegularFile);
+        soup.write(fh, 0, b"mine").expect("write");
+        soup.release(fh);
+        soup.served_mkdir(notes, OsStr::new("sub"), 0o755).expect("served").expect("mkdir");
+        let sub = ino(&soup, &format!("{top}/notes/sub")).expect("sub").ino.0;
+        soup.served_rename(notes, OsStr::new("made.md"), sub, OsStr::new("moved.md")).expect("served").expect("rename");
+        assert_eq!(shared.lock().read("notes/sub/moved.md").as_deref(), Some(b"mine".as_slice()));
+        assert_eq!(soup.served_unlink(notes, OsStr::new("sub"), true).expect("served"), Err(Errno::ENOTEMPTY));
+        soup.served_unlink(sub, OsStr::new("moved.md"), false).expect("served").expect("unlink");
+        soup.served_unlink(notes, OsStr::new("sub"), true).expect("served").expect("rmdir");
+        let truncated = soup.served_setattr(file.ino.0, served::set_attr(None, Some(2), None, None)).expect("served").expect("setattr");
+        assert_eq!(truncated.size, 2);
+        assert_eq!(shared.lock().read("notes/today.md").as_deref(), Some(b"he".as_slice()));
+
+        // Nothing renames out of what's served
+        let soup_root = 1;
+        assert_eq!(soup.served_rename(notes, OsStr::new("today.md"), soup_root, OsStr::new("x")), Some(Err(Errno::EXDEV)));
+        assert_eq!(soup.served_rename(soup_root, OsStr::new("x"), soup_root, OsStr::new("y")), None, "nothing served: not for this");
+    }
+
+    #[test]
+    fn an_anchor_served_elsewhere_or_by_no_service_here_isnt_reached() {
+        let scratch = Scratch::new("mount-served-not");
+        let (soup, anchor, shared, _) = served(&scratch, crate::ninep::memfs::MemFs::new());
+        let repo = scratch.path().join("repo");
+        // Another node's
+        let other = Catalog::open_repo(&repo).expect("catalog").new_anchor().expect("anchor");
+        Catalog::open_repo(&repo).expect("catalog").serve_anchor(&other, b"someone else", "notes", false).expect("serve");
+        assert!(soup.served_at(ino(&soup, &format!("anchors/{other}")).map(|attr| attr.ino.0).unwrap_or_default()).is_none(), "not served here");
+        // A service this node hasn't got
+        Catalog::open_repo(&repo).expect("catalog").serve_anchor(&anchor, b"me", "absent", false).expect("serve");
+        assert_eq!(ino(&soup, &format!("anchors/{anchor}")).map(|_| ()), Err(Errno::EACCES));
+        assert!(shared.lock().attached.is_empty(), "nothing connected to for either");
+    }
+
+    #[test]
+    fn a_server_gone_is_not_connected_till_its_back() {
+        let scratch = Scratch::new("mount-served-gone");
+        let (soup, anchor, shared, socket) = served(&scratch, crate::ninep::memfs::MemFs::new());
+        let top = format!("anchors/{anchor}");
+        let dir = ino(&soup, &top).expect("served").ino.0;
+        // Stopped: hung up, and its socket gone
+        shared.hang_up();
+        std::fs::remove_file(&socket).expect("remove");
+        assert_eq!(soup.attr(dir).map(|_| ()), Err(Errno::ENOTCONN));
+        assert_eq!(soup.list(dir).map(|_| ()), Err(Errno::ENOTCONN));
+        // Back
+        crate::ninep::memfs::listen(shared, &socket).expect("listen again");
+        assert!(soup.attr(dir).is_ok(), "connected again");
     }
 
     #[test]

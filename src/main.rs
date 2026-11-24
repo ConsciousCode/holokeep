@@ -1461,7 +1461,15 @@ fn mount(repo: PathBuf, dir: &Path, read_only: bool) -> anyhow::Result<()> {
     #[cfg(not(feature = "net"))]
     let fetcher = None;
     let work = repo.join("work");
+    // Anchors this node serves are reached through its services
+    #[cfg(feature = "net")]
+    let node = holokeep::net::mesh::node_key(&repo).ok().map(|key| (repo.clone(), key.public().to_peer_id().to_bytes()));
     let soup = holokeep::mount::Soup::new(Box::new(move || Catalog::open_repo(&repo)), fetcher);
+    #[cfg(feature = "net")]
+    let soup = match node {
+        Some((repo, node)) => soup.serving(repo, node),
+        None => soup,
+    };
     let soup = if read_only { soup } else { soup.writable(work) };
     eprintln!("mounted on {}; interrupt to unmount", dir.display());
     holokeep::mount::mount(soup, dir).with_context(|| format!("mounting on {}", dir.display()))

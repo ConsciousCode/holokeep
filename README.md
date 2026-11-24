@@ -407,6 +407,11 @@ Checklist:
   - [x] Git objects as `git-raw` blocks, named by git's SHA-1, linking as go-ipld-git reads them; importing a repository's loose objects and packs, deltas applied, keeping what its refs name (`hk git import`)
   - [ ] `.git` through the mount as `git-raw`, and exporting objects back into a repository
   - [ ] Live anchors, which are whatever their backing is now, and anchors served by a peer, as 9P mounts
+    - [x] Serve claims routing an anchor to a node's service, a 9P2000.L socket its own config names (`hk serve add/rm/show`, `[[serve]]`)
+    - [x] The mount reaching an anchor served by its own node, live: nothing cached, `ENOTCONN` while the server's away
+    - [ ] Anchors served by another node, over the mesh
+    - [ ] Persisting what's served as sets, but for what's `QTTMP`
+    - [ ] A shell, as a service
 - [ ] P2P private mesh
   - [x] Joining: swarm key, members, tickets, mDNS, identify (`hk node id/invite/join/run/peers`)
   - [x] Fetching DAGs from other nodes (`hk dag fetch`, and `cat`/`get`/`dag export` through a running node)
@@ -518,6 +523,7 @@ $hk anchor new                      # an empty identity to hang claims on
 $hk anchor set <anchor> <cid>       # say what an anchor is now
 $hk anchor show <anchor>            # what it is, and its history
 $hk fs log <path>                   # each version of what's at a path, as the mount shows it
+$hk serve add <anchor> <service>    # answer an anchor live from this node's [[serve]] service
 $hk anchor root                     # this account's root anchor, the top of hk mount
 $hk keep ls                         # what's kept
 $hk tag rm <name> <cid>...          # untag blocks, with tombs

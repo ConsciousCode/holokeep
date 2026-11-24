@@ -90,8 +90,9 @@ pub fn connect(service: &Service) -> Result<Client, Error> {
     let path = service.socket();
     let dir = path.parent().unwrap_or_else(|| Path::new("/"));
     let dir_meta = std::fs::metadata(dir).map_err(|e| Error::Io(dir.to_path_buf(), e))?;
-    let socket = std::fs::symlink_metadata(&path).ok().map(|meta| (meta.file_type().is_socket(), meta.uid()));
-    socket_fit(&path, socket, (dir_meta.uid(), dir_meta.mode()), me()).map_err(Error::Unfit)?;
+    // None there is a server not running, not one that's unfit
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| Error::Io(path.clone(), e))?;
+    socket_fit(&path, Some((meta.file_type().is_socket(), meta.uid())), (dir_meta.uid(), dir_meta.mode()), me()).map_err(Error::Unfit)?;
     Client::connect(&path).map_err(|e| Error::Io(path, e))
 }
 
