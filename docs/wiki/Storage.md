@@ -93,6 +93,16 @@ blocks' bytes. Each row is zlib-compressed when that makes it smaller.
   more than 50 deep.
 - A base let go of first makes each block that's a delta on it whole,
   and what's on those shallower.
+- A file whose leaves are all whole, with nothing a delta on them, is
+  moved into the shards to be [[#Kept files|kept whole]]: the database
+  holds it as big as a file would, and a database that big makes for
+  slow [[#Compacting|compacts]]. They come to be there as copies of a
+  file the mount copied rather than moved, or from before it moved them
+  (see [[Mount#Writing]]). The node does it in the background, up to 4
+  GiB every ten minutes, biggest first, each file in a transaction of
+  its own, each leaf checked against its CID as it's written out; what
+  compresses to under nine tenths of its size stays. `hk repo compact`
+  does all of it first.
 
 ## Compacting
 
