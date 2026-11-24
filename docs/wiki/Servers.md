@@ -1,8 +1,8 @@
-**Partly implemented.** The first two slices exist: serve claims,
-`[[serve]]` services, and the mount reaching an anchor served by its own
-node or, through it, by another of the user's machines, live (see
-[[#Slices]] for what's yet to come, which this page describes as the
-plan, saying so where it does).
+**Partly implemented.** The first three slices exist: serve claims,
+`[[serve]]` services, the mount reaching an anchor served by its own node
+or, through it, by another machine, the user's own or, as grants let
+them, another user's, and persistence (see [[#Slices]] for what's yet to
+come, which this page describes as the plan, saying so where it does).
 
 A **served anchor** is an [[Anchors and Names|anchor]] whose tree a
 process answers live, over 9P, instead of being read from blocks. It
@@ -104,7 +104,8 @@ lies in a directory anyone else may write.
   so looking it up never waits on its server either.
 - A server that can't be reached, its socket gone or its connection
   hung up, fails with `ENOTCONN`, and is connected to again on the next
-  request. Not yet: a persisted anchor showing its last set meanwhile.
+  request. Not yet: a persisted anchor showing its last set meanwhile
+  (see [[#Persistence]]).
 - Renaming between a served anchor and anything else fails `EXDEV`, as
   across filesystems, so `mv` copies.
 - An anchor another node serves is reached through this node's (see
@@ -141,35 +142,61 @@ nanoseconds, so one from before a restart isn't taken for a new one.
 The response is `{message}`, the answer. Requests time out after 30 s, a
 mount's own wait being 10 s.
 
-The serving node answers `EACCES` unless the asker is a machine hosting
-the user whose anchor it is, as for anything of theirs (see [[Sharing]]),
-of this node's own account, and the anchor's serve claim names this node
-and the service, which its config has. Only messages it decodes as
-9P2000.L's filesystem requests go on, else `EOPNOTSUPP`; and an attach is
-as it says: `uname` the user's root key, `n_uname` none, as they're no
-user of this machine, `aname` the anchor. Each session has a connection
-of its own to the service, made as the node's own user; a session ends
-when its asker says so, its asker disconnects, or its service hangs up,
+The serving node answers `EACCES` unless the anchor is its own
+account's, and its serve claim names this node and the service, which its
+config has; and the asker is either:
+
+- a machine hosting the anchor's owner, as for anything of theirs (see
+  [[Sharing]]), which may do anything; or
+- a machine hosting another user, a **guest** of this node's (see
+  [[Mesh#Users sharing a mesh]]), asking of the owner's view of the
+  anchor, whom [[Grants#Grants on anchors|grants on it]] let read it or
+  write it. A reader may only read: whatever would change anything
+  (opening to write or truncate, creating, writing, removing, renaming,
+  setting attributes) is answered `EROFS`.
+
+Grants are judged at each message, so taking them away shuts a session
+out at once. Only messages it decodes as 9P2000.L's filesystem requests
+go on, else `EOPNOTSUPP`; and an attach is as it says: `uname` the asking
+user's root key, `n_uname` none, as they're no user of this machine,
+`aname` the anchor itself, whoever's view it was asked of. A session is
+for the user and the anchor it was first asked for, as its attach was,
+and anything asked in it for another is `EACCES`. Each session has a
+connection of its own to the service, made as the node's own user, so
+several users share a server, told apart by `uname`; a session ends when
+its asker says so, its asker disconnects, or its service hangs up,
 whatever's waiting answered `ENOTCONN`.
 
-Not yet: other users reaching what's served, as grants let them, and a
-node serving accounts other than its own.
+A serve claim is shared with guests as the sets of an anchor are: one
+that counts in a view they may read reaches their machines, so their
+mounts show the anchor served there too.
+
+Not yet: a node serving accounts other than its own, and visitors.
 
 ## Persistence
 
-**Not yet implemented**: `persist` is said, and kept, but nothing reads it
-yet.
+With `persist` on (`hk serve add --persist`), the serving node's daemon
+keeps the server's tree as sets of the anchor, as if someone had written
+it through the mount, signed by the node's own account: its files become
+blocks as `hk add` makes them, and the anchor's set when what's served
+has changed. It looks every minute, so that's the most often it's set.
 
-With `persist` on, the serving node keeps the server's tree as sets, as
-if someone had written it through the mount: its files become blocks, by
-the same [[Rules]], and a set is signed when it's changed, at most once a
-minute. Changes are found by `qid.version`, walking only directories
-whose version moved. A file or directory whose qid has `QTTMP` (`0x04`),
-which Plan 9 used for what's left out of its archive, is never kept: a
-server marks what mustn't be, such as handshakes, and the rest is kept.
+- A file or directory whose qid has `QTTMP` (`0x04`), which Plan 9 used
+  for what's left out of its archive, is never kept: a server marks what
+  mustn't be, such as handshakes or a clock, and the rest is kept.
+- Each directory is listed every time, a message or so each. A file is
+  read again only if it seems changed: its qid's version moved, or, for a
+  server that keeps no versions (zero), its size or mtime did. A server
+  with neither has every file read every time.
+- It attaches as the anchor's owner: `uname` the user's root key, and
+  `n_uname` the node's own uid.
+- A server that can't be reached is skipped, and said so once; it's kept
+  again once it's back.
 
 Persisted sets are ordinary history: `hk fs log`, replication, trimming
-and everything else take them as they are.
+and everything else take them as they are. The mount still shows the
+server live, never the last set; not yet: showing the last set while the
+server can't be reached.
 
 ## Privilege
 
@@ -195,16 +222,17 @@ anyone else, without authenticating as them, as sshd doesn't.
    `rm`, `show`), `[[serve]]` configuration, and a 9P2000.L client in the
    mount for a socket of the mount's own user. Live only, with the rules
    of [[#Privilege]] and their tests.
-2. **Across the mesh** (implemented, for the user's own machines). A
-   node protocol carrying 9P to the serving node, which connects to the
-   service as its user (see [[#Across the mesh]]). Not yet: other users,
-   as grants let them in.
-3. **Persistence**, as above.
+2. **Across the mesh** (implemented). A node protocol carrying 9P to the
+   serving node, which connects to the service as its user (see
+   [[#Across the mesh]]), for the user's own machines and for other
+   users, as grants on the anchor let them read or write it.
+3. **Persistence** (implemented), as above.
 4. **A shell**, as a service: sessions in the manner of Plan 9's `/net`
    clone files, as the authenticated user only, if their device is
    granted a shell on that machine; root only as root's own
    configuration allows, as `/root/.ssh/authorized_keys` does.
 
 Source: `src/claim.rs`, `src/store/claims.rs`, `src/served.rs`,
+`src/served/persist.rs`,
 `src/ninep.rs`, `src/ninep/client.rs`, `src/mount/served.rs`,
 `src/net/serve.rs`, `src/net/node/serving.rs`, `src/net/daemon.rs`.

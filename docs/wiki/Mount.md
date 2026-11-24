@@ -92,11 +92,20 @@ Writing to an anchor turns it into an **overlay mount**:
   over what changed, exactly as the importer builds them. The anchor's
   new value is what `hk add` of the tree as it now is would make (hidden
   files included), and one burst, like an editor's save, is one set.
-- Before a work file that's been committed is written to, truncated,
-  replaced, moved or removed, the blocks it was imported as in place are
-  **moved out**, to be blocks of their own. So every value the anchor has
-  had stays whole, while what it is now is stored once, in the work
-  directory: history costs only what changed.
+- A work file that's been committed is what its blocks are, imported in
+  place, so before it's changed they're kept elsewhere. So every value
+  the anchor has had stays whole, while what it is now is stored once, in
+  the work directory: history costs only what changed.
+  - **Moved** within the anchor, it's still what it was, recorded where
+    it is now; nothing's copied.
+  - **Removed, replaced or emptied**, it's moved into the shards as it is,
+    to be [[Storage|kept whole]], as `hk add` keeps a big file, copying
+    nothing. So is everything left in the work directory when it's let go
+    of (see [[#In step with what's set elsewhere]]). A file too small to
+    keep whole (64 KiB or less), on another filesystem than the shards,
+    or open to write, which would write what's kept, is copied instead.
+  - **Written to or truncated** where it is, its blocks are **moved
+    out**, copied to be blocks of their own.
 - What's moved out goes to the [[Storage#Deltas|delta store]], whole,
   and the version of the same path before it, part by part at the same
   offsets, is made a **delta** on it, as git keeps history: the newest
@@ -188,7 +197,8 @@ unless a file of it is open to write or not yet committed:
    conflict beside it (see [[Anchors and Names#Conflicts]]); those aren't
    stored, and what's committed over them is without the ones left be,
    and says which were resolved as they were.
-2. The blocks imported in place are moved out, so every version stays whole.
+2. What's in the work directory is kept, moved into the shards whole, so every
+   version stays whole.
 3. The work directory is renamed aside and removed, and its marks forgotten.
 4. The base is what the anchor is now.
 

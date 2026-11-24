@@ -227,8 +227,7 @@ and the ticket it joined with, for a sandbox without a disk to keep a
 repo on. Every `hk` command run with that directory as `--repo` connects
 to its member, does what it's for there, and disconnects; nothing's kept
 between commands. It's let in as any client is: `hk node id` in the
-directory, `hk node invite <id> --client` on the member, then `hk node
-join --thin <ticket>` in the directory (again with a newer ticket from
+directory, `hk node invite <id> --client` on the member, then `hk node join --thin <ticket>` in the directory (again with a newer ticket from
 the same member, to find it where it listens now).
 
 - **Reading** (`hk cat`, `hk get`, `hk block get`) asks the member over
@@ -287,8 +286,7 @@ mesh's), `anchor latest <view> <key>` (a key's sets that stand, to take
 its write away), and `signed` (its last sign there).
 
 A visitor let write a view writes as itself, since no member may sign for
-it. `hk add` pushes the blocks, keeping nothing, and `hk anchor set
-<view> <cid>` signs a set with its own key, after the view's heads and
+it. `hk add` pushes the blocks, keeping nothing, and `hk anchor set <view> <cid>` signs a set with its own key, after the view's heads and
 its last sign, and pushes both. The member holds what a visitor pushes
 for the owner it's pushed for, if it serves them and the visitor may
 write a view of theirs; of claims, it takes only sets and their signs,
@@ -296,8 +294,7 @@ which count in the owner's view as the grants say, there and on every
 machine they reach. It refuses anything pushed otherwise, and `hk anchor
 set` checks the set counts before it says so.
 
-A visitor let pass a view on (`/anchor/grant`) does as itself: `hk
-anchor share <view> <peer> read` (or `unshare`) signs a grant with its
+A visitor let pass a view on (`/anchor/grant`) does as itself: `hk anchor share <view> <peer> read` (or `unshare`) signs a grant with its
 own key, after the mesh's, and pushes it. The member takes grants on
 anchors from a visitor that may give on a view of the user it pushes
 for, works the grants out again, and tells every member, so a visitor it
