@@ -1415,17 +1415,19 @@ impl Node {
         Ok(arrived)
     }
 
-    /// Keep the repo's free space between watermarks: trim below `low`
-    /// until above `high`, and offer others only what's above `high`.
-    pub const fn set_watermarks(&mut self, low: u64, high: u64) {
-        self.marks = Watermarks::new(low, high);
+    /// Keep the repo's space as the watermarks say: free space between
+    /// them, and what's stored under the target, if there is one.
+    pub const fn set_watermarks(&mut self, marks: Watermarks) {
+        self.marks = marks;
     }
 
     /// Whether the repo's short of space and should trim, by the
-    /// watermarks: from below the low until above the high.
+    /// watermarks: from below the low until above the high, or from past
+    /// the target until a tenth under it.
     pub fn pressed(&mut self) -> Result<bool> {
         let free = self.catalog.offer()?.free;
-        Ok(free.is_some_and(|free| self.marks.update(free)))
+        let used = if self.marks.target.is_some() { self.catalog.stored()? } else { 0 };
+        Ok(self.marks.update(free, used))
     }
 
     pub const fn watermarks(&self) -> Watermarks {
@@ -1436,9 +1438,10 @@ impl Node {
         !self.trims.is_empty()
     }
 
-    /// Let go of what the mesh can spare of these blocks' copies here. It's
+    /// Let go of what the mesh can spare of these blocks' copies here, and,
+    /// `hand_off`, of whatever members with room take copies of first. It's
     /// done when `next` returns `Trimmed` with the id.
-    pub fn trim(&mut self, copies: usize, keys: &[Multihash]) -> Result<TrimId> {
+    pub fn trim(&mut self, copies: usize, keys: &[Multihash], hand_off: bool) -> Result<TrimId> {
         self.tell_hosts()?;
         let group = self.next_trim;
         self.next_trim = group.wrapping_add(1);
@@ -1449,7 +1452,7 @@ impl Node {
             let id = self.next_trim;
             self.next_trim = id.wrapping_add(1);
             let peers = self.machines_for(&local);
-            let (mut trim, intents) = self.catalog.viewing(local.uid, |catalog| Trim::start(catalog, &self.sightings, &peers, copies, keys.iter().cloned()))??;
+            let (mut trim, intents) = self.catalog.viewing(local.uid, |catalog| Trim::start(catalog, &self.sightings, &peers, copies, hand_off, keys.iter().cloned()))??;
             for intent in intents {
                 let intent = intent.for_user(local.user_bytes().as_deref());
                 for peer in &peers {
@@ -1486,6 +1489,7 @@ impl Node {
             group.parts.remove(&group_or_part);
             group.report.considered = group.report.considered.saturating_add(report.considered);
             group.report.dropped = group.report.dropped.saturating_add(report.dropped);
+            group.report.handed = group.report.handed.saturating_add(report.handed);
             group.report.freed = group.report.freed.saturating_add(report.freed);
         }
         if group.parts.is_empty()
@@ -1495,39 +1499,80 @@ impl Node {
         }
     }
 
-    /// Let go of what's spare of a sample of what's here, under pressure,
-    /// or of everything when asked.
+    /// Under pressure, let go of a sample of what's here, handing off what
+    /// isn't spare; or, when asked, of whatever's spare of everything.
     pub fn trim_some(&mut self, copies: usize, all: bool) -> Result<TrimId> {
-        let keys = if all { self.catalog.keys()? } else { self.catalog.sample(durability::FRESH)? };
-        self.trim(copies, &keys)
+        let keys = if all { self.catalog.keys()? } else { self.catalog.sample(trim::BATCH)? };
+        self.trim(copies, &keys, !all)
     }
 
-    /// Once every member's answered a trim's intent, let go of what can
-    /// go, tell the members, and finish.
+    /// Once every member's answered a trim's intent, let go of what can go
+    /// and hand off what's to be; once members have answered for that, let
+    /// go of what they kept, and finish.
     fn drive_trim(&mut self, id: TrimId) -> Result<()> {
+        let Some(&(uid, _)) = self.trims.get(&id) else {
+            return Ok(());
+        };
+        let user = self.local(uid)?.user_bytes();
         let Some((_, trim)) = self.trims.get_mut(&id) else {
             return Ok(());
         };
         if trim.waiting() {
             return Ok(());
         }
-        let dropping = self.catalog.drop_all(&trim.decide())?;
+        if !trim.decided() {
+            let (now, hand) = self.catalog.viewing(uid, |catalog| trim.decide(catalog))??;
+            let pushes = self.catalog.viewing(uid, |catalog| -> Result<Vec<(PeerId, Push)>> {
+                let mut pushes = Vec::new();
+                for (peer, keys) in hand {
+                    let mut blocks = Vec::new();
+                    for key in &keys {
+                        blocks.extend(catalog.read_block(key.as_ref())?);
+                    }
+                    pushes.extend(Push::batches(catalog, blocks)?.into_iter().map(|push| (peer, push)));
+                }
+                Ok(pushes)
+            })??;
+            for (peer, push) in pushes {
+                let request = self.swarm.behaviour_mut().push.send_request(&peer, push.for_user(user.as_deref()));
+                trim.sent_push(request);
+                self.pushed.insert(request, uid);
+            }
+            self.trimmed(id, &now, false)?;
+            if self.trims.get(&id).is_some_and(|(_, trim)| trim.waiting()) {
+                return Ok(());
+            }
+        }
+        let handed = self.trims.get(&id).map(|(_, trim)| trim.handed()).unwrap_or_default();
+        self.trimmed(id, &handed, true)?;
+        if let Some((_, trim)) = self.trims.remove(&id) {
+            self.trim_part_done(id, Some(trim.report()));
+        }
+        Ok(())
+    }
+
+    /// Let go of the copies here of what a trim says can go, and tell the
+    /// members.
+    fn trimmed(&mut self, id: TrimId, keys: &[Multihash], handed: bool) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let dropping = self.catalog.drop_all(keys)?;
         for key in &dropping.dropped {
             if !self.catalog.has(key.as_ref())? {
                 self.sightings.forget(key.as_ref())?;
             }
         }
         let gone = dropping.dropped;
-        trim.dropped(gone.len(), dropping.freed);
-        let report = trim.report();
-        self.trims.remove(&id);
+        if let Some((_, trim)) = self.trims.get_mut(&id) {
+            trim.dropped(gone.len(), if handed { gone.len() } else { 0 }, dropping.freed);
+        }
         if !gone.is_empty() {
             let dropped = trim::dropped(&gone);
             for peer in self.connected() {
                 self.swarm.behaviour_mut().dropped.send_request(&peer, dropped.clone());
             }
         }
-        self.trim_part_done(id, Some(report));
         Ok(())
     }
 
@@ -1538,7 +1583,7 @@ impl Node {
                 let mut grant = match self.serving(&peer, request.user())? {
                     Some(local) => {
                         let mut trims: Vec<&mut Trim> = self.trims.values_mut().map(|(_, trim)| trim).collect();
-                        self.catalog.viewing(local.uid, |catalog| trim::answer(catalog, &me, &peer, &request, &mut trims))??
+                        self.catalog.viewing(local.uid, |catalog| trim::answer(catalog, &me, &peer, &request, &mut trims, &self.marks))??
                     },
                     None => Grant::default(),
                 };
@@ -1865,10 +1910,15 @@ impl Node {
                     let _ = self.swarm.behaviour_mut().push.send_response(channel, kept);
                     return self.took_guest_claims(&local, &claims);
                 }
+                let size = request.size();
                 let kept = match self.serving(&peer, request.user())? {
                     Some(local) => self.catalog.viewing(local.uid, |catalog| durability::answer_push(catalog, &self.sightings, &peer, request, &self.marks))??,
                     None => Kept::default(),
                 };
+                // Counted against the target till it's measured again
+                if !kept.is_empty() {
+                    self.marks.took(size);
+                }
                 let _ = self.swarm.behaviour_mut().push.send_response(channel, kept);
                 return Ok(());
             },
@@ -1881,7 +1931,11 @@ impl Node {
                 }
                 let kept = response.keys();
                 let uid = self.pushed.remove(&request_id);
-                if let Some((_, audit)) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
+                let handed = self.trims.iter().find(|(_, (_, trim))| trim.pushed(request_id)).map(|(&id, _)| id);
+                if let Some((_, trim)) = handed.and_then(|id| self.trims.get_mut(&id)) {
+                    trim.kept(request_id, peer, &response);
+                    response.sight(&self.catalog, &self.sightings, &peer)?;
+                } else if let Some((_, audit)) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
                     unless_busy(audit.kept(&self.sightings, request_id, response), "noting what a member kept")?;
                 } else {
                     response.sight(&self.catalog, &self.sightings, &peer)?;
@@ -1890,12 +1944,21 @@ impl Node {
                     let local = self.local(uid)?;
                     self.notice_backrefs(peer, &kept, &local)?;
                 }
+                if let Some(id) = handed {
+                    self.drive_trim(id)?;
+                }
             },
             request_response::Event::OutboundFailure { request_id, .. } => {
                 self.pushed.remove(&request_id);
                 self.guest_pushes.remove(&request_id);
-                if let Some((_, audit)) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
+                let handed = self.trims.iter().find(|(_, (_, trim))| trim.pushed(request_id)).map(|(&id, _)| id);
+                if let Some((_, trim)) = handed.and_then(|id| self.trims.get_mut(&id)) {
+                    trim.push_failed(request_id);
+                } else if let Some((_, audit)) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
                     audit.push_failed(request_id);
+                }
+                if let Some(id) = handed {
+                    self.drive_trim(id)?;
                 }
             },
             _ => return Ok(()),

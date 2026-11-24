@@ -30,6 +30,7 @@ use tokio::net::unix::OwnedWriteHalf;
 use super::mesh::{self, Error, Members, Place, Result, unless_busy};
 use super::durability::Report;
 use super::node::{AuditId, Event, FetchId, Node, TrimId};
+use super::trim::Watermarks;
 use crate::cid::CidRef as _;
 use crate::store::{Db, ExternalFile, Mount};
 
@@ -390,10 +391,11 @@ pub fn trim(place: &Place) -> Result<Option<super::trim::Report>> {
         let mut words = line.split_whitespace();
         if words.next() == Some("trimmed") {
             let mut number = || words.next().and_then(|n| n.parse::<u64>().ok()).unwrap_or_default();
-            let (considered, dropped, freed) = (number(), number(), number());
+            let (considered, dropped, freed, handed) = (number(), number(), number(), number());
             return Ok(Some(super::trim::Report {
                 considered: usize::try_from(considered).unwrap_or_default(),
                 dropped: usize::try_from(dropped).unwrap_or_default(),
+                handed: usize::try_from(handed).unwrap_or_default(),
                 freed,
             }));
         }
@@ -560,12 +562,12 @@ fn control_socket(place: &Place, shared: bool) -> Result<UnixListener> {
 
 /// A node alone, its swarm's key no member's, made a member of a mesh:
 /// started again, as that mesh's node, if it's in one now.
-fn join_mesh(place: &Place, listen: &Listen, (low, high): (u64, u64)) -> Result<Option<Node>> {
+fn join_mesh(place: &Place, listen: &Listen, marks: Watermarks) -> Result<Option<Node>> {
     let (mut joined, alone) = open_node(place)?;
     if alone {
         return Ok(None);
     }
-    joined.set_watermarks(low, high);
+    joined.set_watermarks(marks);
     start(&mut joined, place, listen, false)?;
     Ok(Some(joined))
 }
@@ -608,7 +610,7 @@ fn notice_change(node: &mut Node, remounts: &mut Remounts, path: PathBuf, again:
 
 /// Join the mesh this node's been made a member of, if it can now. Returns
 /// whether that's been dealt with.
-fn join_now(node: &mut Node, alone: &mut bool, place: &Place, listen: &Listen, marks: (u64, u64)) -> Result<bool> {
+fn join_now(node: &mut Node, alone: &mut bool, place: &Place, listen: &Listen, marks: Watermarks) -> Result<bool> {
     match join_mesh(place, listen, marks) {
         Ok(joined) => {
             if let Some(joined) = joined {
@@ -628,9 +630,10 @@ fn join_now(node: &mut Node, alone: &mut bool, place: &Place, listen: &Listen, m
 /// Run the node until interrupted, auditing as a trickle that it would
 /// take `copies` failures to lose each block it holds.
 ///
-/// Free space is kept between watermarks, `(low, high)`: below the low,
-/// the node lets go of copies the mesh can spare until it's above the
-/// high. If `collecting`, garbage is collected too, a sample at a time.
+/// Space is kept as the watermarks say: below the low mark of free space,
+/// or past the target of what's stored, the node lets go of copies the
+/// mesh can spare, and hands off others to members with room, until it's
+/// back above the high mark and a tenth under the target. If `collecting`, garbage is collected too, a sample at a time.
 /// Once interrupted, or terminated, as a service is stopped.
 async fn stopped(terminate: &mut tokio::signal::unix::Signal) {
     tokio::select! {
@@ -639,9 +642,9 @@ async fn stopped(terminate: &mut tokio::signal::unix::Signal) {
     }
 }
 
-pub async fn run(place: &Place, listen: Listen, copies: usize, (low, high): (u64, u64), collecting: bool, scanning: bool, shared: bool) -> Result<()> {
+pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks, collecting: bool, scanning: bool, shared: bool) -> Result<()> {
     let (mut node, mut alone) = open_node(place)?;
-    node.set_watermarks(low, high);
+    node.set_watermarks(marks);
     start(&mut node, place, &listen, alone)?;
     // What a client holds is a cache: what's lost is its member's to say
     let scanning = scanning && node.client_of().is_none();
@@ -684,7 +687,7 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, (low, high): (u64
                 answer_patiently(&mut node, place, stream, copies, collecting, alone, &mut join, &mut waiting).await?;
                 joining |= join;
                 if joining {
-                    joining = !join_now(&mut node, &mut alone, place, &listen, (low, high))?;
+                    joining = !join_now(&mut node, &mut alone, place, &listen, marks)?;
                 }
             },
             _ = redial.tick() => {
@@ -694,7 +697,7 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, (low, high): (u64
             _ = announce.tick() => {
                 // Anything that was busy before, tried again
                 if joining {
-                    joining = !join_now(&mut node, &mut alone, place, &listen, (low, high))?;
+                    joining = !join_now(&mut node, &mut alone, place, &listen, marks)?;
                 }
                 for path in std::mem::take(&mut changed_again) {
                     notice_change(&mut node, &mut remounts, path, &mut changed_again)?;
@@ -822,9 +825,9 @@ impl Waiting {
             },
             Event::Trimmed { id, report } => {
                 if report.dropped > 0 || self.trimming.contains_key(&id) {
-                    eprintln!("trimmed: {} spare, {} let go of, {} bytes freed", report.considered, report.dropped, report.freed);
+                    eprintln!("trimmed: {} considered, {} let go of ({} handed off), {} bytes freed", report.considered, report.dropped, report.handed, report.freed);
                 }
-                (self.trimming.remove(&id), format!("trimmed {} {} {}\n", report.considered, report.dropped, report.freed))
+                (self.trimming.remove(&id), format!("trimmed {} {} {} {}\n", report.considered, report.dropped, report.freed, report.handed))
             },
             Event::Checked { id, known } => (self.checking.remove(&id), checked(&known)),
             Event::Fetched { id, fetched, missing } => {
@@ -932,6 +935,9 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
     let _ = writeln!(out, "free\t{}", free.map_or_else(|| "unknown".to_owned(), |free| format!("{} MiB", free >> 20)));
     let marks = node.watermarks();
     let _ = writeln!(out, "watermarks\t{} MiB to {} MiB", marks.low >> 20, marks.high >> 20);
+    if let (Some(target), Some(calm)) = (marks.target, marks.calm()) {
+        let _ = writeln!(out, "target\t{} MiB, trimming down to {} MiB, {} MiB stored", target >> 20, calm >> 20, marks.used() >> 20);
+    }
     let _ = writeln!(out, "pressed\t{}", if marks.pressed() { "yes" } else { "no" });
     let _ = writeln!(out, "collecting\t{}", if collecting { "yes" } else { "no" });
     let _ = writeln!(out, "condemned\t{}", node.condemned().count()?);

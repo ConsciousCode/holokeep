@@ -105,6 +105,25 @@ asker ranks below it by the holders' rendezvous order, so the
 lowest-ranked goes first. What's let go is announced (`dropped`), and
 members forget their sightings and audit it soon.
 
+A node can have a target too, the most it means to keep (`--target`, or
+`target` in [[Configuration]]): once what's stored here passes it, the
+node trims until it's a tenth under, and it offers others only what's
+under that. So a laptop needn't fill its disk for the mesh, and holds
+what it was given or wrote until there's somewhere else for it.
+
+## Handing off
+
+Under pressure, by either mark, what isn't surplus can go too, if
+another member takes it first. A member's answer to an intent says where
+it would keep a block and how much room it has, as an advert's answer
+does; a copy here that's needed is pushed to the member whose copy would
+make up for it, and goes once that member says it kept it. A copy goes
+only if what's left takes as many failures to lose as with it, so a
+block short of copies may still move but never gets shorter, and a last
+copy no member has room for stays. Each trim hands off about 64 MiB, and
+one that freed space is followed by another at once, till the pressure's
+off. `hk node trim`, run by hand, lets go only of what's spare.
+
 ## Lost blocks
 
 A `lost` [[Claims|claim]] reports a block couldn't be found as of a time.

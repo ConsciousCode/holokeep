@@ -464,6 +464,11 @@ struct RunArgs {
     /// [default: 4G]
     #[arg(long, value_parser = holokeep::net::daemon::parse_size)]
     high_water: Option<u64>,
+    /// The most to keep here: past it, let go of copies the mesh can spare
+    /// and hand others to members with room, until a tenth under it; nor
+    /// take others' copies past that [default: no most]
+    #[arg(long, value_parser = holokeep::net::daemon::parse_size)]
+    target: Option<u64>,
     /// Don't collect garbage. Otherwise leaves nothing keeps are let go
     /// of a week after they're condemned, once every member's said it
     /// doesn't keep them
@@ -1991,7 +1996,7 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
 #[cfg(feature = "net")]
 fn node_run(place: &holokeep::net::mesh::Place, args: RunArgs) -> anyhow::Result<()> {
     use holokeep::net::daemon;
-    let RunArgs { listen, copies, low_water, high_water, no_collect, no_lost_scan, shared, clients, door } = args;
+    let RunArgs { listen, copies, low_water, high_water, target, no_collect, no_lost_scan, shared, clients, door } = args;
     let config = holokeep::config::Config::load(&place.repo)?;
     let tuned = config.node(&place.mesh);
     let listen = listen.or(tuned.listen).unwrap_or_else(|| if place.is_main() { daemon::LISTEN } else { "/ip4/0.0.0.0/tcp/0" }.to_owned());
@@ -2006,7 +2011,7 @@ fn node_run(place: &holokeep::net::mesh::Place, args: RunArgs) -> anyhow::Result
         holokeep::net::door::open(&place.repo, &holokeep::net::mesh::node_key(&place.repo)?, door.parse().context("not a multiaddr")?)?;
     }
     let copies = copies.or(tuned.copies).unwrap_or(2);
-    let water = (low_water.or(tuned.low_water).unwrap_or(2 << 30), high_water.or(tuned.high_water).unwrap_or(4 << 30));
+    let marks = holokeep::net::trim::Watermarks::new(low_water.or(tuned.low_water).unwrap_or(2 << 30), high_water.or(tuned.high_water).unwrap_or(4 << 30)).with_target(target.or(tuned.target));
     let collect = !no_collect && tuned.collect.unwrap_or(true);
     let lost_scan = !no_lost_scan && tuned.lost_scan.unwrap_or(true);
     let shared = shared || tuned.shared.unwrap_or(false);
@@ -2017,7 +2022,7 @@ fn node_run(place: &holokeep::net::mesh::Place, args: RunArgs) -> anyhow::Result
         eprintln!("this build has no mount, so the config's mounts aren't kept");
     }
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let ran = runtime.block_on(daemon::run(place, listen, copies, water, collect, lost_scan, shared));
+    let ran = runtime.block_on(daemon::run(place, listen, copies, marks, collect, lost_scan, shared));
     #[cfg(feature = "fuse")]
     if let Some(mounts) = mounts {
         mounts.stop();

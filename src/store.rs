@@ -821,6 +821,28 @@ impl Catalog {
         Ok(u64::try_from(used).unwrap_or_default())
     }
 
+    /// The bytes of every block here, whoever put it: what a node's target
+    /// is of.
+    pub fn stored(&self) -> Result<u64> {
+        let stored: i64 = self.db.conn()
+            .prepare_cached(
+                "SELECT coalesce(sum(size), 0) FROM
+                 (SELECT max(size) AS size FROM holdings WHERE block IN (SELECT block FROM blocks) GROUP BY block)",
+            )?
+            .query_row([], |row| row.get(0))?;
+        Ok(u64::try_from(stored).unwrap_or_default())
+    }
+
+    /// A block's bytes, as they were tallied when it was put here, if it
+    /// was.
+    pub fn held_size(&self, key: Key<'_>) -> Result<Option<u64>> {
+        let Some(id) = self.db.lookup(key)? else {
+            return Ok(None);
+        };
+        let size: Option<i64> = self.db.conn().prepare_cached("SELECT max(size) FROM holdings WHERE block = ?1")?.query_row([id], |row| row.get(0))?;
+        Ok(size.and_then(|size| u64::try_from(size).ok()))
+    }
+
     /// Every block here the account this acts for put here, whenever it
     /// did, by CID.
     pub fn held(&self) -> Result<Vec<Link>> {

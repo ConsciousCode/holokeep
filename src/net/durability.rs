@@ -172,6 +172,11 @@ impl Push {
         pushes
     }
 
+    /// The bytes of the blocks it carries.
+    pub fn size(&self) -> u64 {
+        u64::try_from(self.blocks.iter().fold(0usize, |size, (_, data)| size.saturating_add(data.len()))).unwrap_or(u64::MAX)
+    }
+
     /// How many blocks it carries.
     pub const fn len(&self) -> usize {
         self.blocks.len()
@@ -198,6 +203,15 @@ impl Kept {
     /// The multihashes of what was kept.
     pub fn keys(&self) -> Vec<Vec<u8>> {
         self.kept.iter().map(|(key, _)| key.to_vec()).collect()
+    }
+
+    /// What was kept, by multihash, and the copies of each now.
+    pub fn copies(&self) -> impl Iterator<Item = (&[u8], &[Replica])> {
+        self.kept.iter().map(|(key, replicas)| (key.as_slice(), replicas.as_slice()))
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.kept.is_empty()
     }
 
     /// Note the copies a member kept of what was pushed to it outside an
@@ -492,19 +506,25 @@ pub fn answer_advert(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, ad
         }
         held.push((key.clone(), catalog.replicas(multihash.as_ref())?));
     }
+    Ok(Haves { held, offer: Some(offered(catalog, marks)?) })
+}
+
+/// Where this node would keep a block it's sent: its own volume, with
+/// the room the watermarks leave others, and the account's quota.
+pub fn offered(catalog: &Catalog, marks: &super::trim::Watermarks) -> Result<Offer> {
     let mut offer = catalog.offer()?;
-    offer.free = offer.free.map(|free| marks.spare(free));
+    offer.free = marks.room(offer.free);
     if let Some((_, left)) = catalog.quota_left()? {
         offer.free = Some(offer.free.map_or(left, |free| free.min(left)));
     }
-    Ok(Haves { held, offer: Some(offer) })
+    Ok(offer)
 }
 
 /// Keep what's pushed, if there's room and each block matches its CID,
 /// noting the sender's copies of what's kept.
 pub fn answer_push(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, push: Push, marks: &super::trim::Watermarks) -> Result<Kept> {
-    let size = u64::try_from(push.blocks.iter().fold(0usize, |size, (_, data)| size.saturating_add(data.len()))).unwrap_or(u64::MAX);
-    if catalog.offer()?.free.is_some_and(|free| size > marks.spare(free)) {
+    let size = push.size();
+    if marks.room(catalog.offer()?.free).is_some_and(|room| size > room) {
         return Ok(Kept::default());
     }
     // Nor past what the account's allowed

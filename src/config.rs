@@ -8,6 +8,7 @@
 //! [node]              # the main mesh's node, and every other's defaults
 //! copies = 3
 //! low-water = "10G"
+//! target = "50G"      # the most to keep here
 //! ping = "30s"
 //!
 //! [mesh.work]         # the node of `--mesh work`, over [node]
@@ -55,6 +56,9 @@ pub struct Node {
     pub low_water: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "size", serialize_with = "show_size")]
     pub high_water: Option<u64>,
+    /// The most to keep here.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "size", serialize_with = "show_size")]
+    pub target: Option<u64>,
     /// Whether to collect garbage (`--no-collect` if not).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collect: Option<bool>,
@@ -179,6 +183,7 @@ impl Node {
             copies: self.copies.or(base.copies),
             low_water: self.low_water.or(base.low_water),
             high_water: self.high_water.or(base.high_water),
+            target: self.target.or(base.target),
             collect: self.collect.or(base.collect),
             lost_scan: self.lost_scan.or(base.lost_scan),
             shared: self.shared.or(base.shared),
@@ -291,6 +296,7 @@ mod tests {
             [mesh.work]
             copies = 4
             idle = "2h"
+            target = "50G"
 
             [[mount]]
             dir = "~/soup"
@@ -306,6 +312,7 @@ mod tests {
         assert_eq!((main.ping, main.idle, main.door.and_then(|door| door.at("d"))), (Some(Duration::from_secs(30)), None, Some("d".into())));
         let work = config.node("work");
         assert_eq!((work.listen, work.door, work.copies, work.ping, work.idle), (None, None, Some(4), Some(Duration::from_secs(30)), Some(Duration::from_hours(2))), "where to listen is main's alone");
+        assert_eq!((main.target, work.target), (None, Some(50 << 30)));
         assert_eq!(config.node("other").copies, Some(3), "a mesh unsaid is [node]'s");
         assert!(config.mount.first().is_some_and(|mount| !mount.read_only && !mount.dir().starts_with("~")));
         assert!(config.mount.get(1).is_some_and(|mount| mount.read_only && mount.dir() == Path::new("/mnt/soup")));

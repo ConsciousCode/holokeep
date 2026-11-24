@@ -37,6 +37,7 @@ port.
 | `copies`     | integer                 | 2                               | Failures it should take to lose a block (`--copies`); see [[Replication and Retention]].                   |
 | `low-water`  | size                    | `"2G"`                          | Free space below which spare copies are let go of (`--low-water`).                                         |
 | `high-water` | size                    | `"4G"`                          | ...until it's back above this (`--high-water`).                                                            |
+| `target`     | size                    | none                            | The most to keep here: past it, copies are let go of or handed off till it's a tenth under (`--target`).   |
 | `collect`    | boolean                 | true                            | Whether to collect garbage (`--no-collect` if false).                                                      |
 | `lost-scan`  | boolean                 | true                            | Whether to look daily for what's lost (`--no-lost-scan` if false).                                         |
 | `shared`     | boolean                 | false                           | Whether the host's other users may connect (`--shared`); see [[Sharing]].                                  |
