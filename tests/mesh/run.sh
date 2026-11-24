@@ -146,6 +146,16 @@ scenario_served() {
     local first; first=$(sh_on one "cat /soup/anchors/$anchor/clock")
     sleep 1.2
     [ "$(sh_on one "cat /soup/anchors/$anchor/clock")" != "$first" ] || fail "the served clock read the same twice: cached"
+    # With persistence on, two keeps what's served as a set of the anchor,
+    # within a minute, but for the clock, which says it's QTTMP
+    on two hk serve add --persist "$anchor" tiny >/dev/null
+    timeout=90 wait_for "two to keep what's served" sh_on two "hk anchor show $anchor | head -1 | grep -v unset"
+    local kept; kept=$(sh_on two "hk anchor show $anchor | head -1")
+    sh_on two "rm -rf /tmp/kept && hk get $kept -o /tmp/kept >/dev/null"
+    holds two /tmp/kept/hello.txt "hello from a server" || fail "what's served wasn't kept"
+    holds two /tmp/kept/made.txt "from one, over the mesh" || fail "what one wrote wasn't kept"
+    sh_on two '! test -e /tmp/kept/clock' || fail "the clock was kept, though it's QTTMP"
+    wait_for "one to hear what two kept" sh_on one "hk anchor show $anchor | head -1 | grep -qx $kept"
     # Its server stopped, it's not connected, rather than as it was
     sh_on two 'for p in /proc/[0-9]*; do case "$(cat "$p/comm" 2>/dev/null)" in python3*) kill -INT "${p#/proc/}";; esac; done; rm -f /run/tiny.9p; true'
     wait_for "one to find two's server gone" sh_on one "! cat /soup/anchors/$anchor/hello.txt"

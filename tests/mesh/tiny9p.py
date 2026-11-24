@@ -3,7 +3,7 @@ served anchors.
 
     python3 -I tiny9p.py <socket>
 
-Serves /hello.txt, /dir/inner.txt and /clock (the time now, each read),
+Serves /hello.txt, /dir/inner.txt and /clock (the time now, each read, and QTTMP),
 and lets files be written and made. With SLOW set, each read of /clock
 takes 5s.
 """
@@ -27,7 +27,8 @@ def s(b):
 
 def qid(n):
     kind = nodes[n][0]
-    return struct.pack("<BIQ", 0x80 if kind == "dir" else 0, 0, n)
+    # The clock's never the same, so it's left out of what's kept
+    return struct.pack("<BIQ", {"dir": 0x80, "clock": 0x04}.get(kind, 0), 0, n)
 
 
 def data(n):

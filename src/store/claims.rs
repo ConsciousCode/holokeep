@@ -1708,6 +1708,26 @@ impl ClaimStore {
         Ok(self.serves(anchor)?.into_iter().next().map(|(_, serve)| serve))
     }
 
+    /// Every anchor a node serves, as the serve claims that count in the
+    /// view looked at say, and how.
+    pub fn served_by(&self, node: &[u8]) -> Result<Vec<(Link, crate::claim::Serve)>> {
+        let anchors: Vec<(Vec<u8>, Vec<u8>)> = self.db.conn()
+            .prepare_cached(
+                "SELECT DISTINCT t.prefix, m.multihash FROM claims c JOIN claim_targets t ON t.claim = c.id
+                 JOIN multihashes m ON m.id = t.target WHERE c.kind = 'serve' ORDER BY m.multihash",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut served = Vec::new();
+        for (prefix, multihash) in anchors {
+            let anchor = link(&prefix, &multihash)?;
+            if let Some(serve) = self.serving(anchor.multihash())?.filter(|serve| serve.node() == node) {
+                served.push((anchor, serve));
+            }
+        }
+        Ok(served)
+    }
+
     /// The serve claims that count of an anchor, in the view looked at, by
     /// their CIDs, latest first: what's withdrawn by a tomb.
     pub fn serves(&self, anchor: Key<'_>) -> Result<Vec<(Link, crate::claim::Serve)>> {

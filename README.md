@@ -410,8 +410,10 @@ Checklist:
     - [x] Serve claims routing an anchor to a node's service, a 9P2000.L socket its own config names (`hk serve add/rm/show`, `[[serve]]`)
     - [x] The mount reaching an anchor served by its own node, live: nothing cached, `ENOTCONN` while the server's away
     - [x] Anchors served by another of the user's machines, over the mesh, through the mount's own node (`/holokeep/serve/1.0.0`)
-    - [ ] Other users reaching what's served, as grants let them
-    - [ ] Persisting what's served as sets, but for what's `QTTMP`
+    - [x] Other users reaching what's served, as grants on the anchor let them read or write it
+    - [x] Persisting what's served as sets, but for what's `QTTMP` (`hk serve add --persist`)
+    - [ ] A persisted anchor showing its last set while its server can't be reached
+    - [ ] A node serving accounts other than its own
     - [ ] A shell, as a service
 - [ ] P2P private mesh
   - [x] Joining: swarm key, members, tickets, mDNS, identify (`hk node id/invite/join/run/peers`)

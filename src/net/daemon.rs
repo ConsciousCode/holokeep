@@ -652,6 +652,11 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks
     let relay = if place.is_main() { relay_socket(place)? } else { None };
     let mut relays = Relays::default();
     start(&mut node, place, &listen, alone)?;
+    // What's served with persistence on is kept by the main mesh's node
+    let persisting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if place.is_main() {
+        crate::served::persist::run(place.repo.clone(), node.peer_id().to_bytes(), std::sync::Arc::clone(&persisting));
+    }
     // What a client holds is a cache: what's lost is its member's to say
     let scanning = scanning && node.client_of().is_none();
     let (control, mut terminate) = (control_socket(place, shared)?, tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?);
@@ -760,6 +765,7 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks
             () = stopped(&mut terminate) => break Ok(()),
         }
     };
+    persisting.store(true, std::sync::atomic::Ordering::Relaxed);
     std::fs::remove_file(socket(place))?;
     if relay.is_some()
         && let Some(path) = crate::served::relay_socket(&place.repo)

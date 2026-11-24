@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use crate::config::{self, Config, Service};
 use crate::ninep::client::Client;
 
+pub mod persist;
+
 /// Why a service can't be used.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

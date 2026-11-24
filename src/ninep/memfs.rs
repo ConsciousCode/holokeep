@@ -44,6 +44,8 @@ pub struct MemFs {
     conn: u64,
     conns: u64,
     pub attached: Vec<Attached>,
+    /// How many reads of files it's answered.
+    pub reads: usize,
     /// How long to take over each request.
     pub delay: Duration,
 }
@@ -59,7 +61,7 @@ impl Default for MemFs {
 impl MemFs {
     pub fn new() -> Self {
         let root = Node { body: Body::Dir(BTreeMap::new()), parent: ROOT, version: 0, tmp: false };
-        Self { nodes: HashMap::from([(ROOT, root)]), next: ROOT.saturating_add(1), fids: HashMap::new(), conn: 0, conns: 0, attached: Vec::new(), delay: Duration::ZERO }
+        Self { nodes: HashMap::from([(ROOT, root)]), next: ROOT.saturating_add(1), fids: HashMap::new(), conn: 0, conns: 0, attached: Vec::new(), reads: 0, delay: Duration::ZERO }
     }
 
     /// Add a file, making the directories it's in.
@@ -75,6 +77,18 @@ impl MemFs {
             node.tmp = true;
         }
         id
+    }
+
+    /// Write over a file that's there, as a client would.
+    pub fn rewrite(&mut self, path: &str, data: &[u8]) {
+        let (dir, name) = self.dirs(path);
+        let Ok(id) = self.child(dir, name.as_bytes()) else {
+            return;
+        };
+        if let Some(Node { body: Body::File(file), version, .. }) = self.nodes.get_mut(&id) {
+            *file = data.to_vec();
+            *version = version.wrapping_add(1);
+        }
     }
 
     pub fn symlink(&mut self, path: &str, target: &str) -> u64 {
@@ -249,6 +263,7 @@ impl Handler for MemFs {
             },
             Tmsg::Read { fid, offset, count } => {
                 let id = self.fid(fid)?;
+                self.reads = self.reads.saturating_add(1);
                 let Body::File(data) = &self.node(id)?.body else {
                     return Err(EISDIR);
                 };
