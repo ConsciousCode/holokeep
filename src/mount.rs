@@ -373,23 +373,25 @@ pub struct Soup {
     fetcher: Option<Arc<Fetcher>>,
     /// Files of overlays being copied as they're read and written.
     filler: Arc<write::Filler>,
-    inodes: Mutex<Inodes>,
+    inodes: Arc<Mutex<Inodes>>,
     /// The sizes directories say raw blocks are, by CID, so a listing
     /// needn't fetch every file in it to say how big each is. Advisory,
     /// as a stat's size is: reading reads what's there.
     sizes: Mutex<HashMap<Vec<u8>, u64>>,
     /// Directory listings open, by handle.
-    listings: Mutex<HashMap<u64, std::sync::Arc<Vec<Entry>>>>,
+    listings: Arc<Mutex<HashMap<u64, std::sync::Arc<Vec<Entry>>>>>,
     /// Directories' rules files as last read, by anchor and path.
     rules: Mutex<HashMap<(Vec<u8>, PathBuf), RulesRead>>,
-    next_handle: AtomicU64,
+    next_handle: Arc<AtomicU64>,
     uid: u32,
     gid: u32,
     at: SystemTime,
     /// Where it's mounted, for symlinks to anchors.
     dir: Option<PathBuf>,
-    /// The services anchors served by this node are reached through.
-    served: served::Servers,
+    /// The services anchors served by this node are reached through, and
+    /// the threads requests of them are answered on.
+    served: Arc<served::Servers>,
+    pool: served::Pool,
 }
 
 /// A directory's rules file, as read: which it was, and its rules.
@@ -488,17 +490,18 @@ impl Soup {
             work: None,
             handles: Mutex::new(HashMap::new()),
             fetcher,
-            inodes: Mutex::new(Inodes::new()),
+            inodes: Arc::new(Mutex::new(Inodes::new())),
             sizes: Mutex::new(HashMap::new()),
-            listings: Mutex::new(HashMap::new()),
+            listings: Arc::new(Mutex::new(HashMap::new())),
             rules: Mutex::new(HashMap::new()),
             pinned: Mutex::new(HashMap::new()),
-            next_handle: AtomicU64::new(1),
+            next_handle: Arc::new(AtomicU64::new(1)),
             uid: rustix::process::getuid().as_raw(),
             gid: rustix::process::getgid().as_raw(),
             at: SystemTime::now(),
             dir: None,
-            served: served::Servers::none(),
+            served: Arc::new(served::Servers::none()),
+            pool: served::Pool::default(),
         }
     }
 
@@ -512,7 +515,7 @@ impl Soup {
     /// services `repo`'s configuration says.
     #[must_use]
     pub fn serving(mut self, repo: PathBuf, node: Vec<u8>) -> Self {
-        self.served = served::Servers::new(repo, node);
+        self.served = Arc::new(served::Servers::new(repo, node));
         self
     }
 
@@ -938,8 +941,8 @@ impl Soup {
     /// An inode's attributes.
     pub fn attr(&self, ino: u64) -> Result<FileAttr, Errno> {
         let inode = self.inode(ino)?;
-        if let Inode::Served(anchor, service, rel, _) = &inode {
-            return self.served_attr(ino, anchor, service, rel);
+        if let Inode::Served(..) = &inode {
+            return self.served_attr(ino);
         }
         let kind = self.kind(&*self.catalog()?, &inode)?;
         Ok(self.attr_with(ino, &kind, self.writes(&inode)))
@@ -1060,8 +1063,8 @@ impl Soup {
     /// A directory's entries, but `.` and `..`.
     pub fn list(&self, ino: u64) -> Result<Vec<Entry>, Errno> {
         let inode = self.inode(ino)?;
-        if let Inode::Served(anchor, service, rel, via) = inode {
-            return self.served_list(&anchor, &service, &rel, &via);
+        if let Inode::Served(..) = inode {
+            return self.served_list(ino);
         }
         let catalog = self.catalog()?;
         let with_kinds = |names: Vec<(Vec<u8>, Inode)>| -> Result<Vec<(Vec<u8>, Inode, Kind)>, Errno> {
@@ -1188,6 +1191,14 @@ impl Drop for Soup {
 
 impl Filesystem for Soup {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        if let Some(ctx) = self.served_ctx_for(parent.0) {
+            let name = name.to_owned();
+            self.pool.run(move || match ctx.lookup(parent.0, &name) {
+                Ok(attr) => reply.entry(&Duration::ZERO, &attr, Generation(0)),
+                Err(e) => reply.error(e),
+            });
+            return;
+        }
         match self.resolve(parent.0, name) {
             Ok(attr) => reply.entry(&self.ttl(attr.ino.0), &attr, Generation(0)),
             Err(e) => reply.error(e),
@@ -1195,6 +1206,13 @@ impl Filesystem for Soup {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        if let Some(ctx) = self.served_ctx_for(ino.0) {
+            self.pool.run(move || match ctx.attr(ino.0) {
+                Ok(attr) => reply.attr(&Duration::ZERO, &attr),
+                Err(e) => reply.error(e),
+            });
+            return;
+        }
         match self.attr(ino.0) {
             Ok(attr) => reply.attr(&self.ttl(ino.0), &attr),
             Err(e) => reply.error(e),
@@ -1202,6 +1220,13 @@ impl Filesystem for Soup {
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        if let Some(ctx) = self.served_ctx_for(ino.0) {
+            self.pool.run(move || match ctx.readlink(ino.0) {
+                Ok(target) => reply.data(&target),
+                Err(e) => reply.error(e),
+            });
+            return;
+        }
         match self.link(ino.0) {
             Ok(target) => reply.data(&target),
             Err(e) => reply.error(e),
@@ -1224,11 +1249,11 @@ impl Filesystem for Soup {
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         // What's served is read as it is, never from the kernel's cache
-        if let Some(opened) = self.served_open(ino.0, flags.0) {
-            match opened {
+        if let Some(ctx) = self.served_ctx_for(ino.0) {
+            self.pool.run(move || match ctx.open(ino.0, flags.0) {
                 Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
                 Err(e) => reply.error(e),
-            }
+            });
             return;
         }
         let write = flags.0 & libc::O_ACCMODE != libc::O_RDONLY;
@@ -1244,6 +1269,14 @@ impl Filesystem for Soup {
 
     fn read(&self, _req: &Request, ino: INodeNo, fh: FileHandle, offset: u64, size: u32, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyData) {
         let size = usize::try_from(size).unwrap_or(usize::MAX);
+        if self.served.holds(fh.0) {
+            let servers = Arc::clone(&self.served);
+            self.pool.run(move || match servers.read(fh.0, offset, size).unwrap_or(Err(Errno::EBADF)) {
+                Ok(data) => reply.data(&data),
+                Err(e) => reply.error(e),
+            });
+            return;
+        }
         match self.read_handle(fh.0, offset, size).unwrap_or_else(|| self.read(ino.0, offset, size)) {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(e),
@@ -1251,7 +1284,15 @@ impl Filesystem for Soup {
     }
 
     fn write(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, offset: u64, data: &[u8], _write_flags: WriteFlags, _flags: OpenFlags, _lock: Option<LockOwner>, reply: ReplyWrite) {
-        let _writing = (!self.served.holds(fh.0)).then(|| self.writing());
+        if self.served.holds(fh.0) {
+            let (servers, data) = (Arc::clone(&self.served), data.to_vec());
+            self.pool.run(move || match servers.write(fh.0, offset, &data).unwrap_or(Err(Errno::EBADF)) {
+                Ok(n) => reply.written(u32::try_from(n).unwrap_or(u32::MAX)),
+                Err(e) => reply.error(e),
+            });
+            return;
+        }
+        let _writing = self.writing();
         match self.write(fh.0, offset, data) {
             Ok(n) => reply.written(u32::try_from(n).unwrap_or(u32::MAX)),
             Err(e) => reply.error(e),
@@ -1259,6 +1300,14 @@ impl Filesystem for Soup {
     }
 
     fn release(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, _flags: OpenFlags, _lock: Option<LockOwner>, _flush: bool, reply: ReplyEmpty) {
+        if self.served.holds(fh.0) {
+            let servers = Arc::clone(&self.served);
+            self.pool.run(move || {
+                servers.release(fh.0);
+                reply.ok();
+            });
+            return;
+        }
         let _writing = self.is_writable(fh.0).then(|| self.writing());
         self.release(fh.0);
         reply.ok();
@@ -1269,7 +1318,15 @@ impl Filesystem for Soup {
     }
 
     fn fsync(&self, _req: &Request, _ino: INodeNo, fh: FileHandle, datasync: bool, reply: ReplyEmpty) {
-        let _writing = (!self.served.holds(fh.0)).then(|| self.writing());
+        if self.served.holds(fh.0) {
+            let servers = Arc::clone(&self.served);
+            self.pool.run(move || match servers.fsync(fh.0, datasync).unwrap_or(Err(Errno::EBADF)) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(e),
+            });
+            return;
+        }
+        let _writing = self.writing();
         match self.fsync(fh.0, datasync) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -1277,11 +1334,12 @@ impl Filesystem for Soup {
     }
 
     fn create(&self, _req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, flags: i32, reply: ReplyCreate) {
-        if let Some(created) = self.served_create(parent.0, name, flags, mode & !umask) {
-            match created {
+        if let Some(ctx) = self.served_ctx_for(parent.0) {
+            let name = name.to_owned();
+            self.pool.run(move || match ctx.create(parent.0, &name, flags, mode & !umask) {
                 Ok((attr, fh)) => reply.created(&Duration::ZERO, &attr, Generation(0), FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
                 Err(e) => reply.error(e),
-            }
+            });
             return;
         }
         let _writing = self.writing();
@@ -1292,11 +1350,12 @@ impl Filesystem for Soup {
     }
 
     fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
-        if let Some(made) = self.served_mkdir(parent.0, name, mode & !umask) {
-            match made {
+        if let Some(ctx) = self.served_ctx_for(parent.0) {
+            let name = name.to_owned();
+            self.pool.run(move || match ctx.mkdir(parent.0, &name, mode & !umask) {
                 Ok(attr) => reply.entry(&Duration::ZERO, &attr, Generation(0)),
                 Err(e) => reply.error(e),
-            }
+            });
             return;
         }
         let _writing = self.writing();
@@ -1307,11 +1366,12 @@ impl Filesystem for Soup {
     }
 
     fn symlink(&self, _req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
-        if let Some(made) = self.served_symlink(parent.0, link_name, target) {
-            match made {
+        if let Some(ctx) = self.served_ctx_for(parent.0) {
+            let (name, target) = (link_name.to_owned(), target.to_owned());
+            self.pool.run(move || match ctx.symlink(parent.0, &name, &target) {
                 Ok(attr) => reply.entry(&Duration::ZERO, &attr, Generation(0)),
                 Err(e) => reply.error(e),
-            }
+            });
             return;
         }
         let _writing = self.writing();
@@ -1322,11 +1382,12 @@ impl Filesystem for Soup {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        if let Some(removed) = self.served_unlink(parent.0, name, false) {
-            match removed {
+        if let Some(ctx) = self.served_ctx_for(parent.0) {
+            let name = name.to_owned();
+            self.pool.run(move || match ctx.unlink(parent.0, &name, false) {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(e),
-            }
+            });
             return;
         }
         let _writing = self.writing();
@@ -1337,11 +1398,12 @@ impl Filesystem for Soup {
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        if let Some(removed) = self.served_unlink(parent.0, name, true) {
-            match removed {
+        if let Some(ctx) = self.served_ctx_for(parent.0) {
+            let name = name.to_owned();
+            self.pool.run(move || match ctx.unlink(parent.0, &name, true) {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(e),
-            }
+            });
             return;
         }
         let _writing = self.writing();
@@ -1356,11 +1418,12 @@ impl Filesystem for Soup {
             reply.error(Errno::EINVAL);
             return;
         }
-        if let Some(renamed) = self.served_rename(parent.0, name, newparent.0, newname) {
-            match renamed {
+        if self.is_served(parent.0) || self.is_served(newparent.0) {
+            let (ctx, name, newname) = (self.served_ctx(), name.to_owned(), newname.to_owned());
+            self.pool.run(move || match ctx.rename(parent.0, &name, newparent.0, &newname) {
                 Ok(()) => reply.ok(),
                 Err(e) => reply.error(e),
-            }
+            });
             return;
         }
         let _writing = self.writing();
@@ -1391,13 +1454,12 @@ impl Filesystem for Soup {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        if self.is_served(ino.0)
-            && let Some(set) = self.served_setattr(ino.0, served::set_attr(mode, size, atime, mtime))
-        {
-            match set {
+        if let Some(ctx) = self.served_ctx_for(ino.0) {
+            let attr = served::set_attr(mode, size, atime, mtime);
+            self.pool.run(move || match ctx.setattr(ino.0, attr) {
                 Ok(attr) => reply.attr(&Duration::ZERO, &attr),
                 Err(e) => reply.error(e),
-            }
+            });
             return;
         }
         let writing = size.map(|_| self.writing());
@@ -1415,6 +1477,17 @@ impl Filesystem for Soup {
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if let Some(ctx) = self.served_ctx_for(ino.0) {
+            let (listings, handle) = (Arc::clone(&self.listings), self.next_handle.fetch_add(1, Ordering::Relaxed));
+            self.pool.run(move || match ctx.list(ino.0) {
+                Ok(entries) => {
+                    listings.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(handle, std::sync::Arc::new(entries));
+                    reply.opened(FileHandle(handle), FopenFlags::empty());
+                },
+                Err(e) => reply.error(e),
+            });
+            return;
+        }
         // Listed once when opened, so reading it in parts is consistent
         match self.list(ino.0) {
             Ok(entries) => {
@@ -1600,7 +1673,9 @@ mod tests {
         assert!(soup.served_at(ino(&soup, &format!("anchors/{other}")).map(|attr| attr.ino.0).unwrap_or_default()).is_none(), "not served here");
         // A service this node hasn't got
         Catalog::open_repo(&repo).expect("catalog").serve_anchor(&anchor, b"me", "absent", false).expect("serve");
-        assert_eq!(ino(&soup, &format!("anchors/{anchor}")).map(|_| ()), Err(Errno::EACCES));
+        let top = ino(&soup, &format!("anchors/{anchor}")).expect("a directory, without asking").ino.0;
+        assert_eq!(soup.list(top).map(|_| ()), Err(Errno::EACCES));
+        assert_eq!(soup.attr(top).map(|_| ()), Err(Errno::EACCES));
         assert!(shared.lock().attached.is_empty(), "nothing connected to for either");
     }
 

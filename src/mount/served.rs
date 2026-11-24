@@ -14,12 +14,13 @@ use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use fuser::{Errno, FileAttr, FileType, INodeNo};
 
-use super::{Entry, Inode, Soup, Via};
+use super::{Entry, Inode, Inodes, Soup, Via};
 
 use crate::cid::CidRef as _;
 use crate::export::Kind;
@@ -364,16 +365,203 @@ pub(super) fn file_attr(ino: u64, attr: &Attr, uid: u32, gid: u32) -> FileAttr {
     }
 }
 
+/// What a request of something served needs, apart from the mount, so it
+/// can be answered on a thread of the pool's: the services, and the inodes
+/// and handles it hands out.
+#[derive(Clone)]
+pub(super) struct Ctx {
+    servers: Arc<Servers>,
+    inodes: Arc<Mutex<Inodes>>,
+    next_handle: Arc<AtomicU64>,
+    uid: u32,
+    gid: u32,
+}
+
+impl Ctx {
+    fn inodes(&self) -> std::sync::MutexGuard<'_, Inodes> {
+        lock(&self.inodes)
+    }
+
+    /// Where a served inode is: its anchor, service, path and where the
+    /// anchor's reached; or None if it's not served.
+    pub fn at(&self, ino: u64) -> Option<(Link, String, PathBuf, Via)> {
+        let inode = self.inodes().get(ino)?;
+        match inode {
+            Inode::Served(anchor, service, rel, via) => Some((anchor, service, rel, via)),
+            _ => None,
+        }
+    }
+
+    fn handle(&self) -> u64 {
+        self.next_handle.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// An inode's attributes, as its server says.
+    pub fn attr(&self, ino: u64) -> Result<FileAttr, Errno> {
+        let (anchor, service, rel, _) = self.at(ino).ok_or(Errno::ENOENT)?;
+        let attr = self.servers.getattr(&Place { anchor: &anchor, service: &service }, &rel)?;
+        Ok(file_attr(ino, &attr, self.uid, self.gid))
+    }
+
+    /// What's at a path of a served anchor, reached where the anchor is.
+    ///
+    /// The anchor itself is a directory, without asking, since what a
+    /// server's attached to is: it's looked up from what isn't served, on
+    /// the mount's own threads, which mustn't wait on a server. What it's
+    /// like as its server says is for `attr`, on the pool's.
+    pub fn resolve(&self, anchor: Link, service: String, rel: PathBuf, via: Via) -> Result<FileAttr, Errno> {
+        let attr = if rel.as_os_str().is_empty() {
+            Attr { mode: 0o040_755, nlink: 2, blksize: 4096, ..Attr::default() }
+        } else {
+            self.servers.getattr(&Place { anchor: &anchor, service: &service }, &rel)?
+        };
+        let ino = self.inodes().of(Inode::Served(anchor, service, rel, via));
+        Ok(file_attr(ino, &attr, self.uid, self.gid))
+    }
+
+    /// What a name in a served directory is.
+    pub fn lookup(&self, parent: u64, name: &OsStr) -> Result<FileAttr, Errno> {
+        let (anchor, service, rel, via) = self.at(parent).ok_or(Errno::ENOENT)?;
+        self.resolve(anchor, service, rel.join(name), via)
+    }
+
+    pub fn readlink(&self, ino: u64) -> Result<Vec<u8>, Errno> {
+        let (anchor, service, rel, _) = self.at(ino).ok_or(Errno::ENOENT)?;
+        self.servers.readlink(&Place { anchor: &anchor, service: &service }, &rel)
+    }
+
+    /// A served directory's entries, but `.` and `..`.
+    pub fn list(&self, ino: u64) -> Result<Vec<Entry>, Errno> {
+        let (anchor, service, rel, via) = self.at(ino).ok_or(Errno::ENOENT)?;
+        let entries = self.servers.list(&Place { anchor: &anchor, service: &service }, &rel)?;
+        let mut inodes = self.inodes();
+        Ok(entries
+            .into_iter()
+            .map(|entry| {
+                let child = rel.join(OsStr::from_bytes(&entry.name));
+                let ino = inodes.of(Inode::Served(anchor.clone(), service.clone(), child, via.clone()));
+                (entry.name, ino, entry_type(entry.kind))
+            })
+            .collect())
+    }
+
+    /// Open a served file as a new handle.
+    pub fn open(&self, ino: u64, flags: i32) -> Result<u64, Errno> {
+        let (anchor, service, rel, _) = self.at(ino).ok_or(Errno::ENOENT)?;
+        let fh = self.handle();
+        self.servers.open(&Place { anchor: &anchor, service: &service }, &rel, flags, fh).map(|()| fh)
+    }
+
+    /// Make and open a file in a served directory.
+    pub fn create(&self, parent: u64, name: &OsStr, flags: i32, mode: u32) -> Result<(FileAttr, u64), Errno> {
+        let (anchor, service, rel, via) = self.at(parent).ok_or(Errno::ENOENT)?;
+        let fh = self.handle();
+        let attr = self.servers.create(&Place { anchor: &anchor, service: &service }, &rel, name.as_bytes(), (flags, mode, self.gid), fh)?;
+        let ino = self.inodes().of(Inode::Served(anchor, service, rel.join(name), via));
+        Ok((file_attr(ino, &attr, self.uid, self.gid), fh))
+    }
+
+    /// Make a directory in a served one.
+    pub fn mkdir(&self, parent: u64, name: &OsStr, mode: u32) -> Result<FileAttr, Errno> {
+        let (anchor, service, rel, via) = self.at(parent).ok_or(Errno::ENOENT)?;
+        self.servers.mkdir(&Place { anchor: &anchor, service: &service }, &rel, name.as_bytes(), mode, self.gid)?;
+        let child = rel.join(name);
+        self.resolve(anchor, service, child, via)
+    }
+
+    /// Make a symlink in a served directory: its target as it's given, the
+    /// server's to make of.
+    pub fn symlink(&self, parent: u64, name: &OsStr, target: &Path) -> Result<FileAttr, Errno> {
+        let (anchor, service, rel, via) = self.at(parent).ok_or(Errno::ENOENT)?;
+        self.servers.symlink(&Place { anchor: &anchor, service: &service }, &rel, name.as_bytes(), target.as_os_str().as_bytes(), self.gid)?;
+        let child = rel.join(name);
+        self.resolve(anchor, service, child, via)
+    }
+
+    /// Remove a file, or an empty directory, from a served directory.
+    pub fn unlink(&self, parent: u64, name: &OsStr, directory: bool) -> Result<(), Errno> {
+        let (anchor, service, rel, _) = self.at(parent).ok_or(Errno::ENOENT)?;
+        self.servers.unlink(&Place { anchor: &anchor, service: &service }, &rel, name.as_bytes(), directory)
+    }
+
+    /// Rename within one served anchor's service, as across filesystems it
+    /// can't be.
+    pub fn rename(&self, parent: u64, name: &OsStr, new_parent: u64, new_name: &OsStr) -> Result<(), Errno> {
+        match (self.at(parent), self.at(new_parent)) {
+            (Some((anchor, service, from, _)), Some((to_anchor, to_service, to, _))) if anchor == to_anchor && service == to_service => {
+                self.servers.rename(&Place { anchor: &anchor, service: &service }, (&from, name.as_bytes()), (&to, new_name.as_bytes()))
+            },
+            _ => Err(Errno::EXDEV),
+        }
+    }
+
+    /// Change a served file's attributes, saying what they are then.
+    pub fn setattr(&self, ino: u64, attr: SetAttr) -> Result<FileAttr, Errno> {
+        let (anchor, service, rel, _) = self.at(ino).ok_or(Errno::ENOENT)?;
+        if attr.valid != 0 {
+            self.servers.setattr(&Place { anchor: &anchor, service: &service }, &rel, attr)?;
+        }
+        self.attr(ino)
+    }
+}
+
+type Job = Box<dyn FnOnce() + Send>;
+
+/// How many requests of what's served are waited on at once.
+const THREADS: usize = 16;
+
+/// Threads answering requests of what's served, apart from the mount's, so
+/// a slow server holds up only what's asked of it. Started when first
+/// asked, and ended with the mount.
+#[derive(Default)]
+pub(super) struct Pool {
+    jobs: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<Job>>>,
+}
+
+impl Pool {
+    pub fn run(&self, job: impl FnOnce() + Send + 'static) {
+        let jobs = self.jobs.get_or_init(|| {
+            let (send, receive) = std::sync::mpsc::channel::<Job>();
+            let receive = Arc::new(Mutex::new(receive));
+            for n in 0..THREADS {
+                let receive = Arc::clone(&receive);
+                let _ = std::thread::Builder::new().name(format!("served-{n}")).spawn(move || {
+                    loop {
+                        // Taken while it's the only one waiting, then let go
+                        let job = lock(&receive).recv();
+                        match job {
+                            Ok(job) => job(),
+                            Err(_) => return,
+                        }
+                    }
+                });
+            }
+            Mutex::new(send)
+        });
+        let _ = lock(jobs).send(Box::new(job));
+    }
+}
+
 impl Soup {
-    /// Who's asking, noted from the catalog, and the place an anchor's
-    /// served from.
-    fn place<'a>(&self, anchor: &'a Link, service: &'a str) -> Result<Place<'a>, Errno> {
-        self.served.know(&*self.catalog()?);
-        Ok(Place { anchor, service })
+    /// What answering what's served needs, who's asking noted first.
+    pub(super) fn served_ctx(&self) -> Ctx {
+        if let Ok(catalog) = self.catalog() {
+            self.served.know(&catalog);
+        }
+        Ctx { servers: Arc::clone(&self.served), inodes: Arc::clone(&self.inodes), next_handle: Arc::clone(&self.next_handle), uid: self.uid, gid: self.gid }
+    }
+
+    /// As `served_ctx`, if an inode's served.
+    pub(super) fn served_ctx_for(&self, ino: u64) -> Option<Ctx> {
+        self.is_served(ino).then(|| self.served_ctx())
     }
 
     /// What a path of a served anchor is.
     pub(super) fn served_kind(&self, catalog: &Catalog, anchor: &Link, service: &str, rel: &Path) -> Result<Kind, Errno> {
+        // The anchor itself, as `Ctx::resolve` says
+        if rel.as_os_str().is_empty() {
+            return Ok(Kind::Directory);
+        }
         self.served.know(catalog);
         let place = Place { anchor, service };
         let attr = self.served.getattr(&place, rel)?;
@@ -385,34 +573,21 @@ impl Soup {
     }
 
     /// A path of a served anchor's attributes, as its server says.
-    pub(super) fn served_attr(&self, ino: u64, anchor: &Link, service: &str, rel: &Path) -> Result<FileAttr, Errno> {
-        let attr = self.served.getattr(&self.place(anchor, service)?, rel)?;
-        Ok(file_attr(ino, &attr, self.uid, self.gid))
+    pub(super) fn served_attr(&self, ino: u64) -> Result<FileAttr, Errno> {
+        self.served_ctx().attr(ino)
     }
 
     /// What's at a path of a served anchor, reached where the anchor is.
     pub(super) fn served_resolve(&self, anchor: Link, service: String, rel: PathBuf, via: Via) -> Result<FileAttr, Errno> {
-        let attr = self.served.getattr(&self.place(&anchor, &service)?, &rel)?;
-        let ino = self.inodes().of(Inode::Served(anchor, service, rel, via));
-        Ok(file_attr(ino, &attr, self.uid, self.gid))
+        self.served_ctx().resolve(anchor, service, rel, via)
     }
 
     /// A served directory's entries, but `.` and `..`.
-    pub(super) fn served_list(&self, anchor: &Link, service: &str, rel: &Path, via: &Via) -> Result<Vec<Entry>, Errno> {
-        let entries = self.served.list(&self.place(anchor, service)?, rel)?;
-        let mut inodes = self.inodes();
-        Ok(entries
-            .into_iter()
-            .map(|entry| {
-                let child = rel.join(OsStr::from_bytes(&entry.name));
-                let ino = inodes.of(Inode::Served(anchor.clone(), service.to_owned(), child, via.clone()));
-                (entry.name, ino, entry_type(entry.kind))
-            })
-            .collect())
+    pub(super) fn served_list(&self, ino: u64) -> Result<Vec<Entry>, Errno> {
+        self.served_ctx().list(ino)
     }
 
-    /// Where a served inode is: its anchor, service, path and where the
-    /// anchor's reached; or None if it's not served.
+    /// Where a served inode is, if it is one.
     pub(super) fn served_at(&self, ino: u64) -> Option<(Link, String, PathBuf, Via)> {
         match self.inode(ino).ok()? {
             Inode::Served(anchor, service, rel, via) => Some((anchor, service, rel, via)),
@@ -425,73 +600,70 @@ impl Soup {
     }
 
     /// Open a served file, if it is one, as a new handle.
+    #[cfg(test)]
     pub(super) fn served_open(&self, ino: u64, flags: i32) -> Option<Result<u64, Errno>> {
-        let (anchor, service, rel, _) = self.served_at(ino)?;
-        Some(self.place(&anchor, &service).and_then(|place| {
-            let fh = self.next_handle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.served.open(&place, &rel, flags, fh).map(|()| fh)
-        }))
+        self.served_ctx_for(ino).map(|ctx| ctx.open(ino, flags))
     }
 
     /// Make and open a file in a served directory, if it is one.
+    #[cfg(test)]
     pub(super) fn served_create(&self, parent: u64, name: &OsStr, flags: i32, mode: u32) -> Option<Result<(FileAttr, u64), Errno>> {
-        let (anchor, service, rel, via) = self.served_at(parent)?;
-        Some(self.place(&anchor, &service).and_then(|place| {
-            let fh = self.next_handle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let attr = self.served.create(&place, &rel, name.as_bytes(), (flags, mode, self.gid), fh)?;
-            let ino = self.inodes().of(Inode::Served(anchor.clone(), service.clone(), rel.join(name), via));
-            Ok((file_attr(ino, &attr, self.uid, self.gid), fh))
-        }))
+        self.served_ctx_for(parent).map(|ctx| ctx.create(parent, name, flags, mode))
     }
 
     /// Make a directory in a served one, if it is one.
+    #[cfg(test)]
     pub(super) fn served_mkdir(&self, parent: u64, name: &OsStr, mode: u32) -> Option<Result<FileAttr, Errno>> {
-        let (anchor, service, rel, via) = self.served_at(parent)?;
-        Some(self.place(&anchor, &service).and_then(|place| {
-            self.served.mkdir(&place, &rel, name.as_bytes(), mode, self.gid)?;
-            self.served_resolve(anchor.clone(), service.clone(), rel.join(name), via)
-        }))
+        self.served_ctx_for(parent).map(|ctx| ctx.mkdir(parent, name, mode))
     }
 
-    /// Make a symlink in a served directory, if it is one: its target as
-    /// it's given, the server's to make of.
-    pub(super) fn served_symlink(&self, parent: u64, name: &OsStr, target: &Path) -> Option<Result<FileAttr, Errno>> {
-        let (anchor, service, rel, via) = self.served_at(parent)?;
-        Some(self.place(&anchor, &service).and_then(|place| {
-            self.served.symlink(&place, &rel, name.as_bytes(), target.as_os_str().as_bytes(), self.gid)?;
-            self.served_resolve(anchor.clone(), service.clone(), rel.join(name), via)
-        }))
-    }
-
-    /// Remove a file, or an empty directory, from a served directory, if
-    /// it is one.
+    /// Remove from a served directory, if it is one.
+    #[cfg(test)]
     pub(super) fn served_unlink(&self, parent: u64, name: &OsStr, directory: bool) -> Option<Result<(), Errno>> {
-        let (anchor, service, rel, _) = self.served_at(parent)?;
-        Some(self.place(&anchor, &service).and_then(|place| self.served.unlink(&place, &rel, name.as_bytes(), directory)))
+        self.served_ctx_for(parent).map(|ctx| ctx.unlink(parent, name, directory))
     }
 
-    /// Rename in a served anchor, if either directory's served: within one
-    /// anchor's service only, as across filesystems it can't be.
+    /// Rename in a served anchor, if either directory's served.
+    #[cfg(test)]
     pub(super) fn served_rename(&self, parent: u64, name: &OsStr, new_parent: u64, new_name: &OsStr) -> Option<Result<(), Errno>> {
-        let (from, to) = (self.served_at(parent), self.served_at(new_parent));
-        match (from, to) {
-            (None, None) => None,
-            (Some((anchor, service, from, _)), Some((to_anchor, to_service, to, _))) if anchor == to_anchor && service == to_service => {
-                Some(self.place(&anchor, &service).and_then(|place| self.served.rename(&place, (&from, name.as_bytes()), (&to, new_name.as_bytes()))))
-            },
-            _ => Some(Err(Errno::EXDEV)),
-        }
+        (self.is_served(parent) || self.is_served(new_parent)).then(|| self.served_ctx().rename(parent, name, new_parent, new_name))
     }
 
-    /// Change a served file's attributes, if it is one, saying what they
-    /// are then.
+    /// Change a served file's attributes, if it is one.
+    #[cfg(test)]
     pub(super) fn served_setattr(&self, ino: u64, attr: SetAttr) -> Option<Result<FileAttr, Errno>> {
-        let (anchor, service, rel, _) = self.served_at(ino)?;
-        Some(self.place(&anchor, &service).and_then(|place| {
-            if attr.valid != 0 {
-                self.served.setattr(&place, &rel, attr)?;
-            }
-            self.served_attr(ino, &anchor, &service, &rel)
-        }))
+        self.served_ctx_for(ino).map(|ctx| ctx.setattr(ino, attr))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_request_waited_on_doesnt_hold_up_the_rest() {
+        let pool = Pool::default();
+        let (unblock, blocked) = std::sync::mpsc::channel::<()>();
+        let (done, finished) = std::sync::mpsc::channel::<&str>();
+        // As many as there are threads but one wait on a server that's slow
+        let blocked = Arc::new(Mutex::new(blocked));
+        for _ in 1..THREADS {
+            let (blocked, done) = (Arc::clone(&blocked), done.clone());
+            pool.run(move || {
+                let _ = lock(&blocked).recv();
+                let _ = done.send("slow");
+            });
+        }
+        let quick = done.clone();
+        pool.run(move || {
+            let _ = quick.send("quick");
+        });
+        assert_eq!(finished.recv_timeout(Duration::from_secs(5)), Ok("quick"), "answered while the rest wait");
+        for _ in 1..THREADS {
+            let _ = unblock.send(());
+        }
+        for _ in 1..THREADS {
+            assert_eq!(finished.recv_timeout(Duration::from_secs(5)), Ok("slow"));
+        }
     }
 }
