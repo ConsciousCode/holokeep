@@ -67,11 +67,35 @@ pub fn error_for(message: &[u8], errno: i32) -> Vec<u8> {
     Rmsg::Lerror { ecode: u32::try_from(errno).unwrap_or(5) }.encode(tag_of(message)).unwrap_or_default()
 }
 
+/// Whether a request changes anything, which only a writer may ask.
+pub const fn writes(request: &Tmsg) -> bool {
+    const ACCESS: u32 = 0o3;
+    const TRUNC: u32 = 0o1000;
+    match request {
+        Tmsg::Lopen { flags, .. } => (*flags & ACCESS) != 0 || (*flags & TRUNC) != 0,
+        Tmsg::Remove { .. }
+        | Tmsg::Setattr { .. }
+        | Tmsg::Lcreate { .. }
+        | Tmsg::Write { .. }
+        | Tmsg::Mkdir { .. }
+        | Tmsg::Symlink { .. }
+        | Tmsg::Renameat { .. }
+        | Tmsg::Unlinkat { .. } => true,
+        _ => false,
+    }
+}
+
 /// What a peer's message becomes, said as this node says it, or why it
-/// isn't sent on: only what's decoded goes, and an attach is as this node
-/// says, for the user, of the anchor.
-pub fn rewritten(message: &[u8], user: Option<&Link>, anchor: &Link) -> Result<Vec<u8>, i32> {
+/// isn't sent on.
+///
+/// Only what's decoded goes, what changes anything only if the asker may
+/// write, and an attach is as this node says, for the user, of the
+/// anchor.
+pub fn rewritten(message: &[u8], user: Option<&Link>, anchor: &Link, may_write: bool) -> Result<Vec<u8>, i32> {
     let (tag, request) = Tmsg::decode(message).map_err(|_| libc_errno::EOPNOTSUPP)?;
+    if !may_write && writes(&request) {
+        return Err(libc_errno::EROFS);
+    }
     let request = match request {
         Tmsg::Version { .. } => return Err(libc_errno::EINVAL),
         Tmsg::Attach { fid, .. } => Tmsg::Attach {
@@ -95,9 +119,14 @@ pub fn handshake(stream: &mut UnixStream) -> io::Result<u32> {
     }
 }
 
-/// A session's connection to a service, and who's waiting on what.
+/// A session's connection to a service, who it's for, and who's waiting
+/// on what.
 struct Session {
     writer: UnixStream,
+    /// Who it's for and of what, as the first message said: the user and
+    /// the anchor, by their bytes. Its attach was for them, so every other
+    /// message must be.
+    of: (Vec<u8>, Vec<u8>),
     waiting: HashMap<u16, ResponseChannel<Answered>>,
 }
 
@@ -117,14 +146,14 @@ impl Sessions {
         Self { sessions: HashMap::new(), heard }
     }
 
-    /// Whether a session's open.
-    pub fn open(&self, peer: &PeerId, session: u64) -> bool {
-        self.sessions.contains_key(&(*peer, session))
+    /// Who an open session is for and of what (see `Session::of`).
+    pub fn of(&self, peer: &PeerId, session: u64) -> Option<&(Vec<u8>, Vec<u8>)> {
+        self.sessions.get(&(*peer, session)).map(|open| &open.of)
     }
 
-    /// Open a session on a service, connected to as this process's user,
-    /// if it's fit to be.
-    pub fn start(&mut self, peer: PeerId, session: u64, repo: &Path, service: &str) -> Result<(), i32> {
+    /// Open a session on a service for a user, of an anchor, connected to
+    /// as this process's user, if it's fit to be.
+    pub fn start(&mut self, peer: PeerId, session: u64, of: (Vec<u8>, Vec<u8>), repo: &Path, service: &str) -> Result<(), i32> {
         let service = crate::served::service(repo, service).map_err(|e| {
             eprintln!("serving {peer}: {e}");
             libc_errno::EACCES
@@ -147,7 +176,7 @@ impl Sessions {
                 let _ = heard.send((peer, session, None));
             })
             .map_err(|_| libc_errno::ENOTCONN)?;
-        self.sessions.insert((peer, session), Session { writer: stream, waiting: HashMap::new() });
+        self.sessions.insert((peer, session), Session { writer: stream, of, waiting: HashMap::new() });
         Ok(())
     }
 
@@ -204,7 +233,7 @@ mod tests {
         let anchor: Link = crate::claim::anchor().expect("anchor");
         let user: Link = crate::claim::anchor().expect("a CID");
         let attach = Tmsg::Attach { fid: 1, afid: 7, uname: b"root".to_vec(), aname: b"/etc".to_vec(), n_uname: 0 }.encode(3).expect("encode");
-        let (tag, said) = Tmsg::decode(&rewritten(&attach, Some(&user), &anchor).expect("rewritten")).expect("decode");
+        let (tag, said) = Tmsg::decode(&rewritten(&attach, Some(&user), &anchor, true).expect("rewritten")).expect("decode");
         assert_eq!(tag, 3);
         assert_eq!(
             said,
@@ -212,15 +241,25 @@ mod tests {
             "no root, no other tree, no uid of this machine's"
         );
         let walk = Tmsg::Walk { fid: 1, newfid: 2, names: vec![b"a".to_vec()] }.encode(4).expect("encode");
-        assert_eq!(rewritten(&walk, Some(&user), &anchor).expect("rewritten"), walk, "the rest as it is");
+        assert_eq!(rewritten(&walk, Some(&user), &anchor, false).expect("rewritten"), walk, "the rest as it is");
         let version = Tmsg::Version { msize: 1, version: b"9P2000".to_vec() }.encode(NOTAG).expect("encode");
-        assert_eq!(rewritten(&version, None, &anchor), Err(libc_errno::EINVAL));
+        assert_eq!(rewritten(&version, None, &anchor, true), Err(libc_errno::EINVAL));
         // A message of a type it doesn't know, as an auth or a lock
         let mut unknown = Tmsg::Clunk { fid: 1 }.encode(5).expect("encode");
         if let Some(kind) = unknown.get_mut(4) {
             *kind = 102;
         }
-        assert_eq!(rewritten(&unknown, None, &anchor), Err(libc_errno::EOPNOTSUPP));
+        assert_eq!(rewritten(&unknown, None, &anchor, true), Err(libc_errno::EOPNOTSUPP));
         assert_eq!(tag_of(&error_for(&walk, 13)), 4);
+        // Only a writer changes anything
+        let write = Tmsg::Write { fid: 2, offset: 0, data: b"x".to_vec() }.encode(6).expect("encode");
+        assert_eq!(rewritten(&write, Some(&user), &anchor, false), Err(libc_errno::EROFS));
+        assert_eq!(rewritten(&write, Some(&user), &anchor, true).expect("rewritten"), write);
+        let reading = Tmsg::Lopen { fid: 2, flags: 0 }.encode(7).expect("encode");
+        assert!(rewritten(&reading, Some(&user), &anchor, false).is_ok());
+        for flags in [1, 2, 0o1000] {
+            let opening = Tmsg::Lopen { fid: 2, flags }.encode(7).expect("encode");
+            assert_eq!(rewritten(&opening, Some(&user), &anchor, false), Err(libc_errno::EROFS), "{flags:o}");
+        }
     }
 }

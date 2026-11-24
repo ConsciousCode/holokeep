@@ -56,6 +56,7 @@ pub mod libc_errno {
     pub const ENOTDIR: i32 = 20;
     pub const EISDIR: i32 = 21;
     pub const EINVAL: i32 = 22;
+    pub const EROFS: i32 = 30;
     pub const ENOTEMPTY: i32 = 39;
     pub const EPROTO: i32 = 71;
     pub const EOPNOTSUPP: i32 = 95;

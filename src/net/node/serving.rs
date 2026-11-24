@@ -9,7 +9,7 @@ use libp2p::request_response::{self, ResponseChannel};
 use serde_bytes::ByteBuf;
 
 use super::{Event, Node};
-use crate::cid::{Cid as _, CidRef as _};
+use crate::cid::{Cid as _, CidRef};
 use crate::model::Link;
 use crate::net::mesh::{Error, Result};
 use crate::net::serve::{Answered, Asked, error_for, rewritten};
@@ -77,10 +77,7 @@ impl Node {
             let _ = self.swarm.behaviour_mut().serve.send_response(channel, Answered::default());
             return Ok(());
         }
-        // A machine hosting the user whose anchor it is, and only for what
-        // this node's own account serves, from its own config
-        let local = self.serving(&peer, request.user.as_ref().map(|user| user.as_slice()))?;
-        let (Some(local), Some(repo)) = (local, self.repo.clone()) else {
+        let Some(repo) = self.repo.clone() else {
             refuse(self, channel, libc_errno::EACCES);
             return Ok(());
         };
@@ -88,21 +85,26 @@ impl Node {
             refuse(self, channel, libc_errno::EINVAL);
             return Ok(());
         };
-        let me = self.peer_id().to_bytes();
-        let serving = self.catalog.viewing(local.uid, |catalog| catalog.serving(&anchor))??;
-        if local.uid != self.catalog.uid() || !serving.is_some_and(|serve| serve.node() == me.as_slice() && serve.service() == request.service) {
+        let Some((user, of, may_write)) = self.let_in(&peer, request.user.as_ref().map(|user| user.as_slice()), &anchor, &request.service)? else {
+            refuse(self, channel, libc_errno::EACCES);
+            return Ok(());
+        };
+        // A session is for whoever it was first, of what it was: its
+        // attach was for them
+        let bound = (user.as_ref().map(CidRef::to_bytes).unwrap_or_default(), of.to_bytes());
+        if self.sessions.of(&peer, request.session).is_some_and(|was| *was != bound) {
             refuse(self, channel, libc_errno::EACCES);
             return Ok(());
         }
-        let message = match rewritten(&request.message, local.user.as_ref(), &anchor) {
+        let message = match rewritten(&request.message, user.as_ref(), &of, may_write) {
             Ok(message) => message,
             Err(errno) => {
                 refuse(self, channel, errno);
                 return Ok(());
             },
         };
-        if !self.sessions.open(&peer, request.session)
-            && let Err(errno) = self.sessions.start(peer, request.session, &repo, &request.service)
+        if self.sessions.of(&peer, request.session).is_none()
+            && let Err(errno) = self.sessions.start(peer, request.session, bound, &repo, &request.service)
         {
             refuse(self, channel, errno);
             return Ok(());
@@ -111,6 +113,40 @@ impl Node {
             refuse(self, channel, errno);
         }
         Ok(())
+    }
+
+    /// Who's let in to an anchor this node serves, as `service`, and as
+    /// whom: the user asking, the anchor, and whether they may change it.
+    ///
+    /// The anchor is this node's own account's (its own view of one, or a
+    /// view of one named as theirs), and its serve claim, there, names this
+    /// node and the service. The asker is a machine hosting that account's
+    /// user, who may do anything, or a guest of this node's, a user it
+    /// hosts whom grants on the anchor let read it, or write it. With no
+    /// users, it's any machine of the mesh's.
+    fn let_in(&mut self, peer: &PeerId, user: Option<&[u8]>, anchor: &Link, service: &str) -> Result<Option<(Option<Link>, Link, bool)>> {
+        let own = self.local(self.catalog.uid())?;
+        let of = match (crate::claim::viewed(anchor), &own.user) {
+            (Some((of, viewed)), Some(owner)) if viewed.multihash() == owner.multihash() => of,
+            (Some(_), _) => return Ok(None),
+            (None, _) => anchor.clone(),
+        };
+        let me = self.peer_id().to_bytes();
+        let serving = self.catalog.viewing(own.uid, |catalog| catalog.serving(&of))??;
+        if !serving.is_some_and(|serve| serve.node() == me.as_slice() && serve.service() == service) {
+            return Ok(None);
+        }
+        if self.serving(peer, user)?.is_some_and(|local| local.uid == own.uid) {
+            return Ok(Some((own.user, of, true)));
+        }
+        let (Some(owner), Some(guest)) = (own.user, self.guest_of(peer, user)?) else {
+            return Ok(None);
+        };
+        let (read, write) = match self.catalog.claims() {
+            Some(claims) => claims.access(&owner, &of, &guest)?,
+            None => (false, false),
+        };
+        Ok((read || write).then_some((Some(guest), of, write)))
     }
 
     /// What a session's service said, sent back to whoever's waiting; or

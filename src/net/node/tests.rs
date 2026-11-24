@@ -2280,3 +2280,75 @@ async fn only_machines_hosting_its_user_reach_what_a_node_serves() {
     assert_eq!(served_answer(&mut [&mut theirs, &mut server, &mut mine], 3).await, Rmsg::Lerror { ecode: 13 });
     assert_eq!(shared.lock().attached.len(), 1, "theirs never reached it");
 }
+
+/// Another user reaches what a node serves of an anchor only as grants on
+/// it say: nothing without, reading with `/anchor/read`, and changing it
+/// only with `/anchor/write`. The serve claim reaches them as a guest, and
+/// a session stays theirs.
+#[tokio::test]
+async fn other_users_reach_what_a_node_serves_as_grants_on_it_say() {
+    use crate::grants::{READ, USER, WRITE};
+    use crate::ninep::{NOFID, Rmsg, Tmsg};
+    let (mut server, mut mine, mut theirs, _, (me, them)) = Box::pin(shared_by()).await;
+    let genesis = found(&mut [&mut server, &mut mine, &mut theirs], &me);
+    server.catalog().grant(&genesis, &[them.id()], &[USER.to_owned()], &[]).expect("grant");
+    server.reload().expect("reload");
+    assert!(until(&mut [&mut server, &mut mine, &mut theirs], |n| says(n[2], &them.id(), USER)).await);
+    let scratch = crate::testutil::Scratch::new("node-served-guests");
+    let mut fs = crate::ninep::memfs::MemFs::new();
+    fs.file("hello", b"hello");
+    let (anchor, shared) = serve_memfs(&mut server, &scratch, fs);
+    let view = crate::claim::view(&anchor, &me.id()).expect("view");
+    let peer = server.peer_id();
+    let ask = |node: &mut Node, session: u64, message: Tmsg, tag: u16| node.ask_served(&peer, session, &view, "notes", message.encode(tag).expect("encode")).expect("ask");
+    let attach = || Tmsg::Attach { fid: 1, afid: NOFID, uname: Vec::new(), aname: Vec::new(), n_uname: 0 };
+
+    // Nothing's shared
+    ask(&mut theirs, 1, attach(), 1);
+    assert_eq!(served_answer(&mut [&mut theirs, &mut server, &mut mine], 1).await, Rmsg::Lerror { ecode: 13 });
+
+    // Shared to read, which is all they may do, as themselves
+    server.catalog().grant_on(&genesis, &anchor, &[them.id()], &[READ.to_owned()], &[], &[]).expect("share");
+    server.reload().expect("reload");
+    let shared_with = |n: &[&mut Node]| n[2].catalog().serving(&view).ok().flatten().is_some() && n[1].guest_of(&n[0].peer_id(), Some(&them.id().to_bytes())).ok().flatten().is_some();
+    assert!(until(&mut [&mut theirs, &mut server, &mut mine], shared_with).await, "the serve claim's theirs to see, and they're a guest");
+    ask(&mut theirs, 2, attach(), 1);
+    assert!(matches!(served_answer(&mut [&mut theirs, &mut server, &mut mine], 2).await, Rmsg::Attach { .. }));
+    let attached = shared.lock().attached.last().cloned().expect("attached");
+    assert_eq!((attached.uname, attached.aname), (them.id().to_string().into_bytes(), anchor.to_string().into_bytes()), "who they are, and the anchor itself");
+    ask(&mut theirs, 2, Tmsg::Walk { fid: 1, newfid: 2, names: vec![b"hello".to_vec()] }, 2);
+    served_answer(&mut [&mut theirs, &mut server, &mut mine], 2).await;
+    ask(&mut theirs, 2, Tmsg::Lopen { fid: 2, flags: 2 }, 3);
+    assert_eq!(served_answer(&mut [&mut theirs, &mut server, &mut mine], 2).await, Rmsg::Lerror { ecode: 30 }, "not to write");
+    ask(&mut theirs, 2, Tmsg::Lopen { fid: 2, flags: 0 }, 4);
+    served_answer(&mut [&mut theirs, &mut server, &mut mine], 2).await;
+    ask(&mut theirs, 2, Tmsg::Read { fid: 2, offset: 0, count: 100 }, 5);
+    assert_eq!(served_answer(&mut [&mut theirs, &mut server, &mut mine], 2).await, Rmsg::Read { data: b"hello".to_vec() });
+    ask(&mut theirs, 2, Tmsg::Write { fid: 2, offset: 0, data: b"mine now".to_vec() }, 6);
+    assert_eq!(served_answer(&mut [&mut theirs, &mut server, &mut mine], 2).await, Rmsg::Lerror { ecode: 30 });
+
+    // A session's theirs alone: what's asked in it for anyone else, or of
+    // another anchor, isn't sent
+    let forged = crate::net::serve::Asked {
+        user: Some(serde_bytes::ByteBuf::from(me.id().to_bytes())),
+        session: 2,
+        anchor: serde_bytes::ByteBuf::from(view.to_bytes()),
+        service: "notes".into(),
+        message: serde_bytes::ByteBuf::from(Tmsg::Clunk { fid: 2 }.encode(7).expect("encode")),
+    };
+    let request = theirs.swarm.behaviour_mut().serve.send_request(&peer, forged);
+    theirs.asking_served.insert(request, (2, Tmsg::Clunk { fid: 2 }.encode(7).expect("encode")));
+    assert_eq!(served_answer(&mut [&mut theirs, &mut server, &mut mine], 2).await, Rmsg::Lerror { ecode: 13 });
+
+    // Let write, they may
+    server.catalog().grant_on(&genesis, &anchor, &[them.id()], &[WRITE.to_owned()], &[], &[]).expect("share");
+    server.reload().expect("reload");
+    ask(&mut theirs, 2, Tmsg::Write { fid: 2, offset: 0, data: b"ours".to_vec() }, 8);
+    assert_eq!(served_answer(&mut [&mut theirs, &mut server, &mut mine], 2).await, Rmsg::Write { count: 4 });
+
+    // Taken away, nothing more
+    server.catalog().grant_on(&genesis, &anchor, &[them.id()], &[], &[READ.to_owned(), WRITE.to_owned()], &[]).expect("unshare");
+    server.reload().expect("reload");
+    ask(&mut theirs, 2, Tmsg::Read { fid: 2, offset: 0, count: 100 }, 9);
+    assert_eq!(served_answer(&mut [&mut theirs, &mut server, &mut mine], 2).await, Rmsg::Lerror { ecode: 13 });
+}

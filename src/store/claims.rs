@@ -765,9 +765,9 @@ impl ClaimStore {
     }
 
     /// The claims shared with a user, as `Catalog::as_guest` says, by
-    /// multihash: sets that count in views of anchors they may read, and
-    /// sets for their own views; tombs of sets on anchors they may read;
-    /// and the signs of all those.
+    /// multihash: sets and serve claims that count in views of anchors they
+    /// may read, and those for their own views; tombs of those on anchors
+    /// they may read; and the signs of all those.
     pub fn guest_claims(&self, guest: &Link) -> Result<Vec<Multihash>> {
         let sql = format!(
             "WITH g (id) AS (SELECT id FROM multihashes WHERE multihash = ?1),
@@ -776,13 +776,19 @@ impl ClaimStore {
                  JOIN claim_keys ck ON ck.claim = c.id
                  WHERE {shared}
              ),
+             serves (key) AS (
+                 SELECT ck.key FROM serve_claims s JOIN claims c ON c.id = s.id JOIN claim_targets t ON t.claim = c.id
+                 JOIN claim_keys ck ON ck.claim = c.id
+                 WHERE {shared}
+             ),
              tombs (key) AS (
                  SELECT kk.key FROM claims k JOIN claim_keys kk ON kk.claim = k.id JOIN claim_targets x ON x.claim = k.id
-                 JOIN claim_keys tk ON tk.key = x.target JOIN set_claims s ON s.id = tk.claim JOIN claim_targets t ON t.claim = s.id
+                 JOIN claim_keys tk ON tk.key = x.target JOIN claims tc ON tc.id = tk.claim AND tc.kind IN ('set', 'serve')
+                 JOIN claim_targets t ON t.claim = tc.id
                  WHERE k.kind = 'tomb' AND EXISTS (
                      SELECT 1 FROM anchor_access ar WHERE ar.anchor = t.target AND ar.user = (SELECT id FROM g) AND ar.command = 'read')
              ),
-             claimed (key) AS (SELECT key FROM sets UNION SELECT key FROM tombs)
+             claimed (key) AS (SELECT key FROM sets UNION SELECT key FROM serves UNION SELECT key FROM tombs)
              SELECT DISTINCT m.multihash FROM (
                  SELECT key FROM claimed
                  UNION SELECT sk.key FROM claimed JOIN claim_targets st ON st.target = claimed.key
@@ -1165,6 +1171,23 @@ impl ClaimStore {
     /// The multihash of the user this acts for, if it acts for one.
     pub fn acting(&self) -> Option<Vec<u8>> {
         self.acting.lock().ok().and_then(|acting| acting.clone())
+    }
+
+    /// Whether `user` may read, and may write, `owner`'s view of `anchor`:
+    /// both, if it's theirs; otherwise as grants on it say.
+    pub fn access(&self, owner: &Link, anchor: &Link, user: &Link) -> Result<(bool, bool)> {
+        if owner.multihash() == user.multihash() {
+            return Ok((true, true));
+        }
+        let commands: Vec<String> = self.db.conn()
+            .prepare_cached(
+                "SELECT DISTINCT a.command FROM anchor_access a JOIN multihashes o ON o.id = a.owner JOIN multihashes n ON n.id = a.anchor
+                 JOIN multihashes u ON u.id = a.user
+                 WHERE o.multihash = ?1 AND n.multihash = ?2 AND u.multihash = ?3",
+            )?
+            .query_map(params![owner.multihash().to_bytes(), anchor.multihash().to_bytes(), user.multihash().to_bytes()], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((commands.iter().any(|command| command == "read"), commands.iter().any(|command| command == "write")))
     }
 
     /// Whether the acting user may see a user's view of an anchor, if
