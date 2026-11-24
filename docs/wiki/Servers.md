@@ -96,9 +96,11 @@ lies in a directory anyone else may write.
 - Nothing served is cached: entries and attributes have no TTL, and
   files open with direct I/O, so a size that changes, or isn't known, is
   read as it is.
-- Requests to a server time out (10 s), failing `ETIMEDOUT`. Not yet:
-  running them on threads of their own, so a slow server can't hold up
-  the mount's (8) while it's waited on.
+- Requests to a server time out (10 s), failing `ETIMEDOUT`, and are
+  answered on threads of their own (16), apart from the mount's (8), so
+  a slow server holds up only what's asked of it. A served anchor itself
+  is a directory without asking, since what a server's attached to is,
+  so looking it up never waits on its server either.
 - A server that can't be reached, its socket gone or its connection
   hung up, fails with `ENOTCONN`, and is connected to again on the next
   request. Not yet: a persisted anchor showing its last set meanwhile.
