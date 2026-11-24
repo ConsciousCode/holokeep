@@ -688,6 +688,23 @@ fn forks(signs: &[claims::Signed]) -> Vec<Option<Link>> {
 pub const HOLDING: std::time::Duration = std::time::Duration::from_hours(24 * 7);
 
 /// The time from which a block put here is still in its putter's repo.
+/// The recursive steps of a walk up a CTE `up (id)` by links: what links
+/// to each block reached, among those `on` allows, a condition on
+/// `up.id`. It's the `links` view a table at a time, since joining the
+/// view itself builds all of it, every link deduplicated, at each step:
+/// tens of milliseconds a walk, where this takes a fraction of one.
+fn up_by_links(on: &str) -> String {
+    format!(
+        "UNION SELECT l.node FROM unixfs_links l JOIN up ON l.target = up.id WHERE {on}
+         UNION SELECT l.block FROM ipld_links l JOIN up ON l.target = up.id WHERE {on}
+         UNION SELECT c.claim FROM claim_targets t JOIN up ON t.target = up.id JOIN claims c ON c.id = t.claim
+             WHERE c.claim IS NOT NULL AND {on}
+         UNION SELECT c.claim FROM group_claims g JOIN up ON g.into_ = up.id JOIN claims c ON c.id = g.id
+             WHERE c.claim IS NOT NULL AND {on}
+         UNION SELECT r.source FROM refs r JOIN up ON r.target = up.id WHERE {on}"
+    )
+}
+
 fn held_since() -> i64 {
     i64::try_from(now().saturating_sub(HOLDING.as_secs())).unwrap_or(i64::MAX)
 }
@@ -2913,14 +2930,15 @@ impl Catalog {
             .prepare_cached(&format!(
                 "WITH RECURSIVE up (id) AS (
                      SELECT id FROM multihashes WHERE multihash = ?1
-                     UNION SELECT l.source FROM links l JOIN up ON l.target = up.id WHERE NOT {kept}
+                     {links}
                      UNION SELECT a.anchor FROM anchor_history a JOIN up ON a.value = up.id WHERE NOT {kept}
                  )
                  SELECT max(coalesce(k.copies, ?2)) FROM up
                  JOIN claim_targets t ON t.target = up.id
                  JOIN claims c ON c.id = t.claim
                  LEFT JOIN keep_copies k ON k.claim = c.id
-                 WHERE c.kind = 'keep' AND {live}"
+                 WHERE c.kind = 'keep' AND {live}",
+                links = up_by_links(&format!("NOT {kept}")),
             ))?
             .query_row(params![key.to_bytes(), i64::try_from(default).unwrap_or(i64::MAX)], |row| row.get(0))?;
         Ok(most.map(|most| usize::try_from(most).unwrap_or(default)))
@@ -2934,13 +2952,14 @@ impl Catalog {
             .prepare_cached(&format!(
                 "WITH RECURSIVE up (id) AS (
                      SELECT id FROM multihashes WHERE multihash = ?1
-                     UNION SELECT l.source FROM links l JOIN up ON l.target = up.id
+                     {links}
                      UNION SELECT a.anchor FROM {anchors} a JOIN up ON a.value = up.id
                  )
                  SELECT 1 FROM up
                  JOIN claim_targets t ON t.target = up.id
                  JOIN claims c ON c.id = t.claim
-                 WHERE c.kind = 'keep' AND {live} LIMIT 1"
+                 WHERE c.kind = 'keep' AND {live} LIMIT 1",
+                links = up_by_links("1"),
             ))?
             .exists([key.to_bytes()])?)
     }
@@ -2994,7 +3013,7 @@ impl Catalog {
             .prepare_cached(&format!(
                 "WITH RECURSIVE up (id) AS (
                      SELECT id FROM multihashes WHERE multihash = ?1
-                     UNION SELECT l.source FROM links l JOIN up ON l.target = up.id
+                     {links}
                      UNION SELECT a.anchor FROM anchor_history a JOIN up ON a.value = up.id
                  )
                  SELECT 1 FROM up
@@ -3003,6 +3022,7 @@ impl Catalog {
                      AND ar.user = (SELECT id FROM multihashes WHERE multihash = acting_user())
                  WHERE {} LIMIT 1",
                 claims::in_view("c", "s", "t", "ar.owner"),
+                links = up_by_links("1"),
             ))?
             .exists([key.to_bytes()])?)
     }
@@ -3018,13 +3038,14 @@ impl Catalog {
             .prepare_cached(&format!(
                 "WITH RECURSIVE up (id) AS (
                      SELECT id FROM multihashes WHERE multihash = ?1
-                     UNION SELECT l.source FROM links l JOIN up ON l.target = up.id
+                     {links}
                      UNION SELECT a.anchor FROM anchor_history a JOIN up ON a.value = up.id
                  )
                  SELECT 1 FROM up
                  JOIN set_claims s ON s.value = up.id JOIN claims c ON c.id = s.id JOIN claim_targets t ON t.claim = c.id
                  WHERE {} LIMIT 1",
                 claims::shared_with("c", "s", "t", "(SELECT id FROM multihashes WHERE multihash = ?2)"),
+                links = up_by_links("1"),
             ))?
             .exists(params![key.to_bytes(), guest.multihash().to_bytes()])?)
     }
