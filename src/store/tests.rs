@@ -3773,3 +3773,88 @@ fn what_is_said_to_be_the_same_is_checked_through_its_lens_and_joins() {
     assert!(lenses(&wide).is_empty());
     assert!(repo.unsay_same(&narrow, &wide, unixfs).expect("unsay").is_empty());
 }
+
+/// A whole file's CID that isn't here, nor said here to be the same as
+/// anything, is asked of a node: members send the same claims saying what
+/// it's the same as, and the layout's read. Only a claim signed by a key
+/// that counts here is followed.
+#[test]
+fn a_whole_cid_is_read_through_a_layout_members_say_it_is_the_same_as() {
+    use crate::same::UNIXFS;
+    use std::sync::{Arc, Mutex};
+    let scratch = Scratch::new("same-fetched");
+    let mut here = Catalog::open_repo(&scratch.path().join("here")).expect("catalog");
+    let user = here.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    // The user, and the certificates saying this device is theirs
+    let keys: Vec<Block> = here.keys().expect("keys")
+        .into_iter()
+        .map(|key| here.get_block(&here.cid_of(key.as_ref()).expect("cid").expect("cid")).expect("get").expect("block"))
+        .chain(here.claims().expect("claims").dissolved().expect("dissolved").iter().map(Claim::block))
+        .collect();
+    let data: Vec<u8> = (0..5000u32).map(|i| u8::try_from(i % 251).expect("byte")).collect();
+    let importer = Importer { chunk_size: 1000, ..Importer::default() };
+    let layout: Link = importer.add_file(data.as_slice(), &mut here).expect("add").cid.into();
+    let whole: Link = raw(&data).cid().clone().into();
+    here.say_same(&[layout.clone(), whole.clone()], Some(UNIXFS)).expect("the same");
+    let said = here.saying_same_file(&whole).expect("said");
+    assert_eq!(said.len(), 1, "{said:?}");
+    let unsaid: Link = raw(b"unsaid").cid().clone().into();
+    assert!(here.saying_same_file(&unsaid).expect("said").is_empty());
+
+    // What members would send: the claim, its signatures, and the layout's
+    // blocks
+    let signed = |repo: &Catalog, claim: &Link| -> Vec<Block> {
+        let mut blocks = vec![repo.get_block(claim).expect("get").expect("claim")];
+        for about in repo.backrefs(claim.multihash()).expect("backrefs") {
+            let cid = repo.cid_of(about.as_ref()).expect("cid").expect("cid");
+            blocks.push(repo.get_block(&cid).expect("get").expect("signature"));
+        }
+        assert!(blocks.len() > 1, "signed");
+        blocks
+    };
+    let mut blocks = Vec::new();
+    let mut queue = vec![layout.clone()];
+    while let Some(cid) = queue.pop() {
+        let block = here.get_block(&cid).expect("get").expect("block");
+        queue.extend(crate::links::links(cid.codec(), block.data()).expect("links"));
+        blocks.push(block);
+    }
+    let sent: Vec<Block> = signed(&here, &said[0].cid().clone().into()).into_iter().chain(blocks.iter().cloned()).collect();
+    let member = |name: &str, user: &crate::keys::Key, sent: Vec<Block>| {
+        let dir = scratch.path().join(name);
+        let repo = Catalog::open_repo(&dir).expect("catalog");
+        repo.set_user(&user.id()).expect("user");
+        for key in &keys {
+            repo.put_block(key, CidVersion::V1).expect("put");
+        }
+        drop(repo);
+        let mut repo = Catalog::open_repo(&dir).expect("catalog");
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let asks = Arc::clone(&asked);
+        repo.fetch_through(Arc::new(move |cids: &[Link]| {
+            asks.lock().expect("lock").extend_from_slice(cids);
+            let node = Catalog::open_repo(&dir).expect("catalog");
+            for block in &sent {
+                node.put_block(block, CidVersion::V1).expect("put");
+            }
+            true
+        }));
+        (repo, asked)
+    };
+
+    let (there, asked) = member("there", &user, sent);
+    assert_eq!(crate::export::Fetch::same_file(&there, &whole).expect("same"), Some(layout.clone()));
+    assert_eq!(*asked.lock().expect("lock"), std::slice::from_ref(&whole), "asked for as a block");
+    let mut out = Vec::new();
+    crate::export::cat(&there, &whole, &mut out).expect("cat");
+    assert_eq!(out, data);
+
+    // Said by a stranger, it's kept but not followed
+    let stranger = Catalog::open_repo(&scratch.path().join("stranger")).expect("catalog");
+    stranger.found_user(b"pass", crate::keys::Cost::NONE).expect("found");
+    let theirs = stranger.put_claim(&Claim::Same(crate::claim::Same::new([layout, whole.clone()], Some(UNIXFS.to_owned())).expect("same"))).expect("put");
+    let sent: Vec<Block> = signed(&stranger, &theirs).into_iter().chain(blocks).collect();
+    let (elsewhere, _) = member("elsewhere", &user, sent);
+    let err = crate::export::Fetch::same_file(&elsewhere, &whole).expect_err("not followed");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+}

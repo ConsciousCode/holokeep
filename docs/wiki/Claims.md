@@ -125,8 +125,11 @@ targets are read, its **lens**, and says they read the same through it:
   it, as the mount's, can't be checked against a whole hash, so takes
   the claim at its signer's word. What's fetched, and must be this
   account's to read, is the layout: knowing a whole CID isn't reading
-  it. Members don't yet answer for a whole CID, but have its claims, as
-  structure, wherever they hold its root. A lens is a name for now; one not
+  it. Members answer for one: asked for a whole CID as a block, a member
+  without it sends the `same` claims saying what it's the same as, with
+  their signatures, beside its not having it, and the asker keeps them
+  and, if they count there, fetches the layout instead. A thin client,
+  keeping no claims, can't yet. A lens is a name for now; one not
   known is kept, and says nothing this can check. A lens could later be
   an ADL's code by CID, as WASM.
 

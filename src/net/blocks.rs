@@ -13,6 +13,14 @@
 //! no member has is missing. Every block is verified against its CID
 //! before it's kept, whoever sent it.
 //!
+//! A whole file's CID, as DASL and `ATproto` name files, is no block anyone
+//! can send, files being chunked. A member without such a block that
+//! knows what it's the same as, through the UnixFS lens, sends the
+//! `same` claims saying so beside its not having it; the asker keeps
+//! them, and if they count, fetches the layout they name instead, each
+//! block checked as it comes. Whoever reads the whole file checks it
+//! against the whole CID once it's read (see `export::cat`).
+//!
 //! In a small mesh, asking members in turn is enough; Kademlia provider
 //! records are for when it isn't.
 
@@ -25,6 +33,8 @@ use serde_bytes::ByteBuf;
 
 use crate::block::{Block, IDENTITY};
 use crate::cid::{AnyCid, BaseCid, Cid, CidRef, Cidv1, RAW_CODEC};
+use crate::claim::Claim;
+use crate::export::Fetch as _;
 use crate::model::Link;
 use crate::multihash::Multihash;
 use crate::store::{BlockIndex, BlockSource, Catalog, Replica};
@@ -63,8 +73,11 @@ impl Want {
 }
 
 /// An answer to a want: blocks as (CID, bytes), and the multihashes of
-/// those the peer doesn't have; and the copies the peer holds of each
-/// block, so the asker knows where else it lives.
+/// those the peer doesn't have.
+///
+/// With them, the copies the peer holds of each block, so the asker knows
+/// where else it lives, and the `same` claims saying what whole files it
+/// doesn't have as blocks are the same as.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Blocks {
     #[serde(rename = "blocks")]
@@ -72,6 +85,10 @@ pub struct Blocks {
     missing: Vec<ByteBuf>,
     #[serde(default)]
     copies: Vec<Vec<Replica>>,
+    /// Claims as (CID, bytes): omitted by older builds, and when there are
+    /// none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    said: Vec<(ByteBuf, ByteBuf)>,
 }
 
 impl Blocks {
@@ -111,6 +128,9 @@ pub fn answer(catalog: &Catalog, want: &Want) -> Blocks {
         };
         // Another account's is as good as not here
         let Ok(Some(data)) = catalog.visible(multihash.as_ref()).and_then(|visible| visible.then(|| catalog.get(multihash.as_ref())).transpose().map(Option::flatten)) else {
+            // A whole file's, perhaps, which is said to be the same as a
+            // layout of it
+            say_same_file(catalog, &AnyCid::V1(Cidv1::new(RAW_CODEC, multihash)), &mut answer.said);
             answer.missing.push(key.clone());
             continue;
         };
@@ -125,6 +145,27 @@ pub fn answer(catalog: &Catalog, want: &Want) -> Blocks {
         answer.found.push((ByteBuf::from(cid.to_bytes()), ByteBuf::from(data)));
     }
     answer
+}
+
+/// Add to what's said the same claims saying what a whole file's CID is
+/// the same as, with their signatures and tombs, and theirs, without
+/// which they're not what they say (see `structure::backrefs`).
+fn say_same_file(catalog: &Catalog, whole: &Link, said: &mut Vec<(ByteBuf, ByteBuf)>) {
+    let Ok(claims) = catalog.saying_same_file(whole) else {
+        return;
+    };
+    if claims.is_empty() {
+        return;
+    }
+    let keys: Vec<Vec<u8>> = claims.iter().map(|claim| claim.cid().multihash().to_bytes()).collect();
+    let about = super::structure::backrefs(catalog, keys.iter().map(Vec::as_slice)).unwrap_or_default();
+    let about = about.iter().filter_map(|cid| catalog.get_block(cid).ok().flatten());
+    for block in claims.into_iter().chain(about) {
+        let cid = ByteBuf::from(block.cid().to_bytes());
+        if !said.iter().any(|(saying, _)| *saying == cid) {
+            said.push((cid, ByteBuf::from(block.data().to_vec())));
+        }
+    }
 }
 
 /// An answer to a want refused, as from an account whose user the asker
@@ -152,6 +193,9 @@ pub struct Fetch {
     missing: Vec<Link>,
     /// Whether to follow links, fetching whole DAGs, or just the blocks.
     deep: bool,
+    /// Whether what was first queued is yet to be looked up as whole
+    /// files' CIDs, said to be the same as layouts here.
+    roots: bool,
 }
 
 impl Fetch {
@@ -167,12 +211,22 @@ impl Fetch {
     }
 
     fn of(queue: Vec<Link>, deep: bool) -> Self {
-        Self { queue, wanted: BTreeMap::new(), inflight: HashMap::new(), seen: HashSet::new(), fetched: 0, missing: Vec::new(), deep }
+        Self { queue, wanted: BTreeMap::new(), inflight: HashMap::new(), seen: HashSet::new(), fetched: 0, missing: Vec::new(), deep, roots: true }
     }
 
     /// Look at what's queued here, then say what to ask of whom: batches
     /// of multihashes for members. Each is passed to `sent` once it is.
     pub fn plan(&mut self, catalog: &Catalog, peers: &[PeerId]) -> Result<Vec<(PeerId, Batch)>> {
+        // A whole file's CID is fetched as a layout of it, if it's said to
+        // be the same as one here. Only those first queued may be: what
+        // they link to is of a layout already.
+        if std::mem::take(&mut self.roots) {
+            for link in &mut self.queue {
+                if let Some(layout) = catalog.same_file(link)? {
+                    *link = layout;
+                }
+            }
+        }
         while let Some(link) = self.queue.pop() {
             let key = link.multihash().to_bytes();
             if link.hashcode() == IDENTITY || !self.seen.insert(key.clone()) {
@@ -235,6 +289,10 @@ impl Fetch {
         };
         let mut copies = answer.copies.into_iter();
         let mut failed = None;
+        let said = Self::keep_said(catalog, &asked, answer.said).unwrap_or_else(|e| {
+            failed = Some(e);
+            false
+        });
         for (cid, data) in answer.found {
             let theirs = copies.next().unwrap_or_default();
             let Ok(link) = Link::decode(&cid) else {
@@ -270,12 +328,52 @@ impl Fetch {
         }
         for key in answer.missing {
             if let Some((link, tried)) = asked.remove(key.as_slice()) {
+                // Not a block, but a whole file's, said to be the same as a
+                // layout, which is fetched instead
+                if said && let Some(layout) = catalog.same_file(&link)? {
+                    self.queue.push(layout);
+                    continue;
+                }
                 self.wanted.insert(key.into_vec(), (link, tried.saturating_add(1)));
             }
         }
         // Left out to keep the answer small: the same member again
         self.wanted.extend(asked);
         failed.map_or(Ok(()), Err)
+    }
+
+    /// Keep the `same` claims an answer carries which name, through the
+    /// UnixFS lens, what was asked for, and the claims about them, however
+    /// deep: their signatures and tombs. Nothing else is. Whether any
+    /// were. They're kept whoever signed them, but count only if a key
+    /// that counts here did.
+    fn keep_said(catalog: &Catalog, asked: &Batch, said: Vec<(ByteBuf, ByteBuf)>) -> Result<bool> {
+        let mut claims: Vec<(Link, Block, Claim)> = said.into_iter()
+            .filter_map(|(cid, data)| {
+                let link = Link::decode(&cid).ok()?;
+                let block = Block::verify(link.clone().into(), data.into_vec().into_boxed_slice()).ok()?;
+                let claim = Claim::parse(block.data())?;
+                Some((link, block, claim))
+            })
+            .collect();
+        let mut kept: HashSet<Vec<u8>> = HashSet::new();
+        loop {
+            let (keep, rest): (Vec<_>, Vec<_>) = claims.into_iter().partition(|(_, _, claim)| match claim {
+                Claim::Same(same) => same.lens() == Some(crate::same::UNIXFS)
+                    && same.target().iter().any(|target| asked.contains_key(&target.multihash().to_bytes())),
+                claim @ (Claim::Sign(_) | Claim::Tomb(_)) => claim.target().iter().any(|target| kept.contains(&target.multihash().to_bytes())),
+                _ => false,
+            });
+            claims = rest;
+            if keep.is_empty() {
+                break;
+            }
+            for (link, block, _) in keep {
+                catalog.put_block(&block, link.version())?;
+                kept.insert(link.multihash().to_bytes());
+            }
+        }
+        Ok(!kept.is_empty())
     }
 
     /// A want which got no answer: ask the next member.

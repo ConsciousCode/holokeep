@@ -1833,6 +1833,23 @@ impl ClaimStore {
         rows.iter().map(|multihash| claim_link(multihash)).collect()
     }
 
+    /// The same claims that count which name `target` itself, read through
+    /// `lens`, by their CIDs, at most `limit` of them.
+    pub fn saying_same_of(&self, target: &Link, lens: Option<&str>, limit: usize) -> Result<Vec<Link>> {
+        let (prefix, multihash) = split(target)?;
+        let rows: Vec<Vec<u8>> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT k.multihash FROM multihashes m JOIN claim_targets t ON t.target = m.id
+                 JOIN claims c ON c.id = t.claim JOIN same_claims s ON s.id = c.id
+                 JOIN multihashes k ON k.id = c.claim
+                 WHERE m.multihash = ?1 AND t.prefix = ?2 AND c.kind = 'same' AND s.lens IS ?3 AND {LIVE}
+                 ORDER BY c.id LIMIT ?4"
+            ))?
+            .query_map(params![multihash.to_bytes(), prefix, lens, i64::try_from(limit).unwrap_or(i64::MAX)], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.iter().map(|multihash| claim_link(multihash)).collect()
+    }
+
     /// What lost claims that count say, as (block, when), the latest of each.
     pub fn all_lost(&self) -> Result<Vec<(Link, u64)>> {
         let rows: Vec<(Vec<u8>, Vec<u8>, i64)> = self.db.conn()

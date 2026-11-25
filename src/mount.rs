@@ -607,8 +607,23 @@ impl Soup {
         if catalog.visible(cid.multihash()).map_err(store_errno)? {
             return Ok(true);
         }
+        // A whole file's CID, which is no block, is as reachable as the
+        // layout it's said to be the same as, here or by members
+        let same = |catalog: &Catalog| match export::Fetch::same_file(catalog, cid) {
+            Ok(layout) => Ok(layout),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(errno(&e)),
+        };
+        if let Some(layout) = same(catalog)? {
+            return self.reachable(catalog, &layout);
+        }
         match &self.fetcher {
-            Some(fetcher) if catalog.worth_asking_for(cid) && fetcher(std::slice::from_ref(cid)) => catalog.visible(cid.multihash()).map_err(store_errno),
+            Some(fetcher) if catalog.worth_asking_for(cid) && fetcher(std::slice::from_ref(cid)) => {
+                if catalog.visible(cid.multihash()).map_err(store_errno)? {
+                    return Ok(true);
+                }
+                same(catalog)?.map_or(Ok(false), |layout| self.reachable(catalog, &layout))
+            },
             _ => Ok(false),
         }
     }
@@ -1718,8 +1733,14 @@ mod tests {
         let hello: Block = Block::hash(crate::cid::Cidv1Spec::default(), b"hello world".as_slice().into());
         let hello = catalog.cid_of(hello.cid().multihash()).expect("cid").expect("cid");
         catalog.tag(&hello, &crate::claim::tag("greeting").expect("tag")).expect("tag");
+        // Its big file's whole CID, which is no block, said to be the same
+        let big: Link = Importer { chunk_size: 100_000, ..Importer::default() }.add_file(vec![7u8; 300_000].as_slice(), &mut catalog).expect("add").cid.into();
+        let whole: Link = AnyCid::V1(Block::hash(crate::cid::Cidv1Spec::new(crate::cid::RAW_CODEC, crate::multihash::MultihashFunc::Sha2_256), vec![7u8; 300_000].into()).cid().clone());
+        catalog.say_same(&[big, whole.clone()], Some(crate::same::UNIXFS)).expect("the same");
         drop(catalog);
         let soup = Soup::new(Box::new(move || Catalog::open_repo(&repo)), None);
+        assert_eq!(read(&soup, &format!("cid/{whole}")), vec![7u8; 300_000], "read through its layout");
+        assert_eq!(ino(&soup, &format!("cid/{whole}")).expect("whole").size, 300_000);
 
         assert_eq!(names(&soup, ""), ["cid", "anchors", "tags"]);
         assert!(names(&soup, "cid").is_empty());

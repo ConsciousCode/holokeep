@@ -60,10 +60,7 @@ pub trait Fetch {
 impl Fetch for Catalog {
     /// A block here, or, if the catalog fetches through a node, fetched.
     fn fetch(&self, cid: &Link) -> io::Result<Vec<u8>> {
-        let missing = || io::Error::new(io::ErrorKind::NotFound, match self.lost_at(cid) {
-            Ok(Some(at)) => format!("block {cid} not found: reported lost as of {at}"),
-            _ => format!("block {cid} not found"),
-        });
+        let missing = || not_found(self, cid);
         // A block in a file of a mount's being moved out as that's written
         // over: where it was looked up, it's gone, and looking again finds it
         let got = match self.get_block(cid) {
@@ -84,19 +81,27 @@ impl Fetch for Catalog {
 
     /// One whose root is here, if any is: so a whole CID is read through
     /// what was kept, or else fetched as blocks, each checked as it comes.
+    /// If nothing here says what it's the same as, and the catalog fetches
+    /// through a node, it's asked for: as a block, or a layout of it
+    /// members say it's the same as (see `net::blocks`).
     fn same_file(&self, cid: &Link) -> io::Result<Option<Link>> {
         use crate::cid::CidRef as _;
         use crate::store::BlockIndex as _;
         if cid.codec() != RAW_CODEC || cid.hashcode() == crate::block::IDENTITY || self.has(cid.multihash()).map_err(io::Error::other)? {
             return Ok(None);
         }
-        let Some(claims) = self.claims() else {
-            return Ok(None);
-        };
-        let layouts: Vec<Link> = claims.same_as(cid, Some(crate::same::UNIXFS)).map_err(io::Error::other)?
-            .into_iter()
-            .filter(|layout| layout.codec() == DAG_PB_CODEC)
-            .collect();
+        let mut layouts = self.layouts(cid)?;
+        // Asked for, as a block or a whole file, it's not asked for again
+        if layouts.is_empty() && self.ask_for_missing(std::slice::from_ref(cid)).is_some() {
+            if self.has(cid.multihash()).map_err(io::Error::other)? {
+                return Ok(None);
+            }
+            layouts = self.layouts(cid)?;
+            if layouts.is_empty() {
+                // Neither it nor a layout of it is anywhere
+                return Err(not_found(self, cid));
+            }
+        }
         for layout in &layouts {
             if self.has(layout.multihash()).map_err(io::Error::other)? {
                 return Ok(Some(layout.clone()));
@@ -116,6 +121,27 @@ impl Fetch for Catalog {
             self.fetch_missing(&missing);
         }
     }
+}
+
+impl Catalog {
+    /// The UnixFS layouts same claims here say a whole CID is the same as.
+    fn layouts(&self, cid: &Link) -> io::Result<Vec<Link>> {
+        let Some(claims) = self.claims() else {
+            return Ok(Vec::new());
+        };
+        Ok(claims.same_as(cid, Some(crate::same::UNIXFS)).map_err(io::Error::other)?
+            .into_iter()
+            .filter(|layout| layout.codec() == DAG_PB_CODEC)
+            .collect())
+    }
+}
+
+/// That a block isn't here, nor could be fetched.
+fn not_found(catalog: &Catalog, cid: &Link) -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, match catalog.lost_at(cid) {
+        Ok(Some(at)) => format!("block {cid} not found: reported lost as of {at}"),
+        _ => format!("block {cid} not found"),
+    })
 }
 
 fn invalid(msg: impl Into<String>) -> io::Error {

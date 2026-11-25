@@ -199,6 +199,28 @@ scenario_copies() {
     ! sh_on one "hk dag health --ask $cid" | grep -q "^asked" || fail "asked again what was sighted"
 }
 
+# A file kept whole on one, of which two has nothing, is read on two by its
+# whole CID, as DASL and ATproto name files: asked for it, one says what
+# it's the same as, and two fetches that, block by block
+scenario_whole() {
+    local root whole sum
+    sh_on one 'head -c 3000000 /dev/urandom > /tmp/whole && head -c 2000000 /dev/urandom > /tmp/mounted'
+    for file in whole mounted; do
+        root=$(sh_on one "hk add -q /tmp/$file | tail -1")
+        whole=$(on one hk same ls "$root" | awk -F'\t' '$1 == "unixfs" { print $2 }')
+        [ -n "$whole" ] || fail "one doesn't say what $root is the same as"
+        [ -z "$(on two hk same ls "$root")" ] || fail "two knew what $root is the same as already"
+        sum=$(sh_on one "sha256sum < /tmp/$file")
+        if [ "$file" = whole ]; then
+            [ "$(sh_on two "hk cat $whole | sha256sum")" = "$sum" ] || fail "two can't read $whole"
+        else
+            # Through the mount, which fetches as it reads
+            [ "$(sh_on two "sha256sum < /soup/cid/$whole")" = "$sum" ] || fail "two's mount can't read $whole"
+        fi
+        on two hk same ls "$root" | grep -q "$whole" || fail "two doesn't keep what one said of $root"
+    done
+}
+
 # A node joining later sees what the root names, and reads it
 scenario_late_joiner() {
     machine three
@@ -744,7 +766,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read served edits copies late_joiner fork_merge lost forget car restore revoke shared client thin visitor expiry door several)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read served edits copies whole late_joiner fork_merge lost forget car restore revoke shared client thin visitor expiry door several)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

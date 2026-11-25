@@ -3443,15 +3443,19 @@ impl Catalog {
     /// writing them would wait on it, so they're noted instead, for
     /// whoever's in it to fetch once it's over (see `take_missed`).
     pub fn fetch_missing(&self, cids: &[Link]) -> bool {
-        let Some(fetcher) = &self.fetcher else {
-            return false;
-        };
+        self.ask_for_missing(cids).unwrap_or(false)
+    }
+
+    /// As `fetch_missing`, but None if nothing was asked for, rather than
+    /// asked for and not fetched: so what was asked needn't be again.
+    pub fn ask_for_missing(&self, cids: &[Link]) -> Option<bool> {
+        let fetcher = self.fetcher.as_ref()?;
         if !self.db.conn().is_autocommit() {
             self.missed.borrow_mut().extend_from_slice(cids);
-            return false;
+            return None;
         }
         let asking: Vec<Link> = cids.iter().filter(|cid| self.worth_asking_for(cid)).cloned().collect();
-        !asking.is_empty() && fetcher(&asking)
+        (!asking.is_empty()).then(|| fetcher(&asking))
     }
 
     /// Whether to ask members for a block that isn't here: yes, unless it's
@@ -3521,6 +3525,29 @@ impl Catalog {
                 Ok((lens, same))
             })
             .collect()
+    }
+
+    /// The blocks of the same claims that count saying, through the UnixFS
+    /// lens, what a whole file's CID is the same as, which this account
+    /// can read: what to answer one who wants it as a block, which it
+    /// isn't, so they can fetch a layout of it instead. A few at most.
+    pub fn saying_same_file(&self, cid: &Link) -> Result<Vec<Block>> {
+        /// Enough to name a layout, if one's here, without an answer
+        /// growing with however many say so.
+        const SAYING: usize = 4;
+        let Some(claims) = &self.claims else {
+            return Ok(Vec::new());
+        };
+        let mut said = Vec::new();
+        for claim in claims.saying_same_of(cid, Some(crate::same::UNIXFS), SAYING)? {
+            if !self.visible(claim.multihash())? {
+                continue;
+            }
+            if let Some(block) = self.get_block(&claim)? {
+                said.push(block);
+            }
+        }
+        Ok(said)
     }
 
     /// Take back saying that `a` and `b` are the same, read through `lens`:

@@ -1051,12 +1051,13 @@ fn fetch_through_node(_: &mut Catalog, _: &Path) {}
 /// The repo, having fetched what's under a CID through its running node,
 /// if there is one, and made sure it's this account's to read. A whole
 /// file's CID, which isn't a block, is the layout it's said to be the
-/// same as (see `export::Fetch::same_file`), which is what's fetched and
-/// must be this account's: knowing a file's whole CID isn't reading it.
+/// same as (see `export::Fetch::same_file`), which is what's fetched,
+/// whether here or members say so, and must be this account's: knowing a
+/// file's whole CID isn't reading it.
 fn fetched(repo: Option<PathBuf>, cid: &Link) -> anyhow::Result<Catalog> {
-    let layout = export::Fetch::same_file(&open_repo(repo.clone())?, cid)?.unwrap_or_else(|| cid.clone());
-    fetch_first(repo.as_ref(), &layout)?;
+    fetch_first(repo.as_ref(), cid)?;
     let repo = open_repo(repo)?;
+    let layout = export::Fetch::same_file(&repo, cid)?.unwrap_or_else(|| cid.clone());
     in_repo(&repo, &layout)?;
     Ok(repo)
 }
