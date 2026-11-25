@@ -19,8 +19,10 @@
 //! A kept file's multihash is a second name for the content its UnixFS
 //! root names. `shard_roots` records which roots each kept file was
 //! imported as, which is what lets its ranges be rebuilt from the roots'
-//! `blocksizes`. That's a `Same` claim in all but name, and will become
-//! one; until then a kept file isn't a block anyone can get.
+//! `blocksizes`. It's known here alone, whatever's said, so ranges never
+//! hang on a claim that may stop counting; the catalog says it too, as a
+//! `Same` claim, for anyone. A kept file still isn't a block anyone can
+//! get.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};

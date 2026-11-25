@@ -190,7 +190,8 @@ impl Catalog {
                 }
                 self.record(id, &(offset_store, "offset".to_owned()))?;
             }
-            shards.record_root(blob.as_ref(), candidate.multihash.as_ref())
+            shards.record_root(blob.as_ref(), candidate.multihash.as_ref())?;
+            self.say_kept_root(blob.as_ref(), &Self::kept_root(blob.as_ref(), candidate.multihash.as_ref())?)
         });
         if let Err(e) = moved {
             // Nothing refers to it, so it's not left to pass for a block

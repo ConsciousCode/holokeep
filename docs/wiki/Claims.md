@@ -108,6 +108,13 @@ targets are read, its **lens**, and says they read the same through it:
 - **What isn't `same`.** Similarity isn't transitive: a lossy copy of a
   lossy copy drifts. Renditions of one work (a JPEG of a PNG, a scaled
   copy, a translation) are a `group` of the work, said explicitly.
+- **Kept files say so.** A file [[Storage#Placement|kept whole]] is
+  said to be the same, through `unixfs`, as the root it was imported
+  as, by its whole CID (raw, sha2-256): how DASL and ATproto name a
+  blob, and a common denominator any layout can be checked against. A
+  repo opening with files kept before says so of each, once, in one
+  sign. The repo's own record of which roots a kept file is
+  (`shard_roots`) stands apart, so its ranges never hang on a claim.
 - **Not yet acted on.** Nothing reads one member through another yet;
   `same` is said, checked and listed. A lens is a name for now; one not
   known is kept, and says nothing this can check. A lens could later be

@@ -725,6 +725,9 @@ fn path_from(bytes: &[u8]) -> PathBuf {
     PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
 }
 
+/// The migration saying kept files are the same as their roots.
+const KEPT_ROOTS: &str = "kept files are the same as their roots";
+
 impl Catalog {
     /// Open a repo directory with the standard stores, attach whichever
     /// other volumes are where they were last seen, and catch up with
@@ -739,7 +742,55 @@ impl Catalog {
         catalog.attach_known()?;
         catalog.catch_up_if_free()?;
         catalog.sign_as(dir)?;
+        // Once there's a key to say it with, in one sign; another time if
+        // something else is writing, as opening's not to wait on it
+        if !catalog.migrated(KEPT_ROOTS)? {
+            match catalog.batch(|catalog| catalog.migrate(KEPT_ROOTS, Self::say_kept_roots)) {
+                Err(e) if e.is_busy() => {},
+                done => done?,
+            }
+        }
         Ok(catalog)
+    }
+
+    /// Say a kept file is the same as the UnixFS root it was imported as,
+    /// read as a file: its whole multihash, a raw sha2-256 CID, is the CID
+    /// of it as DASL and `ATproto` name a blob, and one any layout of it can
+    /// be checked against. Nothing to say for a file of one chunk, whose
+    /// root is that. Known by having just hashed it, so not checked again.
+    fn say_kept_root(&self, blob: Key<'_>, root: &Link) -> Result<()> {
+        if root.multihash().to_bytes() == blob.to_bytes() {
+            return Ok(());
+        }
+        let blob: Link = Cidv1::new(crate::cid::RAW_CODEC, owned(blob)?).into();
+        let Some(same) = crate::claim::Same::new([root.clone(), blob], Some(crate::same::UNIXFS.to_owned())) else {
+            return Ok(());
+        };
+        self.put_claim(&Claim::Same(same)).map(drop)
+    }
+
+    /// A kept file's root, by its multihash: a dag-pb node, as a file of
+    /// more than one chunk's is, unless it's the file's own multihash.
+    fn kept_root(blob: Key<'_>, root: Key<'_>) -> Result<Link> {
+        let codec = if root.to_bytes() == blob.to_bytes() { crate::cid::RAW_CODEC } else { crate::cid::DAG_PB_CODEC };
+        Ok(Cidv1::new(codec, owned(root)?).into())
+    }
+
+    /// Say each kept file, as `shard_roots` has them, is the same as its
+    /// roots: what was kept before files said so.
+    fn say_kept_roots(&self) -> Result<usize> {
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = self.db.conn()
+            .prepare(
+                "SELECT b.multihash, r.multihash FROM shard_roots s
+                 JOIN multihashes b ON b.id = s.blob JOIN multihashes r ON r.id = s.root",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (blob, root) in &rows {
+            let (blob, root) = (decode_key("kept roots", blob)?, decode_key("kept roots", root)?);
+            self.say_kept_root(blob.as_ref(), &Self::kept_root(blob.as_ref(), root.as_ref())?)?;
+        }
+        Ok(rows.len())
     }
 
     /// Act for the user running this, signing with this node's key, made
@@ -2458,6 +2509,7 @@ impl Catalog {
             return Ok(false);
         }
         shards.record_root(file.blob.as_ref(), root.as_ref())?;
+        self.say_kept_root(file.blob.as_ref(), &Self::kept_root(file.blob.as_ref(), root.as_ref())?)?;
         Ok(true)
     }
 
@@ -3713,10 +3765,14 @@ impl Catalog {
         Ok(())
     }
 
+    /// Whether a change to what's in the repo has been made.
+    fn migrated(&self, name: &str) -> Result<bool> {
+        Ok(self.db.conn().prepare_cached("SELECT 1 FROM migrations WHERE name = ?1")?.exists([name])?)
+    }
+
     /// Make a change to what's in the repo once, if it hasn't been.
     fn migrate<T>(&self, name: &str, change: impl FnOnce(&Self) -> Result<T>) -> Result<()> {
-        let done = self.db.conn().prepare_cached("SELECT 1 FROM migrations WHERE name = ?1")?.exists([name])?;
-        if done {
+        if self.migrated(name)? {
             return Ok(());
         }
         self.db.atomically(|| {
@@ -4179,7 +4235,8 @@ impl BlockSink for Copying<'_> {
             if ranges == 0 && self.router.store_of(blob.as_ref())?.is_none() {
                 return shards.forget(blob.as_ref());
             }
-            shards.record_root(blob.as_ref(), root.cid.multihash())
+            shards.record_root(blob.as_ref(), root.cid.multihash())?;
+            self.router.say_kept_root(blob.as_ref(), &root.cid.clone().into())
         };
         keep().map_err(io_error)
     }

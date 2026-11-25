@@ -1285,7 +1285,7 @@ fn whats_kept_too_isnt_lost_with_the_original() {
     std::fs::remove_file(&file).expect("remove");
     assert!(router.forget_changed(&router.external_files(None).expect("files")).expect("forget").is_empty());
     assert!(router.external_files(None).expect("files").is_empty());
-    assert_eq!(forms(&router), [("offset".to_owned(), 16), ("unixfs".to_owned(), 1)]);
+    assert_eq!(forms(&router), [("claims".to_owned(), 1), ("offset".to_owned(), 16), ("unixfs".to_owned(), 1)]);
 }
 
 #[test]
@@ -1478,7 +1478,7 @@ fn keeps_large_files_whole() {
     let root = import_copying(&mut router, &file);
 
     // Leaves as ranges of the kept file, the node as rows, and no copies
-    assert_eq!(forms(&router), [("offset".to_owned(), 16), ("unixfs".to_owned(), 1)]);
+    assert_eq!(forms(&router), [("claims".to_owned(), 1), ("offset".to_owned(), 16), ("unixfs".to_owned(), 1)]);
     assert_eq!(count(&router.db, "raw_blocks"), 0);
     assert_eq!(count(&router.db, "shard_roots"), 1);
 
@@ -1493,6 +1493,38 @@ fn keeps_large_files_whole() {
     let mut out = Vec::new();
     crate::export::cat(&router, &AnyCid::V1(root.cid), &mut out).expect("cat");
     assert_eq!(out, content(1000, 0));
+}
+
+/// A kept file says it's the same as its root, read as a file, so its
+/// whole multihash names it for anyone; and what was kept before files
+/// said so says it once a key's there to say it with.
+#[test]
+fn kept_files_are_said_to_be_the_same_as_their_roots() {
+    let scratch = Scratch::new("shards-same");
+    let (file, small) = (scratch.path().join("file"), scratch.path().join("small"));
+    std::fs::write(&file, content(1000, 0)).expect("write");
+    let mut router = sharded(&scratch);
+    let root: Link = import_copying(&mut router, &file).cid.into();
+    let whole: Link = raw(&content(1000, 0)).cid().clone().into();
+    let said = || router.same_as(&root).expect("same as");
+    assert_eq!(said(), [(Some(crate::same::UNIXFS.to_owned()), vec![whole.clone()])]);
+    assert_eq!(router.same_as(&whole).expect("same as"), [(Some(crate::same::UNIXFS.to_owned()), vec![root.clone()])]);
+
+    // As before files said so
+    router.db.conn().execute_batch(
+        "DELETE FROM blocks WHERE block IN (SELECT claim FROM claims WHERE kind = 'same');
+         DELETE FROM claims WHERE kind = 'same';",
+    ).expect("delete");
+    assert!(said().is_empty());
+    assert_eq!(router.say_kept_roots().expect("say"), 1);
+    assert_eq!(said(), [(Some(crate::same::UNIXFS.to_owned()), vec![whole])]);
+
+    // A file of one chunk, kept whole, is its root, with nothing to say
+    std::fs::write(&small, content(500, 1)).expect("write");
+    let importer = Importer { chunk_size: 1000, ..Importer::default() };
+    let one: Link = importer.add_path(&small, &mut Copying::new(&mut router), &mut |_, _| {}).expect("import").expect("root").cid.into();
+    assert_eq!(one, raw(&content(500, 1)).cid().clone().into());
+    assert!(router.same_as(&one).expect("same as").is_empty());
 }
 
 #[test]
@@ -1605,7 +1637,7 @@ fn kept_files_go_whole_when_their_leaves_all_do() {
     assert!(kept_files(&scratch).is_empty());
     assert_eq!((count(&router.db, "offset_ranges"), count(&router.db, "shard_roots"), count(&router.db, "raw_blocks")), (0, 0, 0));
     assert!(leaves.iter().all(|leaf| !router.has(leaf.as_ref()).expect("has")));
-    assert_eq!(forms(&router), [("unixfs".to_owned(), 1)]);
+    assert_eq!(forms(&router), [("claims".to_owned(), 1), ("unixfs".to_owned(), 1)]);
 }
 
 #[test]
@@ -1622,7 +1654,7 @@ fn a_leaf_going_splits_its_kept_file() {
     assert_eq!(router.drop_copies(gone.as_ref()).expect("drop"), Some(1000 - 936));
     assert!(kept_files(&scratch).is_empty(), "the kept file's gone");
     assert!(!router.has(gone.as_ref()).expect("has"));
-    assert_eq!(forms(&router), [("raw".to_owned(), 15), ("unixfs".to_owned(), 1)]);
+    assert_eq!(forms(&router), [("claims".to_owned(), 1), ("raw".to_owned(), 15), ("unixfs".to_owned(), 1)]);
     for (leaf, start) in rest.iter().zip((64..).step_by(64)) {
         let cid = router.cid_of(leaf.as_ref()).expect("cid").expect("known");
         let block = router.get_block(&cid).expect("get").expect("still here");
@@ -1631,7 +1663,7 @@ fn a_leaf_going_splits_its_kept_file() {
 
     // And what's left survives a reopen of the shards
     router.reindex().expect("reindex");
-    assert_eq!(forms(&router), [("raw".to_owned(), 15), ("unixfs".to_owned(), 1)]);
+    assert_eq!(forms(&router), [("claims".to_owned(), 1), ("raw".to_owned(), 15), ("unixfs".to_owned(), 1)]);
 }
 
 #[test]
@@ -1651,7 +1683,7 @@ fn collecting_a_file_takes_its_kept_file_along() {
     let (dropping, _) = router.collect_all(&leaves).expect("collect");
     assert_eq!((dropping.dropped.len(), dropping.freed), (16, 1000));
     assert!(kept_files(&scratch).is_empty());
-    assert!(forms(&router).is_empty());
+    assert_eq!(forms(&router), [("claims".to_owned(), 1)], "but what was said of it");
 }
 
 #[test]
