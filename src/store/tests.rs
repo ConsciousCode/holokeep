@@ -1527,6 +1527,30 @@ fn kept_files_are_said_to_be_the_same_as_their_roots() {
     assert!(router.same_as(&one).expect("same as").is_empty());
 }
 
+/// A file whose leaves came as blocks of their own, each a file in the
+/// shards, as fetched from a member, is kept whole once it's rehomed: one
+/// file, its leaves ranges of it, said to be the same as its root.
+#[test]
+fn files_of_a_block_a_leaf_are_kept_whole_once_rehomed() {
+    let scratch = Scratch::new("shards-rehome");
+    let mut router = sharded(&scratch);
+    let data = content(1000, 3);
+    let importer = Importer { chunk_size: 200, ..Importer::default() };
+    let root: Link = importer.add_file(&data[..], &mut router).expect("add").cid.into();
+    assert_eq!(forms(&router), [("flatfs".to_owned(), 5), ("unixfs".to_owned(), 1)]);
+    assert_eq!(kept_files(&scratch).len(), 5, "a file a leaf");
+
+    assert_eq!(router.rehome(u64::MAX).expect("rehome"), crate::store::Rehomed { files: 1, bytes: 1000 });
+    assert_eq!(forms(&router), [("claims".to_owned(), 1), ("offset".to_owned(), 5), ("unixfs".to_owned(), 1)]);
+    assert_eq!(kept_files(&scratch), [shard_path(&scratch, &data)]);
+    let whole: Link = raw(&data).cid().clone().into();
+    assert_eq!(router.same_as(&root).expect("same as"), [(Some(crate::same::UNIXFS.to_owned()), vec![whole])]);
+    let mut out = Vec::new();
+    crate::export::cat(&router, &root, &mut out).expect("cat");
+    assert_eq!(out, data);
+    assert_eq!(router.rehome(u64::MAX).expect("rehome"), crate::store::Rehomed::default(), "once");
+}
+
 #[test]
 fn small_files_are_copied_as_blocks() {
     let scratch = Scratch::new("shards-small");

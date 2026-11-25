@@ -553,8 +553,8 @@ enum ConfigCommand {
 enum FsCommand {
     /// Say what's at each path: its CID and what it is, the anchor it's
     /// in and where (if any: one under `cid/` or `tags/` is in none until
-    /// it's through a mount point), the anchor a mount point names, and its
-    /// tags
+    /// it's through a mount point), the anchor a mount point names, its
+    /// tags, and what's said to be the same as it (`hk same`)
     Stat {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
@@ -2701,6 +2701,11 @@ fn soup_fs(repo: Option<PathBuf>, command: FsCommand) -> anyhow::Result<()> {
                     let tags: Vec<String> = claims.tags(cid.multihash())?.iter().map(|tag| claim::tag_name(tag).map_or_else(|| tag.to_string(), ToOwned::to_owned)).collect();
                     if !tags.is_empty() {
                         out!("tags\t{}", tags.join(" "));
+                    }
+                }
+                for (lens, same) in repo.same_as(&cid)? {
+                    for other in same {
+                        out!("same as\t{other}, as {}", holokeep::same::named(lens.as_deref()));
                     }
                 }
                 if copies || ask.any() {

@@ -2595,9 +2595,10 @@ mod tests {
             assert!(std::fs::read(out.join(name)).expect("read") == big(seed), "{name} as it was");
         }
 
-        // What was copied after all is kept whole later, the same
+        // What was copied after all is kept whole later, the same; and the
+        // anchor's first big file, imported a block a leaf
         let rehomed = catalog.rehome(u64::MAX).expect("rehome");
-        assert_eq!((rehomed.files, rehomed.bytes), (1, 3 * 1024 * 1024));
+        assert_eq!((rehomed.files, rehomed.bytes), (2, 3 * 1024 * 1024 + 3_000_000));
         assert_eq!((copied(), kept()), (0, 3), "c kept whole");
         assert_eq!(catalog.rehome(u64::MAX).expect("again"), crate::store::Rehomed::default());
         let again = scratch.path().join("again");

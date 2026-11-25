@@ -98,11 +98,15 @@ blocks' bytes. Each row is zlib-compressed when that makes it smaller.
   holds it as big as a file would, and a database that big makes for
   slow [[#Compacting|compacts]]. They come to be there as copies of a
   file the mount copied rather than moved, or from before it moved them
-  (see [[Mount#Writing: overlays]]). The node does it in the background, up to 4
-  GiB every ten minutes, biggest first, each file in a transaction of
-  its own, each leaf checked against its CID as it's written out; what
-  compresses to under nine tenths of its size stays. `hk repo compact`
-  does all of it first.
+  (see [[Mount#Writing: overlays]]). So is a file whose leaves are each
+  a block of its own in the shards, as what's fetched from a member is,
+  leaf by leaf, or what was put before files were kept whole: a file per
+  leaf, with no whole multihash to be named by. Kept whole, it's said to
+  be the [[Claims#Same|same]] as its root. The node does it in the
+  background, up to 4 GiB every ten minutes, biggest first, each file in
+  a transaction of its own, each leaf checked against its CID as it's
+  written out; what compresses to under nine tenths of its size stays in
+  the delta store. `hk repo compact` does all of it first.
 
 ## Compacting
 
