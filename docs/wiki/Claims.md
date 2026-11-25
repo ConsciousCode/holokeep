@@ -22,6 +22,7 @@ is not a claim; it's stored as ordinary data.
 | `lost`   | `at: int`                                                                                                 | The targets couldn't be found as of `at`, seconds since the epoch. See [[Replication and Retention#Lost blocks]].                                                                                                                                                                                                                                                                       |
 | `grant`  | `on: Link` (omitted for the mesh), `add: [string]`, `del: [string]` (each omitted if empty), `stands: [Link]` (omitted if empty), `prev: [Link]`, `until: int` (omitted for good) | The targets hold the commands `add`, till `until` if it says, and no longer `del`, after the grants `prev`. Never dissolved. See [[Grants]]. |
 | `same`   | `as: string` (omitted for each codec's data model)                                                        | The targets, two or more, are the same, read through the lens `as`. Never dissolved. See [[#Same]]. |
+| `public` | `mode: string`, `n: int` (omitted if 0)                                                                   | The targets and what they link to are anyone's to have, in `mode`: `serve` or `announce`. `n` is which time, since a tomb is forever. See [[#Public]]. |
 
 Examples, in dag-json for readability:
 
@@ -32,11 +33,12 @@ Examples, in dag-json for readability:
 {"claim": "keep", "copies": 1, "target": [{"/": "bafyqag…"}]}   (made again easily: one copy)
 {"at": 1793750400, "claim": "lost", "target": [{"/": "bafkrei…"}]}
 {"as": "unixfs", "claim": "same", "target": [{"/": "bafkrei…"}, {"/": "bafybei…"}]}   (a file and its whole multihash)
+{"claim": "public", "mode": "serve", "target": [{"/": "bafybei…"}]}   (anyone's who asks, unannounced)
 ```
 
 A node of an older build doesn't know `copies`, so it takes such a keep
 for ordinary data, not a keep; likewise `lost`, `grant`, and a set with
-`for`, and `same`.
+`for`, and `same` and `public`.
 
 Not yet implemented, but planned: `attr` (attributes, with `prev`
 history), `derive` (structure derived from the targets).
@@ -137,6 +139,45 @@ targets are read, its **lens**, and says they read the same through it:
 hk same add --as unixfs <cid> <cid>…   # check, then say so
 hk same ls <cid>                       # lens and CID of what's the same
 hk same rm --as unixfs <a> <b>         # tomb the claims saying both
+```
+
+## Public
+
+Everything is private by default: another account's blocks are as good as
+not here, and nothing is given to anyone outside the mesh. A `public`
+claim makes its targets, and whatever they link to however deep,
+anyone's to have, in a mode:
+
+| Mode       | Given to whoever asks by CID | Announced                       |
+| ---------- | ---------------------------- | ------------------------------- |
+| `serve`    | yes                          | no                              |
+| `announce` | yes                          | the targets, as Kubo's `roots` |
+
+- **Roots are what's announced.** Announcing every block of a big DAG
+  is millions of records reprovided daily; a fetcher finds the rest
+  from whoever provides the root. A public folder is a root like any
+  other.
+- **What a claim reaches is kept, not walked to.** A catalog keeps what
+  each public claim reaches (`public_blocks`): its targets, and what
+  they link to, by the stores' link indexes, whether it's here yet or
+  not, filled in once as the claim's made and as blocks arrive. Whether
+  a block's public is then one indexed lookup, however many ask and
+  however widely the block's shared. Walking up from a block on each
+  request, as for guests, would let anyone make a node visit every
+  parent of a block thousands of files share, only to say no.
+- **A tomb needs nothing taken away.** A claim's rows count only while
+  the claim does, as signed by a key that counts for any account here,
+  and not retracted; making it public again takes a new claim, `n`.
+- **A whole CID is public if its layout is**, as a `unixfs` same claim
+  says (see [[#Same]]).
+- A mode not known is kept, and makes nothing public. Nothing serves or
+  announces yet: Bitswap and Amino will read this.
+
+```
+hk public add [--serve] <cid>…   # anyone's to have; announced unless --serve
+hk public ls                      # mode and root of each
+hk public check <cid>             # public or private, by whatever reaches it
+hk public rm <cid>                # private again
 ```
 
 ## Backreferences

@@ -352,7 +352,7 @@ const SCHEMA: &str =
          CREATE TABLE IF NOT EXISTS claims (
              id INTEGER PRIMARY KEY,
              claim INTEGER UNIQUE REFERENCES multihashes (id),
-             kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant', 'serve', 'same'))
+             kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant', 'serve', 'same', 'public'))
          );
          -- Every claim's targets, which every type has.
          CREATE TABLE IF NOT EXISTS claim_targets (
@@ -421,6 +421,24 @@ const SCHEMA: &str =
              id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
              lens TEXT
          );
+         -- The mode a public claim makes its targets public in, and which
+         -- time it does.
+         CREATE TABLE IF NOT EXISTS public_claims (
+             id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
+             mode TEXT NOT NULL,
+             n INTEGER NOT NULL DEFAULT 0
+         );
+         -- What each public claim reaches, as far as what's here links:
+         -- its targets, and what they link to, however deep, whether it's
+         -- here or not. Kept up as blocks arrive, so whether a block's
+         -- public is one lookup, whoever asks; whether it counts is the
+         -- claim's to say, so a tomb needs nothing taken away.
+         CREATE TABLE IF NOT EXISTS public_blocks (
+             block INTEGER NOT NULL REFERENCES multihashes (id),
+             claim INTEGER NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
+             PRIMARY KEY (block, claim)
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS public_blocks_claim ON public_blocks (claim);
          -- What's particular to each type; a tomb has nothing but targets.
          CREATE TABLE IF NOT EXISTS group_claims (
              id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
@@ -1087,6 +1105,12 @@ impl ClaimStore {
                     .map(Claim::Same)
                     .ok_or_else(|| Error::Invalid { store: NAME, reason: "a same claim of one target".into() })
             },
+            "public" => {
+                let (mode, n): (String, i64) = self.db.conn().prepare_cached("SELECT mode, n FROM public_claims WHERE id = ?1")?.query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                crate::claim::Public::new(self.targets(id)?, mode)
+                    .map(|public| Claim::Public(public.again(u64::try_from(n).unwrap_or_default())))
+                    .ok_or_else(|| Error::Invalid { store: NAME, reason: "a public claim of no targets".into() })
+            },
             _ => Err(Error::Invalid { store: NAME, reason: format!("a claim of kind {kind}") }),
         }
     }
@@ -1519,6 +1543,13 @@ impl ClaimStore {
                 )?
                 .query_row(params![target, prefix, i64::try_from(lost.at()).unwrap_or(i64::MAX)], |r| r.get(0))
                 .optional()?,
+            Claim::Public(public) => self.db.conn()
+                .prepare_cached(
+                    "SELECT c.id FROM claims c JOIN public_claims p ON p.id = c.id JOIN claim_targets t ON t.claim = c.id
+                     WHERE c.claim IS NULL AND t.target = ?1 AND t.prefix = ?2 AND p.mode = ?3 AND p.n = ?4",
+                )?
+                .query_row(params![target, prefix, public.mode(), i64::try_from(public.n()).unwrap_or(i64::MAX)], |r| r.get(0))
+                .optional()?,
             Claim::Keep(_) | Claim::Tomb(_) | Claim::Device(_) => {
                 let (n, copies) = match claim {
                     Claim::Keep(keep) => (keep.n(), keep.copies().unwrap_or_default()),
@@ -1668,6 +1699,17 @@ impl ClaimStore {
         }
         if let Claim::Same(same) = claim {
             conn.prepare_cached("INSERT INTO same_claims (id, lens) VALUES (?1, ?2)")?.execute(params![row, same.lens()])?;
+        }
+        if let Claim::Public(public) = claim {
+            conn.prepare_cached("INSERT INTO public_claims (id, mode, n) VALUES (?1, ?2, ?3)")?
+                .execute(params![row, public.mode(), i64::try_from(public.n()).unwrap_or(i64::MAX)])?;
+            // What it reaches of what's here already
+            let mut stmt = conn.prepare_cached("INSERT OR IGNORE INTO public_blocks (block, claim) VALUES (?1, ?2)")?;
+            for target in public.target() {
+                let target = self.db.intern(target.multihash())?;
+                stmt.execute(params![target, row])?;
+                self.spread_public(target)?;
+            }
         }
         if let Claim::Lost(lost) = claim {
             conn.prepare_cached("INSERT INTO lost_claims (id, at) VALUES (?1, ?2)")?
@@ -1850,6 +1892,68 @@ impl ClaimStore {
         rows.iter().map(|multihash| claim_link(multihash)).collect()
     }
 
+    /// Mark public what a public block links to, however deep, for each
+    /// claim that reaches it, short of what's marked for it already: as
+    /// a claim's made, from its targets, and as a block arrives, from it.
+    /// Links are as the catalog's stores index them, whose tables are in
+    /// any catalog's database.
+    pub(super) fn spread_public(&self, from: Id) -> Result<()> {
+        const UNMARKED: &str = "NOT EXISTS (SELECT 1 FROM public_blocks p WHERE p.block = l.target AND p.claim = down.claim)";
+        self.db.conn()
+            .prepare_cached(&format!(
+                "WITH RECURSIVE down (id, claim) AS (
+                     SELECT block, claim FROM public_blocks WHERE block = ?1
+                     UNION SELECT l.target, down.claim FROM unixfs_links l JOIN down ON l.node = down.id WHERE {UNMARKED}
+                     UNION SELECT l.target, down.claim FROM ipld_links l JOIN down ON l.block = down.id WHERE {UNMARKED}
+                     UNION SELECT l.target, down.claim FROM refs l JOIN down ON l.source = down.id WHERE {UNMARKED}
+                 )
+                 INSERT OR IGNORE INTO public_blocks (block, claim) SELECT id, claim FROM down"
+            ))?
+            .execute([from])?;
+        Ok(())
+    }
+
+    /// Whether a public claim that counts for anyone here, of a mode this
+    /// knows, reaches a block.
+    pub fn is_public(&self, key: Key<'_>) -> Result<bool> {
+        Ok(self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT 1 FROM multihashes m JOIN public_blocks b ON b.block = m.id
+                 JOIN claims c ON c.id = b.claim JOIN public_claims p ON p.id = c.id
+                 WHERE m.multihash = ?1 AND p.mode IN ('{}', '{}') AND {LIVE_ANY} LIMIT 1",
+                crate::claim::Public::ANNOUNCE, crate::claim::Public::SERVE,
+            ))?
+            .exists([key.to_bytes()])?)
+    }
+
+    /// What public claims that count make public, as (mode, target), by
+    /// target: the roots, of whatever mode, known or not.
+    pub fn public_roots(&self) -> Result<Vec<(String, Link)>> {
+        let rows: Vec<(String, Vec<u8>, Vec<u8>)> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT DISTINCT p.mode, t.prefix, m.multihash FROM claims c JOIN public_claims p ON p.id = c.id
+                 JOIN claim_targets t ON t.claim = c.id JOIN multihashes m ON m.id = t.target
+                 WHERE c.kind = 'public' AND {LIVE}
+                 ORDER BY m.multihash, p.mode"
+            ))?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter().map(|(mode, prefix, multihash)| Ok((mode, link(&prefix, &multihash)?))).collect()
+    }
+
+    /// The public claims that count which name a block, by their CIDs:
+    /// what's taken back by a tomb.
+    pub fn publishing(&self, target: Key<'_>) -> Result<Vec<Link>> {
+        let ids: Vec<Id> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT DISTINCT c.id FROM multihashes m JOIN claim_targets t ON t.target = m.id JOIN claims c ON c.id = t.claim
+                 WHERE m.multihash = ?1 AND c.kind = 'public' AND {LIVE}"
+            ))?
+            .query_map([target.to_bytes()], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        ids.into_iter().map(|id| Ok(self.claim(id, "public")?.cid())).collect()
+    }
+
     /// What lost claims that count say, as (block, when), the latest of each.
     pub fn all_lost(&self) -> Result<Vec<(Link, u64)>> {
         let rows: Vec<(Vec<u8>, Vec<u8>, i64)> = self.db.conn()
@@ -2006,7 +2110,7 @@ impl ClaimStore {
 /// constraint, which doesn't touch how rows are stored, is rewritten in
 /// place, as `SQLite` documents for such changes.
 fn widen_kinds(db: &Db) -> Result<()> {
-    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant', 'serve', 'same'))";
+    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant', 'serve', 'same', 'public'))";
     let conn = db.conn();
     let sql: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'claims'", [], |row| row.get(0))?;
     if sql.contains(KINDS) {

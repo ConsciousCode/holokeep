@@ -7,7 +7,9 @@
 //! acts for it (see `keys`). And `Lost`, a report that blocks couldn't be
 //! found; and `Grant`, which gives or takes away what users and machines
 //! may do in a mesh (see `grants`). And `Same`, which says its targets
-//! are the same, read through a lens (see `same`).
+//! are the same, read through a lens (see `same`). And `Public`, which
+//! says its targets and what they link to may be given to anyone who
+//! asks, and whether to say so.
 //!
 //! Signatures are claims about claims, rather than inside them, so equal
 //! claims stay equal blocks whoever makes them, and small ones dissolve.
@@ -201,6 +203,25 @@ pub struct Same {
     as_: Option<String>,
 }
 
+/// "The targets, and whatever they link to, however deep, are anyone's to
+/// have."
+///
+/// In `serve` mode, they're given to whoever asks for them by CID; in
+/// `announce`, the targets alone are announced as being here too, as
+/// Kubo's `roots` strategy announces.
+///
+/// A mode is a name, so one this doesn't know is kept, and makes nothing
+/// public. Like a keep, `n` counts which time the targets are made public,
+/// since a tomb is forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Public {
+    /// Sorted by CID bytes and distinct.
+    target: Vec<Link>,
+    mode: String,
+    /// Left out when 0.
+    n: u64,
+}
+
 /// Any claim this understands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
@@ -214,6 +235,7 @@ pub enum Claim {
     Grant(Grant),
     Serve(Serve),
     Same(Same),
+    Public(Public),
 }
 
 /// Sort links by their bytes and drop repeats, making them a set.
@@ -443,6 +465,33 @@ impl Same {
     pub fn lens(&self) -> Option<&str> { self.as_.as_deref() }
 }
 
+impl Public {
+    /// Given to whoever asks by CID, and the targets announced.
+    pub const ANNOUNCE: &str = "announce";
+    /// Given to whoever asks by CID, never announced.
+    pub const SERVE: &str = "serve";
+
+    /// The targets made public in a mode, if there are any, and the mode's
+    /// named.
+    pub fn new(target: impl IntoIterator<Item = Link>, mode: impl Into<String>) -> Option<Self> {
+        let (target, mode) = (set(target), mode.into());
+        (!target.is_empty() && !mode.is_empty()).then_some(Self { target, mode, n: 0 })
+    }
+
+    /// The same, but the `n`th time.
+    #[must_use]
+    pub const fn again(mut self, n: u64) -> Self {
+        self.n = n;
+        self
+    }
+
+    pub fn target(&self) -> &[Link] { &self.target }
+
+    pub fn mode(&self) -> &str { &self.mode }
+
+    pub const fn n(&self) -> u64 { self.n }
+}
+
 impl Lost {
     /// A report of the targets lost, if there are any.
     pub fn new(target: impl IntoIterator<Item = Link>, at: u64) -> Option<Self> {
@@ -456,6 +505,19 @@ impl Lost {
 }
 
 /// A serve claim's fields, taken from its map.
+/// A public claim's mode and time from its map, taken out of it.
+fn parse_public(map: &mut BTreeMap<String, Ipld>, target: Vec<Link>) -> Option<Public> {
+    let Ipld::String(mode) = map.remove("mode")? else {
+        return None;
+    };
+    let n = match map.remove("n") {
+        Some(Ipld::Integer(n)) => u64::try_from(n).ok().filter(|&n| n > 0)?,
+        Some(_) => return None,
+        None => 0,
+    };
+    Some(Public::new(target, mode)?.again(n))
+}
+
 fn parse_serve(map: &mut BTreeMap<String, Ipld>, target: &[Link]) -> Option<Serve> {
     let (Ipld::Bytes(node), Ipld::String(service), Ipld::Integer(at)) = (map.remove("node")?, map.remove("service")?, map.remove("at")?) else {
         return None;
@@ -565,6 +627,7 @@ impl Claim {
             Self::Grant(grant) => grant.target(),
             Self::Serve(serve) => serve.target(),
             Self::Same(same) => same.target(),
+            Self::Public(public) => public.target(),
         }
     }
 
@@ -581,6 +644,7 @@ impl Claim {
             Self::Grant(_) => "grant",
             Self::Serve(_) => "serve",
             Self::Same(_) => "same",
+            Self::Public(_) => "public",
         }
     }
 
@@ -660,6 +724,13 @@ impl Claim {
                     map.insert("as".to_owned(), Ipld::String(lens.clone()));
                 }
                 ("same", map)
+            },
+            Self::Public(public) => {
+                let mut map = BTreeMap::from([("mode".to_owned(), Ipld::String(public.mode.clone()))]);
+                if public.n > 0 {
+                    map.insert("n".to_owned(), Ipld::Integer(public.n.into()));
+                }
+                ("public", map)
             },
         };
         map.insert("claim".to_owned(), Ipld::String(kind.to_owned()));
@@ -789,6 +860,7 @@ impl Claim {
                 };
                 Self::Same(Same::new(target.clone(), lens)?)
             },
+            "public" => Self::Public(parse_public(&mut map, target.clone())?),
             _ => return None,
         };
         // Nothing else, sorted and distinct already, and canonical dag-cbor
@@ -1000,6 +1072,24 @@ mod tests {
         assert_eq!(Claim::parse(lasting.block().data()), Some(lasting), "no until, as before");
         // Taking away lasts
         assert!(Grant::new([user], Some(cid(b"a")), [], read(), [], []).expect("grant").until(Some(1)).is_none());
+    }
+
+    #[test]
+    fn a_public_claim_names_its_mode_and_counts_again() {
+        let (a, b) = (cid(b"a"), cid(b"b"));
+        assert!(Public::new([], Public::ANNOUNCE).is_none());
+        assert!(Public::new([a.clone()], "").is_none(), "a mode has a name");
+        let announced = Claim::Public(Public::new([a.clone()], Public::ANNOUNCE).expect("public"));
+        let served = Claim::Public(Public::new([a.clone()], Public::SERVE).expect("public"));
+        let again = Claim::Public(Public::new([a.clone()], Public::ANNOUNCE).expect("public").again(1));
+        let both = Claim::Public(Public::new([b, a], "pigeons").expect("a mode not known is kept"));
+        for claim in [&announced, &served, &again, &both] {
+            assert_eq!(Claim::parse(claim.block().data()).as_ref(), Some(claim));
+        }
+        assert!(announced.dissolves(), "one target, small");
+        assert_ne!(announced.cid(), served.cid());
+        assert_ne!(announced.cid(), again.cid());
+        assert_eq!(Claim::Public(Public::new([cid(b"a")], Public::ANNOUNCE).expect("public").again(0)).cid(), announced.cid(), "0 is left out");
     }
 
     #[test]

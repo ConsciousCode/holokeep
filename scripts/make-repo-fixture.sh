@@ -49,6 +49,9 @@ git=$(h git import "$tmp/git" 2>/dev/null | awk '$2 == "HEAD" { print $1 }')
 rechunked=$(h add -q --no-keep -s size-65536 "$tmp/tree/sub/big.txt")
 h same add --as unixfs "$big" "$rechunked" >/dev/null
 
+# Given to whoever asks for it, unannounced, and all it links to
+h public add --serve "$tree" >/dev/null
+
 # Reported lost: what's never been here, so it stays so
 printf 'lost from %s\n' "$name" > "$tmp/lost.txt"
 lost=$(h add -q -n "$tmp/lost.txt")
@@ -88,6 +91,7 @@ viewed $viewed
 served $anchor
 same $big
 rechunked $rechunked
+public $tree
 EXPECT
 echo "made $out"
 du -sh "$out"

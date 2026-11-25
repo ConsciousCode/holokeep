@@ -90,6 +90,10 @@ enum Command {
     /// dag-cbor or dag-json, by any hash function
     #[command(subcommand)]
     Same(SameCommand),
+    /// Make things anyone's to have: given to whoever asks for them by CID,
+    /// and announced, or not. Everything else is private
+    #[command(subcommand)]
+    Public(PublicCommand),
     /// Keep things with friends, encrypted: in this account's vault, which
     /// joins their protected meshes
     #[command(subcommand)]
@@ -430,6 +434,29 @@ enum SameCommand {
     Ls { cid: Link },
 }
 
+#[derive(Subcommand, Debug)]
+enum PublicCommand {
+    /// Make blocks, and whatever they link to, anyone's to have, printing
+    /// each claim
+    Add {
+        /// Give them to whoever asks by CID, but never announce them;
+        /// otherwise the blocks named are announced too
+        #[arg(long)]
+        serve: bool,
+        #[arg(required = true)]
+        cids: Vec<Link>,
+    },
+    /// Make a block private again, in whatever mode it was made public,
+    /// printing the tombs. What it links to stays public if something else
+    /// public does too
+    Rm { cid: Link },
+    /// List what's been made public, a line each: the mode, and the CID
+    Ls,
+    /// Say whether a block's anyone's to have, as what's public here,
+    /// whichever account made it so, reaches it: `public` or `private`
+    Check { cid: Link },
+}
+
 /// A lens as `hk same` takes it: `data` is none, each codec's data model.
 fn lens_named(lens: &str) -> Option<&str> {
     (lens != holokeep::same::named(None)).then_some(lens)
@@ -554,7 +581,8 @@ enum FsCommand {
     /// Say what's at each path: its CID and what it is, the anchor it's
     /// in and where (if any: one under `cid/` or `tags/` is in none until
     /// it's through a mount point), the anchor a mount point names, its
-    /// tags, and what's said to be the same as it (`hk same`)
+    /// tags, what's said to be the same as it (`hk same`), and whether it's
+    /// public (`hk public`)
     Stat {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
@@ -1422,6 +1450,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Keep(command) => keep_here_or_there(args.repo, command),
         Command::Lost(command) => lost(args.repo, command),
         Command::Same(command) => same(args.repo, command),
+        Command::Public(command) => public(args.repo, command),
         Command::Whoami => whoami(args.repo),
         Command::Protect(command) => protect(&repo_dir(args.repo)?, command),
         Command::Cap(command) => cap(args.repo, command),
@@ -2718,6 +2747,9 @@ fn soup_fs(repo: Option<PathBuf>, command: FsCommand) -> anyhow::Result<()> {
                         out!("same as\t{other}, as {}", holokeep::same::named(lens.as_deref()));
                     }
                 }
+                if repo.is_public(&cid)? {
+                    out!("public\tanyone's to have");
+                }
                 if copies || ask.any() {
                     dag_health(&repo, &dir, &cid, ask)?;
                 }
@@ -3641,6 +3673,39 @@ fn same(repo: Option<PathBuf>, command: SameCommand) -> anyhow::Result<()> {
                 }
             }
         },
+    }
+    Ok(out.flush()?)
+}
+
+fn public(repo: Option<PathBuf>, command: PublicCommand) -> anyhow::Result<()> {
+    use holokeep::claim::Public;
+    let mut repo = open_repo(repo)?;
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    match command {
+        PublicCommand::Add { serve, cids } => {
+            let mode = if serve { Public::SERVE } else { Public::ANNOUNCE };
+            repo.batch(|repo| {
+                for cid in &cids {
+                    writeln!(out, "{}", repo.publish(cid, mode)?)?;
+                }
+                anyhow::Ok(())
+            })?;
+        },
+        PublicCommand::Rm { cid } => {
+            let tombs = repo.unpublish(&cid)?;
+            if tombs.is_empty() {
+                anyhow::bail!("{cid} wasn't made public here");
+            }
+            for tomb in tombs {
+                writeln!(out, "{tomb}")?;
+            }
+        },
+        PublicCommand::Ls => {
+            for (mode, root) in repo.public_roots()? {
+                writeln!(out, "{mode}\t{root}")?;
+            }
+        },
+        PublicCommand::Check { cid } => writeln!(out, "{}", if repo.is_public(&cid)? { "public" } else { "private" })?,
     }
     Ok(out.flush()?)
 }

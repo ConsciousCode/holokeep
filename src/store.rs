@@ -243,7 +243,7 @@ pub trait Store: BlockIndex + BlockSource + BlockStore {
 /// making it over as it knows it, its views say, would break what the newer
 /// build reads them with, where that's still running. Raise it with any
 /// change to them (and make a repo fixture, `scripts/make-repo-fixture.sh`).
-pub const SCHEMA: i64 = 5;
+pub const SCHEMA: i64 = 6;
 
 pub const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -3550,6 +3550,63 @@ impl Catalog {
         Ok(said)
     }
 
+    /// Make a block, and whatever it links to, anyone's to have, in a mode
+    /// (see `claim::Public`). Returns the claim's CID.
+    pub fn publish(&self, target: &Link, mode: &str) -> Result<Link> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let public = crate::claim::Public::new([target.clone()], mode).ok_or_else(|| Error::User("a mode has a name".into()))?;
+        // A tomb is forever, so making it public again once it's been made
+        // private takes the next time that hasn't been
+        let mut n = 0u64;
+        let claim = loop {
+            let claim = Claim::Public(public.clone().again(n));
+            if !claims.retracted(&claim.cid())? {
+                break claim;
+            }
+            n = n.saturating_add(1);
+        };
+        self.put_claim(&claim)
+    }
+
+    /// Take back making a block public, in whatever mode: a tomb of each
+    /// public claim that counts naming it. What it links to stays public
+    /// if another claim reaches it otherwise. Returns the tombs.
+    pub fn unpublish(&self, target: &Link) -> Result<Vec<Link>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let mut tombs = Vec::new();
+        for public in claims.publishing(target.multihash())? {
+            tombs.push(self.put_claim(&Claim::Tomb(Tomb::new([public]).ok_or(Error::NoClaims)?))?);
+        }
+        Ok(tombs)
+    }
+
+    /// What public claims that count for the acting account make public,
+    /// as (mode, root).
+    pub fn public_roots(&self) -> Result<Vec<(String, Link)>> {
+        self.claims.as_ref().map_or(Ok(Vec::new()), |claims| claims.public_roots())
+    }
+
+    /// Whether a block's anyone's to have, as a public claim that counts
+    /// for any account here says of it or what links to it: a whole file's
+    /// CID, which is no block, if a layout it's said to be the same as is.
+    pub fn is_public(&self, cid: &Link) -> Result<bool> {
+        let Some(claims) = &self.claims else {
+            return Ok(false);
+        };
+        if claims.is_public(cid.multihash())? {
+            return Ok(true);
+        }
+        if cid.codec() != crate::cid::RAW_CODEC || self.has(cid.multihash())? {
+            return Ok(false);
+        }
+        for layout in claims.same_as(cid, Some(crate::same::UNIXFS))? {
+            if layout.codec() == crate::cid::DAG_PB_CODEC && claims.is_public(layout.multihash())? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Take back saying that `a` and `b` are the same, read through `lens`:
     /// a tomb of each same claim that counts of both. What else says so,
     /// by way of other blocks, stands. Returns the tombs.
@@ -3768,6 +3825,10 @@ impl Catalog {
             }
             if new_cid && let Some(anchor) = mount_point(block.cid().codec(), block.data()) {
                 self.index_mount_point(id, &anchor)?;
+            }
+            // What's under it is public if it is
+            if new_cid && let Some(claims) = &self.claims {
+                claims.spread_public(id)?;
             }
             self.db.conn()
                 .prepare_cached(

@@ -3172,6 +3172,13 @@ fn repos_earlier_builds_made_still_open() {
         // And older ones can be served now
         repo.serve_anchor(&expect["anchor"], b"node", "later", false).expect("serve");
         assert_eq!(repo.serving(&expect["anchor"]).expect("serving").map(|serve| serve.service().to_owned()).as_deref(), Some("later"), "{name}");
+        if let Some(public) = expect.get("public") {
+            assert_eq!(repo.public_roots().expect("roots"), [(crate::claim::Public::SERVE.to_owned(), public.clone())], "{name}");
+            assert!(repo.is_public(&expect["hello"]).expect("public"), "{name}: what it links to");
+        }
+        // And older ones can make things public now, all they link to
+        repo.publish(&expect["tree"], crate::claim::Public::ANNOUNCE).expect("publish");
+        assert!(repo.is_public(&expect["big"]).expect("public"), "{name}: what the tree links to, made public after it was here");
         // Older ones can say so now too
         let reported: Link = raw(name.as_bytes()).cid().clone().into();
         repo.report_lost(&reported).expect("report").expect("a claim");
@@ -3857,4 +3864,85 @@ fn a_whole_cid_is_read_through_a_layout_members_say_it_is_the_same_as() {
     let (elsewhere, _) = member("elsewhere", &user, sent);
     let err = crate::export::Fetch::same_file(&elsewhere, &whole).expect_err("not followed");
     assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+}
+
+/// Every block a DAG's made of, by walking it from its root.
+fn dag_blocks(repo: &Catalog, root: &Link) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    let mut queue = vec![root.clone()];
+    while let Some(cid) = queue.pop() {
+        let Some(block) = repo.get_block(&cid).expect("get") else {
+            continue;
+        };
+        queue.extend(crate::links::links(cid.codec(), block.data()).expect("links"));
+        blocks.push(block);
+    }
+    blocks
+}
+
+/// What's made public is, and all it links to, wherever it's stored: a
+/// kept file's leaves and its whole CID too. Nothing else is. A tomb takes
+/// it back, and making it public again counts again.
+#[test]
+fn what_is_made_public_reaches_all_it_links_to_and_only_that() {
+    let scratch = Scratch::new("public");
+    let tree = scratch.path().join("tree");
+    std::fs::create_dir_all(tree.join("sub")).expect("mkdir");
+    let big = content(1000, 3);
+    std::fs::write(tree.join("sub/big"), &big).expect("write");
+    std::fs::write(tree.join("small"), "small").expect("write");
+    let mut router = sharded(&scratch);
+    let root: Link = import_copying(&mut router, &tree).cid.into();
+    let other: Link = Importer::default().add_file(b"private".as_slice(), &mut router).expect("add").cid.into();
+    let cids: Vec<Link> = dag_blocks(&router, &root).iter().map(|block| block.cid().clone().into()).collect();
+    assert!(cids.len() > 5, "a DAG of some depth: {}", cids.len());
+    assert!(!kept_files(&scratch).is_empty(), "the big file's kept whole");
+    let whole: Link = raw(&big).cid().clone().into();
+    assert!(!router.is_public(&root).expect("public"), "private till it's said");
+
+    let claim = router.publish(&root, crate::claim::Public::ANNOUNCE).expect("publish");
+    for cid in &cids {
+        assert!(router.is_public(cid).expect("public"), "{cid}");
+    }
+    assert!(router.is_public(&whole).expect("public"), "a kept file's whole CID, by its layout");
+    assert!(!router.is_public(&other).expect("public"));
+    assert_eq!(router.public_roots().expect("roots"), [(crate::claim::Public::ANNOUNCE.to_owned(), root.clone())]);
+
+    // Taken back, and made public again, which takes a new claim
+    assert_eq!(router.unpublish(&root).expect("unpublish").len(), 1);
+    assert!(cids.iter().all(|cid| !router.is_public(cid).expect("public")), "private again");
+    assert!(router.public_roots().expect("roots").is_empty());
+    let again = router.publish(&root, crate::claim::Public::SERVE).expect("publish");
+    assert_ne!(again, claim);
+    assert!(cids.iter().all(|cid| router.is_public(cid).expect("public")), "served");
+
+    // A mode not known makes nothing public
+    let pigeons = Claim::Public(crate::claim::Public::new([other.clone()], "pigeons").expect("public"));
+    router.put_claim(&pigeons).expect("put");
+    assert!(!router.is_public(&other).expect("public"));
+}
+
+/// What's made public before its blocks are here is public as they come,
+/// in whatever order.
+#[test]
+fn what_is_made_public_before_it_arrives_is_public_as_it_does() {
+    let scratch = Scratch::new("public-later");
+    let tree = scratch.path().join("tree");
+    std::fs::create_dir_all(tree.join("a/b")).expect("mkdir");
+    std::fs::write(tree.join("a/b/deep"), content(3000, 1)).expect("write");
+    std::fs::write(tree.join("top"), "top").expect("write");
+    let mut there = router();
+    let importer = Importer { chunk_size: 500, ..Importer::default() };
+    let root: Link = importer.add_path(&tree, &mut there, &mut |_, _| {}).expect("import").expect("root").cid.into();
+    let blocks = dag_blocks(&there, &root);
+    for (order, blocks) in [("root first", blocks.clone()), ("leaves first", blocks.iter().rev().cloned().collect())] {
+        let here = router();
+        here.publish(&root, crate::claim::Public::ANNOUNCE).expect("publish");
+        for block in &blocks {
+            here.put_block(block, CidVersion::V1).expect("put");
+        }
+        for block in &blocks {
+            assert!(here.is_public(&block.cid().clone().into()).expect("public"), "{order}: {}", block.cid());
+        }
+    }
 }

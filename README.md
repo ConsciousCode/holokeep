@@ -234,6 +234,14 @@ type Same struct {
   target [Link]
   as optional String
 }
+# Targets, and what they link to, are anyone's to have: given to whoever
+# asks by CID ("serve"), and the targets announced too ("announce").
+# `n` counts which time, since a tomb is forever.
+type Public struct {
+  target [Link]
+  mode String
+  n optional Int
+}
 # Attributes associated with the targets.
 type Attr struct {
   target [Link]
@@ -249,6 +257,7 @@ type Claim union {
   | Tomb "tomb"
   | Group "group"
   | Same "same"
+  | Public "public"
   | Attr "attr"
   | Derive "derive"
 } representation inline {
@@ -294,7 +303,7 @@ Audit/repair and trickle GC are the same homeostasis with opposite signs, akin t
 
 - **Private**: Nodes join a private DHT to stochastically replicate files. These are assumed to be owned by the same entity and are fully permissioned and trusted. Replication is aware of blockstores, which are identified by private-DHT-local UUIDs because nodes are not assumed to own their stores outright. This allows, eg, multiple nodes sharing access to cloud storage without double-counting replicas.
 - **Protected**: Private DHTs can connect at the periphery to semi-trusted nodes (eg owned by friends) which are trusted to provide and maintain access control for encrypted blocks, for mutual replication. Negotiating who provides what is out of scope, but this could also serve paid nodes. The protected tier is a commons, mutual aid: sharing as infrastructure instead of sharing through a platform. Its accounting should be legible enough for trust, but not so financialized it becomes a market.
-- **Public**: The Amino DHT, for public block access. Imported blocks are private by default, and bitswap participation happens only for blocks that are shared or were obtained from bitswap in the first place, to avoid leaking information.
+- **Public**: The Amino DHT, for public block access. Imported blocks are private by default; a `Public` claim makes its targets and all they link to anyone's to have, in `serve` mode given to whoever asks by CID, or in `announce` mode the targets announced too (roots only, as Kubo's `roots` strategy; a public folder is just a root). A catalog keeps what each public claim reaches (`public_blocks`), up to date as blocks arrive, so whether a block's public is one indexed lookup however many ask: an upward walk on every request, as guests get, would let anyone make a node visit every parent of a widely shared block, and announcing needs the list anyway. A tomb takes it back without touching the table, since a claim's rows count only while it does. Blocks held by taking part in Bitswap, which peers asked to be held in exchange, are served and provided as anyone's would be, so that withholding some isn't a tell that they're private; blocks fetched from Amino while browsing aren't, since serving them back says what was read. A private block is answered as missing, alike in what's said and how soon.
 
 Nodes within a mesh use anti-entropy to maintain a well-replicated set of blocks, mediated by set reconciliation. When a new node joins, all peers share lists of multihashes they believe are under-replicated; each node aggregates these and responds with a Bloom filter of every block it hosts.
 
@@ -450,6 +459,10 @@ Checklist:
   - [ ] Proving copies: members answering a challenge with a hash of the block, for media that don't look after their own integrity
   - [x] Configuration beyond the command line: a node's tunables, such as how often it pings and how long it waits, so tests can run them short and nodes in one mesh can differ; and the mounts a node keeps, so it runs as a service (`config.toml`, `hk config`, `hk node service`)
 - [ ] Public Amino DHT
+  - [x] `Public` claims, in `serve` or `announce` mode, and what each reaches kept as blocks arrive, so whether a block's public is one lookup; a kept file's whole CID is public if its layout is (`hk public add/rm/ls/check`)
+  - [ ] Public anchors and groups: following what an anchor is now, or a group's members, kept up as they change
+  - [ ] Bitswap: answering for public blocks, and as missing, alike in timing, for private ones; holding what peers ask in exchange, served and provided as anyone's
+  - [ ] Providing announced roots on Amino, and reproviding them
 - [ ] BitTorrent bridging
 - [ ] User ownership model
   - [x] A user's root key certifies its devices; claims count only when an authorized device signs them; revoking a device signs again what it said before it was lost (`hk device list/revoke`, certificates in `hk node invite` tickets)
