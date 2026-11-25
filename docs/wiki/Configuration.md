@@ -45,6 +45,7 @@ port.
 | `door`       | boolean or multiaddr    | off                             | Open a door: `true` on port 4013, or where it says (`--door`); see [[Capabilities]].                       |
 | `ping`       | duration                | `"10s"`                         | How often a connection's pinged, and how long an answer's waited for, before it's closed and redialled.     |
 | `idle`       | duration                | `"1h"`                          | How long a connection with nothing going on is kept open.                                                  |
+| `relay`      | boolean                 | false                           | Relay between members which can't reach each other, for a member they all can; see [[Mesh#Relays]].         |
 
 A size is a number of bytes, or a string with `K`, `M`, `G` or `T`
 (binary). A duration is a string with `ms`, `s`, `m`, `h` or `d`:

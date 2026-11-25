@@ -52,8 +52,12 @@ impl Ports {
 }
 
 /// An address's port, TCP's or the in-memory transport's, as tests use;
-/// nothing listens on port 0, which asks for any.
+/// nothing listens on port 0, which asks for any. An address through a
+/// relay has no port of this node's, whatever port the relay's on.
 pub fn port(addr: &Multiaddr) -> Option<u64> {
+    if addr.iter().any(|protocol| protocol == Protocol::P2pCircuit) {
+        return None;
+    }
     addr.iter().find_map(|protocol| match protocol {
         Protocol::Tcp(port) => Some(u64::from(port)),
         Protocol::Memory(port) => Some(port),

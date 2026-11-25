@@ -21,6 +21,25 @@ async fn node(swarm_key: PreSharedKey) -> Node {
     }
 }
 
+/// A node over the in-memory transport which may be reached through
+/// relays, and relays itself if `relays`: listening directly only if
+/// `listens`.
+async fn relayed_node(swarm_key: PreSharedKey, relays: bool, listens: bool) -> Node {
+    let key = Keypair::generate_ed25519();
+    let members = Members::open(Db::memory().expect("db"), crate::net::mesh::MAIN).expect("members");
+    let ports = Ports::default();
+    let (relayed, client) = relay::client::new(key.public().to_peer_id());
+    let transport = transport(relayed.or_transport(MemoryTransport::default()), &key, swarm_key, ports.clone()).expect("transport");
+    let catalog = Catalog::standard(Db::memory().expect("db")).expect("catalog");
+    let tunables = Tunables { relay: relays, ..Tunables::default() };
+    let mut node = Node::relayed(transport, client, &key, catalog, members, false, ports, tunables).expect("node");
+    if listens {
+        node.listen(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
+        while !matches!(node.next().await.expect("event"), Event::Listening(_)) {}
+    }
+    node
+}
+
 /// Invite one node to another's mesh, as `hk node invite` and `join` do.
 fn invite(inviter: &Node, joiner: &Node, swarm_key: PreSharedKey) {
     inviter.members().add(&joiner.peer_id()).expect("add");
@@ -105,6 +124,73 @@ async fn members_tell_each_other_of_members() {
     }
     // Once both have spoken to a, b and c let each other in and connect
     assert!(until(&mut [&mut a, &mut b, &mut c], |n| connected(n[0], n[1]) && connected(n[0], n[2]) && connected(n[1], n[2])).await);
+}
+
+/// Two members which listen nowhere the other can reach connect through
+/// a member relaying, and fetch from each other over the circuit, which
+/// is the private network and noise end to end.
+#[tokio::test]
+async fn members_which_cant_reach_each_other_connect_through_a_relay() {
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let mut relay = relayed_node(swarm_key, true, true).await;
+    let (mut a, mut b) = (relayed_node(swarm_key, false, false).await, relayed_node(swarm_key, false, false).await);
+    invite(&relay, &a, swarm_key);
+    invite(&relay, &b, swarm_key);
+    a.members().add(&b.peer_id()).expect("add");
+    b.members().add(&a.peer_id()).expect("add");
+    for node in [&mut relay, &mut a, &mut b] {
+        node.reload().expect("reload");
+    }
+    a.dial_members().expect("dial");
+    b.dial_members().expect("dial");
+    // Each holds a reservation on the relay, and listens through it
+    let reserved = |node: &Node| node.listeners().iter().any(super::is_relayed);
+    assert!(until(&mut [&mut relay, &mut a, &mut b], |n| reserved(n[1]) && reserved(n[2])).await, "reserved");
+    a.dial_members().expect("dial");
+    assert!(until(&mut [&mut relay, &mut a, &mut b], |n| connected(n[1], n[2])).await, "connected through the relay");
+    let block = raw(b"over the circuit");
+    a.catalog().put_block(&block, CidVersion::V1).expect("put");
+    b.fetch(link(&block)).expect("fetch");
+    assert!(until(&mut [&mut relay, &mut a, &mut b], |n| has(n[2], &block)).await, "fetched over the circuit");
+    assert!(!has(&relay, &block), "the relay passed it on, and kept nothing");
+    // Once they're connected directly, the circuit's let go of
+    assert!(!a.circuits.is_empty() && !b.circuits.is_empty(), "connected through the relay");
+    b.listen(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
+    assert!(until(&mut [&mut relay, &mut a, &mut b], |n| n[2].listeners().iter().any(|addr| !super::is_relayed(addr))).await);
+    let direct = b.listeners().into_iter().find(|addr| !super::is_relayed(addr)).expect("listening");
+    a.dial(b.peer_id(), vec![direct]);
+    assert!(until(&mut [&mut relay, &mut a, &mut b], |n| n[1].circuits.is_empty() && n[2].circuits.is_empty() && connected(n[1], n[2])).await, "connected directly, and only so");
+}
+
+/// A relay relays for none but members, which alone reach it, and to
+/// none who wouldn't let them in directly.
+#[tokio::test]
+async fn a_relay_relays_only_for_members() {
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let mut relay = relayed_node(swarm_key, true, true).await;
+    let mut member = relayed_node(swarm_key, false, false).await;
+    invite(&relay, &member, swarm_key);
+    relay.reload().expect("reload");
+    member.reload().expect("reload");
+    member.dial_members().expect("dial");
+    let reserved = |node: &Node| node.listeners().iter().any(super::is_relayed);
+    assert!(until(&mut [&mut relay, &mut member], |n| reserved(n[1])).await, "reserved");
+    // With the key, knowing where the member listens, but no member
+    let mut intruder = relayed_node(swarm_key, false, false).await;
+    intruder.members().add(&member.peer_id()).expect("add");
+    intruder.reload().expect("reload");
+    let at = member.listeners().into_iter().find(super::is_relayed).expect("relayed");
+    intruder.dial(member.peer_id(), vec![at.clone()]);
+    assert!(!within(Duration::from_secs(2), &mut [&mut relay, &mut member, &mut intruder], |n| connected(n[1], n[2])).await);
+    // Nor through the relay to a member which doesn't let it in, though
+    // the relay does
+    relay.members().add(&intruder.peer_id()).expect("add");
+    relay.reload().expect("reload");
+    intruder.members().add(&relay.peer_id()).expect("add");
+    intruder.reload().expect("reload");
+    intruder.dial(member.peer_id(), vec![at]);
+    assert!(!within(Duration::from_secs(2), &mut [&mut relay, &mut member, &mut intruder], |n| connected(n[1], n[2])).await);
+    assert!(intruder.swarm.is_connected(&relay.peer_id()), "the relay let it in");
 }
 
 #[test]

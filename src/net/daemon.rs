@@ -503,7 +503,7 @@ fn open_node(place: &Place) -> Result<(Node, bool)> {
     }
     let tuned = crate::config::Config::load(dir).map_err(|e| Error::Invalid(e.to_string()))?.node(&place.mesh);
     let defaults = super::node::Tunables::default();
-    let tunables = super::node::Tunables { ping: tuned.ping.unwrap_or(defaults.ping), idle: tuned.idle.unwrap_or(defaults.idle) };
+    let tunables = super::node::Tunables { ping: tuned.ping.unwrap_or(defaults.ping), idle: tuned.idle.unwrap_or(defaults.idle), relay: tuned.relay.unwrap_or(defaults.relay) };
     let mut node = Node::tcp(&key, swarm_key, catalog, members, tunables)?;
     serve_accounts(&mut node, dir)?;
     Ok((node, alone))
@@ -1085,6 +1085,17 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
         let _ = writeln!(out, "client of\t{member}");
     }
     let _ = writeln!(out, "connected\t{}", node.connected().len());
+    let relayed = node.connected().iter().filter(|peer| node.relayed_only(peer)).count();
+    if relayed > 0 {
+        let _ = writeln!(out, "through relays\t{relayed}");
+    }
+    if !node.relays().is_empty() {
+        let relays: Vec<String> = node.relays().iter().map(ToString::to_string).collect();
+        let _ = writeln!(out, "reachable through\t{}", relays.join(" "));
+    }
+    if node.relaying() {
+        let _ = writeln!(out, "relaying\tfor members");
+    }
     if let Some((ahead, members)) = node.clocks().mesh() {
         let _ = writeln!(out, "clock\t{} from the mesh's, the median of {members} members'", crate::net::clock::shown(ahead.saturating_neg()));
     }
@@ -1137,7 +1148,11 @@ fn peers(node: &Node) -> Result<String> {
     let connected = node.connected();
     // A ticket's list includes whoever it let in
     for (peer, addrs) in node.members().list()?.into_iter().filter(|(peer, _)| *peer != node.peer_id()) {
-        let state = if connected.contains(&peer) { "connected" } else { "-" };
+        let state = match connected.contains(&peer) {
+            true if node.relayed_only(&peer) => "connected through a relay",
+            true => "connected",
+            false => "-",
+        };
         let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
         // Which accounts here its users are, once it's said
         let hosts: Vec<String> = if connected.contains(&peer) { node.hosted_by(&peer)?.iter().map(ToString::to_string).collect() } else { Vec::new() };

@@ -17,7 +17,7 @@ fuser = ["dep:fuser"]
 libc = ["dep:libc"]
 
 [dependencies]
-libp2p = { version = "0.56", optional = true, features = ["tokio", "tcp", "noise", "yamux", "pnet", "macros", "identify", "ping", "mdns", "kad", "request-response", "cbor", "ed25519"] }
+libp2p = { version = "0.56", optional = true, features = ["tokio", "tcp", "noise", "yamux", "pnet", "macros", "identify", "ping", "mdns", "kad", "request-response", "cbor", "ed25519", "relay", "dcutr"] }
 tokio = { version = "1", optional = true, features = ["rt", "net", "macros", "time", "io-util", "sync", "signal"] }
 notify = { version = "8", optional = true, default-features = false }
 thiserror = "2.0"

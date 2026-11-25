@@ -17,6 +17,7 @@ run=hkmesh-$$
 net=$run
 timeout=${TIMEOUT:-60}
 nodes=()
+nets=("$net")
 
 cleanup() {
     if [ "${KEEP:-}" = 1 ]; then
@@ -26,7 +27,9 @@ cleanup() {
     for node in "${nodes[@]}"; do
         podman rm -f -t 0 "$node" >/dev/null 2>&1 || true
     done
-    podman network rm -f "$net" >/dev/null 2>&1 || true
+    for network in "${nets[@]}"; do
+        podman network rm -f "$network" >/dev/null 2>&1 || true
+    done
 }
 trap cleanup EXIT
 
@@ -62,10 +65,10 @@ wait_for() {
     done
 }
 
-# A machine, on the network, with hk and FUSE
+# A machine, on the network or another, with hk and FUSE
 machine() {
-    local name=$1
-    podman run -d --name "$run-$name" --hostname "$name" --network "$net" \
+    local name=$1 network=${2:-$net}
+    podman run -d --name "$run-$name" --hostname "$name" --network "$network" \
         --device /dev/fuse --cap-add SYS_ADMIN \
         -v "$PWD/target/release/hk:/usr/local/bin/hk:ro" \
         -v "$PWD/tests/mesh/tiny9p.py:/usr/local/share/tiny9p.py:ro" \
@@ -512,6 +515,43 @@ scenario_client() {
     wait_for "the laptop to be cut off" sh_on laptop "hk node status | grep -q '^connected	0$'"
 }
 
+# Two members on networks of their own, which can't reach each other or
+# the mesh, connect through a member that reaches all of them and relays,
+# as a laptop away and a desktop at home do through a server
+scenario_relayed() {
+    local away_peer home_peer note
+    for side in away home; do
+        podman network create -o isolate=true "$run-$side" >/dev/null
+        nets+=("$run-$side")
+    done
+    machine relay
+    podman network connect "$run-away" "$run-relay"
+    podman network connect "$run-home" "$run-relay"
+    invite one relay
+    on relay sh -c 'printf "[node]\nrelay = true\n" > ~/.holokeep/config.toml'
+    node_up relay
+    wait_for "the relay to connect" sh_on one "hk node peers | grep '$(on relay hk node id)' | grep -q connected"
+    on relay hk node status | grep -q "^relaying	for members$" || fail "the relay doesn't say it relays"
+    machine away "$run-away"
+    machine home "$run-home"
+    invite one away
+    invite one home
+    node_up away
+    node_up home
+    away_peer=$(on away hk node id)
+    home_peer=$(on home hk node id)
+    wait_for "the away machine to listen through the relay" sh_on away "hk node status | grep -q '^reachable through'"
+    wait_for "home to listen through the relay" sh_on home "hk node status | grep -q '^reachable through'"
+    wait_for "away and home to connect through the relay" sh_on away "hk node peers | grep '^$home_peer' | grep -q 'connected through a relay'"
+    # The mesh's own network isn't isolated, so one's reached however it can be
+    wait_for "away to reach one" sh_on away "hk node peers | grep '^$(on one hk node id)' | grep -q connected"
+    # What's added away is read at home, over the circuit
+    note=$(sh_on away 'echo "written away from home" | hk add -q -')
+    wait_for "home to fetch what was written away" on home hk dag fetch "$note"
+    [ "$(on home hk cat "$note")" = "written away from home" ] || fail "home read something else"
+    sh_on home "hk node peers | grep '^$away_peer' | grep -q 'connected through a relay'" || fail "home reached away directly, which it can't"
+}
+
 # A thin client of one, in a sandbox: no repo, just a key and a ticket,
 # every command asking one, as ezra's user
 scenario_thin() {
@@ -766,7 +806,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read served edits copies whole late_joiner fork_merge lost forget car restore revoke shared client thin visitor expiry door several)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read served edits copies whole late_joiner fork_merge lost forget car restore revoke shared client thin visitor expiry door several relayed)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

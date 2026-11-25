@@ -20,8 +20,39 @@ Where a member listens for [[#Clients|clients]], on a port of its own,
 connections skip pnet, since clients haven't the key.
 
 Behaviours: identify, ping, mDNS (LAN discovery), Kademlia under
-`/holokeep/kad/1.0.0` (kept apart from Amino), and the request-response
-protocols below.
+`/holokeep/kad/1.0.0` (kept apart from Amino), circuit relay v2 and
+DCUtR (below), and the request-response protocols below.
+
+## Relays
+
+Members that can't reach each other, a laptop away and a desktop at
+home behind their NATs, connect through a member that both can reach and
+that relays (`relay = true` in [[Configuration]]), such as a server with
+a public address. Nothing is routed at the IP layer, so only the mesh's
+traffic goes this way, and only between the members that need it.
+
+- Every member holds a reservation on each relay it's connected to, and
+  listens through it (`hk node status` says `reachable through`).
+- A member it can't reach otherwise is dialled where it was last seen
+  and through every relay at once, so whichever works first wins. One
+  found on the LAN, or reached where it listens, is dialled directly as
+  ever.
+- A relayed connection is pnet, noise and yamux over the circuit, end to
+  end, so the relay sees how much passes and when, and nothing of what.
+  The relay itself is a member, with the swarm key, and lets in only
+  members, so it relays only for them, and only to members that would
+  let them in directly.
+- Connected through a relay, two members try to punch through to each
+  other (DCUtR), and keep dialling each other directly; once they're
+  connected directly, the circuit's dropped. `hk node peers` says
+  `connected through a relay` till then.
+- A relay relays as long and as much as members like, where libp2p's
+  defaults allow a few minutes and kilobytes, enough to punch through
+  and no more.
+
+Hole punching is over TCP, since pnet rules out QUIC, so it works with
+fewer NATs than it would with QUIC; where it doesn't, the relay carries
+the traffic.
 
 ## Joining
 

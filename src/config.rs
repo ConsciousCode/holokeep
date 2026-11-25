@@ -10,6 +10,7 @@
 //! low-water = "10G"
 //! target = "50G"      # the most to keep here
 //! ping = "30s"
+//! relay = true        # relay between members which can't reach each other
 //!
 //! [mesh.work]         # the node of `--mesh work`, over [node]
 //! listen = "/ip4/0.0.0.0/tcp/4111"
@@ -113,7 +114,11 @@ pub struct Node {
     pub ping: Option<Duration>,
     /// How long a connection with nothing going on is kept open.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "duration", serialize_with = "show_duration")]
-    pub idle: Option<Duration>,
+    pub idle: Option<Duration>,    /// Whether to relay between members which can't reach each other:
+    /// for a member others reach where they can't reach each other, as a
+    /// server with a public address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<bool>,
 }
 
 /// Where to listen for something that's off unless asked for.
@@ -226,6 +231,7 @@ impl Node {
             door: self.door.clone().or_else(|| base.door.clone()),
             ping: self.ping.or(base.ping),
             idle: self.idle.or(base.idle),
+            relay: self.relay.or(base.relay),
         }
     }
 }
@@ -327,6 +333,7 @@ mod tests {
             high-water = 21474836480
             ping = "30s"
             door = true
+            relay = true
 
             [mesh.work]
             copies = 4
@@ -349,6 +356,7 @@ mod tests {
         assert_eq!((work.listen, work.door, work.copies, work.ping, work.idle), (None, None, Some(4), Some(Duration::from_secs(30)), Some(Duration::from_hours(2))), "where to listen is main's alone");
         assert_eq!((main.target, work.target), (None, Some(50 << 30)));
         assert_eq!(config.node("other").copies, Some(3), "a mesh unsaid is [node]'s");
+        assert_eq!((main.relay, work.relay), (Some(true), Some(true)));
         assert!(config.mount.first().is_some_and(|mount| !mount.read_only && !mount.dir().starts_with("~")));
         assert!(config.mount.get(1).is_some_and(|mount| mount.read_only && mount.dir() == Path::new("/mnt/soup")));
 

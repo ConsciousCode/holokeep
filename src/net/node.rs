@@ -10,6 +10,16 @@
 //! - mDNS finds members on the LAN; identify tells each where the others
 //!   listen; Kademlia, under its own protocol name so it's no part of
 //!   Amino, finds members' addresses as they move.
+//! - A member configured to relay (`relay = true`), reachable where the
+//!   others aren't, relays between members which can't reach each other:
+//!   each member keeps a reservation on every relay it's connected to,
+//!   and listens through it. A relayed connection is the private network,
+//!   noise and yamux over the circuit, end to end, so the relay sees how
+//!   much passes and when, and nothing of what; and once two members are
+//!   connected through it, they try to punch through to each other
+//!   (`DCUtR`), dropping the circuit once they're connected directly. A
+//!   member found on the LAN or where it listens is dialled directly as
+//!   ever, so a relay's used only where nothing better is.
 //! - Members want blocks of each other; see `blocks`.
 //! - Members keep each other's blocks durable; see `durability`.
 //! - Members tell each other of structure linking to what they hold; see
@@ -38,7 +48,7 @@ use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::core::transport::ListenerId;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport, identify, kad, mdns, ping, tcp};
+use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport, dcutr, identify, kad, mdns, ping, relay, tcp};
 use serde::{Deserialize, Serialize};
 
 use super::blocks::{self, Blocks, Fetch, Want};
@@ -81,11 +91,26 @@ pub struct Tunables {
     pub ping: Duration,
     /// How long a connection with nothing going on is kept open.
     pub idle: Duration,
+    /// Whether to relay between members which can't reach each other.
+    pub relay: bool,
 }
 
 impl Default for Tunables {
     fn default() -> Self {
-        Self { ping: PING, idle: IDLE }
+        Self { ping: PING, idle: IDLE, relay: false }
+    }
+}
+
+/// How a relay relays between members: as long and as much as they like,
+/// since only members reach it, where libp2p's defaults are a few
+/// minutes and kilobytes, enough to punch through and no more.
+fn relay_config() -> relay::Config {
+    relay::Config {
+        max_circuit_duration: Duration::from_hours(24),
+        max_circuit_bytes: 0,
+        reservation_rate_limiters: Vec::new(),
+        circuit_src_rate_limiters: Vec::new(),
+        ..relay::Config::default()
     }
 }
 
@@ -150,6 +175,9 @@ pub struct Behaviour {
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     mdns: Toggle<mdns::tokio::Behaviour>,
+    relay: Toggle<relay::Behaviour>,
+    relayed: Toggle<relay::client::Behaviour>,
+    dcutr: Toggle<dcutr::Behaviour>,
     kad: kad::Behaviour<kad::store::MemoryStore>,
     members: request_response::cbor::Behaviour<Roster, Roster>,
     blocks: request_response::cbor::Behaviour<Want, Blocks>,
@@ -403,26 +431,44 @@ pub struct Node {
     /// Whether this machine's clock was last found far from the mesh's.
     skewed: bool,
     redial: Redial,
+    /// Where this listens through each relay, and the relayed connections
+    /// open, to drop once their peers are connected directly.
+    relays: HashMap<PeerId, (ListenerId, Multiaddr)>,
+    circuits: HashMap<libp2p::swarm::ConnectionId, PeerId>,
     /// The catalog's generation when members were last noticed of what
     /// arrived.
     noticed: i64,
 }
 
 impl Node {
-    /// A node over TCP, finding members on the LAN by mDNS; or a client's,
-    /// with no private network, finding its member where it was told.
+    /// A node over TCP, finding members on the LAN by mDNS, and reaching
+    /// them through relays where it can't otherwise; or a client's, with
+    /// no private network, finding its member where it was told.
     pub fn tcp(key: &Keypair, swarm_key: PreSharedKey, catalog: Catalog, members: Members, tunables: Tunables) -> Result<Self> {
         let base = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
         if members.client_of()?.is_some() {
             return Self::new(super::clients::client_transport(base, key)?, key, catalog, members, false, Ports::default(), tunables);
         }
         let ports = Ports::default();
-        Self::new(transport(base, key, swarm_key, ports.clone())?, key, catalog, members, true, ports, tunables)
+        let (relayed, client) = relay::client::new(key.public().to_peer_id());
+        Self::relayed(transport(relayed.or_transport(base), key, swarm_key, ports.clone())?, client, key, catalog, members, true, ports, tunables)
     }
 
     /// A node over a transport, with or without mDNS, its transport
     /// leaving the private network out on `ports`, where clients connect.
     pub fn new(transport: Boxed<(PeerId, StreamMuxerBox)>, key: &Keypair, catalog: Catalog, members: Members, lan: bool, ports: Ports, tunables: Tunables) -> Result<Self> {
+        Self::with(transport, None, key, catalog, members, lan, ports, tunables)
+    }
+
+    /// A node as `new`, reaching members through relays too: `transport`
+    /// is over the relay client's transport, which `client` goes with.
+    #[allow(clippy::too_many_arguments)]
+    pub fn relayed(transport: Boxed<(PeerId, StreamMuxerBox)>, client: relay::client::Behaviour, key: &Keypair, catalog: Catalog, members: Members, lan: bool, ports: Ports, tunables: Tunables) -> Result<Self> {
+        Self::with(transport, Some(client), key, catalog, members, lan, ports, tunables)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with(transport: Boxed<(PeerId, StreamMuxerBox)>, relayed: Option<relay::client::Behaviour>, key: &Keypair, catalog: Catalog, members: Members, lan: bool, ports: Ports, tunables: Tunables) -> Result<Self> {
         let peer = key.public().to_peer_id();
         let client_of = members.client_of()?;
         let mdns = if lan && client_of.is_none() { Some(mdns::tokio::Behaviour::new(mdns::Config::default(), peer)?) } else { None };
@@ -435,6 +481,10 @@ impl Node {
             identify: identify::Behaviour::new(identify::Config::new(IDENTIFY.into(), key.public())),
             ping: ping::Behaviour::new(ping::Config::new().with_interval(tunables.ping).with_timeout(tunables.ping)),
             mdns: mdns.into(),
+            // A client relays nothing, and is relayed nowhere
+            relay: (tunables.relay && client_of.is_none()).then(|| relay::Behaviour::new(peer, relay_config())).into(),
+            dcutr: relayed.is_some().then(|| dcutr::Behaviour::new(peer)).into(),
+            relayed: relayed.into(),
             kad,
             members: exchange(MEMBERS, request_response::Config::default()),
             blocks: exchange(blocks::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_mins(1))),
@@ -511,6 +561,8 @@ impl Node {
             repo: None,
             skewed: false,
             redial: Redial::default(),
+            relays: HashMap::new(),
+            circuits: HashMap::new(),
             noticed: 0,
         };
         node.reload()?;
@@ -2310,20 +2362,51 @@ impl Node {
         self.swarm.connected_peers().copied().filter(|peer| self.heard.contains(peer)).collect()
     }
 
-    /// Dial every member with an address which isn't connected.
+    /// Dial every member with an address which isn't connected: where
+    /// it's been, and through every relay this listens through, where it
+    /// may be listening too.
     pub fn dial_members(&mut self) -> Result<()> {
         let (me, now) = (self.peer_id(), Instant::now());
-        for (peer, addrs) in self.members.list()? {
-            if peer != me && !addrs.is_empty() && !self.swarm.is_connected(&peer) && self.redial.due(&peer, now) {
+        let relays: Vec<(PeerId, Multiaddr)> = self.relays.iter().map(|(relay, (_, through))| (*relay, through.clone())).collect();
+        for (peer, mut addrs) in self.members.list()? {
+            // Connected through a relay alone, it's dialled where it's
+            // reached directly, if it can be
+            if self.relayed_only(&peer) {
+                addrs.retain(|addr| !is_relayed(addr));
+            } else {
+                addrs.extend(relays.iter().filter(|(relay, _)| *relay != peer).map(|(_, through)| through.clone().with(libp2p::multiaddr::Protocol::P2p(peer))));
+            }
+            if peer != me && !addrs.is_empty() && (!self.swarm.is_connected(&peer) || self.relayed_only(&peer)) && self.redial.due(&peer, now) {
                 self.dial(peer, addrs);
             }
         }
         Ok(())
     }
 
+    /// The relays this listens through.
+    pub fn relays(&self) -> Vec<PeerId> {
+        let mut relays: Vec<PeerId> = self.relays.keys().copied().collect();
+        relays.sort();
+        relays
+    }
+
+    /// Whether this relays between members.
+    pub fn relaying(&self) -> bool {
+        self.swarm.behaviour().relay.is_enabled()
+    }
+
+    /// Whether a peer's connected through relays and no other way.
+    pub fn relayed_only(&self, peer: &PeerId) -> bool {
+        self.circuits.values().any(|through| through == peer)
+    }
+
+    /// Dial a peer, unless it's connected, or connected only through a
+    /// relay, where it's dialled directly regardless.
     fn dial(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) {
+        use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
         self.redial.dialled(peer, Instant::now());
-        let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer).addresses(addrs).build();
+        let condition = if self.relayed_only(&peer) { PeerCondition::Always } else { PeerCondition::DisconnectedAndNotDialing };
+        let opts = DialOpts::peer_id(peer).condition(condition).addresses(addrs).build();
         // A failed dial is reported as an event
         let _ = self.swarm.dial(opts);
     }
@@ -2444,7 +2527,7 @@ impl Node {
             }
         }
         for (peer, addrs) in dial {
-            if !self.swarm.is_connected(&peer) {
+            if !self.swarm.is_connected(&peer) || self.relayed_only(&peer) {
                 self.dial(peer, addrs);
             }
         }
@@ -2544,6 +2627,47 @@ impl Node {
         Ok(())
     }
 
+    /// A peer's identified itself: if it's a member that relays, keep a
+    /// reservation on it, listening through it, unless this already does;
+    /// and if this relays, take where the member saw it, at a port it
+    /// listens on, as where it's reached, which is what it tells those it
+    /// keeps reservations for to give out.
+    fn reserve(&mut self, peer: PeerId, info: &identify::Info) {
+        if self.swarm.behaviour().relay.is_enabled() && !self.is_client(&peer) && !self.visitors.contains_key(&peer) && !is_relayed(&info.observed_addr) {
+            let ports: HashSet<u64> = self.listeners().iter().filter_map(super::clients::port).collect();
+            if super::clients::port(&info.observed_addr).is_some_and(|port| ports.contains(&port)) {
+                self.swarm.add_external_address(info.observed_addr.clone());
+            }
+        }
+        let relays = info.protocols.contains(&relay::HOP_PROTOCOL_NAME);
+        if !relays || !self.swarm.behaviour().relayed.is_enabled() || self.relays.contains_key(&peer) || !self.members.contains(&peer).unwrap_or(false) {
+            return;
+        }
+        // Over the connection to it: where else it's reached matters only
+        // if that's gone
+        let Some(at) = info.listen_addrs.iter().find(|addr| !is_relayed(addr)) else {
+            return;
+        };
+        let at = at.clone().with_p2p(peer).unwrap_or_else(|at| at).with(libp2p::multiaddr::Protocol::P2pCircuit);
+        if let Ok(listener) = self.swarm.listen_on(at.clone()) {
+            self.relays.insert(peer, (listener, at));
+        }
+    }
+
+    /// A connection's established: if through a relay, kept track of till
+    /// its peer's connected directly; if direct, its peer's circuits
+    /// dropped, as no longer needed.
+    fn through_relay(&mut self, peer: PeerId, connection: libp2p::swarm::ConnectionId, relayed: bool) {
+        if relayed {
+            self.circuits.insert(connection, peer);
+            return;
+        }
+        let circuits: Vec<_> = self.circuits.iter().filter(|(_, through)| **through == peer).map(|(circuit, _)| *circuit).collect();
+        for circuit in circuits {
+            self.swarm.close_connection(circuit);
+        }
+    }
+
     /// A member's roster, or its answer to this one's. A client's told of
     /// no members, and can't make any.
     fn on_roster(&mut self, peer: PeerId, message: request_response::Message<Roster, Roster>) -> Result<Option<Event>> {
@@ -2579,9 +2703,14 @@ impl Node {
                 if self.client_listeners.contains(&listener_id) {
                     self.ports.add(&address);
                 }
+                // Members not reached may be reached through it, at once
+                if self.relays.values().any(|(relay, _)| *relay == listener_id) {
+                    self.redial = Redial::default();
+                }
                 Some(Event::Listening(address))
             },
-            SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
+            SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
+                self.through_relay(peer_id, connection_id, endpoint.is_relayed());
                 if endpoint.is_dialer() {
                     unless_busy(self.members.add_addr(&peer_id, endpoint.get_remote_address()), "noting a member's address")?;
                     if let (Some(_), Some(port)) = (self.client_of, super::clients::port(endpoint.get_remote_address())) {
@@ -2594,7 +2723,11 @@ impl Node {
                 self.on_connected(peer_id)?;
                 Some(Event::Connected(peer_id))
             },
-            SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+            SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
+                self.circuits.remove(&connection_id);
+                if num_established > 0 {
+                    return Ok(None);
+                }
                 self.on_disconnected(&peer_id);
                 self.sessions.gone(&peer_id);
                 self.clocks.forget(&peer_id);
@@ -2604,6 +2737,11 @@ impl Node {
             SwarmEvent::IncomingConnectionError { error, .. } => Some(Event::Failed(None, error.to_string())),
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                 self.on_identified(peer_id, &info.listen_addrs)?;
+                self.reserve(peer_id, &info);
+                None
+            },
+            SwarmEvent::ListenerClosed { listener_id, .. } => {
+                self.relays.retain(|_, (listener, _)| *listener != listener_id);
                 None
             },
             SwarmEvent::Behaviour(BehaviourEvent::Ping(ping::Event { connection, result: Err(_), .. })) => {
@@ -2668,6 +2806,11 @@ mod asks;
 
 #[cfg(test)]
 mod tests;
+
+/// Whether an address is through a relay.
+fn is_relayed(addr: &Multiaddr) -> bool {
+    addr.iter().any(|protocol| protocol == libp2p::multiaddr::Protocol::P2pCircuit)
+}
 
 /// Seconds since the epoch, by this machine's clock.
 fn now_secs() -> u64 {
