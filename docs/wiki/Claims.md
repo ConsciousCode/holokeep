@@ -21,6 +21,7 @@ is not a claim; it's stored as ordinary data.
 | `device` | none                                                                                                      | The target keys act for whoever signs this: a certificate when a user's root key signs it.                                                                                                                                                                                                                                                                                              |
 | `lost`   | `at: int`                                                                                                 | The targets couldn't be found as of `at`, seconds since the epoch. See [[Replication and Retention#Lost blocks]].                                                                                                                                                                                                                                                                       |
 | `grant`  | `on: Link` (omitted for the mesh), `add: [string]`, `del: [string]` (each omitted if empty), `stands: [Link]` (omitted if empty), `prev: [Link]`, `until: int` (omitted for good) | The targets hold the commands `add`, till `until` if it says, and no longer `del`, after the grants `prev`. Never dissolved. See [[Grants]]. |
+| `same`   | `as: string` (omitted for each codec's data model)                                                        | The targets, two or more, are the same, read through the lens `as`. Never dissolved. See [[#Same]]. |
 
 Examples, in dag-json for readability:
 
@@ -30,15 +31,15 @@ Examples, in dag-json for readability:
 {"claim": "keep", "target": [{"/": "bafybei…"}]}
 {"claim": "keep", "copies": 1, "target": [{"/": "bafyqag…"}]}   (made again easily: one copy)
 {"at": 1793750400, "claim": "lost", "target": [{"/": "bafkrei…"}]}
+{"as": "unixfs", "claim": "same", "target": [{"/": "bafkrei…"}, {"/": "bafybei…"}]}   (a file and its whole multihash)
 ```
 
 A node of an older build doesn't know `copies`, so it takes such a keep
 for ordinary data, not a keep; likewise `lost`, `grant`, and a set with
-`for`.
+`for`, and `same`.
 
-Not yet implemented, but planned: `same` (targets are the same bytes
-under different hashes), `attr` (attributes, with `prev` history),
-`derive` (structure derived from the targets).
+Not yet implemented, but planned: `attr` (attributes, with `prev`
+history), `derive` (structure derived from the targets).
 
 ## Dissolved and precipitated
 
@@ -77,6 +78,46 @@ contains the whole claim, is 109. Tags dissolve with names up to about
   nothing.
 - **Claims travel with their claims.** A claim is sent along with its
   signatures and tombs, and theirs, however deep.
+
+## Same
+
+A CID's codec says how to decode a block, not what it means: a UnixFS
+file's root decodes as a dag-pb node, and the file is what the UnixFS ADL
+reads from it and the blocks under it. So a `same` claim names how its
+targets are read, its **lens**, and says they read the same through it:
+
+| Lens | Reads | So these are the same |
+|---|---|---|
+| none (`data` to `hk same`) | Each codec's data model: a raw block as its bytes | One value in dag-cbor and dag-json; a raw block and a dag-cbor byte string of its bytes; one block by two hash functions |
+| `unixfs` | What the UnixFS ADL does: a file's contents, a raw block as a file of its bytes, a directory's entries (each name's CID), a symlink's target | A file however it's chunked or laid out, and its whole multihash, by any hash function; a directory basic or a HAMT |
+
+- **Checkable.** `hk same add` checks before it says so, reading each
+  target through the lens; what isn't here is fetched. A raw target
+  beside others is checked by its multihash against what they read as,
+  so it needn't be here: a kept file's whole multihash is no block anyone
+  can get. Past 64 MiB that's only by sha2-256.
+- **An equivalence.** It's symmetric and transitive, so claims of one
+  lens join: `hk same ls` lists whatever's the same as a block, or as
+  what is, and so on. Lenses don't mix: the same file isn't the same
+  dag-pb node. Membership is by CID, not multihash, as one multihash is
+  different things to different codecs.
+- **A set, and nothing else.** Which member to prefer depends on what
+  for (matching Kubo, streaming, what's near), so it's said elsewhere, by
+  the node's policy or facts about members, and claims still merge by
+  union alone.
+- **What isn't `same`.** Similarity isn't transitive: a lossy copy of a
+  lossy copy drifts. Renditions of one work (a JPEG of a PNG, a scaled
+  copy, a translation) are a `group` of the work, said explicitly.
+- **Not yet acted on.** Nothing reads one member through another yet;
+  `same` is said, checked and listed. A lens is a name for now; one not
+  known is kept, and says nothing this can check. A lens could later be
+  an ADL's code by CID, as WASM.
+
+```
+hk same add --as unixfs <cid> <cid>…   # check, then say so
+hk same ls <cid>                       # lens and CID of what's the same
+hk same rm --as unixfs <a> <b>         # tomb the claims saying both
+```
 
 ## Backreferences
 

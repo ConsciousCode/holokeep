@@ -45,6 +45,10 @@ done
 git -C "$tmp/git" repack -adfq
 git=$(h git import "$tmp/git" 2>/dev/null | awk '$2 == "HEAD" { print $1 }')
 
+# The same file chunked otherwise, said to be the same as its one leaf
+rechunked=$(h add -q --no-keep -s size-65536 "$tmp/tree/sub/big.txt")
+h same add --as unixfs "$big" "$rechunked" >/dev/null
+
 # Reported lost: what's never been here, so it stays so
 printf 'lost from %s\n' "$name" > "$tmp/lost.txt"
 lost=$(h add -q -n "$tmp/lost.txt")
@@ -82,6 +86,8 @@ git $git
 lost $lost
 viewed $viewed
 served $anchor
+same $big
+rechunked $rechunked
 EXPECT
 echo "made $out"
 du -sh "$out"

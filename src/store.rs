@@ -243,7 +243,7 @@ pub trait Store: BlockIndex + BlockSource + BlockStore {
 /// making it over as it knows it, its views say, would break what the newer
 /// build reads them with, where that's still running. Raise it with any
 /// change to them (and make a repo fixture, `scripts/make-repo-fixture.sh`).
-pub const SCHEMA: i64 = 4;
+pub const SCHEMA: i64 = 5;
 
 pub const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -3443,6 +3443,44 @@ impl Catalog {
         }
         let lost = crate::claim::Lost::new([cid.clone()], now()).ok_or(Error::NoClaims)?;
         self.put_claim(&Claim::Lost(lost)).map(Some)
+    }
+
+    /// Say the targets are the same, read through `lens` (see `same`),
+    /// once they're checked to be: what isn't here is fetched, but for raw
+    /// targets beside others, checked by their multihashes. Returns the
+    /// claim.
+    pub fn say_same(&self, targets: &[Link], lens: Option<&str>) -> Result<Link> {
+        let same = crate::claim::Same::new(targets.iter().cloned(), lens.map(str::to_owned))
+            .ok_or_else(|| Error::User("the same as what? Name two CIDs or more".into()))?;
+        crate::same::check(self, same.target(), lens).map_err(|e| Error::User(e.to_string()))?;
+        self.put_claim(&Claim::Same(same))
+    }
+
+    /// What's the same as a block, by same claims that count, through each
+    /// lens they read it through: none for each codec's data model.
+    pub fn same_as(&self, target: &Link) -> Result<Vec<(Option<String>, Vec<Link>)>> {
+        let Some(claims) = &self.claims else {
+            return Ok(Vec::new());
+        };
+        claims.same_lenses(target)?
+            .into_iter()
+            .map(|lens| {
+                let same = claims.same_as(target, lens.as_deref())?;
+                Ok((lens, same))
+            })
+            .collect()
+    }
+
+    /// Take back saying that `a` and `b` are the same, read through `lens`:
+    /// a tomb of each same claim that counts of both. What else says so,
+    /// by way of other blocks, stands. Returns the tombs.
+    pub fn unsay_same(&self, a: &Link, b: &Link, lens: Option<&str>) -> Result<Vec<Link>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let mut tombs = Vec::new();
+        for same in claims.saying_same(a, b, lens)? {
+            tombs.push(self.put_claim(&Claim::Tomb(Tomb::new([same]).ok_or(Error::NoClaims)?))?);
+        }
+        Ok(tombs)
     }
 
     /// Take back reports that a block's lost. Returns the tombs' CIDs.

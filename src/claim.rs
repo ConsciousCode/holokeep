@@ -6,7 +6,8 @@
 //! claim, and `Device`, which a user's root key signs to say a node's key
 //! acts for it (see `keys`). And `Lost`, a report that blocks couldn't be
 //! found; and `Grant`, which gives or takes away what users and machines
-//! may do in a mesh (see `grants`).
+//! may do in a mesh (see `grants`). And `Same`, which says its targets
+//! are the same, read through a lens (see `same`).
 //!
 //! Signatures are claims about claims, rather than inside them, so equal
 //! claims stay equal blocks whoever makes them, and small ones dissolve.
@@ -185,6 +186,21 @@ pub struct Serve {
     for_: Option<Link>,
 }
 
+/// "The targets are the same, read through the lens `as_`": with none,
+/// as each codec's data model, otherwise as the ADL it names reads them
+/// (see `same`).
+///
+/// An equivalence, so claims of one lens join: a target is the same as
+/// whatever's the same as what it is. At least two targets, so it's never
+/// dissolved. A lens is a name, so far; one that isn't known is kept, and
+/// says nothing this can check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Same {
+    /// Sorted by CID bytes and distinct, at least two.
+    target: Vec<Link>,
+    as_: Option<String>,
+}
+
 /// Any claim this understands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
@@ -197,6 +213,7 @@ pub enum Claim {
     Lost(Lost),
     Grant(Grant),
     Serve(Serve),
+    Same(Same),
 }
 
 /// Sort links by their bytes and drop repeats, making them a set.
@@ -412,6 +429,20 @@ impl Serve {
     pub const fn owner(&self) -> Option<&Link> { self.for_.as_ref() }
 }
 
+impl Same {
+    /// None unless there are two targets or more, and the lens, if any,
+    /// is named.
+    pub fn new(target: impl IntoIterator<Item = Link>, lens: Option<String>) -> Option<Self> {
+        let target = set(target);
+        (target.len() >= 2 && lens.as_ref().is_none_or(|lens| !lens.is_empty())).then_some(Self { target, as_: lens })
+    }
+
+    pub fn target(&self) -> &[Link] { &self.target }
+
+    /// How the targets are read; none for each codec's data model.
+    pub fn lens(&self) -> Option<&str> { self.as_.as_deref() }
+}
+
 impl Lost {
     /// A report of the targets lost, if there are any.
     pub fn new(target: impl IntoIterator<Item = Link>, at: u64) -> Option<Self> {
@@ -533,6 +564,7 @@ impl Claim {
             Self::Lost(lost) => lost.target(),
             Self::Grant(grant) => grant.target(),
             Self::Serve(serve) => serve.target(),
+            Self::Same(same) => same.target(),
         }
     }
 
@@ -548,6 +580,7 @@ impl Claim {
             Self::Lost(_) => "lost",
             Self::Grant(_) => "grant",
             Self::Serve(_) => "serve",
+            Self::Same(_) => "same",
         }
     }
 
@@ -620,6 +653,13 @@ impl Claim {
                     map.insert("for".to_owned(), Ipld::Link(owner.clone()));
                 }
                 ("serve", map)
+            },
+            Self::Same(same) => {
+                let mut map = BTreeMap::new();
+                if let Some(lens) = &same.as_ {
+                    map.insert("as".to_owned(), Ipld::String(lens.clone()));
+                }
+                ("same", map)
             },
         };
         map.insert("claim".to_owned(), Ipld::String(kind.to_owned()));
@@ -741,6 +781,14 @@ impl Claim {
             "device" => Self::Device(Device::new(target.clone())?),
             "grant" => Self::Grant(parse_grant(&mut map, target.clone())?),
             "serve" => Self::Serve(parse_serve(&mut map, &target)?),
+            "same" => {
+                let lens = match map.remove("as") {
+                    Some(Ipld::String(lens)) => Some(lens),
+                    Some(_) => return None,
+                    None => None,
+                };
+                Self::Same(Same::new(target.clone(), lens)?)
+            },
             _ => return None,
         };
         // Nothing else, sorted and distinct already, and canonical dag-cbor
@@ -952,6 +1000,24 @@ mod tests {
         assert_eq!(Claim::parse(lasting.block().data()), Some(lasting), "no until, as before");
         // Taking away lasts
         assert!(Grant::new([user], Some(cid(b"a")), [], read(), [], []).expect("grant").until(Some(1)).is_none());
+    }
+
+    #[test]
+    fn a_same_claim_names_its_lens_and_is_never_dissolved() {
+        let (a, b) = (cid(b"a"), cid(b"b"));
+        // One target is nothing to say, and a lens has a name
+        assert!(Same::new([a.clone(), a.clone()], None).is_none());
+        assert!(Same::new([a.clone(), b.clone()], Some(String::new())).is_none());
+        let plain = Claim::Same(Same::new([b.clone(), a.clone()], None).expect("same"));
+        let unixfs = Claim::Same(Same::new([a.clone(), b.clone()], Some("unixfs".to_owned())).expect("same"));
+        assert_eq!(plain.target(), Same::new([a, b], None).expect("same").target(), "a set");
+        for claim in [plain.clone(), unixfs.clone()] {
+            assert!(!claim.dissolves());
+            assert_eq!(Claim::parse(claim.block().data()), Some(claim));
+        }
+        assert_ne!(plain.cid(), unixfs.cid());
+        let Ipld::Map(map) = plain.to_ipld() else { panic!("a map") };
+        assert!(!map.contains_key("as"), "no lens is each codec's data model");
     }
 
     #[test]

@@ -3065,6 +3065,18 @@ fn repos_earlier_builds_made_still_open() {
             let serving = repo.serving(served).expect("serving").unwrap_or_else(|| panic!("{name}: served"));
             assert_eq!((serving.service(), serving.persist()), ("fixture", true), "{name}");
         }
+        if let (Some(same), Some(rechunked)) = (expect.get("same"), expect.get("rechunked")) {
+            assert_eq!(repo.same_as(same).expect("same as"), [(Some(crate::same::UNIXFS.to_owned()), vec![rechunked.clone()])], "{name}");
+        }
+        // And older ones can say what's the same now
+        let cbor = block(DAG_CBOR_CODEC, &crate::dagcbor::to_vec(&crate::model::Ipld::String(name.clone())).expect("cbor"));
+        let json = block(crate::cid::DAG_JSON_CODEC, &crate::dagjson::to_vec(&crate::model::Ipld::String(name.clone())).expect("json"));
+        for b in [&cbor, &json] {
+            repo.put_block(b, CidVersion::V1).expect("put");
+        }
+        let (cbor, json): (Link, Link) = (cbor.cid().clone().into(), json.cid().clone().into());
+        repo.say_same(&[cbor.clone(), json.clone()], None).expect("the same");
+        assert_eq!(repo.same_as(&cbor).expect("same as"), [(None, vec![json])], "{name}");
         // And older ones can be served now
         repo.serve_anchor(&expect["anchor"], b"node", "later", false).expect("serve");
         assert_eq!(repo.serving(&expect["anchor"]).expect("serving").map(|serve| serve.service().to_owned()).as_deref(), Some("later"), "{name}");
@@ -3594,4 +3606,78 @@ fn a_visitors_own_sets_count_while_it_may_write() {
     repo.grant_on(&genesis, &anchor, &[visitor.id()], &[], &[WRITE.to_owned()], std::slice::from_ref(&read_only)).expect("grant");
     visitor_sets(&three, vec![read_only], 4_000_000_001);
     assert_eq!(repo.anchor_value(&anchor).expect("value"), Some(link(&two)));
+}
+
+/// A same claim is said only once its targets are checked to be the same,
+/// through its lens: a file however it's chunked, laid out or hashed,
+/// beside its whole multihash, which needn't be here; a directory basic or
+/// a HAMT; a value in dag-cbor or dag-json. Claims of a lens join, and a
+/// tomb takes one back.
+#[test]
+fn what_is_said_to_be_the_same_is_checked_through_its_lens_and_joins() {
+    use crate::model::Ipld;
+    use crate::same::UNIXFS;
+    let mut repo = router();
+    let link = |cid: Cidv1| -> Link { cid.into() };
+    let data: Vec<u8> = (0..5000u32).map(|i| u8::try_from(i % 251).expect("byte")).collect();
+    let file = |repo: &mut Catalog, data: &[u8], chunk_size: usize, width: usize| {
+        let importer = Importer { chunk_size, layout: BalancedLayout { width }, ..Importer::default() };
+        link(importer.add_file(data, repo).expect("add").cid)
+    };
+    let (narrow, wide) = (file(&mut repo, &data, 64, 3), file(&mut repo, &data, 1000, 8));
+    assert_ne!(narrow, wide);
+    // Never put: a kept file's whole multihash, by two hash functions
+    let whole = link(raw(&data).cid().clone());
+    let sha3 = link(Block::hash(Cidv1Spec::new(RAW_CODEC, MultihashFunc::Sha3_256), data.clone().into()).cid().clone());
+    let unixfs = Some(UNIXFS);
+    repo.say_same(&[narrow.clone(), wide.clone(), whole.clone(), sha3], unixfs).expect("the same");
+    let mut other = data;
+    other[4000] ^= 1;
+    let changed = file(&mut repo, &other, 64, 3);
+    assert!(repo.say_same(&[narrow.clone(), changed.clone()], unixfs).is_err(), "a byte differs");
+    assert!(repo.say_same(&[changed.clone(), whole.clone()], unixfs).is_err(), "by its multihash");
+    assert!(repo.say_same(&[narrow.clone(), wide.clone()], None).is_err(), "as dag-pb they differ");
+    assert!(repo.say_same(&[narrow.clone(), wide.clone()], Some("pixels")).is_err(), "a lens not known");
+
+    // Directories, basic or a HAMT, of the same entries
+    let scratch = Scratch::new("same-dirs");
+    let dir = scratch.path().join("d");
+    std::fs::create_dir(&dir).expect("mkdir");
+    for c in 'a'..='z' {
+        std::fs::write(dir.join(c.to_string()), c.to_string()).expect("write");
+    }
+    let tree = |repo: &mut Catalog, threshold: usize| {
+        let importer = Importer { directory: DynamicDirectory { threshold, hamt: Hamt { fanout: 8 } }, ..Importer::default() };
+        link(importer.add_path(&dir, repo, &mut |_, _| {}).expect("import").expect("root").cid)
+    };
+    let (basic, sharded) = (tree(&mut repo, usize::MAX), tree(&mut repo, 1));
+    assert_ne!(basic, sharded);
+    repo.say_same(&[basic.clone(), sharded], unixfs).expect("the same entries");
+    assert!(repo.say_same(&[basic, whole.clone()], unixfs).is_err(), "a directory isn't a file");
+
+    // One value in dag-cbor and dag-json, and bytes as raw or a byte string
+    let cbor = block(DAG_CBOR_CODEC, &crate::dagcbor::to_vec(&Ipld::Map([("a".to_owned(), Ipld::Integer(1))].into())).expect("cbor"));
+    let json = block(crate::cid::DAG_JSON_CODEC, br#"{"a":1}"#);
+    let bytes = block(DAG_CBOR_CODEC, &crate::dagcbor::to_vec(&Ipld::Bytes(b"hi".to_vec())).expect("cbor"));
+    for b in [&cbor, &json, &bytes, &raw(b"hi")] {
+        repo.put_block(b, CidVersion::V1).expect("put");
+    }
+    let cid = |b: &Block| link(b.cid().clone());
+    repo.say_same(&[cid(&cbor), cid(&json)], None).expect("one value");
+    repo.say_same(&[cid(&bytes), cid(&raw(b"hi"))], None).expect("bytes");
+    assert!(repo.say_same(&[cid(&cbor), cid(&bytes)], None).is_err());
+
+    // Joined: whatever's the same as what's the same, through that lens alone
+    let rechunked = file(&mut repo, &other, 1000, 8);
+    repo.say_same(&[changed.clone(), rechunked], unixfs).expect("the same");
+    let lenses = |cid: &Link| repo.same_as(cid).expect("same as");
+    assert_eq!(lenses(&cid(&json)), [(None, vec![cid(&cbor)])]);
+    let [(lens, same)] = lenses(&wide).try_into().expect("one lens");
+    assert_eq!(lens.as_deref(), unixfs);
+    assert_eq!(same.len(), 3, "{same:?}");
+    assert!(same.contains(&narrow) && same.contains(&whole) && !same.contains(&changed));
+    // Taken back
+    assert_eq!(repo.unsay_same(&narrow, &wide, unixfs).expect("unsay").len(), 1);
+    assert!(lenses(&wide).is_empty());
+    assert!(repo.unsay_same(&narrow, &wide, unixfs).expect("unsay").is_empty());
 }

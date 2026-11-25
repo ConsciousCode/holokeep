@@ -27,6 +27,7 @@ pub mod links;
 pub mod delta;
 pub mod git;
 pub mod export;
+pub mod same;
 pub mod fs;
 pub mod health;
 #[cfg(feature = "fuse")]

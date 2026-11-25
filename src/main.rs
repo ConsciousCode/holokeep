@@ -85,6 +85,11 @@ enum Command {
     /// Say what's been lost, for what can't be found anywhere
     #[command(subcommand)]
     Lost(LostCommand),
+    /// Say blocks are the same, read through a lens, and find what is: a
+    /// file however it's chunked, a directory basic or a HAMT, a value in
+    /// dag-cbor or dag-json, by any hash function
+    #[command(subcommand)]
+    Same(SameCommand),
     /// Keep things with friends, encrypted: in this account's vault, which
     /// joins their protected meshes
     #[command(subcommand)]
@@ -396,6 +401,38 @@ impl AskArgs {
     const fn any(self) -> bool {
         self.ask || self.ask_all
     }
+}
+
+#[derive(Subcommand, Debug)]
+enum SameCommand {
+    /// Say blocks are the same, once they're checked to be, printing the
+    /// claim. What isn't here is fetched, but for raw blocks beside others,
+    /// checked by their multihashes, as a kept file's whole one
+    Add {
+        /// What they're read as: `unixfs` for what the UnixFS ADL reads, a
+        /// file's contents (a raw block's a file of its bytes), a
+        /// directory's entries or a symlink's target; or `data`, each
+        /// codec's data model
+        #[arg(long = "as", default_value = "data")]
+        lens: String,
+        #[arg(required = true, num_args = 2..)]
+        cids: Vec<Link>,
+    },
+    /// Take back saying two blocks are the same, printing the tombs. What
+    /// else says so, by way of other blocks, stands
+    Rm {
+        #[arg(long = "as", default_value = "data")]
+        lens: String,
+        a: Link,
+        b: Link,
+    },
+    /// List what's the same as a block, a line each: the lens, and its CID
+    Ls { cid: Link },
+}
+
+/// A lens as `hk same` takes it: `data` is none, each codec's data model.
+fn lens_named(lens: &str) -> Option<&str> {
+    (lens != holokeep::same::named(None)).then_some(lens)
 }
 
 #[derive(Subcommand, Debug)]
@@ -1374,6 +1411,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Tag(command) => tag_here_or_there(args.repo, command),
         Command::Keep(command) => keep_here_or_there(args.repo, command),
         Command::Lost(command) => lost(args.repo, command),
+        Command::Same(command) => same(args.repo, command),
         Command::Whoami => whoami(args.repo),
         Command::Protect(command) => protect(&repo_dir(args.repo)?, command),
         Command::Cap(command) => cap(args.repo, command),
@@ -3565,6 +3603,31 @@ fn with_no_member(dir: &Path, blocks: Vec<Link>) -> anyhow::Result<(Vec<Link>, u
 #[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn with_no_member(_: &Path, blocks: Vec<Link>) -> anyhow::Result<(Vec<Link>, usize)> {
     Ok((blocks, 0))
+}
+
+fn same(repo: Option<PathBuf>, command: SameCommand) -> anyhow::Result<()> {
+    let repo = open_repo(repo)?;
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    match command {
+        SameCommand::Add { lens, cids } => writeln!(out, "{}", repo.say_same(&cids, lens_named(&lens))?)?,
+        SameCommand::Rm { lens, a, b } => {
+            let tombs = repo.unsay_same(&a, &b, lens_named(&lens))?;
+            if tombs.is_empty() {
+                anyhow::bail!("nothing here says {a} and {b} are the same as {lens}");
+            }
+            for tomb in tombs {
+                writeln!(out, "{tomb}")?;
+            }
+        },
+        SameCommand::Ls { cid } => {
+            for (lens, same) in repo.same_as(&cid)? {
+                for other in same {
+                    writeln!(out, "{}\t{other}", holokeep::same::named(lens.as_deref()))?;
+                }
+            }
+        },
+    }
+    Ok(out.flush()?)
 }
 
 fn lost(repo: Option<PathBuf>, command: LostCommand) -> anyhow::Result<()> {

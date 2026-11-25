@@ -352,7 +352,7 @@ const SCHEMA: &str =
          CREATE TABLE IF NOT EXISTS claims (
              id INTEGER PRIMARY KEY,
              claim INTEGER UNIQUE REFERENCES multihashes (id),
-             kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant', 'serve'))
+             kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant', 'serve', 'same'))
          );
          -- Every claim's targets, which every type has.
          CREATE TABLE IF NOT EXISTS claim_targets (
@@ -414,6 +414,12 @@ const SCHEMA: &str =
              data BLOB NOT NULL,
              at INTEGER NOT NULL,
              owner INTEGER REFERENCES multihashes (id)
+         );
+         -- The lens a same claim reads its targets through, NULL for each
+         -- codec's data model.
+         CREATE TABLE IF NOT EXISTS same_claims (
+             id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
+             lens TEXT
          );
          -- What's particular to each type; a tomb has nothing but targets.
          CREATE TABLE IF NOT EXISTS group_claims (
@@ -1075,6 +1081,12 @@ impl ClaimStore {
                     .filter(|claim| matches!(claim, Claim::Serve(_)))
                     .ok_or_else(|| Error::Invalid { store: NAME, reason: "a serve claim that isn't one".into() })
             },
+            "same" => {
+                let lens: Option<String> = self.db.conn().prepare_cached("SELECT lens FROM same_claims WHERE id = ?1")?.query_row([id], |row| row.get(0))?;
+                crate::claim::Same::new(self.targets(id)?, lens)
+                    .map(Claim::Same)
+                    .ok_or_else(|| Error::Invalid { store: NAME, reason: "a same claim of one target".into() })
+            },
             _ => Err(Error::Invalid { store: NAME, reason: format!("a claim of kind {kind}") }),
         }
     }
@@ -1498,7 +1510,8 @@ impl ClaimStore {
                 }
                 same
             },
-            Claim::Sign(_) | Claim::Grant(_) | Claim::Serve(_) => None,
+            // Never dissolved
+            Claim::Sign(_) | Claim::Grant(_) | Claim::Serve(_) | Claim::Same(_) => None,
             Claim::Lost(lost) => self.db.conn()
                 .prepare_cached(
                     "SELECT c.id FROM claims c JOIN lost_claims l ON l.id = c.id JOIN claim_targets t ON t.claim = c.id
@@ -1653,6 +1666,9 @@ impl ClaimStore {
             conn.prepare_cached("INSERT INTO serve_claims (id, data, at, owner) VALUES (?1, ?2, ?3, ?4)")?
                 .execute(params![row, claim.block().data(), i64::try_from(serve.at()).unwrap_or(i64::MAX), owner])?;
         }
+        if let Claim::Same(same) = claim {
+            conn.prepare_cached("INSERT INTO same_claims (id, lens) VALUES (?1, ?2)")?.execute(params![row, same.lens()])?;
+        }
         if let Claim::Lost(lost) = claim {
             conn.prepare_cached("INSERT INTO lost_claims (id, at) VALUES (?1, ?2)")?
                 .execute(params![row, i64::try_from(lost.at()).unwrap_or(i64::MAX)])?;
@@ -1757,6 +1773,64 @@ impl ClaimStore {
                 _ => None,
             })
             .collect())
+    }
+
+    /// The lenses that same claims that count of a block read it through,
+    /// by its CID, as it's named in them: none for each codec's data model.
+    pub fn same_lenses(&self, target: &Link) -> Result<Vec<Option<String>>> {
+        let (prefix, multihash) = split(target)?;
+        Ok(self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT DISTINCT s.lens FROM multihashes m JOIN claim_targets t ON t.target = m.id
+                 JOIN claims c ON c.id = t.claim JOIN same_claims s ON s.id = c.id
+                 WHERE m.multihash = ?1 AND t.prefix = ?2 AND c.kind = 'same' AND {LIVE}
+                 ORDER BY s.lens"
+            ))?
+            .query_map(params![multihash.to_bytes(), prefix], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// What same claims that count say a block is the same as, read through
+    /// `lens`, by CID: all that's the same as it, or as what is, and so on,
+    /// but itself.
+    pub fn same_as(&self, target: &Link, lens: Option<&str>) -> Result<Vec<Link>> {
+        let (prefix, multihash) = split(target)?;
+        // By CID, not multihash: one multihash is different things to
+        // different codecs
+        let rows = self.db.conn()
+            .prepare_cached(&format!(
+                "WITH RECURSIVE class (target, prefix) AS (
+                     SELECT id, ?2 FROM multihashes WHERE multihash = ?1
+                     UNION SELECT t2.target, t2.prefix FROM class
+                     JOIN claim_targets t ON t.target = class.target AND t.prefix = class.prefix
+                     JOIN claims c ON c.id = t.claim JOIN same_claims s ON s.id = c.id
+                     JOIN claim_targets t2 ON t2.claim = c.id
+                     WHERE c.kind = 'same' AND s.lens IS ?3 AND {LIVE}
+                 )
+                 SELECT class.prefix, m.multihash FROM class JOIN multihashes m ON m.id = class.target
+                 ORDER BY m.multihash, class.prefix"
+            ))?
+            .query_map(params![multihash.to_bytes(), prefix, lens], pair)?
+            .collect::<Vec<_>>();
+        Ok(links(rows.into_iter())?.into_iter().filter(|link| link != target).collect())
+    }
+
+    /// The same claims that count which say, through `lens`, that `a` and
+    /// `b` are the same, by their CIDs: what's taken back by a tomb.
+    pub fn saying_same(&self, a: &Link, b: &Link, lens: Option<&str>) -> Result<Vec<Link>> {
+        let ((a_prefix, a), (b_prefix, b)) = (split(a)?, split(b)?);
+        let rows: Vec<Vec<u8>> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT k.multihash FROM claims c JOIN same_claims s ON s.id = c.id
+                 JOIN claim_targets ta ON ta.claim = c.id JOIN multihashes ma ON ma.id = ta.target
+                 JOIN claim_targets tb ON tb.claim = c.id JOIN multihashes mb ON mb.id = tb.target
+                 JOIN multihashes k ON k.id = c.claim
+                 WHERE ma.multihash = ?1 AND ta.prefix = ?2 AND mb.multihash = ?3 AND tb.prefix = ?4
+                     AND c.kind = 'same' AND s.lens IS ?5 AND {LIVE}"
+            ))?
+            .query_map(params![a.to_bytes(), a_prefix, b.to_bytes(), b_prefix, lens], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.iter().map(|multihash| claim_link(multihash)).collect()
     }
 
     /// What lost claims that count say, as (block, when), the latest of each.
@@ -1915,7 +1989,7 @@ impl ClaimStore {
 /// constraint, which doesn't touch how rows are stored, is rewritten in
 /// place, as `SQLite` documents for such changes.
 fn widen_kinds(db: &Db) -> Result<()> {
-    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant', 'serve'))";
+    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant', 'serve', 'same'))";
     let conn = db.conn();
     let sql: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'claims'", [], |row| row.get(0))?;
     if sql.contains(KINDS) {
