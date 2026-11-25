@@ -437,20 +437,25 @@ enum SameCommand {
 #[derive(Subcommand, Debug)]
 enum PublicCommand {
     /// Make blocks, and whatever they link to, anyone's to have, printing
-    /// each claim
+    /// each claim. An anchor is public as it is now, and what it mounts;
+    /// a tag, as what it tags is now
     Add {
         /// Give them to whoever asks by CID, but never announce them;
         /// otherwise the blocks named are announced too
         #[arg(long)]
         serve: bool,
-        #[arg(required = true)]
+        /// A tag to make public, by name, as many as wanted
+        #[arg(long)]
+        tag: Vec<String>,
+        #[arg(required_unless_present = "tag")]
         cids: Vec<Link>,
     },
     /// Make a block private again, in whatever mode it was made public,
     /// printing the tombs. What it links to stays public if something else
     /// public does too
     Rm { cid: Link },
-    /// List what's been made public, a line each: the mode, and the CID
+    /// List what's been made public, a line each: the mode, and the CID,
+    /// or `tag <name>` for a tag
     Ls,
     /// Say whether a block's anyone's to have, as what's public here,
     /// whichever account made it so, reaches it: `public` or `private`
@@ -3682,8 +3687,11 @@ fn public(repo: Option<PathBuf>, command: PublicCommand) -> anyhow::Result<()> {
     let mut repo = open_repo(repo)?;
     let mut out = io::BufWriter::new(io::stdout().lock());
     match command {
-        PublicCommand::Add { serve, cids } => {
+        PublicCommand::Add { serve, tag, mut cids } => {
             let mode = if serve { Public::SERVE } else { Public::ANNOUNCE };
+            for name in &tag {
+                cids.push(tag_cid(name)?);
+            }
             repo.batch(|repo| {
                 for cid in &cids {
                     writeln!(out, "{}", repo.publish(cid, mode)?)?;
@@ -3702,7 +3710,10 @@ fn public(repo: Option<PathBuf>, command: PublicCommand) -> anyhow::Result<()> {
         },
         PublicCommand::Ls => {
             for (mode, root) in repo.public_roots()? {
-                writeln!(out, "{mode}\t{root}")?;
+                match claim::tag_name(&root) {
+                    Some(tag) => writeln!(out, "{mode}\ttag {tag}")?,
+                    None => writeln!(out, "{mode}\t{root}")?,
+                }
             }
         },
         PublicCommand::Check { cid } => writeln!(out, "{}", if repo.is_public(&cid)? { "public" } else { "private" })?,

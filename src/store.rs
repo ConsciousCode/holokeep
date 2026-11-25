@@ -243,7 +243,7 @@ pub trait Store: BlockIndex + BlockSource + BlockStore {
 /// making it over as it knows it, its views say, would break what the newer
 /// build reads them with, where that's still running. Raise it with any
 /// change to them (and make a repo fixture, `scripts/make-repo-fixture.sh`).
-pub const SCHEMA: i64 = 6;
+pub const SCHEMA: i64 = 7;
 
 pub const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -728,6 +728,9 @@ fn path_from(bytes: &[u8]) -> PathBuf {
 /// The migration saying kept files are the same as their roots.
 const KEPT_ROOTS: &str = "kept files are the same as their roots";
 
+/// Public claims made before what's public was kept by unit, built so.
+const PUBLIC_UNITS: &str = "what's public is kept by unit";
+
 impl Catalog {
     /// Open a repo directory with the standard stores, attach whichever
     /// other volumes are where they were last seen, and catch up with
@@ -746,6 +749,12 @@ impl Catalog {
         // something else is writing, as opening's not to wait on it
         if !catalog.migrated(KEPT_ROOTS)? {
             match catalog.batch(|catalog| catalog.migrate(KEPT_ROOTS, Self::say_kept_roots)) {
+                Err(e) if e.is_busy() => {},
+                done => done?,
+            }
+        }
+        if !catalog.migrated(PUBLIC_UNITS)? {
+            match catalog.batch(|catalog| catalog.migrate(PUBLIC_UNITS, |catalog| catalog.claims.as_ref().map_or(Ok(()), |claims| claims.rebuild_public()))) {
                 Err(e) if e.is_busy() => {},
                 done => done?,
             }
@@ -3828,7 +3837,7 @@ impl Catalog {
             }
             // What's under it is public if it is
             if new_cid && let Some(claims) = &self.claims {
-                claims.spread_public(id)?;
+                claims.arrived(id)?;
             }
             self.db.conn()
                 .prepare_cached(

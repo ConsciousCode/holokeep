@@ -51,6 +51,12 @@ h same add --as unixfs "$big" "$rechunked" >/dev/null
 
 # Given to whoever asks for it, unannounced, and all it links to
 h public add --serve "$tree" >/dev/null
+# An anchor made public, as it is now
+printf 'shared from %s\n' "$name" > "$tmp/shared.txt"
+shared=$(h add -q "$tmp/shared.txt")
+published=$(h anchor new)
+h anchor set "$published" "$shared" >/dev/null
+h public add "$published" >/dev/null
 
 # Reported lost: what's never been here, so it stays so
 printf 'lost from %s\n' "$name" > "$tmp/lost.txt"
@@ -92,6 +98,8 @@ served $anchor
 same $big
 rechunked $rechunked
 public $tree
+published $published
+shared $shared
 EXPECT
 echo "made $out"
 du -sh "$out"

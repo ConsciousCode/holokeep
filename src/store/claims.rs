@@ -428,17 +428,31 @@ const SCHEMA: &str =
              mode TEXT NOT NULL,
              n INTEGER NOT NULL DEFAULT 0
          );
-         -- What each public claim reaches, as far as what's here links:
-         -- its targets, and what they link to, however deep, whether it's
-         -- here or not. Kept up as blocks arrive, so whether a block's
-         -- public is one lookup, whoever asks; whether it counts is the
-         -- claim's to say, so a tomb needs nothing taken away.
-         CREATE TABLE IF NOT EXISTS public_blocks (
+         -- What's public, kept by unit: what a public claim names, and
+         -- each anchor or group what it names reaches. A unit's reach is
+         -- what it links to, however deep, here or not, short of other
+         -- units, which are its edges: for an anchor, from what it is now;
+         -- for a group, from its members. Kept up as blocks arrive and
+         -- units change, each unit apart, so an anchor changing walks only
+         -- its own tree; whether a block's public is a lookup and a walk up
+         -- the few units, whoever asks. Whether it counts is the claims'
+         -- to say, so a tomb of one needs nothing taken away.
+         DROP TABLE IF EXISTS public_blocks;
+         CREATE TABLE IF NOT EXISTS public_units (
+             unit INTEGER PRIMARY KEY REFERENCES multihashes (id)
+         );
+         CREATE TABLE IF NOT EXISTS public_reach (
              block INTEGER NOT NULL REFERENCES multihashes (id),
-             claim INTEGER NOT NULL REFERENCES claims (id) ON DELETE CASCADE,
-             PRIMARY KEY (block, claim)
+             unit INTEGER NOT NULL REFERENCES public_units (unit) ON DELETE CASCADE,
+             PRIMARY KEY (block, unit)
          ) WITHOUT ROWID;
-         CREATE INDEX IF NOT EXISTS public_blocks_claim ON public_blocks (claim);
+         CREATE INDEX IF NOT EXISTS public_reach_unit ON public_reach (unit);
+         CREATE TABLE IF NOT EXISTS public_edges (
+             unit INTEGER NOT NULL REFERENCES public_units (unit) ON DELETE CASCADE,
+             child INTEGER NOT NULL REFERENCES multihashes (id),
+             PRIMARY KEY (unit, child)
+         ) WITHOUT ROWID;
+         CREATE INDEX IF NOT EXISTS public_edges_child ON public_edges (child);
          -- What's particular to each type; a tomb has nothing but targets.
          CREATE TABLE IF NOT EXISTS group_claims (
              id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
@@ -1703,13 +1717,6 @@ impl ClaimStore {
         if let Claim::Public(public) = claim {
             conn.prepare_cached("INSERT INTO public_claims (id, mode, n) VALUES (?1, ?2, ?3)")?
                 .execute(params![row, public.mode(), i64::try_from(public.n()).unwrap_or(i64::MAX)])?;
-            // What it reaches of what's here already
-            let mut stmt = conn.prepare_cached("INSERT OR IGNORE INTO public_blocks (block, claim) VALUES (?1, ?2)")?;
-            for target in public.target() {
-                let target = self.db.intern(target.multihash())?;
-                stmt.execute(params![target, row])?;
-                self.spread_public(target)?;
-            }
         }
         if let Claim::Lost(lost) = claim {
             conn.prepare_cached("INSERT INTO lost_claims (id, at) VALUES (?1, ?2)")?
@@ -1892,35 +1899,209 @@ impl ClaimStore {
         rows.iter().map(|multihash| claim_link(multihash)).collect()
     }
 
-    /// Mark public what a public block links to, however deep, for each
-    /// claim that reaches it, short of what's marked for it already: as
-    /// a claim's made, from its targets, and as a block arrives, from it.
-    /// Links are as the catalog's stores index them, whose tables are in
-    /// any catalog's database.
-    pub(super) fn spread_public(&self, from: Id) -> Result<()> {
-        const UNMARKED: &str = "NOT EXISTS (SELECT 1 FROM public_blocks p WHERE p.block = l.target AND p.claim = down.claim)";
-        self.db.conn()
-            .prepare_cached(&format!(
-                "WITH RECURSIVE down (id, claim) AS (
-                     SELECT block, claim FROM public_blocks WHERE block = ?1
-                     UNION SELECT l.target, down.claim FROM unixfs_links l JOIN down ON l.node = down.id WHERE {UNMARKED}
-                     UNION SELECT l.target, down.claim FROM ipld_links l JOIN down ON l.block = down.id WHERE {UNMARKED}
-                     UNION SELECT l.target, down.claim FROM refs l JOIN down ON l.source = down.id WHERE {UNMARKED}
-                 )
-                 INSERT OR IGNORE INTO public_blocks (block, claim) SELECT id, claim FROM down"
-            ))?
-            .execute([from])?;
+    /// Walk a public unit's reach, keeping it: from what it names, or
+    /// from a block of it that's arrived, whose links it's now known by.
+    /// What it links to is followed, short of what's in its reach already
+    /// and of other units, anchors and groups, which are kept as its edges
+    /// and returned. Links are as the catalog's stores index them, a mount
+    /// point's to the anchor it mounts among them, whose tables are in any
+    /// catalog's database.
+    fn walk_public(&self, unit: Id, from: Option<Id>) -> Result<Vec<Id>> {
+        // Anchors and groups, which are units of their own
+        const BOUNDARY: &str = "(EXISTS (SELECT 1 FROM claim_targets bt JOIN claims bc ON bc.id = bt.claim WHERE bt.target = down.id AND bc.kind = 'set')
+             OR EXISTS (SELECT 1 FROM group_claims bg WHERE bg.into_ = down.id))";
+        const UNMARKED: &str = "NOT EXISTS (SELECT 1 FROM public_reach p WHERE p.block = l.target AND p.unit = ?1)";
+        // An anchor's what it is now, every head of it if it's forked, by
+        // whichever account's sets count here; a group, its members
+        let start = if from.is_some() {
+            "SELECT ?2, 1".to_owned()
+        }
+        else {
+            format!(
+                "SELECT ?1, 1
+                 UNION SELECT value, 1 FROM anchor_values_any WHERE anchor = ?1
+                 UNION SELECT t.target, 1 FROM group_claims g JOIN claims c ON c.id = g.id JOIN claim_targets t ON t.claim = c.id
+                     WHERE g.into_ = ?1 AND {LIVE_ANY}"
+            )
+        };
+        let sql = format!(
+            "WITH RECURSIVE down (id, start) AS (
+                 {start}
+                 UNION SELECT l.target, 0 FROM unixfs_links l JOIN down ON l.node = down.id WHERE (down.start OR NOT {BOUNDARY}) AND {UNMARKED}
+                 UNION SELECT l.target, 0 FROM ipld_links l JOIN down ON l.block = down.id WHERE (down.start OR NOT {BOUNDARY}) AND {UNMARKED}
+                 UNION SELECT l.target, 0 FROM refs l JOIN down ON l.source = down.id WHERE (down.start OR NOT {BOUNDARY}) AND {UNMARKED}
+             )
+             SELECT id, max(NOT start AND {BOUNDARY}) FROM down GROUP BY id"
+        );
+        let conn = self.db.conn();
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let row = |row: &rusqlite::Row<'_>| Ok((row.get::<_, Id>(0)?, row.get::<_, bool>(1)?));
+        let reached: Vec<(Id, bool)> = match from {
+            Some(from) => stmt.query_map(params![unit, from], row)?.collect::<rusqlite::Result<_>>()?,
+            None => stmt.query_map([unit], row)?.collect::<rusqlite::Result<_>>()?,
+        };
+        let mut reach = conn.prepare_cached("INSERT OR IGNORE INTO public_reach (block, unit) VALUES (?1, ?2)")?;
+        let mut edge = conn.prepare_cached("INSERT OR IGNORE INTO public_edges (unit, child) VALUES (?1, ?2)")?;
+        let mut children = Vec::new();
+        for (block, boundary) in reached {
+            reach.execute([block, unit])?;
+            if boundary && block != unit {
+                edge.execute([unit, block])?;
+                children.push(block);
+            }
+        }
+        Ok(children)
+    }
+
+    /// Build a public unit's reach afresh, and those of the units it
+    /// reaches which aren't yet.
+    fn build_public(&self, unit: Id) -> Result<()> {
+        let conn = self.db.conn();
+        conn.prepare_cached("INSERT OR IGNORE INTO public_units (unit) VALUES (?1)")?.execute([unit])?;
+        let mut pending = vec![unit];
+        while let Some(unit) = pending.pop() {
+            conn.prepare_cached("DELETE FROM public_edges WHERE unit = ?1")?.execute([unit])?;
+            conn.prepare_cached("DELETE FROM public_reach WHERE unit = ?1")?.execute([unit])?;
+            for child in self.walk_public(unit, None)? {
+                if self.new_public_unit(child)? {
+                    pending.push(child);
+                }
+            }
+        }
         Ok(())
     }
 
+    /// Note a unit, saying whether it's new, so yet to be built.
+    fn new_public_unit(&self, unit: Id) -> Result<bool> {
+        Ok(self.db.conn().prepare_cached("INSERT OR IGNORE INTO public_units (unit) VALUES (?1)")?.execute([unit])? > 0)
+    }
+
+    /// A block's arrived: what it links to is in the reach of each unit
+    /// it's in, but those it's an edge of, the unit it is being its own.
+    pub(super) fn arrived(&self, block: Id) -> Result<()> {
+        let units: Vec<Id> = self.db.conn()
+            .prepare_cached(
+                "SELECT r.unit FROM public_reach r WHERE r.block = ?1
+                 AND NOT EXISTS (SELECT 1 FROM public_edges e WHERE e.unit = r.unit AND e.child = ?1)",
+            )?
+            .query_map([block], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for unit in units {
+            for child in self.walk_public(unit, Some(block))? {
+                if self.new_public_unit(child)? {
+                    self.build_public(child)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Build every public unit afresh, from what public claims name,
+    /// counting or not, since a claim may count later: when who's
+    /// authorized changes, which changes which sets count, and once, for
+    /// repos made before units.
+    pub(super) fn rebuild_public(&self) -> Result<()> {
+        self.db.conn().execute_batch("DELETE FROM public_edges; DELETE FROM public_reach; DELETE FROM public_units;")?;
+        let targets: Vec<Id> = self.db.conn()
+            .prepare_cached("SELECT DISTINCT t.target FROM claims c JOIN claim_targets t ON t.claim = c.id WHERE c.kind = 'public'")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for target in targets {
+            if self.new_public_unit(target)? {
+                self.build_public(target)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep what's public up with a claim just put: a public claim's
+    /// targets are units; a set changes an anchor, a group a group, and a
+    /// tomb or signature of one may, so their units are built afresh, or,
+    /// if they aren't units yet, those whose reach they're in, which then
+    /// find them so. Who's authorized changing, everything is.
+    fn public_changed(&self, claim: &Claim, authorizing: bool) -> Result<()> {
+        if let Claim::Public(public) = claim {
+            for target in public.target() {
+                let target = self.db.intern(target.multihash())?;
+                if self.new_public_unit(target)? {
+                    self.build_public(target)?;
+                }
+            }
+            return Ok(());
+        }
+        if !self.db.conn().prepare_cached("SELECT 1 FROM public_units LIMIT 1")?.exists([])? {
+            return Ok(());
+        }
+        if authorizing {
+            return self.rebuild_public();
+        }
+        let mut changed = Vec::new();
+        match claim {
+            Claim::Set(_) | Claim::Group(_) => changed.extend(self.public_moved(claim)?),
+            Claim::Tomb(_) | Claim::Sign(_) => {
+                for target in claim.target() {
+                    match crate::claim::dissolved(target) {
+                        Some(dissolved) => changed.extend(self.public_moved(&dissolved)?),
+                        None => changed.extend(
+                            self.db.conn()
+                                .prepare_cached(
+                                    "SELECT t.target FROM multihashes m JOIN claims c ON c.claim = m.id JOIN claim_targets t ON t.claim = c.id
+                                     WHERE m.multihash = ?1 AND c.kind = 'set'
+                                     UNION SELECT g.into_ FROM multihashes m JOIN claims c ON c.claim = m.id JOIN group_claims g ON g.id = c.id
+                                     WHERE m.multihash = ?1",
+                                )?
+                                .query_map([target.multihash().to_bytes()], |row| row.get::<_, Id>(0))?
+                                .collect::<rusqlite::Result<Vec<_>>>()?,
+                        ),
+                    }
+                }
+            },
+            _ => {},
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        for moved in changed {
+            let is_unit = self.db.conn().prepare_cached("SELECT 1 FROM public_units WHERE unit = ?1")?.exists([moved])?;
+            let units: Vec<Id> = if is_unit {
+                vec![moved]
+            }
+            else {
+                self.db.conn()
+                    .prepare_cached("SELECT DISTINCT unit FROM public_reach WHERE block = ?1")?
+                    .query_map([moved], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for unit in units {
+                self.build_public(unit)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// What a set or group changes, if it's here: the anchors it sets, or
+    /// the group it's of.
+    fn public_moved(&self, claim: &Claim) -> Result<Vec<Id>> {
+        let moved: Vec<&Link> = match claim {
+            Claim::Set(set) => set.target().iter().collect(),
+            Claim::Group(group) => vec![group.group()],
+            _ => Vec::new(),
+        };
+        moved.into_iter().filter_map(|link| self.db.lookup(link.multihash()).transpose()).collect()
+    }
+
     /// Whether a public claim that counts for anyone here, of a mode this
-    /// knows, reaches a block.
+    /// knows, reaches a block: names a unit whose reach it's in, or one
+    /// whose reach that's an edge of, and so on.
     pub fn is_public(&self, key: Key<'_>) -> Result<bool> {
         Ok(self.db.conn()
             .prepare_cached(&format!(
-                "SELECT 1 FROM multihashes m JOIN public_blocks b ON b.block = m.id
-                 JOIN claims c ON c.id = b.claim JOIN public_claims p ON p.id = c.id
-                 WHERE m.multihash = ?1 AND p.mode IN ('{}', '{}') AND {LIVE_ANY} LIMIT 1",
+                "WITH RECURSIVE up (unit) AS (
+                     SELECT r.unit FROM multihashes m JOIN public_reach r ON r.block = m.id WHERE m.multihash = ?1
+                     UNION SELECT e.unit FROM public_edges e JOIN up ON e.child = up.unit
+                 )
+                 SELECT 1 FROM up JOIN claim_targets t ON t.target = up.unit
+                 JOIN claims c ON c.id = t.claim JOIN public_claims p ON p.id = c.id
+                 WHERE c.kind = 'public' AND p.mode IN ('{}', '{}') AND {LIVE_ANY} LIMIT 1",
                 crate::claim::Public::ANNOUNCE, crate::claim::Public::SERVE,
             ))?
             .exists([key.to_bytes()])?)
@@ -2204,6 +2385,7 @@ impl BlockStore for ClaimStore {
             if authorizing {
                 self.authorize()?;
             }
+            self.public_changed(&claim, authorizing)?;
             Ok(Put::Stored)
         })
     }

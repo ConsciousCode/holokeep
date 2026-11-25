@@ -155,19 +155,28 @@ anyone's to have, in a mode:
 
 - **Roots are what's announced.** Announcing every block of a big DAG
   is millions of records reprovided daily; a fetcher finds the rest
-  from whoever provides the root. A public folder is a root like any
-  other.
-- **What a claim reaches is kept, not walked to.** A catalog keeps what
-  each public claim reaches (`public_blocks`): its targets, and what
-  they link to, by the stores' link indexes, whether it's here yet or
-  not, filled in once as the claim's made and as blocks arrive. Whether
-  a block's public is then one indexed lookup, however many ask and
-  however widely the block's shared. Walking up from a block on each
-  request, as for guests, would let anyone make a node visit every
-  parent of a block thousands of files share, only to say no.
-- **A tomb needs nothing taken away.** A claim's rows count only while
-  the claim does, as signed by a key that counts for any account here,
-  and not retracted; making it public again takes a new claim, `n`.
+  from whoever provides the root.
+- **An anchor is public as it is now**, every head of it if it's forked,
+  by whichever account's sets count here, and so is what it mounts:
+  what it was isn't, once it's changed. A public folder is an anchor,
+  as Kubo's `mfs` strategy announces its MFS root. **A group**, such as
+  a tag, is public as its members are now: tagged later, it's public;
+  untagged, it isn't.
+- **What's public is kept by unit, not walked to.** Each public target,
+  anchor and group is a *unit*, whose reach is what it links to, by the
+  stores' link indexes, here or not, short of other units, which are
+  its edges (`public_units`, `public_reach`, `public_edges`). A unit's
+  filled in as it's made and as blocks arrive, and walked again alone
+  when its anchor or group changes, so publishing a soup of mounted
+  anchors and editing one walks that one's tree. Whether a block's
+  public is a lookup and a walk up the few units to a public claim,
+  however widely the block's shared. Walking up through every link on
+  each request, as for guests, would let anyone make a node visit
+  every parent of a block thousands of files share, only to say no.
+- **A tomb of a public claim needs nothing taken away.** Units count
+  only through claims that count, as signed by a key that counts for
+  any account here, and not retracted; making it public again takes a
+  new claim, `n`. Who's authorized changing, every unit's built again.
 - **A whole CID is public if its layout is**, as a `unixfs` same claim
   says (see [[#Same]]).
 - A mode not known is kept, and makes nothing public. Nothing serves or
@@ -175,6 +184,7 @@ anyone's to have, in a mode:
 
 ```
 hk public add [--serve] <cid>…   # anyone's to have; announced unless --serve
+hk public add --tag <name>        # what a tag tags, as it does
 hk public ls                      # mode and root of each
 hk public check <cid>             # public or private, by whatever reaches it
 hk public rm <cid>                # private again

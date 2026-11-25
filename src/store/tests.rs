@@ -3173,8 +3173,12 @@ fn repos_earlier_builds_made_still_open() {
         repo.serve_anchor(&expect["anchor"], b"node", "later", false).expect("serve");
         assert_eq!(repo.serving(&expect["anchor"]).expect("serving").map(|serve| serve.service().to_owned()).as_deref(), Some("later"), "{name}");
         if let Some(public) = expect.get("public") {
-            assert_eq!(repo.public_roots().expect("roots"), [(crate::claim::Public::SERVE.to_owned(), public.clone())], "{name}");
+            assert!(repo.public_roots().expect("roots").contains(&(crate::claim::Public::SERVE.to_owned(), public.clone())), "{name}");
             assert!(repo.is_public(&expect["hello"]).expect("public"), "{name}: what it links to");
+        }
+        if let (Some(published), Some(shared)) = (expect.get("published"), expect.get("shared")) {
+            assert!(repo.public_roots().expect("roots").contains(&(crate::claim::Public::ANNOUNCE.to_owned(), published.clone())), "{name}");
+            assert!(repo.is_public(shared).expect("public"), "{name}: what the anchor is");
         }
         // And older ones can make things public now, all they link to
         repo.publish(&expect["tree"], crate::claim::Public::ANNOUNCE).expect("publish");
@@ -3945,4 +3949,114 @@ fn what_is_made_public_before_it_arrives_is_public_as_it_does() {
             assert!(here.is_public(&block.cid().clone().into()).expect("public"), "{order}: {}", block.cid());
         }
     }
+}
+
+/// Import a tree of files, each named by its path, mount points among them
+/// as symlinks to `/anchors/<anchor>`.
+fn public_tree(repo: &mut Catalog, scratch: &Scratch, name: &str, files: &[(&str, &str)], mounts: &[(&str, &Link)]) -> Link {
+    let dir = scratch.path().join(name);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    for (path, data) in files {
+        std::fs::write(dir.join(path), data).expect("write");
+    }
+    for (path, anchor) in mounts {
+        std::os::unix::fs::symlink(format!("/anchors/{anchor}"), dir.join(path)).expect("symlink");
+    }
+    Importer::default().add_path(&dir, repo, &mut |_, _| {}).expect("import").expect("root").cid.into()
+}
+
+fn file_cid(data: &str) -> Link {
+    raw(data.as_bytes()).cid().clone().into()
+}
+
+/// A public anchor is public as it is now: what it was isn't, once it's
+/// changed. What it mounts is public as that is now, and a change to a
+/// mounted anchor walks only its own tree.
+#[test]
+fn a_public_anchor_is_public_as_it_is_now_with_what_it_mounts() {
+    let scratch = Scratch::new("public-anchor");
+    let mut repo = Catalog::open_repo(&scratch.path().join("repo")).expect("catalog");
+    let (outer, inner) = (repo.new_anchor().expect("anchor"), repo.new_anchor().expect("anchor"));
+    let first = public_tree(&mut repo, &scratch, "inner-1", &[("deep", "deep, first")], &[]);
+    repo.set_anchor(&inner, &first).expect("set");
+    let top = public_tree(&mut repo, &scratch, "outer-1", &[("old", "old file"), ("kept", "kept file")], &[("mounted", &inner)]);
+    repo.set_anchor(&outer, &top).expect("set");
+    let elsewhere = public_tree(&mut repo, &scratch, "elsewhere", &[("private", "private file")], &[]);
+    let public = |repo: &Catalog, data: &str| repo.is_public(&file_cid(data)).expect("public");
+
+    repo.publish(&outer, crate::claim::Public::ANNOUNCE).expect("publish");
+    for data in ["old file", "kept file", "deep, first"] {
+        assert!(public(&repo, data), "{data}");
+    }
+    assert!(repo.is_public(&top).expect("public") && repo.is_public(&first).expect("public"));
+    assert!(!public(&repo, "private file") && !repo.is_public(&elsewhere).expect("public"));
+
+    // The outer anchor changes: what it was isn't public, what it is is
+    let next = public_tree(&mut repo, &scratch, "outer-2", &[("kept", "kept file"), ("new", "new file")], &[("mounted", &inner)]);
+    repo.set_anchor(&outer, &next).expect("set");
+    assert!(public(&repo, "new file") && public(&repo, "kept file"));
+    assert!(!public(&repo, "old file"), "what it was");
+    assert!(!repo.is_public(&top).expect("public"));
+    assert!(public(&repo, "deep, first"), "still mounted");
+
+    // The mounted anchor changes, and only its own tree's walked again
+    let units = |repo: &Catalog| -> Vec<(i64, i64)> {
+        repo.db.conn().prepare("SELECT unit, count(*) FROM public_reach GROUP BY unit ORDER BY unit").expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?))).expect("query").collect::<rusqlite::Result<_>>().expect("rows")
+    };
+    let outer_unit = repo.db.lookup(outer.multihash()).expect("lookup").expect("interned");
+    let outer_reach = |repo: &Catalog| units(repo).into_iter().find(|(unit, _)| *unit == outer_unit).expect("outer's unit");
+    let before = outer_reach(&repo);
+    let second = public_tree(&mut repo, &scratch, "inner-2", &[("deep", "deep, second")], &[]);
+    repo.set_anchor(&inner, &second).expect("set");
+    assert!(public(&repo, "deep, second") && !public(&repo, "deep, first"));
+    assert_eq!(outer_reach(&repo), before, "the outer anchor's own tree is as it was");
+
+    // Taken back, none of it is
+    repo.unpublish(&outer).expect("unpublish");
+    for data in ["new file", "kept file", "deep, second"] {
+        assert!(!public(&repo, data), "{data}");
+    }
+}
+
+/// An anchor made public before what it's set to is here is public as that
+/// arrives; and one set before it's made public is too.
+#[test]
+fn a_public_anchor_set_to_what_isnt_here_yet_is_public_as_it_comes() {
+    let scratch = Scratch::new("public-anchor-later");
+    let mut there = Catalog::open_repo(&scratch.path().join("there")).expect("catalog");
+    let value = public_tree(&mut there, &scratch, "value", &[("far", "far file"), ("near", "near file")], &[]);
+    let blocks = dag_blocks(&there, &value);
+    let here = Catalog::open_repo(&scratch.path().join("here")).expect("catalog");
+    let anchor = here.new_anchor().expect("anchor");
+    here.publish(&anchor, crate::claim::Public::SERVE).expect("publish");
+    here.set_anchor(&anchor, &value).expect("set");
+    for block in &blocks {
+        here.put_block(block, CidVersion::V1).expect("put");
+    }
+    for block in &blocks {
+        assert!(here.is_public(&block.cid().clone().into()).expect("public"), "{}", block.cid());
+    }
+}
+
+/// A public group, as a tag, is public as its members are now: tagged
+/// later, it's public; untagged, it isn't.
+#[test]
+fn a_public_group_is_public_as_its_members_are() {
+    let scratch = Scratch::new("public-group");
+    let mut repo = Catalog::open_repo(&scratch.path().join("repo")).expect("catalog");
+    let (song, poem) = (
+        public_tree(&mut repo, &scratch, "song", &[("song", "a song")], &[]),
+        public_tree(&mut repo, &scratch, "poem", &[("poem", "a poem")], &[]),
+    );
+    let shared = crate::claim::tag("shared").expect("tag");
+    repo.tag(&song, &shared).expect("tag");
+    repo.publish(&shared, crate::claim::Public::ANNOUNCE).expect("publish");
+    let public = |repo: &Catalog, data: &str| repo.is_public(&file_cid(data)).expect("public");
+    assert!(public(&repo, "a song") && !public(&repo, "a poem"));
+    repo.tag(&poem, &shared).expect("tag");
+    assert!(public(&repo, "a poem"), "tagged later");
+    repo.untag(&song, &shared).expect("untag");
+    assert!(!public(&repo, "a song"), "untagged");
+    assert!(public(&repo, "a poem"));
 }
