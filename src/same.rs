@@ -160,7 +160,7 @@ fn read_unixfs(src: &impl Fetch, target: &Link) -> Result<(Read, Option<Hashed>)
 /// A file's bytes as they're read, hashed with sha2-256, and kept while
 /// they're few enough to hash otherwise.
 #[derive(Default)]
-struct Hashed {
+pub(crate) struct Hashed {
     sha256: Sha256,
     len: u64,
     kept: Option<Vec<u8>>,
@@ -190,7 +190,7 @@ impl Write for Hashed {
 
 impl Hashed {
     /// Whether a raw block's multihash is of these bytes.
-    fn matches(&self, target: &Link) -> Result<bool, Error> {
+    pub(crate) fn matches(&self, target: &Link) -> Result<bool, Error> {
         let multihash = target.multihash();
         if multihash.code() == SHA2_256 {
             return Ok(multihash.digest_ref() == self.sha256.clone().finalize().as_slice());

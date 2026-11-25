@@ -1048,6 +1048,19 @@ fn fetch_through_node(_: &mut Catalog, _: &Path) {}
 
 /// Refuse a block another of the host's accounts has here, but this one
 /// doesn't: it's as good as not here.
+/// The repo, having fetched what's under a CID through its running node,
+/// if there is one, and made sure it's this account's to read. A whole
+/// file's CID, which isn't a block, is the layout it's said to be the
+/// same as (see `export::Fetch::same_file`), which is what's fetched and
+/// must be this account's: knowing a file's whole CID isn't reading it.
+fn fetched(repo: Option<PathBuf>, cid: &Link) -> anyhow::Result<Catalog> {
+    let layout = export::Fetch::same_file(&open_repo(repo.clone())?, cid)?.unwrap_or_else(|| cid.clone());
+    fetch_first(repo.as_ref(), &layout)?;
+    let repo = open_repo(repo)?;
+    in_repo(&repo, &layout)?;
+    Ok(repo)
+}
+
 fn in_repo(repo: &Catalog, cid: &Link) -> anyhow::Result<()> {
     anyhow::ensure!(repo.visible(cid.multihash())?, "block {cid} not found");
     Ok(())
@@ -1391,17 +1404,13 @@ fn run(args: Args) -> anyhow::Result<()> {
             })
         },
         Command::Cat { cid } => {
-            fetch_first(args.repo.as_ref(), &cid)?;
-            let repo = open_repo(args.repo)?;
-            in_repo(&repo, &cid)?;
+            let repo = fetched(args.repo, &cid)?;
             let mut out = io::BufWriter::new(io::stdout().lock());
             export::cat(&repo, &cid, &mut out)?;
             Ok(out.flush()?)
         },
         Command::Get { cid, output } => {
-            fetch_first(args.repo.as_ref(), &cid)?;
-            let repo = open_repo(args.repo)?;
-            in_repo(&repo, &cid)?;
+            let repo = fetched(args.repo, &cid)?;
             let dest = output.unwrap_or_else(|| PathBuf::from(cid.to_string()));
             export::get(&repo, &cid, &dest).with_context(|| format!("writing {}", dest.display()))
         },

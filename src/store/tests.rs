@@ -1551,6 +1551,42 @@ fn files_of_a_block_a_leaf_are_kept_whole_once_rehomed() {
     assert_eq!(router.rehome(u64::MAX).expect("rehome"), crate::store::Rehomed::default(), "once");
 }
 
+/// A kept file is read by its whole CID, which isn't a block, through
+/// the root it's said to be the same as: whole, in part, or written out.
+/// What's read that way whole is checked, so a same claim that's wrong
+/// fails rather than passing for the file.
+#[test]
+fn a_whole_cid_is_read_through_a_layout_said_to_be_the_same() {
+    let scratch = Scratch::new("shards-whole-cid");
+    let file = scratch.path().join("file");
+    let data = content(1000, 5);
+    std::fs::write(&file, &data).expect("write");
+    let mut router = sharded(&scratch);
+    let root: Link = import_copying(&mut router, &file).cid.into();
+    let whole: Link = raw(&data).cid().clone().into();
+    assert!(!router.has(whole.multihash()).expect("has"), "not a block");
+
+    let mut out = Vec::new();
+    crate::export::cat(&router, &whole, &mut out).expect("cat");
+    assert_eq!(out, data);
+    assert!(matches!(crate::export::stat(&router, &whole).expect("stat"), crate::export::Kind::File(1000)));
+    assert_eq!(crate::export::read_at(&router, &whole, 500, 100).expect("read"), &data[500..600]);
+    let dest = scratch.path().join("out");
+    crate::export::get(&router, &whole, &dest).expect("get");
+    assert_eq!(std::fs::read(&dest).expect("read"), data);
+
+    // Said wrongly, by a claim made without checking
+    let other = content(1000, 6);
+    let wrong: Link = raw(&other).cid().clone().into();
+    let same = crate::claim::Same::new([root, wrong.clone()], Some(crate::same::UNIXFS.to_owned())).expect("same");
+    router.put_claim(&Claim::Same(same)).expect("put");
+    let mut out = Vec::new();
+    assert!(crate::export::cat(&router, &wrong, &mut out).is_err(), "what's read isn't it");
+    let dest = scratch.path().join("wrong");
+    assert!(crate::export::get(&router, &wrong, &dest).is_err());
+    assert!(!dest.exists(), "taken away");
+}
+
 #[test]
 fn small_files_are_copied_as_blocks() {
     let scratch = Scratch::new("shards-small");

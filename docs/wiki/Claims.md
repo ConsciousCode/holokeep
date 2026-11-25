@@ -115,8 +115,18 @@ targets are read, its **lens**, and says they read the same through it:
   repo opening with files kept before says so of each, once, in one
   sign. The repo's own record of which roots a kept file is
   (`shard_roots`) stands apart, so its ranges never hang on a claim.
-- **Not yet acted on.** Nothing reads one member through another yet;
-  `same` is said, checked and listed. A lens is a name for now; one not
+- **A whole CID reads through a layout.** A raw CID that isn't a block
+  here, as a kept file's whole one isn't, is read through a layout a
+  `unixfs` claim that counts says it's the same as, one whose root is
+  here if any is, else fetched from members as blocks, each checked
+  against its own CID: by `hk cat`, `hk get`, and the mount's
+  `cid/<cid>`. `hk cat` and `hk get` hash what they write and fail if
+  it isn't the whole CID, `get` taking the file away; a read of part of
+  it, as the mount's, can't be checked against a whole hash, so takes
+  the claim at its signer's word. What's fetched, and must be this
+  account's to read, is the layout: knowing a whole CID isn't reading
+  it. Members don't yet answer for a whole CID, but have its claims, as
+  structure, wherever they hold its root. A lens is a name for now; one not
   known is kept, and says nothing this can check. A lens could later be
   an ADL's code by CID, as WASM.
 

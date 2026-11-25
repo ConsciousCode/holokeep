@@ -327,6 +327,10 @@ impl export::Fetch for Cached<'_> {
         self.0.prefetch(cids);
     }
 
+    fn same_file(&self, cid: &Link) -> io::Result<Option<Link>> {
+        self.0.same_file(cid)
+    }
+
     fn is_dir(&self, cid: &Link) -> io::Result<bool> {
         if cid.codec() == crate::cid::RAW_CODEC {
             return Ok(false);

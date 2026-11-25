@@ -28,6 +28,13 @@ pub trait Fetch {
     /// elsewhere can ask for them all at once rather than one by one.
     fn prefetch(&self, _cids: &[Link]) {}
 
+    /// A UnixFS layout of the file a whole CID names, a raw one which
+    /// isn't a block here: one a `same` claim says is the same, read as a
+    /// file (see `same`). None if it's a block, or nothing says so.
+    fn same_file(&self, _cid: &Link) -> io::Result<Option<Link>> {
+        Ok(None)
+    }
+
     /// Whether a block's a directory, which a raw one can't be. A source
     /// may know without decoding it again.
     fn is_dir(&self, cid: &Link) -> io::Result<bool>
@@ -75,6 +82,29 @@ impl Fetch for Catalog {
         }
     }
 
+    /// One whose root is here, if any is: so a whole CID is read through
+    /// what was kept, or else fetched as blocks, each checked as it comes.
+    fn same_file(&self, cid: &Link) -> io::Result<Option<Link>> {
+        use crate::cid::CidRef as _;
+        use crate::store::BlockIndex as _;
+        if cid.codec() != RAW_CODEC || cid.hashcode() == crate::block::IDENTITY || self.has(cid.multihash()).map_err(io::Error::other)? {
+            return Ok(None);
+        }
+        let Some(claims) = self.claims() else {
+            return Ok(None);
+        };
+        let layouts: Vec<Link> = claims.same_as(cid, Some(crate::same::UNIXFS)).map_err(io::Error::other)?
+            .into_iter()
+            .filter(|layout| layout.codec() == DAG_PB_CODEC)
+            .collect();
+        for layout in &layouts {
+            if self.has(layout.multihash()).map_err(io::Error::other)? {
+                return Ok(Some(layout.clone()));
+            }
+        }
+        Ok(layouts.into_iter().next())
+    }
+
     fn prefetch(&self, cids: &[Link]) {
         use crate::cid::CidRef as _;
         use crate::store::BlockIndex as _;
@@ -102,6 +132,12 @@ enum Node {
 }
 
 fn load(src: &impl Fetch, cid: &Link) -> io::Result<Node> {
+    // A whole file's CID, read through a layout of it
+    if cid.codec() == RAW_CODEC
+        && let Some(layout) = src.same_file(cid)?
+    {
+        return load(src, &layout);
+    }
     let bytes = src.fetch(cid)?;
     match cid.codec() {
         RAW_CODEC => Ok(Node::Raw(bytes)),
@@ -129,9 +165,44 @@ fn deeper(depth: usize) -> io::Result<usize> {
     }
 }
 
-/// Write a file's contents.
+/// Write a file's contents. A whole file's CID read through a layout of
+/// it is checked once it's all written, and fails if it wasn't that.
 pub fn cat(src: &impl Fetch, cid: &Link, out: &mut impl Write) -> io::Result<()> {
-    write_file(src, load(src, cid)?, out, 0)
+    match src.same_file(cid)? {
+        Some(layout) => {
+            let mut checked = Checked { out, hashed: crate::same::Hashed::default() };
+            write_file(src, load(src, &layout)?, &mut checked, 0)?;
+            checked.check(cid, &layout)
+        },
+        None => write_file(src, load(src, cid)?, out, 0),
+    }
+}
+
+/// What's written, passed on and hashed, to check against a whole file's
+/// CID once it's all written.
+struct Checked<W> {
+    out: W,
+    hashed: crate::same::Hashed,
+}
+
+impl<W: Write> Write for Checked<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.out.write(buf)?;
+        self.hashed.write_all(buf.get(..n).unwrap_or_default())?;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> { self.out.flush() }
+}
+
+impl<W: Write> Checked<W> {
+    fn check(&self, cid: &Link, layout: &Link) -> io::Result<()> {
+        match self.hashed.matches(cid) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(invalid(format!("{layout} isn't {cid}, as it was said to be the same"))),
+            Err(e) => Err(invalid(e.to_string())),
+        }
+    }
 }
 
 fn write_file(src: &impl Fetch, node: Node, out: &mut impl Write, depth: usize) -> io::Result<()> {
@@ -158,9 +229,25 @@ fn write_file(src: &impl Fetch, node: Node, out: &mut impl Write, depth: usize) 
     }
 }
 
-/// Write whatever's at a CID to `dest`, which mustn't exist yet.
+/// Write whatever's at a CID to `dest`, which mustn't exist yet. A whole
+/// file's CID read through a layout of it is checked, as `cat` does, and
+/// what's written taken away if it wasn't that.
 pub fn get(src: &impl Fetch, cid: &Link, dest: &Path) -> io::Result<()> {
-    write_entry(src, cid, dest, 0)
+    let Some(layout) = src.same_file(cid)? else {
+        return write_entry(src, cid, dest, 0);
+    };
+    // create_new fails rather than following an existing symlink
+    let file = io::BufWriter::new(File::create_new(dest)?);
+    let mut checked = Checked { out: file, hashed: crate::same::Hashed::default() };
+    let written = load(src, &layout)
+        .and_then(|node| write_file(src, node, &mut checked, 0))
+        .and_then(|()| checked.flush())
+        .and_then(|()| checked.check(cid, &layout));
+    if written.is_err() {
+        // It made it, so it's its to take away
+        let _ = fs::remove_file(dest);
+    }
+    written
 }
 
 fn write_entry(src: &impl Fetch, cid: &Link, dest: &Path, depth: usize) -> io::Result<()> {
