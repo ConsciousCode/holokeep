@@ -51,7 +51,7 @@ __pycache__/   copies=1
 | `inline` | A directory made by this name is an ordinary directory of the anchor it's in. |
 | `copies=<n>` | A directory made by this name is an anchor of its own (unless the rules say `inline`), kept by a keep asking for `n` failures to lose what's in it, at least 1 (see [[Replication and Retention#Durability]]). |
 | `pace=<time>` | An anchor mounted by this name is committed at most this often, as well as by its own pace (see [[Mount#Committing]]). Times are `30s`, `5m`, `1h` or `0`. |
-| `skip` | What's by this name in a watched directory isn't imported. So far, the mount makes nothing of it. |
+| `skip` | What's by this name in a watched directory isn't imported; in the mount, what's new by this name stays in the anchor's work directory and isn't committed. |
 | `include` | What's by this name is imported after all, though an earlier rule said `skip`. |
 | `app=<name>` | The rule applies only to what the application by this name makes: the process making the request, by `/proc/<pid>/comm`. |
 
@@ -74,6 +74,15 @@ once they're done and renamed to what they'll be.
 
 ## When rules apply
 
+- In the mount, `skip` applies as an anchor's committed: what's new in
+  its work directory by a skipped name stays there, shown as ever, and
+  isn't committed, until it's renamed to a name that isn't. What the
+  anchor had stays, whatever a rule added since says, and so does what's
+  renamed within it. The rules heeded are the built-in ones, the root's
+  top's, and the anchor's own rules files, as written or as committed;
+  not yet those of anchors it's mounted inside. What's skipped is left
+  in the work directory, so once the anchor's let go of, it's kept
+  whole like anything else left there.
 - In a watched directory, the built-in rules apply, then the root's
   top's rules file, then each `.souprules` in the directory and below,
   from the top down, its paths from its own directory. Only `skip` and

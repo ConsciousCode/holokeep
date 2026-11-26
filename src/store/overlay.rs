@@ -29,6 +29,10 @@ use crate::dag::{DagLink, DirLayoutBuilder as _, DirLayoutStrategy as _};
 use crate::export::{self, Fetch};
 use crate::model::Link;
 
+/// The rules heeded in an overlay being committed: each with the directory
+/// of the anchor its paths are from, farthest first.
+type Ruled = Vec<(PathBuf, std::sync::Arc<crate::rules::Rules>)>;
+
 use super::{Catalog, Error, InPlace, Mount, Result, path_bytes, path_from};
 
 /// A mark: gone (None), or a block with the size its link says.
@@ -369,7 +373,9 @@ impl Catalog {
         let base = self.overlay_base(&mount.anchor)?;
         let root = base.as_ref().map(|(value, _)| value.clone());
         let importer = mount.importer();
-        let built = self.overlay_node(&importer, Some(&mount.path), Path::new(""), root.clone().map(|cid| (cid, None)), &marks)?;
+        // What's new and the rules skip stays in the work directory alone
+        let ruled: Ruled = vec![(PathBuf::new(), std::sync::Arc::new(self.watch_rules()?))];
+        let built = self.overlay_node(&importer, Some(&mount.path), Path::new(""), root.clone().map(|cid| (cid, None)), &marks, &ruled)?;
         let value: Link = match built {
             Some(link) => link.cid.into(),
             // Everything's gone: an empty directory
@@ -417,15 +423,17 @@ impl Catalog {
     /// An empty directory if nothing's left.
     pub fn edit_value(&mut self, root: Option<Link>, marks: &Marks) -> Result<Link> {
         let importer = crate::import::Importer { hidden: true, ..crate::import::Importer::default() };
-        Ok(match self.overlay_node(&importer, None, Path::new(""), root.map(|cid| (cid, None)), marks)? {
+        Ok(match self.overlay_node(&importer, None, Path::new(""), root.map(|cid| (cid, None)), marks, &Vec::new())? {
             Some(link) => link.cid.into(),
             None => importer.directory.builder().finalize(&mut InPlace::new(self))?.cid.into(),
         })
     }
 
     /// What's at a path of an overlay now, built over what the anchor had
-    /// there, or nothing: of its work directory, if it has one.
-    fn overlay_node(&mut self, importer: &crate::import::Importer, work: Option<&Path>, rel: &Path, base: Base, marks: &Marks) -> Result<Option<DagLink>> {
+    /// there, or nothing: of its work directory, if it has one. What's new
+    /// in the work directory that the rules heeded say to skip is left
+    /// out; what the anchor had stays, whatever they say.
+    fn overlay_node(&mut self, importer: &crate::import::Importer, work: Option<&Path>, rel: &Path, base: Base, marks: &Marks, ruled: &Ruled) -> Result<Option<DagLink>> {
         let base = marks.get(rel).map_or(base, |mark| mark.clone().map(|(cid, size)| (cid, Some(size))));
         // Joining nothing would add a slash, which a file anchor's work
         // file isn't under
@@ -464,13 +472,41 @@ impl Catalog {
                         entries.entry(entry?.file_name().as_bytes().to_vec()).or_insert(None);
                     }
                 }
+                // This directory's own rules, as written or as it was
+                let mut ruled = ruled.clone();
+                if !ruled.is_empty() {
+                    let file = crate::rules::FILE.as_bytes();
+                    let committed = || match entries.get(file) {
+                        Some(Some((cid, _))) => export::read_at(&*self, cid, 0, crate::rules::MOST).ok(),
+                        _ => None,
+                    };
+                    if let Some(text) = fs::read(work_here.join(crate::rules::FILE)).ok().or_else(committed) {
+                        let (here, errors) = crate::rules::Rules::parse(&String::from_utf8_lossy(&text));
+                        for e in errors {
+                            eprintln!("{} in {}: {e}", crate::rules::FILE, rel.display());
+                        }
+                        ruled.push((rel.to_path_buf(), std::sync::Arc::new(here)));
+                    }
+                }
                 let mut dir = importer.directory.builder();
                 for (name, base) in entries {
                     if !importer.hidden && name.starts_with(b".") {
                         continue;
                     }
                     let child = rel.join(std::ffi::OsStr::from_bytes(&name));
-                    if let Some(link) = self.overlay_node(importer, work, &child, base, marks)? {
+                    // Only what's in the work directory, not a mark, which
+                    // would go from what's shown if it were left out
+                    if base.is_none() && !ruled.is_empty() && !marks.contains_key(&child)
+                        && let Ok(meta) = fs::symlink_metadata(work_here.join(std::ffi::OsStr::from_bytes(&name)))
+                    {
+                        let settings = ruled.iter().fold(crate::rules::Settings::default(), |settings, (from, rules)| {
+                            rules.apply(settings, child.strip_prefix(from).unwrap_or(&child), meta.is_dir(), None)
+                        });
+                        if settings.skipped() {
+                            continue;
+                        }
+                    }
+                    if let Some(link) = self.overlay_node(importer, work, &child, base, marks, &ruled)? {
                         dir.add_link(name, link, &mut InPlace::new(self))?;
                     }
                 }
@@ -498,6 +534,42 @@ mod tests {
     fn write(path: &Path, data: &str) {
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         fs::write(path, data).expect("write");
+    }
+
+    /// The names at the top of a directory, sorted.
+    fn names(catalog: &Catalog, dir: &Link) -> Vec<String> {
+        let mut names: Vec<String> = export::list(catalog, dir).expect("list").into_iter().map(|entry| String::from_utf8_lossy(&entry.name).into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn whats_new_and_skipped_stays_in_the_work_directory_alone() {
+        let scratch = Scratch::new("overlay-skip");
+        let mut catalog = Catalog::open_repo(&scratch.path().join("repo")).expect("catalog");
+        // What it had, a download under way among it, from before it was skipped
+        let before = scratch.path().join("before");
+        write(&before.join("had.part"), "committed before");
+        write(&before.join(".souprules"), "*.log skip\nkeep.log include\n");
+        let root = add(&mut catalog, &before);
+        let anchor = catalog.new_anchor().expect("anchor");
+        catalog.set_anchor(&anchor, &root).expect("set");
+        let work = scratch.path().join("work");
+        let mount = Mount { anchor, path: work.clone(), chunk_size: crate::import::CHUNK_SIZE, width: crate::dag::FILE_WIDTH, hidden: true, overlay: true };
+        catalog.mount(&mount).expect("mount");
+
+        write(&work.join("film.mkv.part"), "half a film");
+        write(&work.join("run.log"), "the anchor's own rules skip this");
+        write(&work.join("keep.log"), "but not this");
+        write(&work.join("note"), "a note");
+        let first = catalog.import_overlay(&mount).expect("import");
+        assert_eq!(names(&catalog, &first), [".souprules", "had.part", "keep.log", "note"]);
+        assert!(work.join("film.mkv.part").exists(), "still where it was written");
+
+        // Done and renamed, it's committed
+        fs::rename(work.join("film.mkv.part"), work.join("film.mkv")).expect("rename");
+        let second = catalog.import_overlay(&mount).expect("import");
+        assert_eq!(names(&catalog, &second), [".souprules", "film.mkv", "had.part", "keep.log", "note"]);
     }
 
     #[test]
