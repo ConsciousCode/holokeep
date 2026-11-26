@@ -466,6 +466,7 @@ Checklist:
   - [x] Watching apart from `--nocopy`: listing what's watched and how stale, stopping, `.souprules` skips for watched directories (downloads under way built in), unchanged files not read again (`hk watch add/ls/rm`)
   - [x] Relays: members which can't reach each other connect through a member that relays, and punch through to each other where they can (`relay = true`, `hk node status`)
   - [x] Device names: each device names itself by its hostname, and any may name another, shown by every member (`hk node name`, `hk node peers`)
+  - [x] Looking over the mount's work directories, and letting one go (`hk overlay ls/rm`), with what may not need to be there said when the mount starts
   - [ ] A relay that isn't a member: relaying without the swarm key or the mesh's blocks
   - [ ] Kademlia provider records, once broadcast wants don't scale
   - [x] Measuring how far apart members' clocks are, advisorily (`hk node clocks`)
@@ -551,6 +552,7 @@ $hk add <path> [--no-keep]          # store it, printing CIDs like `ipfs add -r`
 $hk add -n <path>                   # only print CIDs, like `ipfs add --only-hash`
 $hk add --nocopy <path>             # keep contents in place, like Kubo's filestore
 $hk watch add|ls|rm <path>          # import in place and again as it changes, on an anchor
+$hk overlay ls|rm <anchor>          # the mount's work directories, and letting one go
 $hk cat <cid>                       # a file's contents
 $hk get <cid> -o <path>             # a file, directory or symlink
 $hk mount [--read-only] <dir>       # the soup, anchors writable, until interrupted

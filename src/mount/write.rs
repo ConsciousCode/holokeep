@@ -627,6 +627,22 @@ impl Committer {
             if let Err(e) = catalog.note_overlay_base(&mount.anchor) {
                 eprintln!("{} has no base noted yet: {e}", mount.anchor);
             }
+            // Asked to let go of it (`hk overlay rm`), once nothing of it's
+            // open or yet to be committed
+            let asked = self.filler.work.as_ref().map(|work| work.join(format!("{}{}", crate::store::overlay::LET_GO, mount.anchor)));
+            if let Some(asked) = asked.filter(|asked| asked.exists()) {
+                if !self.in_use(&mount.anchor) {
+                    match self.bring_into_step(catalog, &mount) {
+                        Ok(()) if fs::symlink_metadata(&mount.path).is_err() => {
+                            let _ = fs::remove_file(&asked);
+                            eprintln!("let go of {}'s work directory, as asked", mount.anchor);
+                        },
+                        Ok(()) => {},
+                        Err(e) => eprintln!("{} couldn't be let go of yet: {e}", mount.anchor),
+                    }
+                }
+                continue;
+            }
             if !catalog.overlay_behind(&mount.anchor).unwrap_or(false) || self.in_use(&mount.anchor) {
                 continue;
             }
@@ -705,6 +721,9 @@ impl Committer {
                     self.imported(&mount.path);
                 }
                 self.reconcile(&mut catalog);
+                if let Some(work) = &self.filler.work {
+                    audit(&catalog, work);
+                }
             },
             Err(e) => eprintln!("not committing what was written before: {e}"),
         }
@@ -788,6 +807,29 @@ fn written_over(catalog: &Catalog, anchor: &Link, rel: &Path) -> Vec<(Link, Link
 /// missing as it's imported is fetched, outside the import's transaction,
 /// since the node writing it would wait on that, and it's imported again,
 /// as deep as that goes.
+/// Say what's in the work directory that may not need to be: what's kept
+/// there of an anchor nothing names or keeps, and what's no overlay at all.
+/// It only says: letting go is `hk overlay rm`'s.
+fn audit(catalog: &Catalog, work: &Path) {
+    let overlays = match catalog.overlays(work) {
+        Ok(overlays) => overlays,
+        Err(e) => {
+            eprintln!("not looking over the work directory: {e}");
+            return;
+        },
+    };
+    for overlay in overlays.iter().filter(|overlay| overlay.files > 0) {
+        match &overlay.anchor {
+            Some(anchor) if !overlay.named && !overlay.kept => eprintln!(
+                "{} holds {} files, {} MiB, of an anchor nothing names or keeps: `hk overlay rm {anchor}` lets it go",
+                overlay.path.display(), overlay.files, overlay.bytes >> 20,
+            ),
+            Some(_) => {},
+            None => eprintln!("{} holds {} files, {} MiB, and is no overlay this repo knows of", overlay.path.display(), overlay.files, overlay.bytes >> 20),
+        }
+    }
+}
+
 fn import(catalog: &mut Catalog, mount: &Mount, still: &dyn Fn() -> bool) -> crate::store::Result<Option<Link>> {
     let mut imported = catalog.remount_if(mount, still);
     for _ in 0..FETCH_ROUNDS {

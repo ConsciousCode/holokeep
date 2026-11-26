@@ -209,6 +209,28 @@ a file's open to write shows once it's closed.
 A commit does the first of those too, whenever the anchor has moved on from its
 base, so it never replaces what it didn't see.
 
+## Work directories: `hk overlay`
+
+What's in `work/` is each written anchor's files as they are now, the
+one copy of them; every version before is kept apart. `hk overlay ls`
+lists each work directory with its files and size on disk, and whether
+the root as it is now names its anchor (`named`, through mount points),
+a keep targets the anchor itself (`kept`, which an anchor the root names
+needn't be), it's behind what's been set elsewhere, or it's being let go
+of, and then anything in `work/` that's no overlay this repo knows of. When it
+starts, the mount says in its output what may not need to be there:
+work directories of anchors nothing names or keeps, and what's no
+overlay. It only says.
+
+`hk overlay rm <anchor>` lets go of an anchor's work directory, as the
+mount does once it's out of step (above): what's in it is committed,
+kept whole with the anchor's other versions, and the directory removed.
+With a mount running, it leaves `work/.let-go-<anchor>`, and the mount
+does it once nothing of the anchor is open or yet to be committed;
+otherwise it's done at once. The anchor is then what it is, as
+anywhere else; what nothing names or keeps is collected in time, like
+anything let go of. Writing to it again makes its work directory again.
+
 ## From outside: `hk fs`
 
 `hk fs` works on paths as the mount shows them, without going through

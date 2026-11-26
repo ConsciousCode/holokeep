@@ -102,6 +102,11 @@ enum Command {
     /// soup. `.souprules` files say what's left out
     #[command(subcommand)]
     Watch(WatchCommand),
+    /// What `hk mount` keeps in each anchor's work directory, written
+    /// through it: an anchor's files as they are now, the one copy of them,
+    /// which every version before is kept apart from
+    #[command(subcommand)]
+    Overlay(OverlayCommand),
     /// Keep things with friends, encrypted: in this account's vault, which
     /// joins their protected meshes
     #[command(subcommand)]
@@ -467,6 +472,25 @@ enum SameCommand {
     },
     /// List what's the same as a block, a line each: the lens, and its CID
     Ls { cid: Link },
+}
+
+#[derive(Subcommand, Debug)]
+enum OverlayCommand {
+    /// List each work directory: its anchor, files and size on disk, and
+    /// whether the root as it is now names the anchor through mount points,
+    /// a keep targets the anchor itself, it's behind what's been set
+    /// elsewhere, or it's being let go of; then any directory there that's
+    /// no overlay.
+    /// The mount says the same of what may not need to be there when it
+    /// starts
+    Ls,
+    /// Let go of an anchor's work directory: what's in it committed, then
+    /// kept whole with the rest of its versions, and the directory
+    /// removed, so the anchor is what it is, as anywhere else. With a
+    /// mount running, the mount does it once nothing of the anchor's open
+    /// or yet to be committed. What nothing names or keeps is then
+    /// collected in time, like anything let go of
+    Rm { anchor: Link },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1517,6 +1541,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Same(command) => same(args.repo, command),
         Command::Public(command) => public(args.repo, command),
         Command::Watch(command) => watch(args.repo, command),
+        Command::Overlay(command) => overlay(args.repo, command),
         Command::Whoami => whoami(args.repo),
         Command::Protect(command) => protect(&repo_dir(args.repo)?, command),
         Command::Cap(command) => cap(args.repo, command),
@@ -3765,6 +3790,46 @@ fn same(repo: Option<PathBuf>, command: SameCommand) -> anyhow::Result<()> {
         },
     }
     Ok(out.flush()?)
+}
+
+fn overlay(repo: Option<PathBuf>, command: OverlayCommand) -> anyhow::Result<()> {
+    let dir = repo_dir(repo.clone())?;
+    let work = dir.join("work");
+    let mut repo = open_repo(repo)?;
+    match command {
+        OverlayCommand::Ls => {
+            for overlay in repo.overlays(&work)? {
+                let Some(anchor) = &overlay.anchor else {
+                    out!("{}\t{} files\t{} bytes\tno overlay", overlay.path.display(), overlay.files, overlay.bytes);
+                    continue;
+                };
+                let mut said = vec![if overlay.named { "named" } else { "unnamed" }, if overlay.kept { "kept" } else { "unkept" }];
+                if !overlay.exists {
+                    said.push("no work directory");
+                }
+                if overlay.behind {
+                    said.push("behind");
+                }
+                if overlay.letting_go {
+                    said.push("letting go");
+                }
+                out!("{anchor}\t{} files\t{} bytes\t{}", overlay.files, overlay.bytes, said.join(", "));
+            }
+            Ok(())
+        },
+        OverlayCommand::Rm { anchor } => {
+            let mount = repo.mounts()?.into_iter().find(|mount| mount.overlay && mount.anchor == anchor).with_context(|| format!("{anchor} has no work directory here"))?;
+            anyhow::ensure!(mount.path.exists(), "{anchor} has no work directory now");
+            if holokeep::fs::mount_points().is_empty() {
+                repo.let_go_overlay(&mount)?;
+                out!("let go of {anchor}'s work directory: it's {}", repo.anchor_value(&anchor)?.map_or_else(|| "nothing".to_owned(), |value| value.to_string()));
+            } else {
+                std::fs::write(work.join(format!("{}{anchor}", holokeep::store::overlay::LET_GO)), b"")?;
+                out!("the mount will let go of {anchor}'s work directory once nothing of it's open or yet to be committed");
+            }
+            Ok(())
+        },
+    }
 }
 
 fn watch(repo: Option<PathBuf>, command: WatchCommand) -> anyhow::Result<()> {

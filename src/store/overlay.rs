@@ -29,6 +29,52 @@ use crate::dag::{DagLink, DirLayoutBuilder as _, DirLayoutStrategy as _};
 use crate::export::{self, Fetch};
 use crate::model::Link;
 
+/// What, in a work directory, asks the mount to let go of an anchor's
+/// overlay once nothing of it is open or yet to be committed: this, then
+/// the anchor.
+pub const LET_GO: &str = ".let-go-";
+
+/// An overlay's work directory, as `Catalog::overlays` sees it: facts
+/// about it, each its own, as `hk overlay ls` lists them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct Overlay {
+    /// None for a directory that's no overlay recorded here.
+    pub anchor: Option<Link>,
+    pub path: PathBuf,
+    pub exists: bool,
+    pub files: usize,
+    pub bytes: u64,
+    /// Whether the root anchor, as it is now, names its anchor, through
+    /// mount points.
+    pub named: bool,
+    /// Whether a keep targets its anchor itself, not merely what names it.
+    pub kept: bool,
+    /// Whether its anchor's moved on from what it's over, as by a set
+    /// elsewhere, which the mount brings it into step with.
+    pub behind: bool,
+    /// Whether the mount's been asked to let go of it.
+    pub letting_go: bool,
+}
+
+/// How many files are under a directory, and how many bytes they hold.
+fn tally(dir: &Path) -> (usize, u64) {
+    let (mut files, mut bytes) = (0usize, 0u64);
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(at) = pending.pop() {
+        let Ok(meta) = fs::symlink_metadata(&at) else {
+            continue;
+        };
+        if meta.is_dir() {
+            pending.extend(fs::read_dir(&at).into_iter().flatten().flatten().map(|entry| entry.path()));
+        } else {
+            files = files.saturating_add(1);
+            bytes = bytes.saturating_add(std::os::unix::fs::MetadataExt::blocks(&meta).saturating_mul(512));
+        }
+    }
+    (files, bytes)
+}
+
 /// The rules heeded in an overlay being committed: each with the directory
 /// of the anchor its paths are from, farthest first.
 type Ruled = Vec<(PathBuf, std::sync::Arc<crate::rules::Rules>)>;
@@ -355,6 +401,83 @@ impl Catalog {
         })
     }
 
+    /// What's in an overlay mount's work directories, and what's there
+    /// that isn't one, for seeing what's kept there and why: each recorded
+    /// overlay, then each directory in `work` that's none of them.
+    pub fn overlays(&self, work: &Path) -> Result<Vec<Overlay>> {
+        let mut overlays = Vec::new();
+        let mut known = std::collections::HashSet::new();
+        let named = self.named_now()?;
+        for mount in self.mounts()?.into_iter().filter(|mount| mount.overlay) {
+            known.insert(mount.path.clone());
+            let (files, bytes) = tally(&mount.path);
+            let marker = work.join(format!("{LET_GO}{}", mount.anchor));
+            overlays.push(Overlay {
+                named: named.contains(&mount.anchor.multihash().to_bytes()),
+                kept: self.claims().map_or(Ok(false), |claims| claims.kept(mount.anchor.multihash()))?,
+                behind: self.overlay_behind(&mount.anchor)?,
+                letting_go: marker.exists(),
+                exists: mount.path.exists(),
+                anchor: Some(mount.anchor),
+                path: mount.path,
+                files,
+                bytes,
+            });
+        }
+        for entry in fs::read_dir(work).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if known.contains(&path) || entry.file_name().as_bytes().starts_with(b".") {
+                continue;
+            }
+            let (files, bytes) = tally(&path);
+            overlays.push(Overlay { anchor: None, path, exists: true, files, bytes, named: false, kept: false, behind: false, letting_go: false });
+        }
+        Ok(overlays)
+    }
+
+    /// The multihashes of everything the root anchor reaches as it is now,
+    /// through what links to what, mount points, and what anchors are now:
+    /// so whether an anchor's among them is whether it's named now.
+    fn named_now(&self) -> Result<std::collections::HashSet<Vec<u8>>> {
+        let Some(root) = self.root_anchor()? else {
+            return Ok(std::collections::HashSet::new());
+        };
+        let conn = self.db.conn();
+        let has = |table: &str| conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE name = ?1")?.exists([table]);
+        let mut steps = vec!["SELECT r.target FROM refs r JOIN down ON r.source = down.id".to_owned()];
+        if has("anchor_values_any")? {
+            steps.push("SELECT v.value FROM anchor_values_any v JOIN down ON v.anchor = down.id".to_owned());
+        }
+        if has("unixfs_links")? {
+            steps.push("SELECT l.target FROM unixfs_links l JOIN down ON l.node = down.id".to_owned());
+        }
+        if has("ipld_links")? {
+            steps.push("SELECT l.target FROM ipld_links l JOIN down ON l.block = down.id".to_owned());
+        }
+        let sql = format!(
+            "WITH RECURSIVE down (id) AS (SELECT id FROM multihashes WHERE multihash = ?1 UNION {})
+             SELECT m.multihash FROM down JOIN multihashes m ON m.id = down.id",
+            steps.join(" UNION "),
+        );
+        let named = conn.prepare(&sql)?.query_map([root.multihash().to_bytes()], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(named)
+    }
+
+    /// Let go of an overlay's work directory, as the mount does once it's
+    /// out of step, for when no mount's running: what's in it committed,
+    /// as a fork if the anchor's moved on, then kept whole in the shards,
+    /// so every version stays whole, and the directory removed. The anchor
+    /// is then what it is, as anywhere else, and its work directory's made
+    /// again when it's next written to.
+    pub fn let_go_overlay(&mut self, mount: &Mount) -> Result<()> {
+        self.import_overlay(mount)?;
+        self.preserve_in_place(&mount.path, true)?;
+        if fs::symlink_metadata(&mount.path).is_ok() {
+            fs::remove_dir_all(&mount.path)?;
+        }
+        self.overlay_dropped(&mount.anchor)
+    }
+
     /// Import an overlay mount, setting its anchor to what it now is, if
     /// that's anything new, and saying what it is.
     pub fn import_overlay(&mut self, mount: &Mount) -> Result<Link> {
@@ -541,6 +664,54 @@ mod tests {
         let mut names: Vec<String> = export::list(catalog, dir).expect("list").into_iter().map(|entry| String::from_utf8_lossy(&entry.name).into_owned()).collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn work_directories_are_looked_over_and_let_go_of() {
+        let scratch = Scratch::new("overlay-audit");
+        let mut catalog = Catalog::open_repo(&scratch.path().join("repo")).expect("catalog");
+        let work = scratch.path().join("work");
+        let overlay_of = |catalog: &mut Catalog, name: &str| {
+            let anchor = catalog.new_anchor().expect("anchor");
+            let mount = Mount { anchor, path: work.join(name), chunk_size: crate::import::CHUNK_SIZE, width: crate::dag::FILE_WIDTH, hidden: true, overlay: true };
+            catalog.mount(&mount).expect("mount");
+            write(&mount.path.join("file"), &format!("written to {name}"));
+            catalog.import_overlay(&mount).expect("commit");
+            mount
+        };
+        let (named, stray) = (overlay_of(&mut catalog, "named"), overlay_of(&mut catalog, "stray"));
+        // A mount point in what the root is now names the one; the other's
+        // named only by what the root was
+        let tree = |catalog: &mut Catalog, mounting: &Link| -> Link {
+            let point = crate::dag::symlink_node(format!("/anchors/{mounting}").as_bytes(), catalog).expect("point");
+            let mut dir = crate::dag::DynamicDirectory::default().builder();
+            dir.add_link(b"mounted".to_vec(), point, catalog).expect("link");
+            dir.finalize(catalog).expect("dir").cid.into()
+        };
+        let root = catalog.root_anchor().expect("root").expect("a root");
+        let was = tree(&mut catalog, &stray.anchor);
+        catalog.set_anchor(&root, &was).expect("set");
+        let now = tree(&mut catalog, &named.anchor);
+        catalog.set_anchor(&root, &now).expect("set");
+        write(&work.join("unknown/x"), "what no overlay is");
+        write(&work.join(format!("{LET_GO}nothing")), "");
+
+        let overlays = catalog.overlays(&work).expect("overlays");
+        let find = |path: &Path| overlays.iter().find(|overlay| overlay.path == path).cloned().expect("listed");
+        let (seen_named, seen_stray, unknown) = (find(&named.path), find(&stray.path), find(&work.join("unknown")));
+        assert!(seen_named.named && !seen_stray.named);
+        assert!(!seen_stray.kept && seen_stray.exists && seen_stray.files == 1);
+        assert_eq!((unknown.anchor, unknown.files), (None, 1), "no overlay, and a marker's no directory of one");
+        assert_eq!(overlays.len(), 3);
+
+        // Let go of, it's what it was, read from where it's kept now
+        let value = catalog.anchor_value(&stray.anchor).expect("value").expect("set");
+        catalog.let_go_overlay(&stray).expect("let go");
+        assert!(!stray.path.exists());
+        assert_eq!(catalog.anchor_value(&stray.anchor).expect("value"), Some(value.clone()));
+        let file = export::list(&catalog, &value).expect("list").into_iter().next().expect("file");
+        assert_eq!(export::read_at(&catalog, &file.cid, 0, 100).expect("read"), b"written to stray");
+        assert!(!catalog.overlays(&work).expect("overlays").iter().any(|overlay| overlay.path == stray.path && overlay.exists));
     }
 
     #[test]

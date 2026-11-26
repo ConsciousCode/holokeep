@@ -2204,6 +2204,24 @@ mod tests {
         catalog.put_claim(&crate::claim::Claim::Set(set)).expect("put")
     }
 
+    /// Asked to (`hk overlay rm`), the mount lets go of an anchor's work
+    /// directory once it can, and the anchor's what it was.
+    #[test]
+    fn the_mount_lets_go_of_a_work_directory_when_asked() {
+        let scratch = Scratch::new("mount-let-go");
+        let (soup, anchor, repo) = writable(&scratch);
+        save(&soup, &anchor, "page", b"written");
+        soup.commit();
+        let work = repo.join("work").join(anchor.to_string());
+        assert!(work.exists(), "written, it has a work directory");
+        let asked = repo.join("work").join(format!("{}{anchor}", crate::store::overlay::LET_GO));
+        std::fs::write(&asked, b"").expect("ask");
+        soup.commit();
+        assert!(!work.exists() && !asked.exists(), "let go of, as asked");
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/page")), b"written");
+        assert_eq!(read(&soup, &format!("anchors/{anchor}/a")), b"first");
+    }
+
     /// What's been set elsewhere is what's written to, as soon as it shows,
     /// though nothing's looked since: an edit of what's seen isn't a conflict.
     #[test]
