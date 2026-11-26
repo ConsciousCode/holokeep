@@ -366,8 +366,13 @@ impl Members {
             .execute([&self.mesh, &peer.to_string()])? > 0)
     }
 
-    /// Note where a member listens, if it's a member.
+    /// Note where a member listens, if it's a member: but not through a
+    /// relay, since where it's reached through the relays a node's
+    /// connected to is worked out afresh, and kept, it'd only go stale.
     pub fn add_addr(&self, peer: &PeerId, addr: &Multiaddr) -> Result<()> {
+        if relayed(addr) {
+            return Ok(());
+        }
         self.db.conn()
             .prepare_cached(
                 "INSERT OR IGNORE INTO mesh_member_addrs (mesh, peer, addr)
@@ -395,7 +400,8 @@ impl Members {
             let (peer, addr) = row?;
             let peer = PeerId::from_str(&peer).map_err(|e| Error::Invalid(format!("member {peer}: {e}")))?;
             let addrs: &mut Vec<Multiaddr> = members.entry(peer).or_default();
-            if let Some(addr) = addr.and_then(|addr| addr.parse().ok()) {
+            // Kept by older builds
+            if let Some(addr) = addr.and_then(|addr| addr.parse().ok()).filter(|addr| !relayed(addr)) {
                 addrs.push(addr);
             }
         }
@@ -641,6 +647,11 @@ impl Ticket {
         };
         Ok(Self { swarm_key, client, inviter, members, user, protected, sealed, held, grants })
     }
+}
+
+/// Whether an address is through a relay.
+fn relayed(addr: &Multiaddr) -> bool {
+    addr.iter().any(|protocol| protocol == libp2p::multiaddr::Protocol::P2pCircuit)
 }
 
 #[cfg(test)]

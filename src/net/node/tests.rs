@@ -144,10 +144,17 @@ async fn members_which_cant_reach_each_other_connect_through_a_relay() {
     a.dial_members().expect("dial");
     b.dial_members().expect("dial");
     // Each holds a reservation on the relay, and listens through it
-    let reserved = |node: &Node| node.listeners().iter().any(super::is_relayed);
+    let reserved = |node: &Node| !node.relayed_listeners().is_empty();
     assert!(until(&mut [&mut relay, &mut a, &mut b], |n| reserved(n[1]) && reserved(n[2])).await, "reserved");
     a.dial_members().expect("dial");
     assert!(until(&mut [&mut relay, &mut a, &mut b], |n| connected(n[1], n[2])).await, "connected through the relay");
+    // Where each is reached through the relay is worked out, not kept
+    for node in [&relay, &a, &b] {
+        let kept = node.members().list().expect("list");
+        assert!(kept.values().flatten().all(|addr| !super::is_relayed(addr)), "{kept:?}");
+    }
+    assert!(a.members().add_addr(&b.peer_id(), b.relayed_listeners().first().expect("relayed")).is_ok());
+    assert!(a.members().list().expect("list").values().flatten().all(|addr| !super::is_relayed(addr)), "a relayed address said is let go of");
     let block = raw(b"over the circuit");
     a.catalog().put_block(&block, CidVersion::V1).expect("put");
     b.fetch(link(&block)).expect("fetch");
@@ -156,8 +163,8 @@ async fn members_which_cant_reach_each_other_connect_through_a_relay() {
     // Once they're connected directly, the circuit's let go of
     assert!(!a.circuits.is_empty() && !b.circuits.is_empty(), "connected through the relay");
     b.listen(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
-    assert!(until(&mut [&mut relay, &mut a, &mut b], |n| n[2].listeners().iter().any(|addr| !super::is_relayed(addr))).await);
-    let direct = b.listeners().into_iter().find(|addr| !super::is_relayed(addr)).expect("listening");
+    assert!(until(&mut [&mut relay, &mut a, &mut b], |n| !n[2].listeners().is_empty()).await);
+    let direct = b.listeners().first().cloned().expect("listening");
     a.dial(b.peer_id(), vec![direct]);
     assert!(until(&mut [&mut relay, &mut a, &mut b], |n| n[1].circuits.is_empty() && n[2].circuits.is_empty() && connected(n[1], n[2])).await, "connected directly, and only so");
 }
@@ -173,13 +180,13 @@ async fn a_relay_relays_only_for_members() {
     relay.reload().expect("reload");
     member.reload().expect("reload");
     member.dial_members().expect("dial");
-    let reserved = |node: &Node| node.listeners().iter().any(super::is_relayed);
+    let reserved = |node: &Node| !node.relayed_listeners().is_empty();
     assert!(until(&mut [&mut relay, &mut member], |n| reserved(n[1])).await, "reserved");
     // With the key, knowing where the member listens, but no member
     let mut intruder = relayed_node(swarm_key, false, false).await;
     intruder.members().add(&member.peer_id()).expect("add");
     intruder.reload().expect("reload");
-    let at = member.listeners().into_iter().find(super::is_relayed).expect("relayed");
+    let at = member.relayed_listeners().first().cloned().expect("relayed");
     intruder.dial(member.peer_id(), vec![at.clone()]);
     assert!(!within(Duration::from_secs(2), &mut [&mut relay, &mut member, &mut intruder], |n| connected(n[1], n[2])).await);
     // Nor through the relay to a member which doesn't let it in, though

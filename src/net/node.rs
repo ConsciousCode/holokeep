@@ -434,6 +434,8 @@ pub struct Node {
     /// Where this listens through each relay, and the relayed connections
     /// open, to drop once their peers are connected directly.
     relays: HashMap<PeerId, (ListenerId, Multiaddr)>,
+    /// Where each peer this dialled was reached, directly.
+    dialled_at: HashMap<PeerId, Multiaddr>,
     circuits: HashMap<libp2p::swarm::ConnectionId, PeerId>,
     /// The catalog's generation when members were last noticed of what
     /// arrived.
@@ -563,6 +565,7 @@ impl Node {
             skewed: false,
             redial: Redial::default(),
             relays: HashMap::new(),
+            dialled_at: HashMap::new(),
             circuits: HashMap::new(),
             noticed: 0,
         };
@@ -2354,9 +2357,15 @@ impl Node {
         Ok(())
     }
 
-    /// Where this listens for members.
+    /// Where this listens for members, but for through relays, which
+    /// members work out for themselves.
     pub fn listeners(&self) -> Vec<Multiaddr> {
-        self.swarm.listeners().filter(|addr| !self.ports.contains(addr)).cloned().collect()
+        self.swarm.listeners().filter(|addr| !self.ports.contains(addr) && !is_relayed(addr)).cloned().collect()
+    }
+
+    /// Where this listens through relays.
+    pub fn relayed_listeners(&self) -> Vec<Multiaddr> {
+        self.swarm.listeners().filter(|addr| is_relayed(addr)).cloned().collect()
     }
 
     /// Where this listens for clients.
@@ -2658,7 +2667,12 @@ impl Node {
     /// listens on, as where it's reached, which is what it tells those it
     /// keeps reservations for to give out.
     fn reserve(&mut self, peer: PeerId, info: &identify::Info) {
-        if self.swarm.behaviour().relay.is_enabled() && !self.is_client(&peer) && !self.visitors.contains_key(&peer) && !is_relayed(&info.observed_addr) {
+        // Dialling a member where it said it listens can reach this node
+        // itself, as at a loopback address, which isn't where it's reached
+        if peer == self.peer_id() {
+            return;
+        }
+        if self.swarm.behaviour().relay.is_enabled() && !is_loopback(&info.observed_addr) && !self.is_client(&peer) && !self.visitors.contains_key(&peer) && !is_relayed(&info.observed_addr) {
             let ports: HashSet<u64> = self.listeners().iter().filter_map(super::clients::port).collect();
             if super::clients::port(&info.observed_addr).is_some_and(|port| ports.contains(&port)) {
                 self.swarm.add_external_address(info.observed_addr.clone());
@@ -2668,9 +2682,11 @@ impl Node {
         if !relays || !self.swarm.behaviour().relayed.is_enabled() || self.relays.contains_key(&peer) || !self.members.contains(&peer).unwrap_or(false) {
             return;
         }
-        // Over the connection to it: where else it's reached matters only
-        // if that's gone
-        let Some(at) = info.listen_addrs.iter().find(|addr| !is_relayed(addr)) else {
+        // Over the connection to it, so where it's said to be reached
+        // matters only once that's gone: where this dialled it, or else
+        // anywhere it says it listens, but for loopback
+        let listening = info.listen_addrs.iter().filter(|addr| !is_relayed(addr));
+        let Some(at) = self.dialled_at.get(&peer).or_else(|| listening.clone().find(|addr| !is_loopback(addr))).or_else(|| listening.clone().next()) else {
             return;
         };
         let at = at.clone().with_p2p(peer).unwrap_or_else(|at| at).with(libp2p::multiaddr::Protocol::P2pCircuit);
@@ -2681,11 +2697,14 @@ impl Node {
 
     /// A connection's established: if through a relay, kept track of till
     /// its peer's connected directly; if direct, its peer's circuits
-    /// dropped, as no longer needed.
-    fn through_relay(&mut self, peer: PeerId, connection: libp2p::swarm::ConnectionId, relayed: bool) {
-        if relayed {
+    /// dropped, as no longer needed, and where it was dialled noted.
+    fn through_relay(&mut self, peer: PeerId, connection: libp2p::swarm::ConnectionId, endpoint: &libp2p::core::ConnectedPoint) {
+        if endpoint.is_relayed() {
             self.circuits.insert(connection, peer);
             return;
+        }
+        if endpoint.is_dialer() {
+            self.dialled_at.insert(peer, endpoint.get_remote_address().clone());
         }
         let circuits: Vec<_> = self.circuits.iter().filter(|(_, through)| **through == peer).map(|(circuit, _)| *circuit).collect();
         for circuit in circuits {
@@ -2735,7 +2754,7 @@ impl Node {
                 Some(Event::Listening(address))
             },
             SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
-                self.through_relay(peer_id, connection_id, endpoint.is_relayed());
+                self.through_relay(peer_id, connection_id, &endpoint);
                 if endpoint.is_dialer() {
                     unless_busy(self.members.add_addr(&peer_id, endpoint.get_remote_address()), "noting a member's address")?;
                     if let (Some(_), Some(port)) = (self.client_of, super::clients::port(endpoint.get_remote_address())) {
@@ -2831,6 +2850,15 @@ mod asks;
 
 #[cfg(test)]
 mod tests;
+
+/// Whether an address is a loopback one.
+fn is_loopback(addr: &Multiaddr) -> bool {
+    addr.iter().any(|protocol| match protocol {
+        libp2p::multiaddr::Protocol::Ip4(ip) => ip.is_loopback(),
+        libp2p::multiaddr::Protocol::Ip6(ip) => ip.is_loopback(),
+        _ => false,
+    })
+}
 
 /// Whether an address is through a relay.
 fn is_relayed(addr: &Multiaddr) -> bool {
