@@ -1040,7 +1040,7 @@ async fn read_message(read: &mut (impl tokio::io::AsyncRead + Unpin)) -> std::io
 /// Collect a sample of what's here, if it's due.
 fn collect_some(node: &mut Node) -> Result<()> {
     match node.collect(false) {
-        Ok(report) if report.collected > 0 => eprintln!("collected: {} let go of, {} bytes freed", report.collected, report.freed),
+        Ok(report) if report.collected > 0 => eprintln!("collected: {} let go of, {} freed", report.collected, crate::health::bytes(report.freed)),
         Ok(_) => {},
         Err(e) => unless_busy(Err(e), "collecting")?,
     }
@@ -1113,7 +1113,7 @@ impl Waiting {
             },
             Event::Trimmed { id, report } => {
                 if report.dropped > 0 || self.trimming.contains_key(&id) {
-                    eprintln!("trimmed: {} considered, {} let go of ({} handed off), {} bytes freed", report.considered, report.dropped, report.handed, report.freed);
+                    eprintln!("trimmed: {} considered, {} let go of ({} handed off), {} freed", report.considered, report.dropped, report.handed, crate::health::bytes(report.freed));
                 }
                 (self.trimming.remove(&id), format!("trimmed {} {} {} {}\n", report.considered, report.dropped, report.freed, report.handed))
             },
@@ -1235,11 +1235,11 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
     let _ = writeln!(out, "copies\t{copies}");
     let _ = writeln!(out, "trickle\t{:.1}s", node.trickle_interval().as_secs_f64());
     let free = node.catalog().offer()?.free;
-    let _ = writeln!(out, "free\t{}", free.map_or_else(|| "unknown".to_owned(), |free| format!("{} MiB", free >> 20)));
+    let _ = writeln!(out, "free\t{}", free.map_or_else(|| "unknown".to_owned(), crate::health::bytes));
     let marks = node.watermarks();
-    let _ = writeln!(out, "watermarks\t{} MiB to {} MiB", marks.low >> 20, marks.high >> 20);
+    let _ = writeln!(out, "watermarks\t{} to {}", crate::health::bytes(marks.low), crate::health::bytes(marks.high));
     if let (Some(target), Some(calm)) = (marks.target, marks.calm()) {
-        let _ = writeln!(out, "target\t{} MiB, trimming down to {} MiB, {} MiB stored", target >> 20, calm >> 20, marks.used() >> 20);
+        let _ = writeln!(out, "target\t{}, trimming down to {}, {} stored", crate::health::bytes(target), crate::health::bytes(calm), crate::health::bytes(marks.used()));
     }
     let _ = writeln!(out, "pressed\t{}", if marks.pressed() { "yes" } else { "no" });
     let _ = writeln!(out, "collecting\t{}", if collecting { "yes" } else { "no" });
@@ -1254,10 +1254,10 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
     let _ = writeln!(out, "lost\t{}", node.catalog().lost_blocks()?.len());
     match node.catalog().quota_left()? {
         Some((quota, left)) => {
-            let _ = writeln!(out, "used\t{} of {} bytes", quota.saturating_sub(left), quota);
+            let _ = writeln!(out, "used\t{} of {}", crate::health::bytes(quota.saturating_sub(left)), crate::health::bytes(quota));
         },
         None => {
-            let _ = writeln!(out, "used\t{} bytes", node.catalog().used()?);
+            let _ = writeln!(out, "used\t{}", crate::health::bytes(node.catalog().used()?));
         },
     }
     Ok(out)

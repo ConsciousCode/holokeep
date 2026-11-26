@@ -2435,11 +2435,14 @@ impl Node {
     }
 
     /// Dial a peer, unless it's connected, or connected only through a
-    /// relay, where it's dialled directly regardless.
+    /// relay, where it's dialled directly regardless. A dial still under
+    /// way doesn't hold this one back: one to where the peer was, which
+    /// may hang till it times out, would keep it from being dialled
+    /// through a relay since, which may be the only way it's reached.
     fn dial(&mut self, peer: PeerId, addrs: Vec<Multiaddr>) {
         use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
         self.redial.dialled(peer, Instant::now());
-        let condition = if self.relayed_only(&peer) { PeerCondition::Always } else { PeerCondition::DisconnectedAndNotDialing };
+        let condition = if self.relayed_only(&peer) { PeerCondition::Always } else { PeerCondition::Disconnected };
         let opts = DialOpts::peer_id(peer).condition(condition).addresses(addrs).build();
         // A failed dial is reported as an event
         let _ = self.swarm.dial(opts);

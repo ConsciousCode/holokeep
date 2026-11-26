@@ -128,22 +128,28 @@ impl Summary {
     }
 }
 
-/// A count of bytes, for people: in binary units, to a tenth.
+/// A count of bytes, for people: `512 B`, `1.5 KiB`, `21.0 GiB`.
+///
+/// In binary units to a tenth, up to EiB, as far as a u64 goes. A unit's
+/// chosen by what's shown, so what rounds up to 1024 of one is 1.0 of the
+/// next.
 pub fn bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["bytes", "KiB", "MiB", "GiB", "TiB"];
-    let mut unit = 0usize;
-    let mut scaled = bytes;
-    while scaled >= 1024 && unit < UNITS.len().saturating_sub(1) {
-        scaled /= 1024;
-        unit = unit.saturating_add(1);
+    const UNITS: [&str; 6] = ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
     }
-    if unit == 0 {
-        return format!("{bytes} bytes");
+    let mut divisor = 1u128;
+    let mut shown = (0u128, "B");
+    for unit in UNITS {
+        divisor = divisor.saturating_mul(1024);
+        // In tenths, rounded
+        let tenths = u128::from(bytes).saturating_mul(10).saturating_add(divisor / 2).checked_div(divisor).unwrap_or_default();
+        shown = (tenths, unit);
+        if tenths < 10_240 {
+            break;
+        }
     }
-    let divisor = 1u128 << 10u32.saturating_mul(u32::try_from(unit).unwrap_or_default());
-    // In tenths, rounded
-    let tenths = (u128::from(bytes).saturating_mul(10).saturating_add(divisor / 2)).checked_div(divisor).unwrap_or_default();
-    format!("{}.{} {}", tenths / 10, tenths % 10, UNITS.get(unit).copied().unwrap_or("bytes"))
+    format!("{}.{} {}", shown.0 / 10, shown.0 % 10, shown.1)
 }
 
 /// How long ago a time was, roughly: `just now`, `5m ago`, `3h ago`, `2d

@@ -258,7 +258,7 @@ pub fn run(repo: std::path::PathBuf, stop: std::sync::Arc<std::sync::atomic::Ato
                 }
                 if let Some(catalog) = &catalog {
                     match catalog.rehome(ROUND) {
-                        Ok(done) if done.files > 0 => eprintln!("kept {} files whole, {} bytes out of the database", done.files, done.bytes),
+                        Ok(done) if done.files > 0 => eprintln!("kept {} files whole, {} out of the database", done.files, crate::health::bytes(done.bytes)),
                         Ok(_) => {},
                         Err(e) => eprintln!("not keeping copied files whole: {e}"),
                     }

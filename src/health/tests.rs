@@ -50,9 +50,15 @@ fn a_blocks_tolerance_counts_copies_here_and_elsewhere_by_what_they_share() {
 
 #[test]
 fn sizes_ages_and_labels_read_as_people_and_the_socket_want() {
-    assert_eq!(bytes(512), "512 bytes");
+    assert_eq!(bytes(0), "0 B");
+    assert_eq!(bytes(1023), "1023 B");
+    assert_eq!(bytes(1024), "1.0 KiB");
     assert_eq!(bytes(1536), "1.5 KiB");
     assert_eq!(bytes(21 << 30), "21.0 GiB");
+    assert_eq!(bytes((1 << 20) - 1), "1.0 MiB", "not 1024.0 KiB");
+    assert_eq!(bytes(3 << 40), "3.0 TiB");
+    assert_eq!(bytes(5 << 50), "5.0 PiB");
+    assert_eq!(bytes(u64::MAX), "16.0 EiB");
     assert_eq!(ago(100, 130), "just now");
     assert_eq!(ago(0, 7200), "2h ago");
     assert_eq!(ago(0, 3 * 86_400), "3d ago");

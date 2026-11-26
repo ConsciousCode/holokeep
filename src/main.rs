@@ -2144,8 +2144,8 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
         NodeCommand::Collect => {
             let report = daemon::collect(place)?.context("this node isn't running: start `hk node run`")?;
             out!(
-                "condemned {}, pardoned {}, let go of {}, freeing {} bytes",
-                report.condemned, report.pardoned, report.collected, report.freed,
+                "condemned {}, pardoned {}, let go of {}, freeing {}",
+                report.condemned, report.pardoned, report.collected, health::bytes(report.freed),
             );
         },
         NodeCommand::Forget { peer } => daemon::forget(place, &peer)?,
@@ -2173,7 +2173,7 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
         NodeCommand::ScanLost => drop(daemon::ask(place, "scan-lost")?.context("this node isn't running: start `hk node run`")?),
         NodeCommand::Trim => {
             let report = daemon::trim(place)?.context("this node isn't running: start `hk node run`")?;
-            out!("let go of {} of {} spare blocks, freeing {} bytes", report.dropped, report.considered, report.freed);
+            out!("let go of {} of {} spare blocks, freeing {}", report.dropped, report.considered, health::bytes(report.freed));
         },
         NodeCommand::Clocks => {
             for line in &daemon::ask(place, "clocks")?.context("this node isn't running: start `hk node run`")? {
@@ -2744,7 +2744,7 @@ fn compact(repo: &Catalog, compact: Compact) -> anyhow::Result<()> {
     if !compact.dry_run {
         let done = repo.rehome(u64::MAX)?;
         if done.files > 0 {
-            eprintln!("kept {} files whole, {} bytes out of the database", done.files, done.bytes);
+            eprintln!("kept {} files whole, {} out of the database", done.files, health::bytes(done.bytes));
         }
     }
     let mut refused = Vec::new();
@@ -2755,7 +2755,7 @@ fn compact(repo: &Catalog, compact: Compact) -> anyhow::Result<()> {
             Outcome::Compacted { took, wal_left: false } => format!("compacted in {:.2}s", took.as_secs_f64()),
             Outcome::Compacted { took, wal_left: true } => format!("compacted in {:.2}s, its WAL not emptied since a reader's still on it; compact again, or it goes once nothing has it open", took.as_secs_f64()),
             Outcome::TooLong => "refused: big enough that writers might give up waiting for it".to_owned(),
-            Outcome::NoRoom { needed, available } => format!("refused: needs {needed} bytes for its WAL, {available} left"),
+            Outcome::NoRoom { needed, available } => format!("refused: needs {} for its WAL, {} left", health::bytes(needed), health::bytes(available)),
         };
         out!("{}\t{}\t{}\t{outcome}", done.volume, done.before, done.after);
         if done.outcome.refused() {
@@ -2843,7 +2843,7 @@ fn soup_fs(repo: Option<PathBuf>, command: FsCommand) -> anyhow::Result<()> {
                 out!("cid\t{cid}");
                 match holokeep::export::stat(&repo, &cid) {
                     Ok(holokeep::export::Kind::Directory) => out!("kind\tdirectory"),
-                    Ok(holokeep::export::Kind::File(size)) => out!("kind\tfile, {size} bytes"),
+                    Ok(holokeep::export::Kind::File(size)) => out!("kind\tfile, {} ({size} bytes)", health::bytes(size)),
                     Ok(holokeep::export::Kind::Symlink(target)) => out!("kind\tsymlink to {}", String::from_utf8_lossy(&target)),
                     Err(e) => out!("kind\tunknown: {e}"),
                 }
@@ -3800,7 +3800,7 @@ fn overlay(repo: Option<PathBuf>, command: OverlayCommand) -> anyhow::Result<()>
         OverlayCommand::Ls => {
             for overlay in repo.overlays(&work)? {
                 let Some(anchor) = &overlay.anchor else {
-                    out!("{}\t{} files\t{} bytes\tno overlay", overlay.path.display(), overlay.files, overlay.bytes);
+                    out!("{}\t{} files\t{}\tno overlay", overlay.path.display(), overlay.files, health::bytes(overlay.bytes));
                     continue;
                 };
                 let mut said = vec![if overlay.named { "named" } else { "unnamed" }, if overlay.kept { "kept" } else { "unkept" }];
@@ -3813,7 +3813,7 @@ fn overlay(repo: Option<PathBuf>, command: OverlayCommand) -> anyhow::Result<()>
                 if overlay.letting_go {
                     said.push("letting go");
                 }
-                out!("{anchor}\t{} files\t{} bytes\t{}", overlay.files, overlay.bytes, said.join(", "));
+                out!("{anchor}\t{} files\t{}\t{}", overlay.files, health::bytes(overlay.bytes), said.join(", "));
             }
             Ok(())
         },
@@ -3876,7 +3876,7 @@ fn watch(repo: Option<PathBuf>, command: WatchCommand) -> anyhow::Result<()> {
                 let size: u64 = read.iter().filter_map(|file| std::fs::metadata(&file.path).ok()).map(|meta| meta.len()).sum();
                 let stale = read.iter().filter(|file| file.changed()).count();
                 let now = repo.anchor_value(&watch.anchor)?.map_or_else(|| "-".to_owned(), |root| root.to_string());
-                out!("{}\t{}\t{now}\t{} files\t{size} bytes\t{stale} stale", watch.path.display(), watch.anchor, read.len());
+                out!("{}\t{}\t{now}\t{} files\t{}\t{stale} stale", watch.path.display(), watch.anchor, read.len(), health::bytes(size));
             }
             Ok(())
         },

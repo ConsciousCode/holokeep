@@ -51,6 +51,8 @@ logs() {
 
 fail() {
     echo "FAIL: $*" >&2
+    # What a scenario asks to be shown of how things stood
+    [ -z "${on_fail:-}" ] || eval "$on_fail" >&2 || true
     logs
     exit 1
 }
@@ -583,6 +585,7 @@ scenario_relayed() {
     node_up home
     away_peer=$(on away hk node id)
     home_peer=$(on home hk node id)
+    on_fail='for n in relay away home; do echo "--- $n status, peers"; on $n hk node status; on $n hk node peers | cut -c1-200; done'
     wait_for "the away machine to listen through the relay" sh_on away "hk node status | grep -q '^reachable through'"
     wait_for "home to listen through the relay" sh_on home "hk node status | grep -q '^reachable through'"
     wait_for "away and home to connect through the relay" sh_on away "hk node peers | grep '^$home_peer' | grep -q 'connected through a relay'"
@@ -593,6 +596,7 @@ scenario_relayed() {
     wait_for "home to fetch what was written away" on home hk dag fetch "$note"
     [ "$(on home hk cat "$note")" = "written away from home" ] || fail "home read something else"
     sh_on home "hk node peers | grep '^$away_peer' | grep -q 'connected through a relay'" || fail "home reached away directly, which it can't"
+    on_fail=
 }
 
 # A thin client of one, in a sandbox: no repo, just a key and a ticket,

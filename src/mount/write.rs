@@ -821,11 +821,11 @@ fn audit(catalog: &Catalog, work: &Path) {
     for overlay in overlays.iter().filter(|overlay| overlay.files > 0) {
         match &overlay.anchor {
             Some(anchor) if !overlay.named && !overlay.kept => eprintln!(
-                "{} holds {} files, {} MiB, of an anchor nothing names or keeps: `hk overlay rm {anchor}` lets it go",
-                overlay.path.display(), overlay.files, overlay.bytes >> 20,
+                "{} holds {} files, {}, of an anchor nothing names or keeps: `hk overlay rm {anchor}` lets it go",
+                overlay.path.display(), overlay.files, crate::health::bytes(overlay.bytes),
             ),
             Some(_) => {},
-            None => eprintln!("{} holds {} files, {} MiB, and is no overlay this repo knows of", overlay.path.display(), overlay.files, overlay.bytes >> 20),
+            None => eprintln!("{} holds {} files, {}, and is no overlay this repo knows of", overlay.path.display(), overlay.files, crate::health::bytes(overlay.bytes)),
         }
     }
 }
