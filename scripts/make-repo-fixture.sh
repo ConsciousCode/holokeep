@@ -79,6 +79,9 @@ h anchor share "$anchor" "$other" read write >/dev/null 2>&1
 viewed=$(h anchor view "$anchor" "$founder")
 # Served by this node's service, kept as sets
 h serve add --persist "$anchor" fixture >/dev/null
+# This device named, and another of the user's, by its peer ID
+h node name fixture-device >/dev/null
+named=$(h node name --peer "$(peer third)" fixture-third)
 
 mkdir -p "$out"
 cp -a "$repo/." "$out/"
@@ -100,6 +103,7 @@ rechunked $rechunked
 public $tree
 published $published
 shared $shared
+named $named
 EXPECT
 echo "made $out"
 du -sh "$out"

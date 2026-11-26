@@ -243,7 +243,7 @@ pub trait Store: BlockIndex + BlockSource + BlockStore {
 /// making it over as it knows it, its views say, would break what the newer
 /// build reads them with, where that's still running. Raise it with any
 /// change to them (and make a repo fixture, `scripts/make-repo-fixture.sh`).
-pub const SCHEMA: i64 = 7;
+pub const SCHEMA: i64 = 8;
 
 pub const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -3587,6 +3587,42 @@ impl Catalog {
             tombs.push(self.put_claim(&Claim::Tomb(Tomb::new([public]).ok_or(Error::NoClaims)?))?);
         }
         Ok(tombs)
+    }
+
+    /// Call a device, by its key, this, in place of whatever it was called:
+    /// a name claim targeting its key and its certificates, so it reaches
+    /// every member, the next time it's named, and a tomb of each name of
+    /// it that counted. Returns the name claim.
+    pub fn name_device(&self, key: &Link, name: &str) -> Result<Link> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let (was, most) = claims.naming(key)?;
+        let targets = std::iter::once(key.clone()).chain(claims.certificates(key)?);
+        let named = crate::claim::Name::new(targets, name)
+            .ok_or_else(|| Error::User(format!("a name is up to {} characters, with no tabs, newlines or spaces at either end", crate::claim::Name::LONGEST)))?
+            .again(most.map_or(0, |most| most.saturating_add(1)));
+        // The new name first: till the old is tombed, it's the greater
+        let claim = self.put_claim(&Claim::Name(named))?;
+        for old in was {
+            self.put_claim(&Claim::Tomb(Tomb::new([old]).ok_or(Error::NoClaims)?))?;
+        }
+        Ok(claim)
+    }
+
+    /// Call a device nothing: a tomb of each name of it that counts.
+    /// Returns the tombs.
+    pub fn unname_device(&self, key: &Link) -> Result<Vec<Link>> {
+        let claims = self.claims.as_ref().ok_or(Error::NoClaims)?;
+        let mut tombs = Vec::new();
+        for old in claims.naming(key)?.0 {
+            tombs.push(self.put_claim(&Claim::Tomb(Tomb::new([old]).ok_or(Error::NoClaims)?))?);
+        }
+        Ok(tombs)
+    }
+
+    /// What each device is called, by its key, as the names that count for
+    /// the acting account say.
+    pub fn device_names(&self) -> Result<Vec<(Link, String)>> {
+        self.claims.as_ref().map_or(Ok(Vec::new()), |claims| claims.names())
     }
 
     /// What public claims that count for the acting account make public,

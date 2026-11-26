@@ -222,6 +222,25 @@ pub struct Public {
     n: u64,
 }
 
+/// "The device whose key is among the targets goes by `name`."
+///
+/// A label for people, never what anything's let in by: whatever a device
+/// is called, it's its key that's trusted. Its targets are the device's key
+/// and its certificates, which every member holds, so a name reaches every
+/// member, and no one else. A device names itself, by its hostname unless
+/// told otherwise, and any device of the user may name another, so two
+/// machines of one hostname can be told apart. Like a keep, `n` counts
+/// which time it's named, since a tomb is forever: the name that counts
+/// with the greatest `n` is the one it goes by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Name {
+    /// Sorted by CID bytes and distinct.
+    target: Vec<Link>,
+    called: String,
+    /// Left out when 0.
+    n: u64,
+}
+
 /// Any claim this understands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claim {
@@ -236,6 +255,7 @@ pub enum Claim {
     Serve(Serve),
     Same(Same),
     Public(Public),
+    Name(Name),
 }
 
 /// Sort links by their bytes and drop repeats, making them a set.
@@ -492,6 +512,33 @@ impl Public {
     pub const fn n(&self) -> u64 { self.n }
 }
 
+impl Name {
+    /// The longest a name may be, in characters.
+    pub const LONGEST: usize = 64;
+
+    /// The targets named, if there are any and the name's fit to show: not
+    /// empty, not padded, no longer than `LONGEST`, and nothing that isn't
+    /// printed, such as tabs and newlines, which would break up a listing.
+    pub fn new(target: impl IntoIterator<Item = Link>, name: impl Into<String>) -> Option<Self> {
+        let (target, name) = (set(target), name.into());
+        let fit = !name.is_empty() && name.trim() == name && name.chars().count() <= Self::LONGEST && !name.chars().any(char::is_control);
+        (!target.is_empty() && fit).then_some(Self { target, called: name, n: 0 })
+    }
+
+    /// The same, but the `n`th time.
+    #[must_use]
+    pub const fn again(mut self, n: u64) -> Self {
+        self.n = n;
+        self
+    }
+
+    pub fn target(&self) -> &[Link] { &self.target }
+
+    pub fn name(&self) -> &str { &self.called }
+
+    pub const fn n(&self) -> u64 { self.n }
+}
+
 impl Lost {
     /// A report of the targets lost, if there are any.
     pub fn new(target: impl IntoIterator<Item = Link>, at: u64) -> Option<Self> {
@@ -516,6 +563,19 @@ fn parse_public(map: &mut BTreeMap<String, Ipld>, target: Vec<Link>) -> Option<P
         None => 0,
     };
     Some(Public::new(target, mode)?.again(n))
+}
+
+/// A name claim's name and time from its map, taken out of it.
+fn parse_name(map: &mut BTreeMap<String, Ipld>, target: Vec<Link>) -> Option<Name> {
+    let Ipld::String(name) = map.remove("name")? else {
+        return None;
+    };
+    let n = match map.remove("n") {
+        Some(Ipld::Integer(n)) => u64::try_from(n).ok().filter(|&n| n > 0)?,
+        Some(_) => return None,
+        None => 0,
+    };
+    Some(Name::new(target, name)?.again(n))
 }
 
 fn parse_serve(map: &mut BTreeMap<String, Ipld>, target: &[Link]) -> Option<Serve> {
@@ -628,6 +688,7 @@ impl Claim {
             Self::Serve(serve) => serve.target(),
             Self::Same(same) => same.target(),
             Self::Public(public) => public.target(),
+            Self::Name(name) => name.target(),
         }
     }
 
@@ -645,6 +706,7 @@ impl Claim {
             Self::Serve(_) => "serve",
             Self::Same(_) => "same",
             Self::Public(_) => "public",
+            Self::Name(_) => "name",
         }
     }
 
@@ -731,6 +793,13 @@ impl Claim {
                     map.insert("n".to_owned(), Ipld::Integer(public.n.into()));
                 }
                 ("public", map)
+            },
+            Self::Name(name) => {
+                let mut map = BTreeMap::from([("name".to_owned(), Ipld::String(name.called.clone()))]);
+                if name.n > 0 {
+                    map.insert("n".to_owned(), Ipld::Integer(name.n.into()));
+                }
+                ("name", map)
             },
         };
         map.insert("claim".to_owned(), Ipld::String(kind.to_owned()));
@@ -861,6 +930,7 @@ impl Claim {
                 Self::Same(Same::new(target.clone(), lens)?)
             },
             "public" => Self::Public(parse_public(&mut map, target.clone())?),
+            "name" => Self::Name(parse_name(&mut map, target.clone())?),
             _ => return None,
         };
         // Nothing else, sorted and distinct already, and canonical dag-cbor
@@ -1090,6 +1160,22 @@ mod tests {
         assert_ne!(announced.cid(), served.cid());
         assert_ne!(announced.cid(), again.cid());
         assert_eq!(Claim::Public(Public::new([cid(b"a")], Public::ANNOUNCE).expect("public").again(0)).cid(), announced.cid(), "0 is left out");
+    }
+
+    #[test]
+    fn a_name_claim_is_fit_to_show_and_counts_again() {
+        let (key, cert) = (cid(b"key"), cid(b"cert"));
+        for unfit in ["", " theseus", "theseus\n", "the\tseus", &"x".repeat(Name::LONGEST + 1)] {
+            assert!(Name::new([key.clone()], unfit).is_none(), "{unfit:?}");
+        }
+        assert!(Name::new([], "theseus").is_none());
+        let named = Claim::Name(Name::new([key.clone(), cert.clone()], "theseus").expect("name"));
+        let again = Claim::Name(Name::new([cert, key.clone()], "theseus 2").expect("name").again(1));
+        let wide = Claim::Name(Name::new([key], "テセウス").expect("any script"));
+        for claim in [&named, &again, &wide] {
+            assert_eq!(Claim::parse(claim.block().data()).as_ref(), Some(claim));
+        }
+        assert_ne!(named.cid(), again.cid());
     }
 
     #[test]

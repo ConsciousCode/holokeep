@@ -352,7 +352,7 @@ const SCHEMA: &str =
          CREATE TABLE IF NOT EXISTS claims (
              id INTEGER PRIMARY KEY,
              claim INTEGER UNIQUE REFERENCES multihashes (id),
-             kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant', 'serve', 'same', 'public'))
+             kind TEXT NOT NULL CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant', 'serve', 'same', 'public', 'name'))
          );
          -- Every claim's targets, which every type has.
          CREATE TABLE IF NOT EXISTS claim_targets (
@@ -426,6 +426,12 @@ const SCHEMA: &str =
          CREATE TABLE IF NOT EXISTS public_claims (
              id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
              mode TEXT NOT NULL,
+             n INTEGER NOT NULL DEFAULT 0
+         );
+         -- What a name claim calls a device, and which time it does.
+         CREATE TABLE IF NOT EXISTS name_claims (
+             id INTEGER PRIMARY KEY REFERENCES claims (id) ON DELETE CASCADE,
+             name TEXT NOT NULL,
              n INTEGER NOT NULL DEFAULT 0
          );
          -- What's public, kept by unit: what a public claim names, and
@@ -1119,6 +1125,12 @@ impl ClaimStore {
                     .map(Claim::Same)
                     .ok_or_else(|| Error::Invalid { store: NAME, reason: "a same claim of one target".into() })
             },
+            "name" => {
+                let (name, n): (String, i64) = self.db.conn().prepare_cached("SELECT name, n FROM name_claims WHERE id = ?1")?.query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                crate::claim::Name::new(self.targets(id)?, name)
+                    .map(|named| Claim::Name(named.again(u64::try_from(n).unwrap_or_default())))
+                    .ok_or_else(|| Error::Invalid { store: NAME, reason: "a name claim of no targets".into() })
+            },
             "public" => {
                 let (mode, n): (String, i64) = self.db.conn().prepare_cached("SELECT mode, n FROM public_claims WHERE id = ?1")?.query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))?;
                 crate::claim::Public::new(self.targets(id)?, mode)
@@ -1557,6 +1569,13 @@ impl ClaimStore {
                 )?
                 .query_row(params![target, prefix, i64::try_from(lost.at()).unwrap_or(i64::MAX)], |r| r.get(0))
                 .optional()?,
+            Claim::Name(named) => self.db.conn()
+                .prepare_cached(
+                    "SELECT c.id FROM claims c JOIN name_claims n ON n.id = c.id JOIN claim_targets t ON t.claim = c.id
+                     WHERE c.claim IS NULL AND t.target = ?1 AND t.prefix = ?2 AND n.name = ?3 AND n.n = ?4",
+                )?
+                .query_row(params![target, prefix, named.name(), i64::try_from(named.n()).unwrap_or(i64::MAX)], |r| r.get(0))
+                .optional()?,
             Claim::Public(public) => self.db.conn()
                 .prepare_cached(
                     "SELECT c.id FROM claims c JOIN public_claims p ON p.id = c.id JOIN claim_targets t ON t.claim = c.id
@@ -1713,6 +1732,10 @@ impl ClaimStore {
         }
         if let Claim::Same(same) = claim {
             conn.prepare_cached("INSERT INTO same_claims (id, lens) VALUES (?1, ?2)")?.execute(params![row, same.lens()])?;
+        }
+        if let Claim::Name(named) = claim {
+            conn.prepare_cached("INSERT INTO name_claims (id, name, n) VALUES (?1, ?2, ?3)")?
+                .execute(params![row, named.name(), i64::try_from(named.n()).unwrap_or(i64::MAX)])?;
         }
         if let Claim::Public(public) = claim {
             conn.prepare_cached("INSERT INTO public_claims (id, mode, n) VALUES (?1, ?2, ?3)")?
@@ -2135,6 +2158,71 @@ impl ClaimStore {
         ids.into_iter().map(|id| Ok(self.claim(id, "public")?.cid())).collect()
     }
 
+    /// What each device is called, by the names that count: of those naming
+    /// it, the one with the greatest `n`, and of those, the least CID, so
+    /// every node says the same of names given at once.
+    pub fn names(&self) -> Result<Vec<(Link, String)>> {
+        // Each name's device key, name, `n`, claim multihash and row
+        type Named = (Vec<u8>, String, i64, Option<Vec<u8>>, Id);
+        let rows: Vec<Named> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT m.multihash, n.name, n.n, cm.multihash, c.id FROM claims c JOIN name_claims n ON n.id = c.id
+                 JOIN claim_targets t ON t.claim = c.id JOIN multihashes m ON m.id = t.target
+                 LEFT JOIN multihashes cm ON cm.id = c.claim
+                 WHERE c.kind = 'name' AND t.prefix = ?1 AND {LIVE}"
+            ))?
+            .query_map([KEY_PREFIX.as_slice()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut best: std::collections::BTreeMap<Vec<u8>, (i64, Vec<u8>, String)> = std::collections::BTreeMap::new();
+        for (key, name, n, claim, id) in rows {
+            // A dissolved claim's CID is its own bytes
+            let cid = match claim {
+                Some(claim) => claim,
+                None => self.claim(id, "name")?.cid().to_bytes(),
+            };
+            let better = best.get(&key).is_none_or(|(most, least, _)| n > *most || (n == *most && cid < *least));
+            if better {
+                best.insert(key, (n, cid, name));
+            }
+        }
+        best.into_iter().map(|(key, (_, _, name))| Ok((link(&KEY_PREFIX, &key)?, name))).collect()
+    }
+
+    /// The name claims that count naming a device, by their CIDs, what a
+    /// tomb takes back; and the greatest `n` of any naming it, counting or
+    /// not, so the next is greater.
+    pub fn naming(&self, key: &Link) -> Result<(Vec<Link>, Option<u64>)> {
+        let multihash = key.multihash().to_bytes();
+        let ids: Vec<Id> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT DISTINCT c.id FROM multihashes m JOIN claim_targets t ON t.target = m.id JOIN claims c ON c.id = t.claim
+                 WHERE m.multihash = ?1 AND c.kind = 'name' AND {LIVE}"
+            ))?
+            .query_map([&multihash], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let most: Option<i64> = self.db.conn()
+            .prepare_cached(
+                "SELECT max(n.n) FROM multihashes m JOIN claim_targets t ON t.target = m.id JOIN name_claims n ON n.id = t.claim
+                 WHERE m.multihash = ?1",
+            )?
+            .query_row([&multihash], |row| row.get(0))?;
+        let naming = ids.into_iter().map(|id| Ok(self.claim(id, "name")?.cid())).collect::<Result<_>>()?;
+        Ok((naming, most.map(|most| u64::try_from(most).unwrap_or_default())))
+    }
+
+    /// A device's certificates that count, by their CIDs: what a name of it
+    /// targets besides its key, so it reaches whoever holds them.
+    pub fn certificates(&self, key: &Link) -> Result<Vec<Link>> {
+        let ids: Vec<Id> = self.db.conn()
+            .prepare_cached(&format!(
+                "SELECT DISTINCT c.id FROM multihashes m JOIN claim_targets t ON t.target = m.id JOIN claims c ON c.id = t.claim
+                 WHERE m.multihash = ?1 AND c.kind = 'device' AND {LIVE_ANY}"
+            ))?
+            .query_map([key.multihash().to_bytes()], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        ids.into_iter().map(|id| Ok(self.claim(id, "device")?.cid())).collect()
+    }
+
     /// What lost claims that count say, as (block, when), the latest of each.
     pub fn all_lost(&self) -> Result<Vec<(Link, u64)>> {
         let rows: Vec<(Vec<u8>, Vec<u8>, i64)> = self.db.conn()
@@ -2291,7 +2379,7 @@ impl ClaimStore {
 /// constraint, which doesn't touch how rows are stored, is rewritten in
 /// place, as `SQLite` documents for such changes.
 fn widen_kinds(db: &Db) -> Result<()> {
-    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant', 'serve', 'same', 'public'))";
+    const KINDS: &str = "CHECK (kind IN ('group', 'keep', 'set', 'tomb', 'sign', 'device', 'lost', 'grant', 'serve', 'same', 'public', 'name'))";
     let conn = db.conn();
     let sql: String = conn.query_row("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'claims'", [], |row| row.get(0))?;
     if sql.contains(KINDS) {

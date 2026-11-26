@@ -540,6 +540,26 @@ fn serve_accounts(node: &mut Node, dir: &Path) -> Result<()> {
     node.serve(keys)
 }
 
+/// Name this device by its hostname, if it's never been named, so members
+/// can tell it apart by more than its key; once it's named, renamed or
+/// unnamed, that's that.
+fn name_self(catalog: &crate::store::Catalog) -> Result<()> {
+    let (Some(signer), Some(claims)) = (catalog.signer(), catalog.claims()) else {
+        return Ok(());
+    };
+    let key = signer.id();
+    if claims.naming(&key)?.1.is_some() {
+        return Ok(());
+    }
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+    let hostname = hostname.trim();
+    if crate::claim::Name::new([key.clone()], hostname).is_some() {
+        catalog.name_device(&key, hostname)?;
+        eprintln!("named this device {hostname}");
+    }
+    Ok(())
+}
+
 /// Listen and connect to members, and say so, unless alone; or as a
 /// client, listening nowhere, connect to its member.
 fn start(node: &mut Node, place: &Place, listen: &Listen, alone: bool) -> Result<()> {
@@ -554,6 +574,11 @@ fn start(node: &mut Node, place: &Place, listen: &Listen, alone: bool) -> Result
         node.dial_members()?;
         eprintln!("node {} a client of {member}", node.peer_id());
         return Ok(());
+    }
+    if place.is_main()
+        && let Err(e) = name_self(node.catalog())
+    {
+        eprintln!("not naming this device: {e}");
     }
     node.listen(listen.members.clone())?;
     if let Some(clients) = &listen.clients {
@@ -1101,6 +1126,10 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
     use std::fmt::Write as _;
     let mut out = String::new();
     let _ = writeln!(out, "peer\t{}", node.peer_id());
+    let name = called(&node.catalog().device_names()?, &node.peer_id());
+    if name != "-" {
+        let _ = writeln!(out, "name\t{name}");
+    }
     if alone {
         let _ = writeln!(out, "mesh\tnone yet, alone");
     }
@@ -1164,11 +1193,19 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
     Ok(out)
 }
 
+/// What a peer's called, as names that count say, or `-`.
+fn called(names: &[(crate::model::Link, String)], peer: &libp2p::PeerId) -> String {
+    let key = crate::keys::from_peer_id(&peer.to_string());
+    names.iter().find(|(named, _)| Some(named) == key.as_ref()).map_or_else(|| "-".to_owned(), |(_, name)| name.clone())
+}
+
 /// What `peers` says: each member, whether it's connected, where it
-/// listens, and which accounts here its users are; then each client.
+/// listens, which accounts here its users are, and what it's called; then
+/// each client, and what it's called.
 fn peers(node: &Node) -> Result<String> {
     let mut out = String::new();
     let connected = node.connected();
+    let names = node.catalog().device_names()?;
     // A ticket's list includes whoever it let in
     for (peer, addrs) in node.members().list()?.into_iter().filter(|(peer, _)| *peer != node.peer_id()) {
         let state = match connected.contains(&peer) {
@@ -1180,13 +1217,13 @@ fn peers(node: &Node) -> Result<String> {
         // Which accounts here its users are, once it's said
         let hosts: Vec<String> = if connected.contains(&peer) { node.hosted_by(&peer)?.iter().map(ToString::to_string).collect() } else { Vec::new() };
         let hosts = if hosts.is_empty() { "-".to_owned() } else { hosts.join(" ") };
-        let _ = writeln!(out, "{peer}\t{state}\t{}\t{hosts}", addrs.join(" "));
+        let _ = writeln!(out, "{peer}\t{state}\t{}\t{hosts}\t{}", addrs.join(" "), called(&names, &peer));
     }
     let mut clients: Vec<(&libp2p::PeerId, &u32)> = node.clients().iter().collect();
     clients.sort();
     for (peer, uid) in clients {
         let state = if connected.contains(peer) { "connected" } else { "-" };
-        let _ = writeln!(out, "{peer}\t{state}\tclient\t{uid}");
+        let _ = writeln!(out, "{peer}\t{state}\tclient\t{uid}\t{}", called(&names, peer));
     }
     let visiting = node.visiting();
     let mut visitors: Vec<&libp2p::PeerId> = node.visitors().keys().collect();

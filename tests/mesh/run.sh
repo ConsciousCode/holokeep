@@ -291,7 +291,8 @@ scenario_revoke() {
 
     on one hk device log "$peer" --claims | grep "$keep" | grep "keep" | grep "alone" >/dev/null || fail "the log doesn't say what it signed"
     sign=$(on one hk device log "$peer" | awk -v keep="$keep" 'END { print $1 }')
-    [ "$(on one hk device revoke "$peer" --until 1 --dry-run 2>/dev/null | cut -f1)" = "$keep" ] || fail "the dry run doesn't name it"
+    # Its keep, among what it alone signed, as is the name it gave itself
+    on one hk device revoke "$peer" --until 1 --dry-run 2>/dev/null | cut -f1 | grep -qx "$keep" || fail "the dry run doesn't name it"
     on one hk node peers | grep "$peer" >/dev/null || fail "a dry run shouldn't have done anything"
     ! on one hk device revoke "$peer" --until 1 </dev/null >/dev/null 2>&1 || fail "revoked without being told to lose it"
     on one hk keep ls | grep "$block" >/dev/null || fail "refusing lost it"
@@ -430,9 +431,9 @@ scenario_shared() {
     local one_peer two_peer
     one_peer=$(on one hk node id)
     two_peer=$(on two hk node id)
-    wait_for "one to see ezra hosts its account" sh_on one "hk node peers | grep '^$peer	connected	' | grep -q '	4000000001$'"
-    wait_for "ezra to see one hosts its user" sh_on ezra "hk node peers | grep '^$one_peer	connected	' | grep -q '	0$'"
-    on one hk node peers | grep "^$two_peer" | grep -q '	0$' || fail "one doesn't see two hosts only its own"
+    wait_for "one to see ezra hosts its account" sh_on one "hk node peers | grep '^$peer	connected	' | grep -q '	4000000001	'"
+    wait_for "ezra to see one hosts its user" sh_on ezra "hk node peers | grep '^$one_peer	connected	' | grep -q '	0	'"
+    on one hk node peers | grep "^$two_peer" | grep -q '	0	' || fail "one doesn't see two hosts only its own"
     theirs=$(sh_on ezra 'echo "a note of ezra'"'"'s" | hk add -q -')
     ours=$(sh_on one 'echo "a note of one'"'"'s" | hk add -q -')
     ! on two hk dag fetch "$theirs" >/dev/null 2>&1 || fail "two fetched ezra's note"
@@ -487,7 +488,7 @@ scenario_client() {
     ticket=$(on one hk node invite "$peer" --client --account 4000000001 2>/dev/null)
     on laptop hk node join "$ticket" >/dev/null
     node_up laptop
-    wait_for "the client to connect" sh_on one "hk node peers | grep -q '^$peer	connected	client	4000000001$'"
+    wait_for "the client to connect" sh_on one "hk node peers | grep -q '^$peer	connected	client	4000000001	'"
     on laptop hk node status | grep -q "^client of	$one_peer$" || fail "the laptop doesn't say it's one's client"
     [ "$(on one hk node grant ls | grep "^$peer	")" = "$peer	/mesh/client" ] || fail "the client wasn't given /mesh/client, and that alone"
     [ "$(on laptop hk node peers | cut -f1)" = "$one_peer" ] || fail "the client was told of members"
@@ -513,6 +514,21 @@ scenario_client() {
     on one hk node grant rm "$peer" /mesh/client >/dev/null
     wait_for "one to stop listing the client" sh_on one "! hk node peers | grep -q '$peer'"
     wait_for "the laptop to be cut off" sh_on laptop "hk node status | grep -q '^connected	0$'"
+}
+
+# Each device names itself by its hostname, and any may name another,
+# which every member then shows it by
+scenario_names() {
+    local one_peer two_peer
+    one_peer=$(on one hk node id)
+    two_peer=$(on two hk node id)
+    [ "$(on one hk node name)" = one ] || fail "one didn't name itself by its hostname"
+    on one hk node status | grep -q "^name	one$" || fail "one's status doesn't say its name"
+    wait_for "two to hear what one's called" sh_on two "hk node peers | grep '^$one_peer	' | grep -q '	one$'"
+    on one hk node name --peer "$two_peer" "two-desk" >/dev/null
+    wait_for "two to hear what one named it" sh_on two '[ "$(hk node name)" = two-desk ]'
+    on two hk node name --rm >/dev/null
+    wait_for "one to hear two's called nothing" sh_on one "hk node peers | grep '^$two_peer	' | grep -q '	-$'"
 }
 
 # Two members on networks of their own, which can't reach each other or
@@ -809,7 +825,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read served edits copies whole late_joiner fork_merge lost forget car restore revoke shared client thin visitor expiry door several relayed)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read names served edits copies whole late_joiner fork_merge lost forget car restore revoke shared client thin visitor expiry door several relayed)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

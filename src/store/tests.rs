@@ -3180,6 +3180,17 @@ fn repos_earlier_builds_made_still_open() {
             assert!(repo.public_roots().expect("roots").contains(&(crate::claim::Public::ANNOUNCE.to_owned(), published.clone())), "{name}");
             assert!(repo.is_public(shared).expect("public"), "{name}: what the anchor is");
         }
+        if let Some(named) = expect.get("named") {
+            let block = repo.get_block(named).expect("get").unwrap_or_else(|| panic!("{name}: the name"));
+            let Some(crate::claim::Claim::Name(claim)) = crate::claim::Claim::parse(block.data()) else { panic!("{name}: a name claim") };
+            let names = repo.device_names().expect("names");
+            assert!(claim.target().iter().any(|key| names.contains(&(key.clone(), "fixture-third".to_owned()))), "{name}: {names:?}");
+            assert_eq!(names.len(), 2, "{name}: this device, and the other");
+        }
+        // And older ones can name devices now
+        let device = crate::keys::Key::generate().expect("key").id();
+        repo.name_device(&device, "later").expect("name");
+        assert!(repo.device_names().expect("names").contains(&(device, "later".to_owned())), "{name}");
         // And older ones can make things public now, all they link to
         repo.publish(&expect["tree"], crate::claim::Public::ANNOUNCE).expect("publish");
         assert!(repo.is_public(&expect["big"]).expect("public"), "{name}: what the tree links to, made public after it was here");
@@ -4059,4 +4070,59 @@ fn a_public_group_is_public_as_its_members_are() {
     repo.untag(&song, &shared).expect("untag");
     assert!(!public(&repo, "a song"), "untagged");
     assert!(public(&repo, "a poem"));
+}
+
+#[test]
+fn a_device_goes_by_the_latest_name_that_counts() {
+    let root = crate::keys::Key::generate().expect("key");
+    let (router, device) = signed_router(&root);
+    let other = crate::keys::Key::generate().expect("key");
+    let certificate = router.certify(&root, &other.id()).expect("certify");
+    let names = || router.device_names().expect("names");
+    let called = |key: &crate::keys::Key| names().into_iter().find(|(named, _)| *named == key.id()).map(|(_, name)| name);
+    assert!(names().is_empty(), "nothing's called anything till it's named");
+    assert!(router.name_device(&device.id(), "").is_err());
+    assert!(router.name_device(&device.id(), "two\nlines").is_err());
+
+    // Named, and its certificate's targeted, so it goes where that does
+    let first = router.name_device(&other.id(), "theseus").expect("name");
+    let block = router.get_block(&first).expect("get").expect("here");
+    let Some(Claim::Name(claim)) = Claim::parse(block.data()) else { panic!("a name claim") };
+    assert!(claim.target().contains(&certificate) && claim.target().contains(&other.id()));
+    assert_eq!(called(&other).as_deref(), Some("theseus"));
+
+    // Two may go by one name, told apart by key
+    router.name_device(&device.id(), "theseus").expect("name");
+    assert_eq!((called(&device).as_deref(), called(&other).as_deref()), (Some("theseus"), Some("theseus")));
+
+    // Renamed, the old name's tombed
+    router.name_device(&other.id(), "theseus-desk").expect("rename");
+    assert_eq!(called(&other).as_deref(), Some("theseus-desk"));
+    let claims = router.claims().expect("claims");
+    assert_eq!(claims.naming(&other.id()).expect("naming").0.len(), 1, "one name counts");
+    assert!(claims.retracted(&first).expect("retracted"));
+
+    // Unnamed, then named again, it's a later time, not the first again
+    router.unname_device(&other.id()).expect("unname");
+    assert_eq!(called(&other), None);
+    let again = router.name_device(&other.id(), "theseus").expect("name");
+    assert_ne!(again, first, "a tomb is forever, so it's named a new time");
+    assert_eq!(called(&other).as_deref(), Some("theseus"));
+
+    // A stranger's name says nothing
+    let stranger = crate::keys::Key::generate().expect("key");
+    let theirs = Claim::Name(crate::claim::Name::new([other.id()], "mine now").expect("name").again(99));
+    router.put_block(&theirs.block(), CidVersion::V1).expect("put");
+    sign(&router, &stranger, &theirs.cid());
+    assert_eq!(called(&other).as_deref(), Some("theseus"));
+
+    // Named at once, as two devices might, the least CID wins, wherever
+    let n = claims.naming(&device.id()).expect("naming").1.expect("named") + 1;
+    let [left, right] = ["left", "right"].map(|name| Claim::Name(crate::claim::Name::new([device.id()], name).expect("name").again(n)));
+    for claim in [&left, &right] {
+        router.put_block(&claim.block(), CidVersion::V1).expect("put");
+        sign(&router, &device, &claim.cid());
+    }
+    let least = if left.cid().to_bytes() < right.cid().to_bytes() { "left" } else { "right" };
+    assert_eq!(called(&device).as_deref(), Some(least));
 }

@@ -194,7 +194,8 @@ owner, fetching from the owner's machines as the mount reads, and what a
 writer sets for it reaches every machine of the owner's.
 
 `hk node peers` lists, for each connected member, the accounts here whose
-users it hosts.
+users it hosts, and last, what each member's called (see
+[[Claims#Names]]), or `-`.
 
 ## Clients
 
@@ -263,7 +264,7 @@ members where its ticket and their rosters said, and again wherever each
 says it listens on the port it connected to it on.
 
 `hk node peers` on the member lists each client, whether it's connected,
-`client`, and the account it acts for; `hk node status` on a client says
+`client`, the account it acts for, and what it's called; `hk node status` on a client says
 whose client it is.
 
 ### Thin clients

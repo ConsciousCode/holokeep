@@ -282,7 +282,23 @@ enum NodeCommand {
         #[arg(required = true)]
         addrs: Vec<libp2p::Multiaddr>,
     },
-    /// List the mesh's members, and which are connected
+    /// Call this device, or another of the user's, something: a label
+    /// members show it by, never what it's let in by. A device names
+    /// itself by its hostname when its node first runs; naming it again
+    /// replaces that, everywhere. With no name, print what it's called
+    Name {
+        name: Option<String>,
+        /// Name another device, by its peer ID, as two of one hostname
+        /// might need
+        #[arg(long)]
+        peer: Option<libp2p::PeerId>,
+        /// Call it nothing, rather than anything. Naming prints the name
+        /// claim, this the tombs
+        #[arg(long, conflicts_with = "name")]
+        rm: bool,
+    },
+    /// List the mesh's members, and which are connected, then what each is
+    /// called
     Peers,
     /// Give and take away what users and machines may do in the mesh. Once
     /// the mesh has grants, its machines are those given /mesh/machine, its
@@ -1974,9 +1990,12 @@ fn peers(place: &holokeep::net::mesh::Place) -> anyhow::Result<()> {
         }
     } else {
         eprintln!("this node isn't running; members it knows of:");
+        let names = open_repo(Some(place.repo.clone()))?.device_names()?;
         for (peer, addrs) in daemon::members(place)?.list()? {
             let addrs: Vec<String> = addrs.iter().map(ToString::to_string).collect();
-            out!("{peer}\t-\t{}\t-", addrs.join(" "));
+            let key = holokeep::keys::from_peer_id(&peer.to_string());
+            let name = names.iter().find(|(named, _)| Some(named) == key.as_ref()).map_or("-", |(_, name)| name.as_str());
+            out!("{peer}\t-\t{}\t-\t{name}", addrs.join(" "));
         }
     }
     Ok(())
@@ -2072,6 +2091,26 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
         },
         NodeCommand::Forget { peer } => daemon::forget(place, &peer)?,
         NodeCommand::Reach { peer, addrs } => daemon::reach(place, &peer, &addrs)?,
+        NodeCommand::Name { name, peer, rm } => {
+            let peer = peer.unwrap_or(mesh::node_key(dir)?.public().to_peer_id());
+            let key = holokeep::keys::from_peer_id(&peer.to_string()).context("not a device's key")?;
+            let repo = open_repo(Some(dir.to_path_buf()))?;
+            match (name, rm) {
+                (Some(name), _) => out!("{}", repo.name_device(&key, &name)?),
+                (None, true) => {
+                    let tombs = repo.unname_device(&key)?;
+                    anyhow::ensure!(!tombs.is_empty(), "{peer} isn't called anything");
+                    for tomb in tombs {
+                        out!("{tomb}");
+                    }
+                },
+                (None, false) => {
+                    if let Some((_, name)) = repo.device_names()?.into_iter().find(|(named, _)| *named == key) {
+                        out!("{name}");
+                    }
+                },
+            }
+        },
         NodeCommand::ScanLost => drop(daemon::ask(place, "scan-lost")?.context("this node isn't running: start `hk node run`")?),
         NodeCommand::Trim => {
             let report = daemon::trim(place)?.context("this node isn't running: start `hk node run`")?;

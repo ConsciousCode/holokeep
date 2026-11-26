@@ -2469,3 +2469,25 @@ async fn other_users_reach_what_a_node_serves_as_grants_on_it_say() {
     ask(&mut theirs, 2, Tmsg::Read { fid: 2, offset: 0, count: 100 }, 9);
     assert_eq!(served_answer(&mut [&mut theirs, &mut server, &mut mine], 2).await, Rmsg::Lerror { ecode: 13 });
 }
+
+/// What a device's called reaches every member, since it targets the
+/// device's certificate, which they hold.
+#[tokio::test]
+async fn names_reach_every_member() {
+    let (mut a, mut b, _) = Box::pin(holding()).await;
+    one_user(&mut [&mut a, &mut b]);
+    let (mine, theirs) = (a.catalog().signer().expect("signer").id(), b.catalog().signer().expect("signer").id());
+    a.catalog().name_device(&mine, "ender").expect("name");
+    a.catalog().name_device(&theirs, "theseus").expect("name");
+    a.announce().expect("announce");
+    let names = |node: &Node| node.catalog().device_names().expect("names");
+    let expected = |node: &Node| {
+        let names = names(node);
+        names.contains(&(mine.clone(), "ender".to_owned())) && names.contains(&(theirs.clone(), "theseus".to_owned()))
+    };
+    assert!(until(&mut [&mut a, &mut b], |n| expected(n[1])).await, "{:?}", names(&b));
+    // Renamed, the tomb goes the same way
+    a.catalog().name_device(&theirs, "theseus-desk").expect("rename");
+    a.announce().expect("announce");
+    assert!(until(&mut [&mut a, &mut b], |n| names(n[1]).contains(&(theirs.clone(), "theseus-desk".to_owned()))).await, "{:?}", names(&b));
+}

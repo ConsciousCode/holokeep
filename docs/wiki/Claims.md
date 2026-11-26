@@ -23,6 +23,7 @@ is not a claim; it's stored as ordinary data.
 | `grant`  | `on: Link` (omitted for the mesh), `add: [string]`, `del: [string]` (each omitted if empty), `stands: [Link]` (omitted if empty), `prev: [Link]`, `until: int` (omitted for good) | The targets hold the commands `add`, till `until` if it says, and no longer `del`, after the grants `prev`. Never dissolved. See [[Grants]]. |
 | `same`   | `as: string` (omitted for each codec's data model)                                                        | The targets, two or more, are the same, read through the lens `as`. Never dissolved. See [[#Same]]. |
 | `public` | `mode: string`, `n: int` (omitted if 0)                                                                   | The targets and what they link to are anyone's to have, in `mode`: `serve` or `announce`. `n` is which time, since a tomb is forever. See [[#Public]]. |
+| `name`   | `name: string`, `n: int` (omitted if 0)                                                                   | The device whose key is among the targets goes by `name`. The targets are the key and its certificates. `n` is which time, since a tomb is forever. See [[#Names]]. |
 
 Examples, in dag-json for readability:
 
@@ -34,11 +35,12 @@ Examples, in dag-json for readability:
 {"at": 1793750400, "claim": "lost", "target": [{"/": "bafkrei…"}]}
 {"as": "unixfs", "claim": "same", "target": [{"/": "bafkrei…"}, {"/": "bafybei…"}]}   (a file and its whole multihash)
 {"claim": "public", "mode": "serve", "target": [{"/": "bafybei…"}]}   (anyone's who asks, unannounced)
+{"claim": "name", "name": "theseus", "target": [{"/": "bafzaaj…"}, {"/": "bafyqah…"}]}   (a device's key and its certificate)
 ```
 
 A node of an older build doesn't know `copies`, so it takes such a keep
 for ordinary data, not a keep; likewise `lost`, `grant`, and a set with
-`for`, and `same` and `public`.
+`for`, and `same`, `public` and `name`.
 
 Not yet implemented, but planned: `attr` (attributes, with `prev`
 history), `derive` (structure derived from the targets).
@@ -188,6 +190,37 @@ hk public add --tag <name>        # what a tag tags, as it does
 hk public ls                      # mode and root of each
 hk public check <cid>             # public or private, by whatever reaches it
 hk public rm <cid>                # private again
+```
+
+## Names
+
+A device is known by its key, its peer ID, which is what grants, allow
+lists and certificates name. A `name` claim gives it a label for
+people, shown by `hk node peers` and `hk node status`, and never what
+anything's let in by.
+
+- A device names itself by its hostname when its node first runs, if
+  it's never been named. Once it's named, renamed or unnamed, that
+  stands.
+- Any device of the user may name another, as two machines of one
+  hostname need. Naming a device again tombs what it was called.
+- The targets are the device's key and its certificates. Every member
+  holds the certificates, so a name reaches every member, the way any
+  claim reaches holders of what it targets. Guests are sent only what's
+  shared with them, so they never hear of names.
+- Of the names that count, the one with the greatest `n` wins, and of
+  those, the least CID, so names given at once on two devices come out
+  the same everywhere. Two devices may share a name, so `peers` shows
+  the name beside the peer ID, not instead of it.
+- A name is up to 64 characters, with no tabs, newlines or spaces at
+  either end. Claims are kept, so a device's old names stay in its
+  history even once they're tombed.
+
+```
+hk node name                       # what this device is called
+hk node name <name>                # call it this
+hk node name --peer <id> <name>    # call another of the user's devices this
+hk node name --rm [--peer <id>]    # call it nothing
 ```
 
 ## Backreferences

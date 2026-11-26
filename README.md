@@ -242,6 +242,15 @@ type Public struct {
   mode String
   n optional Int
 }
+# The device whose key is among the targets goes by `name`: a label for
+# people, never what anything's let in by. The targets are the key and
+# its certificates, so it goes where they do, to every member. The name
+# with the greatest `n` that counts is the one it goes by.
+type Name struct {
+  target [Link]
+  name String
+  n optional Int
+}
 # Attributes associated with the targets.
 type Attr struct {
   target [Link]
@@ -258,6 +267,7 @@ type Claim union {
   | Group "group"
   | Same "same"
   | Public "public"
+  | Name "name"
   | Attr "attr"
   | Derive "derive"
 } representation inline {
@@ -454,6 +464,7 @@ Checklist:
   - [x] Anchors: empty identities (identity CIDs of 16 random bytes) which are whatever their latest `Set` claim says; a kept anchor references only what it is now, so what it was is collected after the grace period (`hk anchor new/set/show`)
   - [x] Files imported in place as mounts on anchors, kept through them, and imported again as they change; the path is known only to the node with the file (`hk add --nocopy`)
   - [x] Relays: members which can't reach each other connect through a member that relays, and punch through to each other where they can (`relay = true`, `hk node status`)
+  - [x] Device names: each device names itself by its hostname, and any may name another, shown by every member (`hk node name`, `hk node peers`)
   - [ ] A relay that isn't a member: relaying without the swarm key or the mesh's blocks
   - [ ] Kademlia provider records, once broadcast wants don't scale
   - [x] Measuring how far apart members' clocks are, advisorily (`hk node clocks`)
