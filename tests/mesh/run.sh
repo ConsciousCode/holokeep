@@ -273,6 +273,30 @@ scenario_lost() {
     [ "$(on one hk cat "$cid")" = "only here" ] || fail "it isn't what it was"
 }
 
+# A directory watched from empty: a download under way isn't imported till
+# it's renamed, a new subdirectory's noticed, and once it's not watched,
+# nothing more is
+scenario_watch() {
+    local anchor before
+    sh_on one 'mkdir -p /tmp/dl'
+    anchor=$(on one hk watch add /tmp/dl | tail -1 | awk '{ print $NF }')
+    on one hk watch ls | grep -q "^/tmp/dl	$anchor	.*	0 files	" || fail "it isn't listed as watched"
+    sh_on one 'echo "half a film" > /tmp/dl/film.mkv.part'
+    sleep 4
+    on one hk watch ls | grep -q "	0 files	" || fail "a download under way was imported"
+    sh_on one 'mv /tmp/dl/film.mkv.part /tmp/dl/film.mkv'
+    wait_for "the finished download to be imported" sh_on one "hk watch ls | grep -q '	1 files	'"
+    sh_on one 'mkdir /tmp/dl/sub && sleep 3 && echo "deeper" > /tmp/dl/sub/note'
+    wait_for "what's in a new subdirectory to be imported" sh_on one "hk watch ls | grep -q '	2 files	'"
+    [ "$(on one hk watch ls --files /tmp/dl | cut -f1 | sort -u)" = ok ] || fail "a file's not as it was"
+    before=$(on one hk anchor show "$anchor")
+    on one hk watch rm /tmp/dl | grep -q "stopped watching /tmp/dl" || fail "rm didn't say it stopped"
+    [ -z "$(on one hk watch ls)" ] || fail "still listed"
+    sh_on one 'echo "after" > /tmp/dl/later'
+    sleep 4
+    [ "$(on one hk anchor show "$anchor")" = "$before" ] || fail "imported again after it stopped"
+}
+
 # A device's claims can be seen, and revoking it says what it'd cost first,
 # trusting what's asked to and taking nothing else unasked
 scenario_revoke() {
@@ -825,7 +849,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read names served edits copies whole late_joiner fork_merge lost forget car restore revoke shared client thin visitor expiry door several relayed)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read names served edits copies whole late_joiner fork_merge lost watch forget car restore revoke shared client thin visitor expiry door several relayed)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

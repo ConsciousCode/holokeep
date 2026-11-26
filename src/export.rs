@@ -611,6 +611,7 @@ mod tests {
             layout: BalancedLayout { width: 3 },
             directory: DynamicDirectory { threshold: 400, hamt: Hamt { fanout: 8 } },
             hidden: true,
+            rules: None,
         }
     }
 

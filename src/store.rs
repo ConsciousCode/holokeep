@@ -3245,6 +3245,79 @@ impl Catalog {
         .collect()
     }
 
+    /// What each file of what's watched at `path` was last imported as,
+    /// for those unchanged since, so importing it again with the same
+    /// settings needn't read them: from what its anchor is now.
+    fn imported_before(&self, importer: &crate::import::Importer, path: &Path) -> Result<std::collections::HashMap<PathBuf, crate::dag::DagLink>> {
+        let mut before = std::collections::HashMap::new();
+        let Some(mount) = self.mount_at(path)?.filter(|mount| !mount.overlay && mount.chunk_size == importer.chunk_size && mount.width == importer.layout.width) else {
+            return Ok(before);
+        };
+        let Some(root) = self.anchor_value(&mount.anchor)? else {
+            return Ok(before);
+        };
+        // Each entry, with the size its directory says it is
+        let mut pending: Vec<(PathBuf, Link, Option<u64>)> = vec![(path.to_path_buf(), root, None)];
+        while let Some((at, cid, tsize)) = pending.pop() {
+            match crate::export::stat(self, &cid) {
+                Ok(crate::export::Kind::Directory) => {
+                    for entry in crate::export::list(self, &cid).unwrap_or_default() {
+                        let name = std::ffi::OsStr::from_bytes(&entry.name);
+                        pending.push((at.join(name), entry.cid, entry.size));
+                    }
+                },
+                Ok(crate::export::Kind::File(filesize)) => {
+                    let (crate::cid::AnyCid::V1(cid), Some(tsize)) = (cid, tsize) else {
+                        continue;
+                    };
+                    let unchanged = self.external_at(&at)?.iter().any(|file| !file.changed());
+                    if unchanged {
+                        before.insert(at, crate::dag::DagLink { cid, tsize, filesize });
+                    }
+                },
+                _ => {},
+            }
+        }
+        Ok(before)
+    }
+
+    /// The directories and files watched: imported in place, and again as
+    /// they change, each mounted on an anchor (`hk watch`).
+    pub fn watches(&self) -> Result<Vec<Mount>> {
+        Ok(self.mounts()?.into_iter().filter(|mount| !mount.overlay).collect())
+    }
+
+    /// Stop watching what's at a path, or mounted on an anchor: whatever
+    /// state it's in, its anchor stays as it was last imported, kept as it
+    /// was, read from the files where they are while they're unchanged.
+    /// Returns what was watched, if anything was.
+    pub fn unwatch(&self, path: Option<&Path>, anchor: Option<&Link>) -> Result<Option<Mount>> {
+        let Some(watch) = self.watches()?.into_iter().find(|watch| Some(watch.path.as_path()) == path || Some(&watch.anchor) == anchor) else {
+            return Ok(None);
+        };
+        self.db.conn().prepare_cached("DELETE FROM mounts WHERE path = ?1 AND NOT overlay")?.execute([path_bytes(&watch.path)])?;
+        Ok(Some(watch))
+    }
+
+    /// The rules a watched directory's import heeds besides its own rules
+    /// files: the built-in rules, then the root's top's rules file, as the
+    /// mount heeds them.
+    pub fn watch_rules(&self) -> Result<crate::rules::Rules> {
+        let rules = crate::rules::Rules::defaults();
+        let Some(top) = self.root_anchor()?.map(|root| self.anchor_value(&root)).transpose()?.flatten() else {
+            return Ok(rules);
+        };
+        let Some(file) = crate::export::list(self, &top).ok().and_then(|listed| listed.into_iter().find(|entry| entry.name == crate::rules::FILE.as_bytes())) else {
+            return Ok(rules);
+        };
+        let text = crate::export::read_at(self, &file.cid, 0, crate::rules::MOST).unwrap_or_default();
+        let (root, errors) = crate::rules::Rules::parse(&String::from_utf8_lossy(&text));
+        for e in errors {
+            eprintln!("{} at the root's top: {e}", crate::rules::FILE);
+        }
+        Ok(rules.then(root))
+    }
+
     /// Record a mount, replacing whatever was at its path.
     pub fn mount(&self, mount: &Mount) -> Result<()> {
         self.db.conn()
@@ -3265,8 +3338,17 @@ impl Catalog {
     /// mount and what it's now.
     pub fn import_mounted(&mut self, importer: &crate::import::Importer, path: &Path, report: &mut dyn FnMut(&Path, &crate::dag::DagLink)) -> Result<(Mount, Link)> {
         let path = std::fs::canonicalize(path)?;
+        // What a watched directory's rules leave out isn't imported
+        let importer = &crate::import::Importer {
+            chunk_size: importer.chunk_size,
+            layout: crate::dag::BalancedLayout { width: importer.layout.width },
+            hidden: importer.hidden,
+            rules: Some(std::sync::Arc::new(self.watch_rules()?)),
+            ..crate::import::Importer::default()
+        };
+        let previous = self.imported_before(importer, &path)?;
         let root = importer
-            .add_path(&path, &mut InPlace::new(self), &mut |p: &Path, link: &crate::dag::DagLink| report(p, link))?
+            .add_path(&path, &mut InPlace::new(self).again(previous), &mut |p: &Path, link: &crate::dag::DagLink| report(p, link))?
             .ok_or_else(|| Error::Invalid { store: "router", reason: format!("unsupported file type: {}", path.display()) })?;
         let root: Link = root.cid.into();
         let anchor = match self.mount_at(&path)? {
@@ -3301,6 +3383,10 @@ impl Catalog {
     pub fn remount(&mut self, mount: &Mount) -> Result<Link> {
         if mount.overlay {
             return self.batch_breathing(|catalog| catalog.import_overlay(mount));
+        }
+        // Not watched any more, it's not watched again
+        if self.mount_at(&mount.path)?.is_none_or(|now| now.anchor != mount.anchor) {
+            return Err(Error::User(format!("{} isn't watched", mount.path.display())));
         }
         let importer = mount.importer();
         let path = mount.path.clone();
@@ -4245,11 +4331,21 @@ fn io_error(e: Error) -> io::Error {
 pub struct InPlace<'a> {
     router: &'a mut Catalog,
     file: Option<(Fingerprint, Whole)>,
+    /// What files were imported as before, which are unchanged since.
+    previous: std::collections::HashMap<PathBuf, crate::dag::DagLink>,
 }
 
 impl<'a> InPlace<'a> {
-    pub const fn new(router: &'a mut Catalog) -> Self {
-        Self { router, file: None }
+    pub fn new(router: &'a mut Catalog) -> Self {
+        Self { router, file: None, previous: std::collections::HashMap::new() }
+    }
+
+    /// Importing again, taking what files were imported as before for what
+    /// they are now, without reading them, if they're unchanged.
+    #[must_use]
+    pub fn again(mut self, previous: std::collections::HashMap<PathBuf, crate::dag::DagLink>) -> Self {
+        self.previous = previous;
+        self
     }
 }
 
@@ -4271,6 +4367,10 @@ impl BlockSink for InPlace<'_> {
             .ok_or_else(|| io::Error::other(format!("can't fingerprint {}", path.display())))?;
         self.file = Some((fingerprint, Whole::default()));
         Ok(())
+    }
+
+    fn unchanged(&mut self, path: &Path) -> io::Result<Option<DagLink>> {
+        Ok(self.previous.get(path).cloned())
     }
 
     fn end_file(&mut self, path: &Path, _root: &DagLink) -> io::Result<()> {

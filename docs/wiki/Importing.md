@@ -34,13 +34,41 @@ By default `hk add` skips names starting with `.`, as Kubo does without
 
 ## In place: `--nocopy`
 
-`hk add --nocopy` doesn't copy file contents. Each leaf is recorded as
-a range (blob, offset, length) of the file where it was found, and the
-file is mounted on an anchor (see [[Anchors and Names]]).
-When the file changes, a running node imports it again and moves the
-anchor. A range is only served while the file's fingerprint (size,
+`hk add --nocopy` doesn't copy file contents, like Kubo's filestore. Each
+leaf is recorded as a range (blob, offset, length) of the file where it
+was found. A range is only served while the file's fingerprint (size,
 mtime, inode) still holds; otherwise reads fail as stale rather than
-returning wrong bytes.
+returning wrong bytes. Nothing's watched, and there's no anchor: to
+follow a file or directory as it changes, watch it.
+
+## Watched: `hk watch`
+
+`hk watch add <path>` imports a file or directory in place, as
+`--nocopy` does, mounts it on an anchor (see [[Anchors and Names]]),
+keeps the anchor, and prints it. While the node runs, it watches every
+directory in it (inotify), and imports it again when something changes,
+moving the anchor. A changed file is noticed by its fingerprint and read
+again; a file unchanged since the last import isn't read at all, but
+taken for what it was. Newly watched, and when the node starts, it's
+imported again once, for what changed while nothing was watching. Where
+it's watched is known only to this machine and never enters the soup.
+
+What [[Rules]] say to `skip` isn't imported: the built-in rules skip
+downloads under way (`*.part`, `*.crdownload`, `*.download`,
+`*.partial`, `*.tmp`), so a download's imported once, when it's renamed
+to what it'll be; the root's `.souprules` and any `.souprules` in the
+watched directory and below say more, a nearer saying over a farther.
+
+```
+hk watch add <path>             # watch it, printing its anchor
+hk watch ls                     # path, anchor, root, files, size, how many stale
+hk watch ls --files [<path>]    # each file read in place: ok, changed or gone
+hk watch rm <path|anchor>       # stop watching, whatever state it's in
+```
+
+Stopping leaves the anchor as it was last imported, still kept: what's
+read from files where they are stays readable while they're unchanged,
+as with `--nocopy`, and members' copies stay where they are.
 
 ## Copying
 

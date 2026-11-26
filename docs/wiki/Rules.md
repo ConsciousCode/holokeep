@@ -1,5 +1,6 @@
 Rules say what [[Mount|hk mount]] makes of what applications make
-through it. An application's state (`.obsidian/`, `.git/`) changes far
+through it, and what's left out of a directory watched with
+[[Importing#Watched: `hk watch`|hk watch]]. An application's state (`.obsidian/`, `.git/`) changes far
 more often than what it's about, and inside an anchor it would change
 that anchor with it; a rule makes it an anchor of its own instead.
 Rules apply as something's made, so nothing has to scan for them.
@@ -50,19 +51,34 @@ __pycache__/   copies=1
 | `inline` | A directory made by this name is an ordinary directory of the anchor it's in. |
 | `copies=<n>` | A directory made by this name is an anchor of its own (unless the rules say `inline`), kept by a keep asking for `n` failures to lose what's in it, at least 1 (see [[Replication and Retention#Durability]]). |
 | `pace=<time>` | An anchor mounted by this name is committed at most this often, as well as by its own pace (see [[Mount#Committing]]). Times are `30s`, `5m`, `1h` or `0`. |
+| `skip` | What's by this name in a watched directory isn't imported. So far, the mount makes nothing of it. |
+| `include` | What's by this name is imported after all, though an earlier rule said `skip`. |
 | `app=<name>` | The rule applies only to what the application by this name makes: the process making the request, by `/proc/<pid>/comm`. |
 
 ## Built-in rules
 
 ```
-.obsidian/ detach
-.git/      detach
-.vscode/   detach
-.idea/     detach
+.obsidian/   detach
+.git/        detach
+.vscode/     detach
+.idea/       detach
+*.part       skip
+*.crdownload skip
+*.download   skip
+*.partial    skip
+*.tmp        skip
 ```
+
+The skips are downloads under way, which a watched directory imports
+once they're done and renamed to what they'll be.
 
 ## When rules apply
 
+- In a watched directory, the built-in rules apply, then the root's
+  top's rules file, then each `.souprules` in the directory and below,
+  from the top down, its paths from its own directory. Only `skip` and
+  `include` mean anything there so far; `app=` can't, since a change
+  isn't known to be any application's.
 - `detach` and `inline` apply when a directory is made (`mkdir`).
   Directories already there stay as they are; to detach one, make it
   again: `mv .obsidian .obsidian.old && mkdir .obsidian && cp -a

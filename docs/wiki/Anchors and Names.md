@@ -20,11 +20,12 @@ to keep it.
 
 Anchors carry everything mutable:
 
-- **Files imported in place** (`hk add --nocopy`): the path is mounted on
-  an anchor. The mount (path and import settings) is known only to the
-  node with the file and never enters the soup. A running node watches it
-  (inotify on its directory, a sample each tick, and a sweep at start),
-  imports it again when it changes, and moves the anchor.
+- **Watched files and directories** (`hk watch add`): the path is
+  mounted on an anchor. The mount (path and import settings) is known
+  only to the node with the file and never enters the soup. A running
+  node watches it (inotify on each of its directories, a sample each
+  tick, and an import at start), imports it again when it changes, and
+  moves the anchor. See [[Importing#Watched: `hk watch`]].
 - **Overlay mounts**: anchors written through `hk mount` (see [[Mount]]).
 - **Names**: the root anchor, below.
 
@@ -39,8 +40,7 @@ is named by an anchor CID of its own:
 view = identity CID of dag-cbor {"anchor": <the anchor's nonce>, "of": <user's key>}
 ```
 
-`hk anchor view <anchor> <owner>` prints it. Showing a view (`hk anchor
-show`, `hk get`, the mount's `anchors/<view>`) shows what counts in the
+`hk anchor view <anchor> <owner>` prints it. Showing a view (`hk anchor show`, `hk get`, the mount's `anchors/<view>`) shows what counts in the
 owner's view of the anchor, if the acting user may read it, and nothing
 otherwise. Setting one (`hk anchor set <view> <cid>`, or writing under
 it in the mount) makes a set of the anchor for the owner's view (its
@@ -173,8 +173,7 @@ builds, and that a set says, holds one version of each name, the
 whichever heads are merged, so a conflict comes out the same however
 it's come to. Kubo, `hk get`, and older builds see a plain directory.
 
-The mount shows each other version beside it, as `name (conflict
-<tag>)`, before the extension (`page (conflict ab3c2d).md`), the tag
+The mount shows each other version beside it, as `name (conflict <tag>)`, before the extension (`page (conflict ab3c2d).md`), the tag
 being the last six characters of the CID of the set it's of; where that
 name's taken, with a number after the tag. Those names aren't stored:
 a file that's really called that is just a file, and nothing mistakes

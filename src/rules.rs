@@ -1,5 +1,6 @@
-//! Rules for what's made through the mount: `.souprules` files, a line to
-//! a rule, as a pattern and what's made by that name is.
+//! Rules for what's made through the mount, and what's imported of a
+//! watched directory: `.souprules` files, a line to a rule, as a pattern
+//! and what's made or imported by that name is.
 //!
 //! ```text
 //! # pattern    settings
@@ -17,8 +18,20 @@ use std::path::Path;
 use std::time::Duration;
 
 /// What the built-in rules say, before any file's: what applications
-/// keep their state in, made anchors of their own.
-const DEFAULTS: &str = ".obsidian/ detach\n.git/ detach\n.vscode/ detach\n.idea/ detach\n";
+/// keep their state in, made anchors of their own; and downloads under
+/// way, which a watched directory doesn't import till they're done and
+/// renamed to what they'll be.
+const DEFAULTS: &str = "\
+.obsidian/ detach
+.git/ detach
+.vscode/ detach
+.idea/ detach
+*.part skip
+*.crdownload skip
+*.download skip
+*.partial skip
+*.tmp skip
+";
 
 /// The name of a directory's rules file.
 pub const FILE: &str = ".souprules";
@@ -39,12 +52,20 @@ pub struct Settings {
     /// name, which makes it an anchor of its own unless it's `inline`, kept
     /// so.
     pub copies: Option<usize>,
+    /// Whether what's by this name in a watched directory is left out of
+    /// what's imported of it. So far, the mount makes no use of it.
+    pub skip: Option<bool>,
 }
 
 impl Settings {
     /// These, with what `over` says over them.
     fn and(self, over: Self) -> Self {
-        Self { detach: over.detach.or(self.detach), pace: over.pace.or(self.pace), copies: over.copies.or(self.copies) }
+        Self { detach: over.detach.or(self.detach), pace: over.pace.or(self.pace), copies: over.copies.or(self.copies), skip: over.skip.or(self.skip) }
+    }
+
+    /// Whether what they're said of is left out.
+    pub fn skipped(self) -> bool {
+        self.skip == Some(true)
     }
 }
 
@@ -87,6 +108,13 @@ impl Rules {
         Self::parse(DEFAULTS).0
     }
 
+    /// These, then `more`, which say over them.
+    #[must_use]
+    pub fn then(mut self, more: Self) -> Self {
+        self.0.extend(more.0);
+        self
+    }
+
     /// What these say of what's made at `rel` from their directory, a
     /// directory if `dir`, by `app` if it's known, over `settings`.
     pub fn apply(&self, settings: Settings, rel: &Path, dir: bool, app: Option<&str>) -> Settings {
@@ -116,11 +144,13 @@ impl Rule {
             match word.split_once('=') {
                 None if word == "detach" => rule.settings.detach = Some(true),
                 None if word == "inline" => rule.settings.detach = Some(false),
+                None if word == "skip" => rule.settings.skip = Some(true),
+                None if word == "include" => rule.settings.skip = Some(false),
                 Some(("pace", pace)) => rule.settings.pace = Some(duration(pace).ok_or_else(|| format!("{pace:?} isn't a time, as 30s, 5m or 1h"))?),
                 Some(("app", app)) if !app.is_empty() => rule.app = Some(app.to_owned()),
                 Some(("copies", "0")) => return Err("copies=0 isn't yet: a cache dropped under pressure would be left half there".to_owned()),
                 Some(("copies", copies)) => rule.settings.copies = Some(copies.parse().ok().filter(|&copies| copies > 0).ok_or_else(|| format!("{copies:?} isn't a number of copies"))?),
-                _ => return Err(format!("{word:?} isn't a setting: detach, inline, pace=<time>, copies=<n> or app=<name>")),
+                _ => return Err(format!("{word:?} isn't a setting: detach, inline, skip, include, pace=<time>, copies=<n> or app=<name>")),
             }
         }
         Ok(rule)
@@ -201,8 +231,13 @@ mod tests {
         assert_eq!(said(text, ".git", true, Some("git")).detach, Some(false));
         assert_eq!(said(text, ".git", true, Some("bash")).detach, Some(true));
         assert_eq!(said(text, ".git", true, None).detach, Some(true));
-        assert_eq!(said("x pace=1h\nx detach", "x", true, None), Settings { detach: Some(true), pace: Some(Duration::from_hours(1)), copies: None }, "settings say over only what they say");
+        assert_eq!(said("x pace=1h\nx detach", "x", true, None), Settings { detach: Some(true), pace: Some(Duration::from_hours(1)), ..Settings::default() }, "settings say over only what they say");
         assert_eq!(said("__pycache__/ copies=1", "src/__pycache__", true, None).copies, Some(1));
+        // Downloads under way are skipped, unless a later rule says otherwise
+        assert!(Rules::defaults().apply(Settings::default(), Path::new("film.mkv.part"), false, None).skipped());
+        assert!(!Rules::defaults().apply(Settings::default(), Path::new("film.mkv"), false, None).skipped());
+        assert!(!said("*.part skip\nkeep.part include", "keep.part", false, None).skipped());
+        assert!(said("*.part skip\nkeep.part include", "other.part", false, None).skipped());
     }
 
     #[test]

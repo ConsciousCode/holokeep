@@ -90,6 +90,9 @@ const LOST_SCAN: Duration = Duration::from_hours(24);
 struct Watch {
     watcher: Option<notify::RecommendedWatcher>,
     dirs: HashSet<PathBuf>,
+    /// The paths watched with `hk watch`, as of when their directories
+    /// were last looked for.
+    watched: Vec<PathBuf>,
 }
 
 impl Watch {
@@ -105,7 +108,58 @@ impl Watch {
             }
         });
         let watcher = watcher.map_err(|e| eprintln!("not watching files imported in place: {e}")).ok();
-        Self { watcher, dirs: HashSet::new() }
+        Self { watcher, dirs: HashSet::new(), watched: Vec::new() }
+    }
+
+    /// Watch a directory too.
+    fn add_dir(&mut self, dir: &Path) {
+        let Some(watcher) = &mut self.watcher else {
+            return;
+        };
+        if self.dirs.insert(dir.to_owned()) {
+            use notify::Watcher as _;
+            if let Err(e) = watcher.watch(dir, notify::RecursiveMode::NonRecursive) {
+                eprintln!("not watching {}: {e}", dir.display());
+            }
+        }
+    }
+
+    /// Watch every directory in what `hk watch` watches, an empty one or
+    /// one with nothing imported yet included, so what's new in it is
+    /// noticed: if what's watched has changed, or `again` says to look in
+    /// one of them afresh, as once it's imported again. Returns what's
+    /// newly watched, which may have changed before it was.
+    fn add_watched(&mut self, catalog: &crate::store::Catalog, again: Option<&Path>) -> Result<Vec<PathBuf>> {
+        let watches = catalog.watches()?;
+        let paths: Vec<PathBuf> = watches.iter().map(|watch| watch.path.clone()).collect();
+        let changed = paths != self.watched;
+        let new: Vec<PathBuf> = paths.iter().filter(|path| !self.watched.contains(path)).cloned().collect();
+        for watch in &watches {
+            if !changed && again != Some(watch.path.as_path()) {
+                continue;
+            }
+            if !watch.path.is_dir() {
+                if let Some(dir) = watch.path.parent() {
+                    self.add_dir(dir);
+                }
+                continue;
+            }
+            let mut pending = vec![watch.path.clone()];
+            while let Some(dir) = pending.pop() {
+                self.add_dir(&dir);
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let hidden = entry.file_name().as_encoded_bytes().starts_with(b".");
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) && (watch.hidden || !hidden) {
+                        pending.push(entry.path());
+                    }
+                }
+            }
+        }
+        self.watched = paths;
+        Ok(new)
     }
 
     /// Watch the directories of these files too.
@@ -756,6 +810,14 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks
                 unless_busy(node.announce_written(), "noticing members of what's written")?;
             },
             _ = announce.tick() => {
+                // What's newly watched, perhaps empty, so nothing's arrived
+                if place.is_main() {
+                    match watch.add_watched(node.catalog(), None) {
+                        // Imported again, for what changed before it was watched
+                        Ok(new) => remounts.changed(&node, &new)?,
+                        Err(e) => unless_busy(Err(e), "watching what's newly watched")?,
+                    }
+                }
                 // Anything that was busy before, tried again
                 if joining {
                     joining = !join_now(&mut node, &mut alone, place, &listen, marks)?;
@@ -810,7 +872,13 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks
                 }
             },
             Some(heard) = relays_heard.recv() => relays.heard(&mut node, heard),
-            Some((mount, root)) = remounted.recv() => remounts.finished(&mount, &root),
+            Some((mount, root)) = remounted.recv() => {
+                remounts.finished(&mount, &root);
+                // What's new in it may be directories, to watch
+                if place.is_main() {
+                    unless_busy(watch.add_watched(node.catalog(), Some(&mount.path)).map(drop), "watching what's new")?;
+                }
+            },
             () = stopped(&mut terminate) => break Ok(()),
         }
     };
@@ -985,6 +1053,8 @@ fn collect_some(node: &mut Node) -> Result<()> {
 fn watch_external(node: &Node, notify: tokio::sync::mpsc::UnboundedSender<PathBuf>) -> Result<Watch> {
     let mut watch = Watch::new(notify.clone());
     let files = node.catalog().external_files(None)?;
+    // What's watched with `hk watch` is taken up on the first tick, and
+    // imported again then, for what's new in it since the node last ran
     watch.add(&files);
     tokio::task::spawn_blocking(move || {
         for file in files.into_iter().filter(ExternalFile::changed) {

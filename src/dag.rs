@@ -37,6 +37,13 @@ pub trait BlockSink {
         let _ = (path, root);
         Ok(())
     }
+
+    /// What the file at `path` was imported as before, if this knows and
+    /// it's unchanged since, so it needn't be read again.
+    fn unchanged(&mut self, path: &std::path::Path) -> io::Result<Option<DagLink>> {
+        let _ = path;
+        Ok(None)
+    }
 }
 
 /// Where a block's bytes came from, when that's known. A block's bytes

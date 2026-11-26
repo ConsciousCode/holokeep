@@ -48,7 +48,8 @@ enum Command {
         max_file_links: usize,
         /// Keep files' contents where they are rather than copying them
         /// into the repo, like Kubo's filestore. The blocks are only
-        /// readable while the files are unchanged.
+        /// readable while the files are unchanged; to import what's there
+        /// again as it changes, `hk watch add` it instead.
         #[arg(long, conflicts_with = "only_hash")]
         nocopy: bool,
         /// Don't keep what's added: without a keep, what nothing kept links
@@ -94,6 +95,13 @@ enum Command {
     /// and announced, or not. Everything else is private
     #[command(subcommand)]
     Public(PublicCommand),
+    /// Watch directories and files where they are: each imported in place,
+    /// as `hk add --nocopy` does, mounted on an anchor that's kept, and
+    /// imported again whenever it changes while the node runs, moving the
+    /// anchor. Where it's watched is this machine's alone, never in the
+    /// soup. `.souprules` files say what's left out
+    #[command(subcommand)]
+    Watch(WatchCommand),
     /// Keep things with friends, encrypted: in this account's vault, which
     /// joins their protected meshes
     #[command(subcommand)]
@@ -459,6 +467,48 @@ enum SameCommand {
     },
     /// List what's the same as a block, a line each: the lens, and its CID
     Ls { cid: Link },
+}
+
+#[derive(Subcommand, Debug)]
+enum WatchCommand {
+    /// Watch a directory or file: import it in place, mount it on an
+    /// anchor, keep that, and print it. What the built-in rules, the
+    /// root's `.souprules` and the directory's own say to skip, such as
+    /// downloads under way, isn't imported. Watching it again imports it
+    /// again, onto the same anchor
+    Add {
+        path: PathBuf,
+        /// Only print the root CID
+        #[arg(short, long)]
+        quiet: bool,
+        /// Include dotfiles
+        #[arg(short = 'H', long)]
+        hidden: bool,
+        /// Chunking algorithm, only size-[bytes] is supported
+        #[arg(short = 's', long, default_value = "size-1048576")]
+        chunker: String,
+        /// Maximum links per file node
+        #[arg(long, default_value_t = dag::FILE_WIDTH)]
+        max_file_links: usize,
+        /// Don't keep its anchor
+        #[arg(long)]
+        no_keep: bool,
+    },
+    /// List what's watched: path, anchor, what it is now, how many files
+    /// it's read from, their size, and how many of them have changed or
+    /// gone since, so what was imported of them can't be read
+    Ls {
+        /// List instead each file imported in place, with whether it's as
+        /// it was (`ok`), `changed` or `gone`: of one watch, or all
+        #[arg(long)]
+        files: bool,
+        path: Option<PathBuf>,
+    },
+    /// Stop watching a directory or file, by its path or its anchor,
+    /// whatever state it's in. Its anchor stays as it was last imported,
+    /// and kept; what's read from files where they are is readable while
+    /// they're unchanged, as with `hk add --nocopy`
+    Rm { which: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1436,24 +1486,7 @@ fn run(args: Args) -> anyhow::Result<()> {
                 return add(&importer, &path, quiet, &mut NullSink).map(drop);
             }
             open_repo(args.repo)?.batch_breathing(|repo| {
-                // What's imported in place is mounted on an anchor, which is
-                // what's kept, so it's kept through its changes
-                let kept = if nocopy && path != Path::new("-") {
-                    let canonical = std::fs::canonicalize(&path).with_context(|| format!("adding {}", path.display()))?;
-                    let base = canonical.parent().unwrap_or_else(|| Path::new("")).to_owned();
-                    let mut report = |p: &Path, link: &dag::DagLink| {
-                        if !quiet {
-                            out!("added {} {}", link.cid, p.strip_prefix(&base).unwrap_or(p).display());
-                        }
-                    };
-                    let (mount, root) = repo.import_mounted(&importer, &path, &mut report)?;
-                    if quiet {
-                        out!("{root}");
-                    } else {
-                        eprintln!("mounted on {}", mount.anchor);
-                    }
-                    mount.anchor
-                } else if nocopy {
+                let kept = if nocopy {
                     add(&importer, &path, quiet, &mut InPlace::new(repo))?
                 } else {
                     add(&importer, &path, quiet, &mut Copying::new(repo))?
@@ -1483,6 +1516,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         Command::Lost(command) => lost(args.repo, command),
         Command::Same(command) => same(args.repo, command),
         Command::Public(command) => public(args.repo, command),
+        Command::Watch(command) => watch(args.repo, command),
         Command::Whoami => whoami(args.repo),
         Command::Protect(command) => protect(&repo_dir(args.repo)?, command),
         Command::Cap(command) => cap(args.repo, command),
@@ -3731,6 +3765,65 @@ fn same(repo: Option<PathBuf>, command: SameCommand) -> anyhow::Result<()> {
         },
     }
     Ok(out.flush()?)
+}
+
+fn watch(repo: Option<PathBuf>, command: WatchCommand) -> anyhow::Result<()> {
+    let mut repo = open_repo(repo)?;
+    match command {
+        WatchCommand::Add { path, quiet, hidden, chunker, max_file_links, no_keep } => {
+            let importer = importer(&chunker, max_file_links, hidden)?;
+            let canonical = std::fs::canonicalize(&path).with_context(|| format!("watching {}", path.display()))?;
+            let base = canonical.parent().unwrap_or_else(|| Path::new("")).to_owned();
+            repo.batch_breathing(|repo| {
+                let mut report = |p: &Path, link: &dag::DagLink| {
+                    if !quiet {
+                        out!("added {} {}", link.cid, p.strip_prefix(&base).unwrap_or(p).display());
+                    }
+                };
+                // The anchor's what's kept, so it's kept through its changes
+                let (mount, root) = repo.import_mounted(&importer, &canonical, &mut report)?;
+                if !no_keep {
+                    repo.keep(&mount.anchor)?;
+                }
+                if quiet {
+                    out!("{root}");
+                } else {
+                    out!("watching {} on {}", mount.path.display(), mount.anchor);
+                }
+                anyhow::Ok(())
+            })
+        },
+        WatchCommand::Ls { files, path } => {
+            let path = path.map(|path| std::fs::canonicalize(&path).unwrap_or(path));
+            let watches: Vec<_> = repo.watches()?.into_iter().filter(|watch| path.as_ref().is_none_or(|path| watch.path == *path)).collect();
+            anyhow::ensure!(path.is_none() || !watches.is_empty(), "{} isn't watched", path.as_ref().map_or_else(String::new, |path| path.display().to_string()));
+            let external = repo.external_files(None)?;
+            for watch in watches {
+                let mut read: Vec<_> = external.iter().filter(|file| file.path.starts_with(&watch.path)).collect();
+                read.sort_by(|a, b| a.path.cmp(&b.path));
+                if files {
+                    for file in read {
+                        let state = if !file.path.exists() { "gone" } else if file.changed() { "changed" } else { "ok" };
+                        out!("{state}\t{}", file.path.display());
+                    }
+                    continue;
+                }
+                let size: u64 = read.iter().filter_map(|file| std::fs::metadata(&file.path).ok()).map(|meta| meta.len()).sum();
+                let stale = read.iter().filter(|file| file.changed()).count();
+                let now = repo.anchor_value(&watch.anchor)?.map_or_else(|| "-".to_owned(), |root| root.to_string());
+                out!("{}\t{}\t{now}\t{} files\t{size} bytes\t{stale} stale", watch.path.display(), watch.anchor, read.len());
+            }
+            Ok(())
+        },
+        WatchCommand::Rm { which } => {
+            let anchor: Option<Link> = which.parse().ok();
+            let path = std::fs::canonicalize(&which).unwrap_or_else(|_| PathBuf::from(&which));
+            let watch = repo.unwatch(Some(&path), anchor.as_ref())?.with_context(|| format!("{which} isn't watched"))?;
+            let now = repo.anchor_value(&watch.anchor)?.map_or_else(|| "nothing".to_owned(), |root| root.to_string());
+            out!("stopped watching {}: {} stays {now}", watch.path.display(), watch.anchor);
+            Ok(())
+        },
+    }
 }
 
 fn public(repo: Option<PathBuf>, command: PublicCommand) -> anyhow::Result<()> {

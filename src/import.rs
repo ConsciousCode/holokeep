@@ -31,7 +31,15 @@ pub struct Importer<F = BalancedLayout, D = DynamicDirectory> {
     pub directory: D,
     /// Include dotfiles (`ipfs add --hidden`).
     pub hidden: bool,
+    /// Rules of what's left out of a directory imported, if any are to
+    /// be heeded: these, from the directory, then each `.souprules` found
+    /// in it and below, a nearer saying over a farther, as in the mount.
+    pub rules: Option<std::sync::Arc<crate::rules::Rules>>,
 }
+
+/// The rules heeded in a directory being imported: each with the
+/// directory its paths are from, farthest first.
+type Ruled = Vec<(std::path::PathBuf, std::sync::Arc<crate::rules::Rules>)>;
 
 impl Default for Importer {
     fn default() -> Self {
@@ -40,6 +48,7 @@ impl Default for Importer {
             layout: BalancedLayout::default(),
             directory: DynamicDirectory::default(),
             hidden: false,
+            rules: None,
         }
     }
 }
@@ -59,7 +68,8 @@ impl<F: FileLayoutStrategy, D: DirLayoutStrategy> Importer<F, D> {
             self.import_file(path, sink)?
         }
         else if kind.is_dir() {
-            self.add_dir(path, sink, report)?
+            let ruled = self.rules.iter().map(|rules| (path.to_path_buf(), rules.clone())).collect();
+            self.add_dir_in(path, sink, report, ruled)?
         }
         else if kind.is_symlink() {
             dag::symlink_node(fs::read_link(path)?.as_os_str().as_bytes(), sink)?
@@ -79,6 +89,9 @@ impl<F: FileLayoutStrategy, D: DirLayoutStrategy> Importer<F, D> {
 
     /// Import a file, telling the sink where each leaf came from.
     fn import_file(&self, path: &Path, sink: &mut impl BlockSink) -> io::Result<DagLink> {
+        if let Some(link) = sink.unchanged(path)? {
+            return Ok(link);
+        }
         sink.begin_file(path)?;
         let root = self.read_file(File::open(path)?, Some(path), sink)?;
         sink.end_file(path, &root)?;
@@ -132,6 +145,24 @@ impl<F: FileLayoutStrategy, D: DirLayoutStrategy> Importer<F, D> {
         sink: &mut impl BlockSink,
         report: &mut impl FnMut(&Path, &DagLink),
     ) -> io::Result<DagLink> {
+        let ruled = self.rules.iter().map(|rules| (path.to_path_buf(), rules.clone())).collect();
+        self.add_dir_in(path, sink, report, ruled)
+    }
+
+    /// Import a directory, leaving out what the rules heeded in it say to,
+    /// its own rules file's included.
+    fn add_dir_in(
+        &self,
+        path: &Path,
+        sink: &mut impl BlockSink,
+        report: &mut impl FnMut(&Path, &DagLink),
+        mut ruled: Ruled,
+    ) -> io::Result<DagLink> {
+        if self.rules.is_some()
+            && let Some(rules) = rules_in(path)
+        {
+            ruled.push((path.to_path_buf(), std::sync::Arc::new(rules)));
+        }
         let mut dir = self.directory.builder();
         for entry in fs::read_dir(path)? {
             let entry = entry?;
@@ -139,12 +170,47 @@ impl<F: FileLayoutStrategy, D: DirLayoutStrategy> Importer<F, D> {
             if !self.hidden && name.as_bytes().starts_with(b".") {
                 continue;
             }
-            if let Some(link) = self.add_path(&entry.path(), sink, report)? {
+            let entry_path = entry.path();
+            let is_dir = entry.file_type()?.is_dir();
+            if skipped(&ruled, &entry_path, is_dir) {
+                continue;
+            }
+            let link = if is_dir {
+                let link = self.add_dir_in(&entry_path, sink, report, ruled.clone())?;
+                report(&entry_path, &link);
+                Some(link)
+            } else {
+                self.add_path(&entry_path, sink, report)?
+            };
+            if let Some(link) = link {
                 dir.add_link(name.as_bytes().to_vec(), link, sink)?;
             }
         }
         dir.finalize(sink)
     }
+}
+
+/// A directory's own rules file, if it has one: what isn't a rule said,
+/// and skipped.
+fn rules_in(dir: &Path) -> Option<crate::rules::Rules> {
+    let file = dir.join(crate::rules::FILE);
+    let mut text = Vec::new();
+    File::open(&file).ok()?.take(u64::try_from(crate::rules::MOST).unwrap_or(u64::MAX)).read_to_end(&mut text).ok()?;
+    let (rules, errors) = crate::rules::Rules::parse(&String::from_utf8_lossy(&text));
+    for e in errors {
+        eprintln!("{}: {e}", file.display());
+    }
+    Some(rules)
+}
+
+/// Whether the rules heeded say to leave out what's at `path`, a directory
+/// if `dir`.
+fn skipped(ruled: &Ruled, path: &Path, dir: bool) -> bool {
+    ruled.iter()
+        .fold(crate::rules::Settings::default(), |settings, (from, rules)| {
+            rules.apply(settings, path.strip_prefix(from).unwrap_or(path), dir, None)
+        })
+        .skipped()
 }
 
 /// Store a chunk as a raw leaf.

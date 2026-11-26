@@ -53,7 +53,7 @@ use crate::model::Link;
 use crate::store::Catalog;
 use crate::store::overlay;
 
-mod rules;
+use crate::rules;
 mod served;
 mod write;
 use write::{Committer, Filler, Handle};

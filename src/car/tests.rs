@@ -27,6 +27,7 @@ fn tree(router: &mut Catalog) -> Link {
         layout: BalancedLayout { width: 4 },
         directory: DynamicDirectory { threshold: 200, hamt: Hamt::default() },
         hidden: false,
+        rules: None,
     };
     let root = importer.add_path(&t, router, &mut |_, _| {}).expect("import").expect("root");
     AnyCid::V1(root.cid)

@@ -23,6 +23,7 @@ pub mod unixfs;
 pub mod dag;
 pub mod hamt;
 pub mod import;
+pub mod rules;
 pub mod links;
 pub mod delta;
 pub mod git;

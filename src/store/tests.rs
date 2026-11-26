@@ -4126,3 +4126,83 @@ fn a_device_goes_by_the_latest_name_that_counts() {
     let least = if left.cid().to_bytes() < right.cid().to_bytes() { "left" } else { "right" };
     assert_eq!(called(&device).as_deref(), Some(least));
 }
+
+/// The names in a directory, sorted.
+fn names_in(catalog: &Catalog, dir: &Link) -> Vec<String> {
+    let mut names: Vec<String> = crate::export::list(catalog, dir).expect("list").into_iter().map(|entry| String::from_utf8_lossy(&entry.name).into_owned()).collect();
+    names.sort();
+    names
+}
+
+/// What's named in a directory.
+fn entry(catalog: &Catalog, dir: &Link, name: &str) -> Link {
+    crate::export::list(catalog, dir).expect("list").into_iter().find(|entry| entry.name == name.as_bytes()).map_or_else(|| panic!("{name}"), |entry| entry.cid)
+}
+
+#[test]
+fn a_watched_directory_leaves_out_what_its_rules_say() {
+    let scratch = Scratch::new("watch-rules");
+    let downloads = scratch.path().join("Downloads");
+    std::fs::create_dir_all(downloads.join("notes")).expect("mkdir");
+    for (path, data) in [
+        ("film.mkv", "a film"),
+        ("next.mkv.part", "half a film"),
+        ("old.bak", "the root's rules skip this"),
+        ("notes/.souprules", "*.log skip\nkeep.log include\nbad rule here\n"),
+        ("notes/a.log", "skipped by the notes' rules"),
+        ("notes/keep.log", "but not this"),
+        ("notes/a.txt", "a note"),
+    ] {
+        std::fs::write(downloads.join(path), data).expect("write");
+    }
+    let mut catalog = Catalog::open_repo(&scratch.path().join("repo")).expect("catalog");
+    // The root's top has rules of its own
+    let top = scratch.path().join("top");
+    std::fs::create_dir_all(&top).expect("mkdir");
+    std::fs::write(top.join(".souprules"), "*.bak skip\n").expect("write");
+    let top: Link = Importer { hidden: true, ..Importer::default() }.add_path(&top, &mut Copying::new(&mut catalog), &mut |_, _| {}).expect("import").expect("top").cid.into();
+    let root = catalog.root_anchor().expect("root").expect("a root");
+    catalog.set_anchor(&root, &top).expect("set");
+
+    let (_, imported) = catalog.batch(|catalog| catalog.import_mounted(&Importer::default(), &downloads, &mut |_, _| {})).expect("import");
+    assert_eq!(names_in(&catalog, &imported), ["film.mkv", "notes"], "no download under way, nor what the root's rules skip");
+    assert_eq!(names_in(&catalog, &entry(&catalog, &imported, "notes")), ["a.txt", "keep.log"], "a nearer rules file says over, and is a dotfile");
+}
+
+#[test]
+fn a_watch_stopped_stays_as_it_was_and_whats_unchanged_isnt_read_again() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let scratch = Scratch::new("watch-stop");
+    let dir = scratch.path().join("watched");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("a"), content(1000, 1)).expect("write");
+    std::fs::write(dir.join("b"), content(1000, 2)).expect("write");
+    let mut catalog = Catalog::open_repo(&scratch.path().join("repo")).expect("catalog");
+    let importer = Importer { chunk_size: 64, ..Importer::default() };
+    let (mount, first) = catalog.batch(|catalog| catalog.import_mounted(&importer, &dir, &mut |_, _| {})).expect("import");
+    assert_eq!(catalog.watches().expect("watches"), std::slice::from_ref(&mount));
+
+    // Unchanged, a file's taken for what it was, unread: it can't be read
+    std::fs::set_permissions(dir.join("b"), std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let again = catalog.remount(&mount);
+    std::fs::set_permissions(dir.join("b"), std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    assert_eq!(again.expect("remount"), first);
+    // What's new is read
+    std::fs::write(dir.join("c"), "new").expect("write");
+    let second = catalog.remount(&mount).expect("remount");
+    assert_eq!(names_in(&catalog, &second), ["a", "b", "c"]);
+    // Settings changed, everything's read again, as it's another import
+    let wider = Importer { chunk_size: 128, ..Importer::default() };
+    let (rewatched, third) = catalog.batch(|catalog| catalog.import_mounted(&wider, &dir, &mut |_, _| {})).expect("import");
+    assert_eq!(rewatched.anchor, mount.anchor, "watched again on the same anchor");
+    assert_ne!(third, second);
+
+    // Stopped, it stays as it was, and isn't imported again
+    std::fs::write(dir.join("d"), "after").expect("write");
+    let stopped = catalog.unwatch(Some(&rewatched.path), None).expect("unwatch").expect("was watched");
+    assert_eq!(stopped.anchor, mount.anchor);
+    assert!(catalog.watches().expect("watches").is_empty());
+    assert!(catalog.remount(&rewatched).is_err(), "not watched");
+    assert_eq!(catalog.anchor_value(&mount.anchor).expect("value"), Some(third));
+    assert!(catalog.unwatch(None, Some(&mount.anchor)).expect("unwatch").is_none(), "once");
+}
