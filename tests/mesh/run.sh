@@ -536,6 +536,9 @@ scenario_relayed() {
     machine home "$run-home"
     invite one away
     invite one home
+    # Told where the relay is by name, before its node runs
+    on away hk node reach "$(on relay hk node id)" "/dns4/$run-relay/tcp/4011"
+    on away hk node peers | grep "^$(on relay hk node id)" | grep -q "/dns4/$run-relay/tcp/4011" || fail "away didn't note where the relay is"
     node_up away
     node_up home
     away_peer=$(on away hk node id)

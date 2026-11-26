@@ -50,6 +50,21 @@ traffic goes this way, and only between the members that need it.
   defaults allow a few minutes and kilobytes, enough to punch through
   and no more.
 
+Setting one up, on a server with a public address:
+
+1. `hk node id` on it, `hk node invite <id>` on a member, `hk node
+   join <ticket>` back on it.
+2. `relay = true` in its `config.toml`, TCP 4011 open, and `hk node
+   run`.
+3. `hk node reach <id> /ip4/<its address>/tcp/4011` (or
+   `/dns4/<its name>/tcp/4011`) on any member. A relay can't reach the
+   members behind their NATs, so it can't say where it is; this says it
+   for it, and the member dials it and tells the members it's connected
+   to, which tell theirs.
+
+A member that's away when this is said hears of it once it's connected
+to one that knows, so say it while they're together, or on each.
+
 Hole punching is over TCP, since pnet rules out QUIC, so it works with
 fewer NATs than it would with QUIC; where it doesn't, the relay carries
 the traffic.

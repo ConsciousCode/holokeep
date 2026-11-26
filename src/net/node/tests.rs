@@ -193,6 +193,30 @@ async fn a_relay_relays_only_for_members() {
     assert!(intruder.swarm.is_connected(&relay.peer_id()), "the relay let it in");
 }
 
+/// A member none can find by itself, told where it's reached on one
+/// member, is dialled there, and the members connected are told too.
+#[tokio::test]
+async fn a_member_told_where_another_is_reached_dials_it_and_says_so() {
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let (mut a, mut c, mut far) = (node(swarm_key).await, node(swarm_key).await, node(swarm_key).await);
+    invite(&a, &c, swarm_key);
+    for (one, other) in [(&a, &far), (&c, &far), (&far, &a), (&far, &c)] {
+        one.members().add(&other.peer_id()).expect("add");
+    }
+    for node in [&mut a, &mut c, &mut far] {
+        node.reload().expect("reload");
+    }
+    c.dial_members().expect("dial");
+    assert!(until(&mut [&mut a, &mut c, &mut far], |n| connected(n[0], n[1])).await);
+    let knows = |node: &Node, peer: &PeerId| node.members().list().expect("list").get(peer).is_some_and(|addrs| !addrs.is_empty());
+    assert!(!knows(&a, &far.peer_id()) && !knows(&c, &far.peer_id()), "no one knows where it is");
+    let at = far.listeners();
+    assert!(a.reach_member(&PeerId::random(), &at).is_err(), "a stranger's no member to reach");
+    a.reach_member(&far.peer_id(), &at).expect("reach");
+    let far_peer = far.peer_id();
+    assert!(until(&mut [&mut a, &mut c, &mut far], |n| connected(n[0], n[2]) && knows(n[1], &far_peer)).await, "dialled, and the others told");
+}
+
 #[test]
 fn a_member_not_reached_is_dialled_less_often_till_it_is() {
     let (peer, start) = (PeerId::random(), std::time::Instant::now());

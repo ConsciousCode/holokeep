@@ -445,7 +445,8 @@ impl Node {
     /// them through relays where it can't otherwise; or a client's, with
     /// no private network, finding its member where it was told.
     pub fn tcp(key: &Keypair, swarm_key: PreSharedKey, catalog: Catalog, members: Members, tunables: Tunables) -> Result<Self> {
-        let base = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
+        // Addresses may name hosts, /dns4/relay.example.com/tcp/4011
+        let base = libp2p::dns::tokio::Transport::system(tcp::tokio::Transport::new(tcp::Config::default().nodelay(true)))?;
         if members.client_of()?.is_some() {
             return Self::new(super::clients::client_transport(base, key)?, key, catalog, members, false, Ports::default(), tunables);
         }
@@ -1376,6 +1377,30 @@ impl Node {
     /// No longer take a peer for a member, as one that won't be back: it
     /// holds up nothing now, and isn't believed to hold anything. One that's
     /// connected is plainly there. A client is no longer let in.
+    /// Take a member to be reached at these addresses too, as told by
+    /// someone who knows, since a member behind no NAT, such as a relay,
+    /// can't say where it is to members it can't reach: dialling it now
+    /// if it isn't connected, and telling every member connected, so
+    /// they know too.
+    pub fn reach_member(&mut self, peer: &PeerId, addrs: &[Multiaddr]) -> Result<()> {
+        if !self.members.contains(peer)? {
+            return Err(Error::Invalid(format!("{peer} isn't a member")));
+        }
+        for addr in addrs {
+            self.members.add_addr(peer, addr)?;
+            self.swarm.behaviour_mut().kad.add_address(peer, addr.clone());
+        }
+        self.redial.reset(peer);
+        self.dial_members()?;
+        let roster = self.roster()?;
+        for member in self.connected() {
+            if !self.is_client(&member) && member != *peer {
+                self.swarm.behaviour_mut().members.send_request(&member, roster.clone());
+            }
+        }
+        Ok(())
+    }
+
     pub fn forget_member(&mut self, peer: &PeerId) -> Result<()> {
         if self.granted_clients().is_some_and(|clients| clients.contains(peer)) {
             return Err(Error::Invalid(format!("the mesh's grants say {peer} is a client: take that away with `hk node grant rm {peer} /mesh/client`")));

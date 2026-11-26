@@ -271,6 +271,17 @@ enum NodeCommand {
     /// say so on each node. Inviting it lets it back in. To stop what its key
     /// signs counting, `hk device revoke` too
     Forget { peer: libp2p::PeerId },
+    /// Say where a member is reached, for one no member can find by
+    /// itself, such as a relay with a public address that can't reach
+    /// any of them: this node dials it there, and tells the members it's
+    /// connected to, which tell the others, so saying it once, on any
+    /// member, is enough. An address is a multiaddr, such as
+    /// /ip4/203.0.113.7/tcp/4011 or /dns4/relay.example.com/tcp/4011
+    Reach {
+        peer: libp2p::PeerId,
+        #[arg(required = true)]
+        addrs: Vec<libp2p::Multiaddr>,
+    },
     /// List the mesh's members, and which are connected
     Peers,
     /// Give and take away what users and machines may do in the mesh. Once
@@ -2060,6 +2071,7 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
             );
         },
         NodeCommand::Forget { peer } => daemon::forget(place, &peer)?,
+        NodeCommand::Reach { peer, addrs } => daemon::reach(place, &peer, &addrs)?,
         NodeCommand::ScanLost => drop(daemon::ask(place, "scan-lost")?.context("this node isn't running: start `hk node run`")?),
         NodeCommand::Trim => {
             let report = daemon::trim(place)?.context("this node isn't running: start `hk node run`")?;

@@ -406,6 +406,29 @@ pub fn trim(place: &Place) -> Result<Option<super::trim::Report>> {
     Err(Error::Invalid("the node hung up without saying what it trimmed".into()))
 }
 
+/// Take a member to be reached at these addresses too, through the
+/// running daemon, which dials it and tells the members connected, if
+/// there is one, or else here, for the daemon to dial when it starts.
+pub fn reach(place: &Place, peer: &libp2p::PeerId, addrs: &[libp2p::Multiaddr]) -> Result<()> {
+    let said: Vec<String> = addrs.iter().map(ToString::to_string).collect();
+    let Some(lines) = ask(place, &format!("reach {peer} {}", said.join(" ")))? else {
+        let members = members(place)?;
+        if !members.contains(peer)? {
+            return Err(Error::Invalid(format!("{peer} isn't a member")));
+        }
+        for addr in addrs {
+            members.add_addr(peer, addr)?;
+        }
+        return Ok(());
+    };
+    match lines.first().map(String::as_str) {
+        Some("noted") => Ok(()),
+        Some(line) if line.starts_with("unknown command") => Err(Error::Invalid("the running node is older than this hk: restart `hk node run`".into())),
+        Some(line) => Err(Error::Invalid(line.trim_start_matches("error: ").to_owned())),
+        None => Err(Error::Invalid("the node hung up without answering".into())),
+    }
+}
+
 /// No longer take a peer for a member of this mesh, through the running
 /// daemon, if there is one, or else here.
 pub fn forget(place: &Place, peer: &libp2p::PeerId) -> Result<()> {
@@ -1194,6 +1217,23 @@ async fn check(node: &mut Node, command: &str, copies: usize, mut write: OwnedWr
     Ok(None)
 }
 
+/// Say what came of a command which answers nothing more: `done`, or the
+/// error.
+fn answered(out: &mut String, result: Result<()>, done: &str) {
+    match result {
+        Ok(()) => { let _ = writeln!(out, "{done}"); },
+        Err(e) => { let _ = writeln!(out, "error: {e}"); },
+    }
+}
+
+/// What `reach <peer> <addr>...` asks: that a member be reached there.
+fn reach_member(node: &mut Node, words: &str) -> Result<()> {
+    let mut words = words.split_whitespace();
+    let peer: libp2p::PeerId = words.next().unwrap_or_default().parse().map_err(|e| Error::Invalid(format!("not a peer: {e}")))?;
+    let addrs = words.map(str::parse).collect::<std::result::Result<Vec<libp2p::Multiaddr>, _>>().map_err(|e| Error::Invalid(format!("not an address: {e}")))?;
+    node.reach_member(&peer, &addrs)
+}
+
 /// Answer one command on the control socket, or say which fetch it waits
 /// on, to be answered when that finishes.
 async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, copies: usize, collecting: bool, alone: bool, join: &mut bool) -> Result<Option<(Waiter, OwnedWriteHalf)>> {
@@ -1251,11 +1291,10 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
             }
         },
         command if command.starts_with("clients-at ") => out.push_str(&clients_at(node, command.trim_start_matches("clients-at "))?),
+        command if command.starts_with("reach ") => answered(&mut out, reach_member(node, command.trim_start_matches("reach ")), "noted"),
         command if command.starts_with("forget ") => {
-            match command.trim_start_matches("forget ").trim().parse().map_err(|e| Error::Invalid(format!("not a peer: {e}"))).and_then(|peer| node.forget_member(&peer)) {
-                Ok(()) => out.push_str("forgotten\n"),
-                Err(e) => { let _ = writeln!(out, "error: {e}"); },
-            }
+            let forgotten = command.trim_start_matches("forget ").trim().parse().map_err(|e| Error::Invalid(format!("not a peer: {e}"))).and_then(|peer| node.forget_member(&peer));
+            answered(&mut out, forgotten, "forgotten");
         },
         command if command.starts_with("fetch-blocks ") => {
             let cids: std::result::Result<Vec<crate::model::Link>, _> = command.trim_start_matches("fetch-blocks ").split_whitespace().map(str::parse).collect();
