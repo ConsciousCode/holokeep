@@ -250,6 +250,14 @@ private network, so its peers reach its Kademlia DHT
   empty for none. Fetching waits on a router's answer, and on the
   roots' providers being looked for, but a router finding no one new
   doesn't keep it from giving up.
+- **Gateways**: some providers a router finds are trustless gateways,
+  reached over HTTP rather than Bitswap (`/dns/…/tcp/443/https`, or
+  `…/tls/http`), as storage providers often are. Each block's had of
+  them as `/ipfs/<cid>?format=raw`, 8 at a time from each, and checked
+  against its CID as a block from Bitswap is, what it links to wanted
+  too; one that sends something else, or 404s, is taken not to have
+  that block, and one that's had none of 16 running is asked no more.
+  A gateway sees what's wanted of it as a Bitswap peer does.
   `--private` keeps what's fetched to oneself, answered as missing.
 - **Announcing**: what each `announce` claim names is provided on the
   DHT, an anchor as what it is now and a group, such as a tag, as its

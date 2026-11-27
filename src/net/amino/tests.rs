@@ -243,12 +243,13 @@ async fn whats_announced_is_found_through_the_dht_by_whoever_wants_it() {
     assert!(!provider.announce(), "and stays so");
 }
 
-/// A router over HTTP on a port of its own, answering every ask with these
-/// providers: where it is, and the paths it's been asked.
-fn router(answer: String) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+/// A server over HTTP on a port of its own, answering each path it's
+/// asked with a status and body: where it is, and the paths it's been
+/// asked.
+fn serve(answer: impl Fn(&str) -> (u16, Vec<u8>) + Send + 'static) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     use std::io::{BufRead as _, Write as _};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let at = format!("http://{}", listener.local_addr().expect("addr"));
+    let port = listener.local_addr().expect("addr").port();
     let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let log = asked.clone();
     std::thread::spawn(move || {
@@ -256,14 +257,23 @@ fn router(answer: String) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String
             let mut reader = std::io::BufReader::new(stream);
             let mut line = String::new();
             let _ = reader.read_line(&mut line);
-            log.lock().expect("log").push(line.split(' ').nth(1).unwrap_or_default().to_owned());
+            let path = line.split(' ').nth(1).unwrap_or_default().to_owned();
+            log.lock().expect("log").push(path.clone());
             while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
                 line.clear();
             }
-            let _ = write!(reader.get_mut(), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}", answer.len());
+            let (status, body) = answer(&path);
+            let _ = write!(reader.get_mut(), "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = reader.get_mut().write_all(&body);
         }
     });
-    (at, asked)
+    (port, asked)
+}
+
+/// A router answering every ask with these providers, as JSON.
+fn router(answer: String) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let (port, asked) = serve(move |_| (200, answer.clone().into_bytes()));
+    (format!("http://127.0.0.1:{port}"), asked)
 }
 
 #[tokio::test]
@@ -285,11 +295,44 @@ async fn a_router_finds_what_nothing_else_does_and_isnt_asked_once_its_found() {
     // Known to no one, the fetcher finds the provider by the router alone
     let done = fetched(&mut a, &mut b, fetcher.fetch(vec![link(&first)], false, true)).await;
     assert_eq!(done, Fetched { fetched: 1, missing: Vec::new() });
-    assert_eq!(*asked.lock().expect("asked"), [format!("/routing/v1/providers/{}?filter-protocols=transport-bitswap,unknown&filter-addrs=tcp,!p2p-circuit", link(&first))]);
+    assert_eq!(*asked.lock().expect("asked"), [format!("/routing/v1/providers/{}?filter-protocols=transport-bitswap,transport-ipfs-gateway-http,unknown&filter-addrs=tcp,!p2p-circuit", link(&first))]);
     // Connected to it now, it's found of whoever's connected, and the
     // router's asked nothing more
     let done = fetched(&mut a, &mut b, fetcher.fetch(vec![link(&second)], false, true)).await;
     assert_eq!(done, Fetched { fetched: 1, missing: Vec::new() });
     assert_eq!(asked.lock().expect("asked").len(), 1, "asked again");
     assert_eq!(b.status().routed, 1);
+}
+
+#[tokio::test]
+async fn a_dag_is_had_of_a_gateway_a_router_finds_each_block_checked() {
+    let scratch = Scratch::new("amino-gateway");
+    let (leaf, deep) = (raw(b"a leaf over HTTP"), raw(b"a deeper leaf over HTTP"));
+    let cbor = |links: Vec<&crate::block::Block>| crate::block::Block::hash(Cidv1Spec::new(crate::cid::DAG_CBOR_CODEC, crate::multihash::MultihashFunc::Sha2_256), crate::dagcbor::to_vec(&crate::model::Ipld::List(links.into_iter().map(|block| crate::model::Ipld::Link(link(block))).collect())).expect("cbor").into());
+    let branch = cbor(vec![&deep]);
+    let root = cbor(vec![&branch, &leaf]);
+    let (lied, missing) = (raw(b"what the gateway lies about"), raw(b"what the gateway hasn't"));
+    let mut blocks: HashMap<String, Vec<u8>> = [&root, &branch, &leaf, &deep].into_iter().map(|block| (link(block).to_string(), block.data().to_vec())).collect();
+    blocks.insert(link(&lied).to_string(), b"not what it says".to_vec());
+    let (port, asked) = serve(move |path| {
+        let cid = path.strip_prefix("/ipfs/").and_then(|rest| rest.strip_suffix("?format=raw")).unwrap_or_default();
+        blocks.get(cid).map_or((404, Vec::new()), |data| (200, data.clone()))
+    });
+    let (url, _) = router(format!(r#"{{"Providers":[{{"Schema":"peer","ID":"12D3KooWP9jPCTRwpRk7J7CknwqC3h14ujuvtBoN518YuiJ5MSFR","Addrs":["/dns4/localhost/tcp/{port}/http"],"Protocols":["transport-ipfs-gateway-http"]}}]}}"#));
+    // Neither connected to nor known by the other: only the gateway has it
+    let (mut a, _) = swarm(Catalog::open_repo(&scratch.path().join("idle")).expect("catalog")).await;
+    let (mut b, _) = swarm(Catalog::open_repo(&scratch.path().join("fetching")).expect("catalog")).await;
+    b.route_by(vec![url]);
+    let fetcher = b.fetcher();
+
+    let done = fetched(&mut a, &mut b, fetcher.fetch(vec![link(&root)], true, true)).await;
+    assert_eq!(done, Fetched { fetched: 4, missing: Vec::new() });
+    for block in [&root, &branch, &leaf, &deep] {
+        assert!(b.catalog().has(block.cid().multihash()).expect("has"));
+    }
+    assert!(asked.lock().expect("asked").iter().all(|path| path.ends_with("?format=raw")));
+    // What isn't what it says, or isn't there, is missing
+    let done = fetched(&mut a, &mut b, fetcher.fetch(vec![link(&lied), link(&missing)], false, true)).await;
+    assert_eq!(done.fetched, 0);
+    assert!(!b.catalog().has(lied.cid().multihash()).expect("has"), "not kept as what it isn't");
 }

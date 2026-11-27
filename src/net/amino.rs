@@ -97,6 +97,14 @@ const STALLED: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const STALLED: Duration = Duration::from_millis(200);
 
+/// The most blocks wanted of a gateway at once, over HTTP, where each is
+/// a request of its own.
+const GATEWAY_WINDOW: usize = 8;
+
+/// How many blocks running a gateway may not have before it's asked no
+/// more: a gateway with none of it says so as quickly as one with all.
+const GATEWAY_FAILS: usize = 16;
+
 /// How often it's sought again, of another block, while nothing arrives.
 #[cfg(not(test))]
 const SEEK_AGAIN: Duration = Duration::from_secs(5);
@@ -195,6 +203,10 @@ struct Fetching {
     sources: Vec<PeerId>,
     /// Which source's next.
     turn: usize,
+    /// Trustless gateways a router found, had of over HTTP.
+    gateways: Vec<Gateway>,
+    /// What's being had of a gateway now.
+    over_http: HashSet<Vec<u8>>,
     /// Who's been asked whether they have any of it, or found by a router.
     asked: HashSet<PeerId>,
     dag: bool,
@@ -320,6 +332,20 @@ pub enum Event {
 /// A message read from a peer, or the end of what it sent.
 type Read = (PeerId, Message);
 
+/// A trustless gateway a fetch has blocks of over HTTP: where, how many
+/// it's being asked for now, which it hasn't had, and how many of those
+/// running.
+struct Gateway {
+    url: String,
+    asked: usize,
+    lacks: HashSet<Vec<u8>>,
+    failed: usize,
+}
+
+/// A block had of a gateway for a fetch, or not: the fetch, the gateway,
+/// the block's CID, and what it sent.
+type OverHttp = (u64, String, Link, Option<Vec<u8>>);
+
 /// A search of the DHT for providers: for which fetch, and whether of its
 /// roots, which it isn't idle while it waits on, or of a block it's
 /// stalled on.
@@ -330,7 +356,7 @@ struct Search {
 }
 
 /// The providers a router found for a fetch, and where they're reached.
-type Route = (u64, Vec<(PeerId, Vec<Multiaddr>)>);
+type Route = (u64, routers::Found);
 
 /// The swarm, and what it answers from.
 pub struct Amino {
@@ -356,6 +382,9 @@ pub struct Amino {
     /// What they've found, for which fetch, as it's found.
     route: tokio::sync::mpsc::UnboundedSender<Route>,
     routes: tokio::sync::mpsc::UnboundedReceiver<Route>,
+    /// What gateways have sent, or not, as it comes.
+    http: tokio::sync::mpsc::UnboundedSender<OverHttp>,
+    https: tokio::sync::mpsc::UnboundedReceiver<OverHttp>,
     routed: usize,
     /// The peers a router found that are being dialled, and the fetches
     /// they're to be asked for once connected.
@@ -399,6 +428,7 @@ impl Amino {
         let (status, statuses) = tokio::sync::mpsc::unbounded_channel();
         let handle = Handle { asks: ask, statuses: status };
         let (route, routes) = tokio::sync::mpsc::unbounded_channel();
+        let (http, https) = tokio::sync::mpsc::unbounded_channel();
         let mut amino = Self {
             swarm,
             catalog,
@@ -416,6 +446,8 @@ impl Amino {
             routers: Vec::new(),
             route,
             routes,
+            http,
+            https,
             routed: 0,
             dialling: HashMap::new(),
             searches: HashMap::new(),
@@ -559,9 +591,10 @@ impl Amino {
                     }
                 },
                 Some((fetch, found)) = self.routes.recv() => self.found(fetch, found),
+                Some((fetch, gateway, cid, data)) = self.https.recv() => self.over_http(fetch, &gateway, &cid, data),
                 Some((peer, message)) = self.reads.recv() => {
                     self.answer(peer, &message);
-                    self.received(peer, &message);
+                    self.received(Some(peer), &message);
                     return Ok(Event::Received(peer, message));
                 },
             }
@@ -682,6 +715,8 @@ impl Amino {
             routing: false,
             sought_at: None,
             sought: HashSet::new(),
+            gateways: Vec::new(),
+            over_http: HashSet::new(),
             wanted,
             window: BTreeMap::new(),
             sources: Vec::new(),
@@ -728,19 +763,23 @@ impl Amino {
         self.routed = self.routed.saturating_add(1);
         let (id, routers, route, cid) = (fetching.id, self.routers.clone(), self.route.clone(), cid.to_string());
         tokio::task::spawn_blocking(move || {
-            let found = routers.iter().flat_map(|router| routers::ask(router, &cid)).collect();
+            let mut found = routers::Found::default();
+            for router in &routers {
+                found.extend(routers::ask(router, &cid));
+            }
             let _ = route.send((id, found));
         });
     }
 
     /// Take the providers a router found for a fetch: each asked if it's
     /// connected, and dialled to be asked once it is if not.
-    fn found(&mut self, id: u64, found: Vec<(PeerId, Vec<Multiaddr>)>) {
+    fn found(&mut self, id: u64, found: routers::Found) {
         let Some(fetch) = self.fetch_of(id) else {
             return;
         };
         let me = *self.swarm.local_peer_id();
-        let found: Vec<_> = found.into_iter().filter(|(peer, _)| *peer != me).take(PROVIDERS).collect();
+        let routers::Found { peers, gateways } = found;
+        let found: Vec<_> = peers.into_iter().filter(|(peer, _)| *peer != me).take(PROVIDERS).collect();
         if let Some(fetching) = self.fetches.get_mut(fetch) {
             fetching.routing = false;
             // Waited on afresh while any it hadn't known of are dialled:
@@ -749,10 +788,17 @@ impl Amino {
             for (peer, _) in &found {
                 new |= fetching.asked.insert(*peer) && !fetching.sources.contains(peer);
             }
+            for url in gateways.into_iter().take(PROVIDERS) {
+                if !fetching.gateways.iter().any(|gateway| gateway.url == url) {
+                    fetching.gateways.push(Gateway { url, asked: 0, lacks: HashSet::new(), failed: 0 });
+                    new = true;
+                }
+            }
             if new {
                 fetching.last = Instant::now();
             }
         }
+        self.over_gateways(fetch);
         for (peer, addrs) in found {
             if self.swarm.is_connected(&peer) {
                 self.ask(fetch, peer);
@@ -763,6 +809,57 @@ impl Amino {
             if !dialling {
                 let _ = self.swarm.dial(libp2p::swarm::dial_opts::DialOpts::peer_id(peer).addresses(addrs).build());
             }
+        }
+    }
+
+    /// Want of each gateway a fetch has what's wanted, as many at once as
+    /// it may be asked, each in a thread of its own, what's sent coming
+    /// back to `over_http`.
+    fn over_gateways(&mut self, fetch: usize) {
+        let Some(fetching) = self.fetches.get_mut(fetch).filter(|fetching| fetching.reply.is_some()) else {
+            return;
+        };
+        for gateway in &mut fetching.gateways {
+            while gateway.asked < GATEWAY_WINDOW && gateway.failed < GATEWAY_FAILS {
+                let Some((key, cid)) = fetching.wanted.iter().find(|(key, _)| !fetching.over_http.contains(*key) && !gateway.lacks.contains(*key)) else {
+                    break;
+                };
+                fetching.over_http.insert(key.clone());
+                gateway.asked = gateway.asked.saturating_add(1);
+                let (id, url, cid, http) = (fetching.id, gateway.url.clone(), cid.clone(), self.http.clone());
+                tokio::task::spawn_blocking(move || {
+                    let data = routers::block(&url, &cid.to_string());
+                    let _ = http.send((id, url, cid, data));
+                });
+            }
+        }
+    }
+
+    /// Take what a gateway sent for a fetch, as from Bitswap, if it's the
+    /// block it's said to be, and want more of it; if not, it's taken not
+    /// to have it, and once it's had none of many running, asked no more.
+    fn over_http(&mut self, id: u64, url: &str, cid: &Link, data: Option<Vec<u8>>) {
+        let Some(fetch) = self.fetch_of(id) else {
+            return;
+        };
+        let key = cid.multihash().to_bytes();
+        let block = data.filter(|data| block_of(cid, data).is_some());
+        if let Some(fetching) = self.fetches.get_mut(fetch) {
+            fetching.over_http.remove(&key);
+            if let Some(gateway) = fetching.gateways.iter_mut().find(|gateway| gateway.url == url) {
+                gateway.asked = gateway.asked.saturating_sub(1);
+                if block.is_some() {
+                    gateway.failed = 0;
+                } else {
+                    gateway.failed = gateway.failed.saturating_add(1);
+                    gateway.lacks.insert(key);
+                }
+            }
+        }
+        match block {
+            // Taking it wants more of every gateway
+            Some(data) => self.received(None, &Message { blocks: vec![(cid.clone(), data)], ..Message::default() }),
+            None => self.over_gateways(fetch),
         }
     }
 
@@ -805,12 +902,13 @@ impl Amino {
     /// Take in what's arrived that's wanted: kept, shared if it's to be,
     /// and for a DAG, what it links to that isn't here wanted too; whoever
     /// sent it, or says they have it, taken for a source; and the window
-    /// filled again.
-    fn received(&mut self, peer: PeerId, message: &Message) {
+    /// filled again, and more wanted of its gateways. A block from a
+    /// gateway is from no peer.
+    fn received(&mut self, from: Option<PeerId>, message: &Message) {
         let now = Instant::now();
         let mut touched = BTreeSet::new();
         let mut wants = Vec::new();
-        for (cid, presence) in &message.presences {
+        for (peer, cid, presence) in from.iter().flat_map(|&peer| message.presences.iter().map(move |(cid, presence)| (peer, cid, presence))) {
             let key = cid.multihash().to_bytes();
             for (fetch, fetching) in self.fetches.iter_mut().enumerate() {
                 if fetching.reply.is_none() || !fetching.wanted.contains_key(&key) {
@@ -848,7 +946,9 @@ impl Amino {
                 fetching.window.remove(&key);
                 fetching.fetched = fetching.fetched.saturating_add(1);
                 fetching.last = now;
-                fetching.source(peer);
+                if let Some(peer) = from {
+                    fetching.source(peer);
+                }
                 touched.insert(fetch);
                 if fetching.share {
                     let _ = self.catalog.share_fetched(std::slice::from_ref(cid));
@@ -863,12 +963,15 @@ impl Amino {
                 }
             }
         }
-        for fetch in touched {
+        for &fetch in &touched {
             if let Some(fetching) = self.fetches.get_mut(fetch).filter(|fetching| fetching.reply.is_some()) {
                 wants.extend(fetching.fill(now));
             }
         }
         self.want(wants);
+        for fetch in touched {
+            self.over_gateways(fetch);
+        }
     }
 
     /// Say what came of each fetch that's done: nothing left to want, or
@@ -886,7 +989,7 @@ impl Amino {
             // Not idle while its roots' providers are still being looked
             // for, a router's being asked, or it's yet to be sought at all
             let first = seek && fetching.sought_at.is_none();
-            let searching = first || fetching.routing || self.searches.values().any(|search| search.roots && search.fetch == index);
+            let searching = first || fetching.routing || !fetching.over_http.is_empty() || self.searches.values().any(|search| search.roots && search.fetch == index);
             let idle = !searching && now.duration_since(fetching.last) > IDLE;
             let over = fetching.wanted.is_empty() || idle;
             if over && let Some(reply) = fetching.reply.take() {
