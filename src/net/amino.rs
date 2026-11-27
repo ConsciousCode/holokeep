@@ -20,7 +20,9 @@ use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::Boxed;
 use libp2p::identity::Keypair;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, autonat, identify, kad, ping};
+use libp2p::swarm::ConnectionId;
+use libp2p::swarm::behaviour::toggle::Toggle;
+use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, autonat, dcutr, identify, kad, ping, relay};
 
 use super::bitswap::{self, Entry, Message, Presence, WantType};
 use super::mesh::{Error, Result};
@@ -146,6 +148,10 @@ pub struct Status {
     pub failed: Option<String>,
     /// How many times a router's been asked who has a block.
     pub routed: usize,
+    /// How many peers it's reached through a relay, and punched through
+    /// to directly from there.
+    pub relayed: usize,
+    pub punched: usize,
 }
 
 /// A way to ask the running swarm to fetch, or how it is.
@@ -283,6 +289,12 @@ pub struct Behaviour {
     autonat: autonat::Behaviour,
     streams: libp2p_stream::Behaviour,
     inbound: inbound::Behaviour,
+    /// Dialling peers reached only through a relay (`/p2p-circuit`), as
+    /// many behind NATs are, and punching through to them from there:
+    /// a relay cuts what it carries off soon, so Bitswap goes over the
+    /// direct connection once there is one.
+    relayed: Toggle<relay::client::Behaviour>,
+    dcutr: Toggle<dcutr::Behaviour>,
 }
 
 /// The swarm's key: generated, and kept, the first time it's asked for.
@@ -309,11 +321,13 @@ pub fn key(dir: &std::path::Path) -> Result<Keypair> {
 /// # Errors
 ///
 /// If the system's DNS configuration can't be read.
-pub fn transport(key: &Keypair) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
+pub fn transport(key: &Keypair) -> Result<(Boxed<(PeerId, StreamMuxerBox)>, relay::client::Behaviour)> {
     use futures::future::Either;
     use libp2p::Transport as _;
     let noise = libp2p::noise::Config::new(key).map_err(|e| Error::Invalid(format!("noise: {e}")))?;
-    let tcp = libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default().nodelay(true))
+    let (relayed, client) = relay::client::new(key.public().to_peer_id());
+    let tcp = relayed
+        .or_transport(libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default().nodelay(true)))
         .upgrade(libp2p::core::upgrade::Version::V1)
         .authenticate(noise)
         .multiplex(libp2p::yamux::Config::default())
@@ -325,7 +339,7 @@ pub fn transport(key: &Keypair) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
         Either::Left((peer, muxer)) => (peer, StreamMuxerBox::new(muxer)),
         Either::Right((peer, muxer)) => (peer, StreamMuxerBox::new(muxer)),
     });
-    Ok(libp2p::dns::tokio::Transport::system(either)?.boxed())
+    Ok((libp2p::dns::tokio::Transport::system(either)?.boxed(), client))
 }
 
 /// Where QUIC listens beside TCP: the same address and port, over UDP.
@@ -407,6 +421,11 @@ pub struct Amino {
     http: tokio::sync::mpsc::UnboundedSender<OverHttp>,
     https: tokio::sync::mpsc::UnboundedReceiver<OverHttp>,
     routed: usize,
+    /// Each peer's connections through a relay, closed once there's a
+    /// direct one; and how many it's reached so, and punched through to.
+    relayed: HashMap<PeerId, Vec<ConnectionId>>,
+    relayed_to: usize,
+    punched: usize,
     /// The peers a router found that are being dialled, and the fetches
     /// they're to be asked for once connected.
     dialling: HashMap<PeerId, Vec<u64>>,
@@ -425,7 +444,7 @@ pub struct Amino {
 impl Amino {
     /// A swarm over a transport, answering from the catalog, which knows
     /// these peers to start from.
-    pub fn new(transport: Boxed<(PeerId, StreamMuxerBox)>, key: &Keypair, catalog: Catalog, bootstrap: &[Multiaddr]) -> Self {
+    pub fn new(transport: Boxed<(PeerId, StreamMuxerBox)>, relayed: Option<relay::client::Behaviour>, key: &Keypair, catalog: Catalog, bootstrap: &[Multiaddr]) -> Self {
         let peer = key.public().to_peer_id();
         let (streams, incoming) = tokio::sync::mpsc::unbounded_channel();
         let mut kad = kad::Behaviour::with_config(peer, kad::store::MemoryStore::new(peer), kad::Config::new(KAD));
@@ -441,6 +460,8 @@ impl Amino {
             autonat: autonat::Behaviour::new(peer, autonat::Config::default()),
             streams: libp2p_stream::Behaviour::new(),
             inbound: inbound::Behaviour::new(StreamProtocol::new(bitswap::PROTOCOL), streams),
+            dcutr: relayed.is_some().then(|| dcutr::Behaviour::new(peer)).into(),
+            relayed: relayed.into(),
         };
         let swarm = Swarm::new(transport, behaviour, peer, libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(Duration::from_mins(1)));
         let control = swarm.behaviour().streams.new_control();
@@ -472,6 +493,9 @@ impl Amino {
             https,
             routed: 0,
             dialling: HashMap::new(),
+            relayed: HashMap::new(),
+            relayed_to: 0,
+            punched: 0,
             searches: HashMap::new(),
             providing: HashSet::new(),
             announced_at: None,
@@ -555,6 +579,8 @@ impl Amino {
             peers,
             failed: self.failed.clone(),
             routed: self.routed,
+            relayed: self.relayed_to,
+            punched: self.punched,
         }
     }
 
@@ -650,7 +676,11 @@ impl Amino {
                 }
                 None
             },
-            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+            SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
+                if endpoint.is_relayed() {
+                    self.relayed.entry(peer_id).or_default().push(connection_id);
+                    self.relayed_to = self.relayed_to.saturating_add(1);
+                }
                 self.connected.entry(peer_id).or_default().0 = Some(endpoint.get_remote_address().clone());
                 // Found by a router, and dialled to be asked
                 for id in self.dialling.remove(&peer_id).unwrap_or_default() {
@@ -660,8 +690,23 @@ impl Amino {
                 }
                 None
             },
-            SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
-                self.connected.remove(&peer_id);
+            SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
+                if let Some(relayed) = self.relayed.get_mut(&peer_id) {
+                    relayed.retain(|id| *id != connection_id);
+                }
+                if num_established == 0 {
+                    self.connected.remove(&peer_id);
+                    self.relayed.remove(&peer_id);
+                }
+                None
+            },
+            // Through to it directly, what the relay carries goes, so
+            // Bitswap's streams go over the direct connection
+            SwarmEvent::Behaviour(BehaviourEvent::Dcutr(dcutr::Event { remote_peer_id, result: Ok(_) })) => {
+                self.punched = self.punched.saturating_add(1);
+                for connection in self.relayed.remove(&remote_peer_id).unwrap_or_default() {
+                    self.swarm.close_connection(connection);
+                }
                 None
             },
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -1145,7 +1190,8 @@ pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multi
                 // router of the real one's unless told to
                 let routers = routers.unwrap_or_else(|| if bootstrap.is_none() { routers::ROUTERS.iter().map(|&router| router.to_owned()).collect() } else { Vec::new() });
                 let bootstrap = bootstrap.unwrap_or_else(|| BOOTSTRAP.iter().filter_map(|addr| addr.parse().ok()).collect());
-                let mut amino = Amino::new(transport(&key)?, &key, Catalog::open_repo(&repo)?, &bootstrap);
+                let (transport, relayed) = transport(&key)?;
+                let mut amino = Amino::new(transport, Some(relayed), &key, Catalog::open_repo(&repo)?, &bootstrap);
                 amino.route_by(routers);
                 amino.gateway_requests(gateway_requests);
                 if let Some(quic) = quic_beside(&addr) {

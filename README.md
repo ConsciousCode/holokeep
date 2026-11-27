@@ -484,6 +484,7 @@ Checklist:
   - [x] Seeking who has a block a stalled fetch waits on, in the DHT and of a delegated router (Routing V1 HTTP, `delegated-ipfs.dev` by default): asked only of a fetch that's had nothing for a moment, of what's under the roots rather than the roots, and what it finds joined to the DHT, so it's asked less as more's known (`amino-routers`)
   - [x] Fetching from trustless gateways a router finds, over HTTP (`/https`, `/tls/http`): each block as `?format=raw`, checked against its CID, a few at a time from each
   - [x] QUIC beside TCP, listening on the same port over UDP and dialling whoever lists it alone (checked against a Kubo node on QUIC alone)
+  - [x] Peers reached only through a relay (`/p2p-circuit`), and DCUtR punching through to them from there, the relayed connection closed once it has (checked against a Kubo node behind a Kubo relay)
   - [x] How the node is in Amino: where it's reached, server or client of the DHT, its routing table, who's connected and as what, and the last dial that failed (`hk node amino [--peers]`)
   - [x] Checked against Kubo 0.42 both ways: each fetching what the other announced, found through the DHT, and what's only served got by a Kubo node peering hk (`tests/mesh/kubo.sh`)
 - [ ] BitTorrent bridging

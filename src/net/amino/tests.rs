@@ -66,7 +66,7 @@ async fn swarm(catalog: Catalog) -> (Amino, Multiaddr) {
         .authenticate(libp2p::noise::Config::new(&key).expect("noise"))
         .multiplex(libp2p::yamux::Config::default())
         .boxed();
-    let mut amino = Amino::new(transport, &key, catalog, &[]);
+    let mut amino = Amino::new(transport, None, &key, catalog, &[]);
     amino.listen(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
     loop {
         if let Event::Listening(at) = amino.next().await.expect("event") {
@@ -183,7 +183,7 @@ async fn joining(catalog: Catalog, bootstrap: &[Multiaddr]) -> (Amino, Multiaddr
         .authenticate(libp2p::noise::Config::new(&key).expect("noise"))
         .multiplex(libp2p::yamux::Config::default())
         .boxed();
-    let mut amino = Amino::new(transport, &key, catalog, bootstrap);
+    let mut amino = Amino::new(transport, None, &key, catalog, bootstrap);
     amino.listen(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
     amino.serve_dht();
     loop {
@@ -295,7 +295,7 @@ async fn a_router_finds_what_nothing_else_does_and_isnt_asked_once_its_found() {
     // Known to no one, the fetcher finds the provider by the router alone
     let done = fetched(&mut a, &mut b, fetcher.fetch(vec![link(&first)], false, true)).await;
     assert_eq!(done, Fetched { fetched: 1, missing: Vec::new() });
-    assert_eq!(*asked.lock().expect("asked"), [format!("/routing/v1/providers/{}?filter-protocols=transport-bitswap,transport-ipfs-gateway-http,unknown&filter-addrs=tcp,quic-v1,!p2p-circuit", link(&first))]);
+    assert_eq!(*asked.lock().expect("asked"), [format!("/routing/v1/providers/{}?filter-protocols=transport-bitswap,transport-ipfs-gateway-http,unknown&filter-addrs=tcp,quic-v1", link(&first))]);
     // Connected to it now, it's found of whoever's connected, and the
     // router's asked nothing more
     let done = fetched(&mut a, &mut b, fetcher.fetch(vec![link(&second)], false, true)).await;

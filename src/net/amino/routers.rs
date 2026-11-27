@@ -143,9 +143,9 @@ pub fn block(gateway: &str, cid: &str) -> Option<Vec<u8>> {
 /// Ask a router who provides a CID: blocking, so in a thread of its own.
 /// Nothing if it can't be asked, or doesn't know.
 pub fn ask(router: &str, cid: &str) -> Found {
-    // Only what may be reached over TCP or QUIC, of routers that heed it
-    // (IPIP-484)
-    let url = format!("{}/routing/v1/providers/{cid}?filter-protocols=transport-bitswap,transport-ipfs-gateway-http,unknown&filter-addrs=tcp,quic-v1,!p2p-circuit", router.trim_end_matches('/'));
+    // Only what may be reached over TCP or QUIC, directly or through a
+    // relay, of routers that heed it (IPIP-484)
+    let url = format!("{}/routing/v1/providers/{cid}?filter-protocols=transport-bitswap,transport-ipfs-gateway-http,unknown&filter-addrs=tcp,quic-v1", router.trim_end_matches('/'));
     let Ok(mut answer) = agent().get(&url).config().timeout_global(Some(TIMEOUT)).build().header("Accept", "application/json").call() else {
         return Found::default();
     };

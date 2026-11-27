@@ -207,7 +207,12 @@ private network, so its peers reach its Kademlia DHT
 (`/ipfs/kad/1.0.0`) and Bitswap 1.2.0, and nothing else. It listens
 over TCP where it's told (port 4015 by default) and over QUIC on the same
 port over UDP, so a firewall should let both in; it dials peers over
-either, as many list QUIC alone.
+either, as many list QUIC alone. A peer behind a NAT is often reached
+only through a relay (`/p2p-circuit`); hk dials it there, and from
+there DCUtR punches through to it directly, the relayed connection
+closed once it has, since a relay cuts off what it carries within
+minutes and Kubo serves nothing over it. Punching through mostly takes
+QUIC: TCP seldom gets through a NAT.
 
 - **What's served** to a peer who wants it is what's public, and what was
   fetched from Amino to be shared (all that's fetched, unless fetched to
@@ -286,7 +291,8 @@ either, as many list QUIC alone.
 where it listens and where it's taken to be reached, whether it's a
 server of the DHT and how many peers its routing table has, how many
 roots it provides, how many peers it's connected to, how many times a
-router's been asked who has a block, and the last dial that failed, which says why if it can't join; `--peers` lists each
+router's been asked who has a block, how many peers it's reached
+through a relay and punched through to, and the last dial that failed, which says why if it can't join; `--peers` lists each
 connected peer, where, and its agent (`kubo/0.42.0`).
 
 ## Gateway
