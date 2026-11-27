@@ -114,7 +114,15 @@ pub struct Node {
     pub ping: Option<Duration>,
     /// How long a connection with nothing going on is kept open.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "duration", serialize_with = "show_duration")]
-    pub idle: Option<Duration>,    /// Whether to serve what's public over HTTP, as a trustless gateway,
+    pub idle: Option<Duration>,    /// Whether to take part in Amino, the public IPFS network, and where:
+    /// `true` where `--amino` alone would.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amino: Option<Listen>,
+    /// The peers Amino's joined by, as multiaddrs: Amino's own bootstrap
+    /// peers if unsaid, none if empty, as for a test of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amino_bootstrap: Option<Vec<String>>,
+    /// Whether to serve what's public over HTTP, as a trustless gateway,
     /// and where: `true` where `--gateway` alone would.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway: Option<Listen>,
@@ -209,7 +217,7 @@ impl Config {
         if mesh == "main" {
             return self.node.clone();
         }
-        let base = Node { listen: None, clients: None, door: None, gateway: None, ..self.node.clone() };
+        let base = Node { listen: None, clients: None, door: None, gateway: None, amino: None, ..self.node.clone() };
         self.mesh.get(mesh).map_or_else(|| base.clone(), |own| own.over(&base))
     }
 }
@@ -237,6 +245,8 @@ impl Node {
             idle: self.idle.or(base.idle),
             relay: self.relay.or(base.relay),
             gateway: self.gateway.clone().or_else(|| base.gateway.clone()),
+            amino: self.amino.clone().or_else(|| base.amino.clone()),
+            amino_bootstrap: self.amino_bootstrap.clone().or_else(|| base.amino_bootstrap.clone()),
         }
     }
 }

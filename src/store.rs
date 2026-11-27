@@ -243,7 +243,7 @@ pub trait Store: BlockIndex + BlockSource + BlockStore {
 /// making it over as it knows it, its views say, would break what the newer
 /// build reads them with, where that's still running. Raise it with any
 /// change to them (and make a repo fixture, `scripts/make-repo-fixture.sh`).
-pub const SCHEMA: i64 = 8;
+pub const SCHEMA: i64 = 9;
 
 pub const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -1616,7 +1616,13 @@ impl Catalog {
                  target INTEGER NOT NULL REFERENCES multihashes (id),
                  PRIMARY KEY (source, target)
              ) WITHOUT ROWID;
-             CREATE INDEX IF NOT EXISTS refs_target ON refs (target);",
+             CREATE INDEX IF NOT EXISTS refs_target ON refs (target);
+             -- What was fetched from Amino and may be given back to its
+             -- peers who ask for it: everything fetched there, but what was
+             -- fetched to be kept to oneself. Never announced, only served.
+             CREATE TABLE IF NOT EXISTS shared_fetches (
+                 block INTEGER PRIMARY KEY REFERENCES multihashes (id)
+             );",
         )?;
         db.conn().execute_batch(volume::BLOCK_CIDS)?;
         let fresh = !db.conn().prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'holdings'")?.exists([])?;
@@ -3673,6 +3679,28 @@ impl Catalog {
             tombs.push(self.put_claim(&Claim::Tomb(Tomb::new([public]).ok_or(Error::NoClaims)?))?);
         }
         Ok(tombs)
+    }
+
+    /// Say these blocks, fetched from Amino, may be given back to its peers
+    /// who ask for them, as `Self::shared_fetch` says.
+    pub fn share_fetched(&self, blocks: &[Link]) -> Result<()> {
+        self.db.atomically(|| {
+            let conn = self.db.conn();
+            let mut insert = conn.prepare_cached("INSERT OR IGNORE INTO shared_fetches (block) VALUES (?1)")?;
+            for block in blocks {
+                insert.execute([self.db.intern(block.multihash())?])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Whether a block was fetched from Amino to be given back to whoever
+    /// there asks: served, never announced.
+    pub fn shared_fetch(&self, cid: &Link) -> Result<bool> {
+        let Some(id) = self.db.lookup(cid.multihash())? else {
+            return Ok(false);
+        };
+        Ok(self.db.conn().prepare_cached("SELECT 1 FROM shared_fetches WHERE block = ?1")?.exists([id])?)
     }
 
     /// Call a device, by its key, this, in place of whatever it was called:

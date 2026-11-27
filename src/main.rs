@@ -678,6 +678,12 @@ struct RunArgs {
     /// default, for a reverse proxy in front to give it HTTPS
     #[arg(long, num_args = 0..=1, default_missing_value = holokeep::gateway::LISTEN)]
     gateway: Option<String>,
+    /// Take part in Amino, the public IPFS network, here [default: port
+    /// 4015]: its DHT, and Bitswap, serving what's public and what was
+    /// fetched from it to be shared, and nothing else. A swarm of its own,
+    /// with a key of its own, so nothing there links to the mesh
+    #[arg(long, num_args = 0..=1, default_missing_value = holokeep::net::amino::LISTEN)]
+    amino: Option<String>,
 }
 
 #[derive(Subcommand, Debug, Clone, Copy)]
@@ -2210,7 +2216,7 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
 #[cfg(feature = "net")]
 fn node_run(place: &holokeep::net::mesh::Place, args: RunArgs) -> anyhow::Result<()> {
     use holokeep::net::daemon;
-    let RunArgs { listen, copies, low_water, high_water, target, no_collect, no_lost_scan, shared, clients, door, gateway } = args;
+    let RunArgs { listen, copies, low_water, high_water, target, no_collect, no_lost_scan, shared, clients, door, gateway, amino } = args;
     let config = holokeep::config::Config::load(&place.repo)?;
     let tuned = config.node(&place.mesh);
     let listen = listen.or(tuned.listen).unwrap_or_else(|| if place.is_main() { daemon::LISTEN } else { "/ip4/0.0.0.0/tcp/0" }.to_owned());
@@ -2218,6 +2224,8 @@ fn node_run(place: &holokeep::net::mesh::Place, args: RunArgs) -> anyhow::Result
     let door = door.or_else(|| tuned.door.and_then(|door| door.at(daemon::LISTEN_DOOR)));
     let gateway = gateway.or_else(|| tuned.gateway.and_then(|gateway| gateway.at(holokeep::gateway::LISTEN)));
     anyhow::ensure!(gateway.is_none() || place.is_main(), "the gateway is the main mesh's");
+    let amino = amino.or_else(|| tuned.amino.and_then(|amino| amino.at(holokeep::net::amino::LISTEN)));
+    anyhow::ensure!(amino.is_none() || place.is_main(), "Amino is the main mesh's");
     anyhow::ensure!(clients.is_none() || place.is_main(), "clients are of the main mesh");
     let listen = daemon::Listen {
         members: listen.parse().context("not a multiaddr")?,
@@ -2234,6 +2242,10 @@ fn node_run(place: &holokeep::net::mesh::Place, args: RunArgs) -> anyhow::Result
         });
         let at = holokeep::gateway::open(&place.repo, &gateway, Some(fetch)).with_context(|| format!("serving the gateway on {gateway}"))?;
         eprintln!("the gateway serves what's public on http://{at}");
+    }
+    if let Some(amino) = amino {
+        let bootstrap = tuned.amino_bootstrap.map(|peers| peers.iter().map(|addr| addr.parse()).collect::<Result<Vec<_>, _>>()).transpose().context("amino-bootstrap: not a multiaddr")?;
+        holokeep::net::amino::open(&place.repo, amino.parse().context("not a multiaddr")?, bootstrap)?;
     }
     let copies = copies.or(tuned.copies).unwrap_or(2);
     let marks = holokeep::net::trim::Watermarks::new(low_water.or(tuned.low_water).unwrap_or(2 << 30), high_water.or(tuned.high_water).unwrap_or(4 << 30)).with_target(target.or(tuned.target));

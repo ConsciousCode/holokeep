@@ -5,6 +5,8 @@
 // `Send`; so are the futures which use them
 #![allow(clippy::future_not_send)]
 
+pub mod amino;
+pub mod bitswap;
 pub mod blocks;
 pub mod check;
 pub mod clients;

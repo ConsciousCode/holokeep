@@ -182,8 +182,8 @@ anyone's to have, in a mode:
 - **A whole CID is public if its layout is**, as a `unixfs` same claim
   says (see [[#Same]]).
 - A mode not known is kept, and makes nothing public. Nothing announces
-  yet, and Bitswap doesn't serve yet: Amino will read this. The
-  [[#Gateway]] serves what's public over HTTP.
+  yet. [[#Amino]] serves what's public over Bitswap, and the
+  [[#Gateway]] over HTTP.
 - **Every member hears what's public**, holding it or not: a notice
   marks public claims as wanted by all, so any member can serve what's
   public, fetching it if need be. What's under a public root is known to
@@ -197,6 +197,28 @@ hk public ls                      # mode and root of each
 hk public check <cid>             # public or private, by whatever reaches it
 hk public rm <cid>                # private again
 ```
+
+## Amino
+
+`hk node run --amino [addr]` (or `amino = true`) takes part in Amino,
+the public IPFS network: a swarm of its own, apart from the mesh, with a
+key of its own (`amino.key`), so nothing there links to the mesh, and no
+private network, so its peers reach its Kademlia DHT
+(`/ipfs/kad/1.0.0`) and Bitswap 1.2.0, and nothing else.
+
+- **What's served** to a peer who wants it is what's public, and what was
+  fetched from Amino to be shared (all that's fetched, unless fetched to
+  be kept to oneself). Bitswap holds nothing for anyone: a node gets only
+  what it asks for. Whoever wanted something once may again, so what's
+  fetched is served back; it's never announced, since provider records
+  are kept by indexers long after they lapse.
+- **What isn't served**, private or missing, is said not to be had alike,
+  where the asker wants to be told, and only after 50 ms and up to 50 ms
+  more at random: how long it takes says nothing of which.
+- **Joining**: Amino's bootstrap peers, unless `amino-bootstrap` says
+  others (empty for none). Seen by its peers at a port it listens on, as
+  on a server with a public address, it's taken to be reached there, so
+  the DHT takes it for a server.
 
 ## Gateway
 

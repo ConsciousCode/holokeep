@@ -3187,6 +3187,10 @@ fn repos_earlier_builds_made_still_open() {
             assert!(claim.target().iter().any(|key| names.contains(&(key.clone(), "fixture-third".to_owned()))), "{name}: {names:?}");
             assert_eq!(names.len(), 2, "{name}: this device, and the other");
         }
+        // And older ones can say what's fetched from Amino may be shared
+        repo.share_fetched(std::slice::from_ref(&expect["hello"])).expect("share");
+        assert!(repo.shared_fetch(&expect["hello"]).expect("shared"), "{name}");
+        assert!(!repo.shared_fetch(&expect["tree"]).expect("shared"), "{name}");
         // And older ones can name devices now
         let device = crate::keys::Key::generate().expect("key").id();
         repo.name_device(&device, "later").expect("name");

@@ -27,8 +27,8 @@ dir = "~/soup"
 
 `[node]` tunes the main mesh's node, and is the default for every other
 mesh's. `[mesh.<name>]` tunes the node of `--mesh <name>`, key by key
-over `[node]`; there's no `[mesh.main]`. `listen`, `clients`, `door`
-and `gateway` in `[node]` are the main mesh's alone, since two nodes can't share a
+over `[node]`; there's no `[mesh.main]`. `listen`, `clients`, `door`,
+`gateway` and `amino` in `[node]` are the main mesh's alone, since two nodes can't share a
 port.
 
 | Key          | Type                    | Default                         | Meaning                                                                                                    |
@@ -45,6 +45,8 @@ port.
 | `door`       | boolean or multiaddr    | off                             | Open a door: `true` on port 4013, or where it says (`--door`); see [[Capabilities]].                       |
 | `ping`       | duration                | `"10s"`                         | How often a connection's pinged, and how long an answer's waited for, before it's closed and redialled.     |
 | `idle`       | duration                | `"1h"`                          | How long a connection with nothing going on is kept open.                                                  |
+| `amino`      | boolean or multiaddr    | off                             | Take part in Amino, the public IPFS network: `true` on port 4015, or where it says (`--amino`); see [[Claims#Amino]]. The main mesh's only. |
+| `amino-bootstrap` | list of multiaddrs | Amino's own                     | The peers Amino's joined by; empty for none, as for a test of its own. |
 | `gateway`    | boolean or address      | off                             | Serve what's public over HTTP: `true` on `127.0.0.1:4014`, or where it says, as `host:port` (`--gateway`); see [[Claims#Gateway]]. The main mesh's only. |
 | `relay`      | boolean                 | false                           | Relay between members which can't reach each other, for a member they all can; see [[Mesh#Relays]].         |
 
