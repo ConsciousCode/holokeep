@@ -481,6 +481,7 @@ Checklist:
   - [x] A swarm of its own for Amino, with a key of its own and no private network: its DHT (`/ipfs/kad/1.0.0`) and Bitswap 1.2.0, answering wants for what's public and what was fetched to be shared, and saying what's private or missing isn't had alike, after a floor of time (`hk node run --amino`)
   - [x] Bitswap fetching from Amino, for what the mesh hasn't got, of a CID nothing here links to so asking says nothing of what's private: providers looked for in the DHT, shared back on request, never announced, unless fetched to be kept to oneself (`hk dag fetch [--amino] [--private]`)
   - [x] Providing announced roots on Amino, and reproviding them: an anchor as what it is now, a tag as its members; withdrawn once private again (`amino-server` for a DHT server on a LAN)
+  - [x] Seeking who has a block a stalled fetch waits on, in the DHT and of a delegated router (Routing V1 HTTP, `delegated-ipfs.dev` by default): asked only of a fetch that's had nothing for a moment, of what's under the roots rather than the roots, and what it finds joined to the DHT, so it's asked less as more's known (`amino-routers`)
   - [x] How the node is in Amino: where it's reached, server or client of the DHT, its routing table, who's connected and as what, and the last dial that failed (`hk node amino [--peers]`)
   - [x] Checked against Kubo 0.42 both ways: each fetching what the other announced, found through the DHT, and what's only served got by a Kubo node peering hk (`tests/mesh/kubo.sh`)
 - [ ] BitTorrent bridging

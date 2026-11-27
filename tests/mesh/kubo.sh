@@ -67,7 +67,7 @@ machine() {
 ip_of() { sh_on "$1" "hostname -I | awk '{ print \$1 }'"; }
 
 # A Kubo node, a server of the DHT, with a key of this algorithm, joined
-# by these peers
+# by these peers, and a router (/routing/v1) on its gateway
 kubo_up() {
     local name=$1 algorithm=$2; shift 2
     local bootstrap=
@@ -82,7 +82,8 @@ kubo_up() {
         && ipfs config Routing.Type dhtserver \
         && ipfs config --json Addresses.Swarm '[\"/ip4/0.0.0.0/tcp/4001\"]' \
         && ipfs config Addresses.API /ip4/127.0.0.1/tcp/5001 \
-        && ipfs config Addresses.Gateway /ip4/127.0.0.1/tcp/8080"
+        && ipfs config Addresses.Gateway /ip4/0.0.0.0/tcp/8080 \
+        && ipfs config --json Gateway.ExposeRoutingAPI true"
     podman exec -d "$run-$name" sh -c "GOLOG_LOG_LEVEL=error,bitswap/server=debug exec ipfs daemon >>/tmp/ipfs.log 2>&1"
     wait_for "$name's Kubo to be ready" sh_on "$name" "grep -q 'Daemon is ready' /tmp/ipfs.log"
 }
@@ -129,6 +130,18 @@ wait_for "the directory's record to be on the hub" sh_on hub "timeout 5 ipfs rou
 on hk hk dag fetch "$dir" >/dev/null || fail "hk couldn't fetch the directory $dir from Kubo"
 on hk hk get -o /tmp/got "$dir" >/dev/null
 [ "$(sh_on hk 'cd /tmp/got && find . -type f | sort | xargs sha256sum')" = "$(sh_on provider 'cd /tmp/dir && find . -type f | sort | xargs sha256sum')" ] || fail "the directory hk fetched isn't the one Kubo added"
+
+say "an hk node joined by no one finds the provider by asking the hub as a router"
+machine loner
+on loner hk node id >/dev/null
+sh_on loner "printf '[node]\namino-bootstrap = []\namino-routers = [\"http://$(ip_of hub):8080\"]\n' > ~/.holokeep/config.toml"
+podman exec -d "$run-loner" sh -c "exec hk node run --amino >>/tmp/node.log 2>&1"
+wait_for "the loner to join its Amino" sh_on loner "grep -q 'in Amino as' /tmp/node.log"
+on loner hk dag fetch "$big" >/dev/null || fail "the loner couldn't fetch $big through the router"
+[ "$(on loner hk cat "$big" | sha256sum)" = "$(on provider ipfs cat "$big" | sha256sum)" ] || fail "the loner fetched something else"
+on loner hk node amino | grep -q "asked a router who has a block [1-9]" || fail "the loner didn't say it asked the router"
+# And the provider it found, a server of the DHT, is in its routing table
+wait_for "the loner to have the provider in its routing table" sh_on loner "hk node amino | grep -q 'with [1-9][0-9]* peers in its routing table'"
 
 say "Kubo finds what hk announced through the DHT, and fetches it"
 sh_on hk "head -c 2500000 /dev/urandom > /tmp/announced"

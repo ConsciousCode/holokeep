@@ -10,7 +10,7 @@ path = "src/main.rs"
 [features]
 default = ["net", "fuse"]
 # The private mesh: libp2p, and a daemon to run it
-net = ["dep:libp2p", "dep:libp2p-stream", "dep:tokio", "dep:notify"]
+net = ["dep:libp2p", "dep:libp2p-stream", "dep:tokio", "dep:notify", "dep:ureq", "dep:serde_json"]
 # `hk mount`: the soup as a read-only filesystem
 fuse = ["dep:fuser", "dep:libc"]
 fuser = ["dep:fuser"]
@@ -21,6 +21,8 @@ libp2p = { version = "0.56", optional = true, features = ["tokio", "tcp", "noise
 libp2p-stream = { version = "=0.4.0-alpha", optional = true }
 tokio = { version = "1", optional = true, features = ["rt", "net", "macros", "time", "io-util", "sync", "signal"] }
 notify = { version = "8", optional = true, default-features = false }
+ureq = { version = "3.5", optional = true }
+serde_json = { version = "1", optional = true }
 thiserror = "2.0"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 anyhow = { version = "1.0.104", features = ["backtrace"] }

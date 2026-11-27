@@ -85,8 +85,23 @@ const ANNOUNCE: Duration = Duration::from_mins(1);
 /// public is announced in seconds, however busy the catalog.
 const ANNOUNCE_SOON: Duration = Duration::from_secs(5);
 
-/// The most providers of a root asked.
+/// The most providers of a block asked.
 const PROVIDERS: usize = 20;
+
+/// How long a fetch goes with nothing arriving, from no source found or
+/// none with much of it, before who has a block it's waiting on is sought,
+/// in the DHT and of a router: a DAG's roots may be had by many who hold
+/// little under them, as whoever's visited a site's front page.
+#[cfg(not(test))]
+const STALLED: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const STALLED: Duration = Duration::from_millis(200);
+
+/// How often it's sought again, of another block, while nothing arrives.
+#[cfg(not(test))]
+const SEEK_AGAIN: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const SEEK_AGAIN: Duration = Duration::from_millis(500);
 
 /// What's asked of the swarm from outside it: to fetch these, or the whole
 /// DAGs under them, sharing what's fetched or not.
@@ -121,6 +136,8 @@ pub struct Status {
     pub peers: Vec<(PeerId, Option<Multiaddr>, Option<String>)>,
     /// The last dial that failed, and why.
     pub failed: Option<String>,
+    /// How many times a router's been asked who has a block.
+    pub routed: usize,
 }
 
 /// A way to ask the running swarm to fetch, or how it is.
@@ -161,6 +178,14 @@ pub fn handle() -> Option<&'static Handle> {
 /// each of one source in turn, as Kubo's sessions do: wanting every block
 /// of everyone connected floods them, and has each answer it isn't had.
 struct Fetching {
+    /// Which fetch it is, however many have come and gone.
+    id: u64,
+    /// Whether a router's being asked who has some of it.
+    routing: bool,
+    /// When who has a block it's waiting on was last sought, and which
+    /// blocks have been.
+    sought_at: Option<Instant>,
+    sought: HashSet<Vec<u8>>,
     /// What's wanted and not yet here, by multihash.
     wanted: BTreeMap<Vec<u8>, Link>,
     /// Of those, what's wanted of a source now: of which, and since when.
@@ -170,7 +195,7 @@ struct Fetching {
     sources: Vec<PeerId>,
     /// Which source's next.
     turn: usize,
-    /// Who's been asked whether they have the roots.
+    /// Who's been asked whether they have any of it, or found by a router.
     asked: HashSet<PeerId>,
     dag: bool,
     share: bool,
@@ -295,6 +320,18 @@ pub enum Event {
 /// A message read from a peer, or the end of what it sent.
 type Read = (PeerId, Message);
 
+/// A search of the DHT for providers: for which fetch, and whether of its
+/// roots, which it isn't idle while it waits on, or of a block it's
+/// stalled on.
+#[derive(Debug, Clone, Copy)]
+struct Search {
+    fetch: usize,
+    roots: bool,
+}
+
+/// The providers a router found for a fetch, and where they're reached.
+type Route = (u64, Vec<(PeerId, Vec<Multiaddr>)>);
+
 /// The swarm, and what it answers from.
 pub struct Amino {
     swarm: Swarm<Behaviour>,
@@ -312,8 +349,19 @@ pub struct Amino {
     connected: HashMap<PeerId, (Option<Multiaddr>, Option<String>)>,
     failed: Option<String>,
     fetches: Vec<Fetching>,
+    /// The next fetch's id.
+    next_fetch: u64,
+    /// The routers asked who provides what a fetch gets nothing of.
+    routers: Vec<String>,
+    /// What they've found, for which fetch, as it's found.
+    route: tokio::sync::mpsc::UnboundedSender<Route>,
+    routes: tokio::sync::mpsc::UnboundedReceiver<Route>,
+    routed: usize,
+    /// The peers a router found that are being dialled, and the fetches
+    /// they're to be asked for once connected.
+    dialling: HashMap<PeerId, Vec<u64>>,
     /// Which fetch each search for providers is for.
-    searches: HashMap<kad::QueryId, usize>,
+    searches: HashMap<kad::QueryId, Search>,
     /// What's announced as here, by multihash, and when that was last
     /// looked at.
     providing: HashSet<Vec<u8>>,
@@ -350,12 +398,43 @@ impl Amino {
         let (ask, asks) = tokio::sync::mpsc::unbounded_channel();
         let (status, statuses) = tokio::sync::mpsc::unbounded_channel();
         let handle = Handle { asks: ask, statuses: status };
-        let mut amino = Self { swarm, catalog, control, incoming: Some(incoming), read, reads, asks, statuses, handle, connected: HashMap::new(), failed: None, fetches: Vec::new(), searches: HashMap::new(), providing: HashSet::new(), announced_at: None, announced_of: None, serving: false };
+        let (route, routes) = tokio::sync::mpsc::unbounded_channel();
+        let mut amino = Self {
+            swarm,
+            catalog,
+            control,
+            incoming: Some(incoming),
+            read,
+            reads,
+            asks,
+            statuses,
+            handle,
+            connected: HashMap::new(),
+            failed: None,
+            fetches: Vec::new(),
+            next_fetch: 0,
+            routers: Vec::new(),
+            route,
+            routes,
+            routed: 0,
+            dialling: HashMap::new(),
+            searches: HashMap::new(),
+            providing: HashSet::new(),
+            announced_at: None,
+            announced_of: None,
+            serving: false,
+        };
         if !bootstrap.is_empty() {
             // Joining the DHT, which the behaviour does again now and then
             let _ = amino.swarm.behaviour_mut().kad.bootstrap();
         }
         amino
+    }
+
+    /// Ask these routers (`https://…`) who provides what a fetch gets
+    /// nothing of otherwise.
+    pub fn route_by(&mut self, routers: Vec<String>) {
+        self.routers = routers;
     }
 
     pub fn peer_id(&self) -> PeerId {
@@ -415,6 +494,7 @@ impl Amino {
             providing: self.providing.len(),
             peers,
             failed: self.failed.clone(),
+            routed: self.routed,
         }
     }
 
@@ -478,6 +558,7 @@ impl Amino {
                         return Ok(event);
                     }
                 },
+                Some((fetch, found)) = self.routes.recv() => self.found(fetch, found),
                 Some((peer, message)) = self.reads.recv() => {
                     self.answer(peer, &message);
                     self.received(peer, &message);
@@ -497,7 +578,7 @@ impl Amino {
                 Some(Event::Listening(address))
             },
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, result: kad::QueryResult::GetProviders(result), step, .. })) => {
-                if let (Some(&fetch), Ok(kad::GetProvidersOk::FoundProviders { providers, .. })) = (self.searches.get(&id), result) {
+                if let (Some(&Search { fetch, .. }), Ok(kad::GetProvidersOk::FoundProviders { providers, .. })) = (self.searches.get(&id), result) {
                     for provider in providers.into_iter().take(PROVIDERS) {
                         self.ask(fetch, provider);
                     }
@@ -510,6 +591,12 @@ impl Amino {
             },
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                 self.connected.entry(peer_id).or_default().0 = Some(endpoint.get_remote_address().clone());
+                // Found by a router, and dialled to be asked
+                for id in self.dialling.remove(&peer_id).unwrap_or_default() {
+                    if let Some(fetch) = self.fetch_of(id) {
+                        self.ask(fetch, peer_id);
+                    }
+                }
                 None
             },
             SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
@@ -517,12 +604,26 @@ impl Amino {
                 None
             },
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                if let Some(peer) = peer_id
+                    && !self.swarm.is_connected(&peer)
+                {
+                    self.dialling.remove(&peer);
+                }
                 self.failed = Some(format!("{}: {error}", peer_id.map_or_else(|| "a peer".to_owned(), |peer| peer.to_string())));
                 None
             },
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                 if let Some(known) = self.connected.get_mut(&peer_id) {
                     known.1 = Some(info.agent_version);
+                }
+                // A server of the DHT, wherever it's connected from, joins
+                // the routing table where it says it listens: as one found
+                // by a router does, so the DHT finds more next time
+                if info.protocols.contains(&KAD) {
+                    let kad = &mut self.swarm.behaviour_mut().kad;
+                    for addr in info.listen_addrs.into_iter().filter(routers::dialable) {
+                        kad.add_address(&peer_id, addr);
+                    }
                 }
                 None
             },
@@ -574,7 +675,13 @@ impl Amino {
         }
         let now = Instant::now();
         let fetch = self.fetches.len();
+        let id = self.next_fetch;
+        self.next_fetch = self.next_fetch.wrapping_add(1);
         self.fetches.push(Fetching {
+            id,
+            routing: false,
+            sought_at: None,
+            sought: HashSet::new(),
             wanted,
             window: BTreeMap::new(),
             sources: Vec::new(),
@@ -589,9 +696,74 @@ impl Amino {
         });
         for root in &ask.roots {
             let search = self.swarm.behaviour_mut().kad.get_providers(kad::RecordKey::new(&root.multihash().to_bytes()));
-            self.searches.insert(search, fetch);
+            self.searches.insert(search, Search { fetch, roots: true });
         }
         self.ask_connected(fetch);
+    }
+
+    /// Which of the fetches under way this is, if it's still under way.
+    fn fetch_of(&self, id: u64) -> Option<usize> {
+        self.fetches.iter().position(|fetching| fetching.id == id && fetching.reply.is_some())
+    }
+
+    /// Seek who has a block a stalled fetch is waiting on, one not sought
+    /// before: in the DHT, and of the routers, in a thread of their own,
+    /// what they find coming back to `found`.
+    fn seek(&mut self, fetch: usize) {
+        let Some(fetching) = self.fetches.get_mut(fetch) else {
+            return;
+        };
+        fetching.sought_at = Some(Instant::now());
+        // What's wanted of a source now first, as what's waited on longest
+        let Some(cid) = fetching.window.keys().chain(fetching.wanted.keys()).find(|key| !fetching.sought.contains(*key)).and_then(|key| fetching.wanted.get(key)).cloned() else {
+            return;
+        };
+        fetching.sought.insert(cid.multihash().to_bytes());
+        let search = self.swarm.behaviour_mut().kad.get_providers(kad::RecordKey::new(&cid.multihash().to_bytes()));
+        self.searches.insert(search, Search { fetch, roots: false });
+        if self.routers.is_empty() || fetching.routing {
+            return;
+        }
+        fetching.routing = true;
+        self.routed = self.routed.saturating_add(1);
+        let (id, routers, route, cid) = (fetching.id, self.routers.clone(), self.route.clone(), cid.to_string());
+        tokio::task::spawn_blocking(move || {
+            let found = routers.iter().flat_map(|router| routers::ask(router, &cid)).collect();
+            let _ = route.send((id, found));
+        });
+    }
+
+    /// Take the providers a router found for a fetch: each asked if it's
+    /// connected, and dialled to be asked once it is if not.
+    fn found(&mut self, id: u64, found: Vec<(PeerId, Vec<Multiaddr>)>) {
+        let Some(fetch) = self.fetch_of(id) else {
+            return;
+        };
+        let me = *self.swarm.local_peer_id();
+        let found: Vec<_> = found.into_iter().filter(|(peer, _)| *peer != me).take(PROVIDERS).collect();
+        if let Some(fetching) = self.fetches.get_mut(fetch) {
+            fetching.routing = false;
+            // Waited on afresh while any it hadn't known of are dialled:
+            // only then, so routers finding none new end it as idle
+            let mut new = false;
+            for (peer, _) in &found {
+                new |= fetching.asked.insert(*peer) && !fetching.sources.contains(peer);
+            }
+            if new {
+                fetching.last = Instant::now();
+            }
+        }
+        for (peer, addrs) in found {
+            if self.swarm.is_connected(&peer) {
+                self.ask(fetch, peer);
+                continue;
+            }
+            let dialling = self.dialling.contains_key(&peer);
+            self.dialling.entry(peer).or_default().push(id);
+            if !dialling {
+                let _ = self.swarm.dial(libp2p::swarm::dial_opts::DialOpts::peer_id(peer).addresses(addrs).build());
+            }
+        }
     }
 
     /// Ask whoever's connected and hasn't been whether they have some of
@@ -706,9 +878,15 @@ impl Amino {
         let mut done = Vec::new();
         let mut again = Vec::new();
         let mut unsourced = Vec::new();
+        let mut stalled = Vec::new();
         for (index, fetching) in self.fetches.iter_mut().enumerate() {
-            // Not idle while providers are still being looked for
-            let searching = self.searches.values().any(|fetch| *fetch == index);
+            // Nothing coming, from no source or none with much of it, who
+            // has what it's waiting on is sought
+            let seek = now.duration_since(fetching.last) >= STALLED && fetching.sought_at.is_none_or(|at| now.duration_since(at) >= SEEK_AGAIN);
+            // Not idle while its roots' providers are still being looked
+            // for, a router's being asked, or it's yet to be sought at all
+            let first = seek && fetching.sought_at.is_none();
+            let searching = first || fetching.routing || self.searches.values().any(|search| search.roots && search.fetch == index);
             let idle = !searching && now.duration_since(fetching.last) > IDLE;
             let over = fetching.wanted.is_empty() || idle;
             if over && let Some(reply) = fetching.reply.take() {
@@ -721,6 +899,9 @@ impl Amino {
                     fetching.asked_at = now;
                     unsourced.push(index);
                 }
+                if seek {
+                    stalled.push(index);
+                }
             }
         }
         self.want(again);
@@ -728,12 +909,16 @@ impl Amino {
         for fetch in unsourced {
             self.ask_connected(fetch);
         }
+        for fetch in stalled {
+            self.seek(fetch);
+        }
         // Done with, the searches for them go, and once none's under way the
         // list starts again
-        self.searches.retain(|_, fetch| !done.contains(fetch));
+        self.searches.retain(|_, search| !done.contains(&search.fetch));
         if self.fetches.iter().all(|fetching| fetching.reply.is_none()) {
             self.fetches.clear();
             self.searches.clear();
+            self.dialling.clear();
         }
     }
 }
@@ -808,13 +993,15 @@ pub fn answers(catalog: &Catalog, message: &Message) -> (Vec<Message>, Message) 
 /// Run the swarm for the repo, on a thread of its own.
 ///
 /// It listens on `addr`, joining Amino by these peers, or its own
-/// bootstrap peers if none are said; a server of its DHT, reached where it
+/// bootstrap peers if none are said; asking these routers who provides
+/// what a fetch gets nothing of, or its own if none are said and it's
+/// joined by its own peers; a server of its DHT, reached where it
 /// listens, if `server`.
 ///
 /// # Errors
 ///
 /// If the repo won't open, or the key can't be had.
-pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multiaddr>>, server: bool) -> Result<()> {
+pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multiaddr>>, routers: Option<Vec<String>>, server: bool) -> Result<()> {
     drop(Catalog::open_repo(repo)?);
     let key = key(repo)?;
     let repo = repo.to_path_buf();
@@ -822,8 +1009,12 @@ pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multi
         let run = || -> Result<()> {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
             runtime.block_on(async {
+                // An Amino of its own, joined by peers of its own, asks no
+                // router of the real one's unless told to
+                let routers = routers.unwrap_or_else(|| if bootstrap.is_none() { routers::ROUTERS.iter().map(|&router| router.to_owned()).collect() } else { Vec::new() });
                 let bootstrap = bootstrap.unwrap_or_else(|| BOOTSTRAP.iter().filter_map(|addr| addr.parse().ok()).collect());
                 let mut amino = Amino::new(transport(&key)?, &key, Catalog::open_repo(&repo)?, &bootstrap);
+                amino.route_by(routers);
                 amino.listen(addr)?;
                 if server {
                     amino.serve_dht();
@@ -845,6 +1036,7 @@ pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multi
 }
 
 mod inbound;
+pub mod routers;
 
 #[cfg(test)]
 mod tests;

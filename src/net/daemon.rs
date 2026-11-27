@@ -1411,6 +1411,7 @@ fn amino_status_for(peers: bool, write: OwnedWriteHalf) -> std::result::Result<(
                 let _ = writeln!(out, "a {} of the DHT, with {} peers in its routing table", if status.server { "server" } else { "client" }, status.routing);
                 let _ = writeln!(out, "providing {}", status.providing);
                 let _ = writeln!(out, "connected to {}", status.peers.len());
+                let _ = writeln!(out, "asked a router who has a block {} time{}", status.routed, if status.routed == 1 { "" } else { "s" });
                 if let Some(failed) = &status.failed {
                     let _ = writeln!(out, "last failed dial: {failed}");
                 }

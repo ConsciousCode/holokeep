@@ -122,6 +122,13 @@ pub struct Node {
     /// peers if unsaid, none if empty, as for a test of its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amino_bootstrap: Option<Vec<String>>,
+    /// The routers (`https://…`, the Routing V1 HTTP API) asked who
+    /// provides what a fetch gets nothing of for a moment, from whoever
+    /// the DHT finds or is connected:
+    /// Kubo's, `delegated-ipfs.dev`, if unsaid, unless the bootstrap peers
+    /// are said; none if empty. A router learns what's sought of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amino_routers: Option<Vec<String>>,
     /// Whether to be a server of Amino's DHT, reached where it listens,
     /// whatever it's seen as: for a LAN, or a test, where that's no public
     /// address. One with a public address is taken for a server anyway.
@@ -252,6 +259,7 @@ impl Node {
             gateway: self.gateway.clone().or_else(|| base.gateway.clone()),
             amino: self.amino.clone().or_else(|| base.amino.clone()),
             amino_bootstrap: self.amino_bootstrap.clone().or_else(|| base.amino_bootstrap.clone()),
+            amino_routers: self.amino_routers.clone().or_else(|| base.amino_routers.clone()),
             amino_server: self.amino_server.or(base.amino_server),
         }
     }

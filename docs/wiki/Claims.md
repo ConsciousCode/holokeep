@@ -234,6 +234,22 @@ private network, so its peers reach its Kademlia DHT
   or hasn't sent in 3 s, is wanted of the next, since an answer lost
   isn't sent again. A fetch goes on as long as blocks keep arriving, and
   gives up after 20 s of nothing.
+- **Seeking**: a fetch that's had nothing for 2 s, from no source or
+  none with much of it, seeks who has a block it's waiting on, one not
+  sought before, and again every 5 s while nothing comes: in the DHT,
+  and of a router (`amino-routers`, the Routing V1 HTTP API), which
+  knows many providers the DHT doesn't, from IPNI's indexers. A DAG's
+  roots may be provided by many who hold little under them, as whoever
+  visited a site's front page, so it's what's under them that's sought.
+  Those a router finds are dialled and become sources, and, as servers
+  of the DHT, join the routing table, so the DHT finds more next time.
+  A router learns what's sought of it, as a DNS resolver learns what's
+  visited, so it's asked only of a fetch that's stalled: the more of
+  Amino that's known, the less it's asked. It's `delegated-ipfs.dev`,
+  Kubo's, unless `amino-bootstrap` says peers of an Amino of its own;
+  empty for none. Fetching waits on a router's answer, and on the
+  roots' providers being looked for, but a router finding no one new
+  doesn't keep it from giving up.
   `--private` keeps what's fetched to oneself, answered as missing.
 - **Announcing**: what each `announce` claim names is provided on the
   DHT, an anchor as what it is now and a group, such as a tag, as its
@@ -249,13 +265,16 @@ private network, so its peers reach its Kademlia DHT
   listens on isn't enough, since it dials out from that port, and a
   firewall or NAT lets the answers back in but no one else.
   `amino-server = true` makes it a server regardless, reached where it
-  listens, as on a LAN.
+  listens, as on a LAN. A peer that serves the DHT joins the routing
+  table where it says it listens, wherever it's connected from, so
+  those who dial in, and those a router finds, add to it; only public
+  addresses are taken, from it and from routers alike.
 
 `hk node amino` says how the running node is in Amino: its peer id,
 where it listens and where it's taken to be reached, whether it's a
 server of the DHT and how many peers its routing table has, how many
-roots it provides, how many peers it's connected to, and the last dial
-that failed, which says why if it can't join; `--peers` lists each
+roots it provides, how many peers it's connected to, how many times a
+router's been asked who has a block, and the last dial that failed, which says why if it can't join; `--peers` lists each
 connected peer, where, and its agent (`kubo/0.42.0`).
 
 ## Gateway

@@ -242,3 +242,54 @@ async fn whats_announced_is_found_through_the_dht_by_whoever_wants_it() {
     assert!(provider.providing.is_empty());
     assert!(!provider.announce(), "and stays so");
 }
+
+/// A router over HTTP on a port of its own, answering every ask with these
+/// providers: where it is, and the paths it's been asked.
+fn router(answer: String) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::io::{BufRead as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let at = format!("http://{}", listener.local_addr().expect("addr"));
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = asked.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            log.lock().expect("log").push(line.split(' ').nth(1).unwrap_or_default().to_owned());
+            while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
+                line.clear();
+            }
+            let _ = write!(reader.get_mut(), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}", answer.len());
+        }
+    });
+    (at, asked)
+}
+
+#[tokio::test]
+async fn a_router_finds_what_nothing_else_does_and_isnt_asked_once_its_found() {
+    let scratch = Scratch::new("amino-route");
+    let serving = Catalog::open_repo(&scratch.path().join("serving")).expect("catalog");
+    let (first, second) = (raw(b"found by a router"), raw(b"then of whoever's connected"));
+    for block in [&first, &second] {
+        serving.put_block(block, CidVersion::V1).expect("put");
+        serving.publish(&link(block), crate::claim::Public::SERVE).expect("publish");
+    }
+    let (mut a, at) = swarm(serving).await;
+    let (mut b, _) = swarm(Catalog::open_repo(&scratch.path().join("fetching")).expect("catalog")).await;
+    let addr = at.iter().filter(|protocol| !matches!(protocol, Protocol::P2p(_))).collect::<Multiaddr>();
+    let (url, asked) = router(format!(r#"{{"Providers":[{{"Schema":"peer","ID":"{}","Addrs":["{addr}"],"Protocols":["transport-bitswap"]}}]}}"#, a.peer_id()));
+    b.route_by(vec![url]);
+    let fetcher = b.fetcher();
+
+    // Known to no one, the fetcher finds the provider by the router alone
+    let done = fetched(&mut a, &mut b, fetcher.fetch(vec![link(&first)], false, true)).await;
+    assert_eq!(done, Fetched { fetched: 1, missing: Vec::new() });
+    assert_eq!(*asked.lock().expect("asked"), [format!("/routing/v1/providers/{}?filter-protocols=transport-bitswap,unknown&filter-addrs=tcp,!p2p-circuit", link(&first))]);
+    // Connected to it now, it's found of whoever's connected, and the
+    // router's asked nothing more
+    let done = fetched(&mut a, &mut b, fetcher.fetch(vec![link(&second)], false, true)).await;
+    assert_eq!(done, Fetched { fetched: 1, missing: Vec::new() });
+    assert_eq!(asked.lock().expect("asked").len(), 1, "asked again");
+    assert_eq!(b.status().routed, 1);
+}
