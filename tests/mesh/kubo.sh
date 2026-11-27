@@ -66,12 +66,13 @@ machine() {
 }
 ip_of() { sh_on "$1" "hostname -I | awk '{ print \$1 }'"; }
 
-# A Kubo node, a server of the DHT, joined by these peers
+# A Kubo node, a server of the DHT, with a key of this algorithm, joined
+# by these peers
 kubo_up() {
-    local name=$1; shift
+    local name=$1 algorithm=$2; shift 2
     local bootstrap=
     [ $# -eq 0 ] || bootstrap=$(printf '"%s",' "$@")
-    on "$name" ipfs init --empty-repo >/dev/null
+    on "$name" ipfs init --empty-repo --algorithm "$algorithm" >/dev/null
     sh_on "$name" "ipfs config --json Bootstrap '[${bootstrap%,}]' \
         && ipfs config --json AutoConf.Enabled false \
         && ipfs config --json DNS.Resolvers '{}' \
@@ -93,12 +94,14 @@ podman build -q -t "$image" -f tests/mesh/Containerfile tests/mesh >/dev/null
 podman network create --subnet 11.0.0.0/24 "$net" >/dev/null
 say "$(ipfs version) against hk"
 
-say "a Kubo hub, and a Kubo provider joined by it"
+# The hub's key is RSA, as Amino's bootstrap peers' are, and many of
+# its older peers'
+say "a Kubo hub with an RSA key, and a Kubo provider joined by it"
 machine hub
-kubo_up hub
+kubo_up hub rsa
 hub=$(kubo_addr hub)
 machine provider
-kubo_up provider "$hub"
+kubo_up provider ed25519 "$hub"
 provider_id=$(on provider ipfs id -f '<id>')
 
 say "an hk node in Amino, joined by the hub alone"
