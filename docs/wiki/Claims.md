@@ -211,7 +211,10 @@ private network, so its peers reach its Kademlia DHT
   be kept to oneself). Bitswap holds nothing for anyone: a node gets only
   what it asks for. Whoever wanted something once may again, so what's
   fetched is served back; it's never announced, since provider records
-  are kept by indexers long after they lapse.
+  are kept by indexers long after they lapse. Kubo wants things only of
+  peers it's had blocks from, on its LAN or peered (`Peering.Peers`),
+  and a few at random, so what's only served reaches a Kubo node that
+  peers this one, or has had blocks of it before.
 - **What isn't served**, private or missing, is said not to be had alike,
   where the asker wants to be told, and only after 50 ms and up to 50 ms
   more at random: how long it takes says nothing of which.
@@ -223,12 +226,14 @@ private network, so its peers reach its Kademlia DHT
   --amino` asks regardless. Providers of each root are looked for in the
   DHT and asked, with whoever's connected, and what they send is kept,
   each block checked against its CID, and what it links to wanted too.
+  With nothing arriving for 3 s, what's still wanted is wanted again,
+  since an answer lost isn't sent again.
   `--private` keeps what's fetched to oneself, answered as missing.
 - **Announcing**: what each `announce` claim names is provided on the
   DHT, an anchor as what it is now and a group, such as a tag, as its
-  members, as Kubo's `roots` strategy does; looked at again every minute,
-  what's no longer to be is no longer provided, and the DHT republishes
-  the rest. Nothing fetched is ever announced. A provider record says
+  members, as Kubo's `roots` strategy does; looked at again within 5 s
+  of the catalog changing, and every minute regardless, what's no longer
+  to be is no longer provided, and the DHT republishes the rest. Nothing fetched is ever announced. A provider record says
   where the node's reached, which takes a public address, or
   `amino-server`.
 - **Joining**: Amino's bootstrap peers, unless `amino-bootstrap` says

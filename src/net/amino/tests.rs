@@ -66,7 +66,7 @@ async fn swarm(catalog: Catalog) -> (Amino, Multiaddr) {
         .authenticate(libp2p::noise::Config::new(&key).expect("noise"))
         .multiplex(libp2p::yamux::Config::default())
         .boxed();
-    let mut amino = Amino::new(transport, &key, catalog, &[]).expect("amino");
+    let mut amino = Amino::new(transport, &key, catalog, &[]);
     amino.listen(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
     loop {
         if let Event::Listening(at) = amino.next().await.expect("event") {
@@ -183,7 +183,7 @@ async fn joining(catalog: Catalog, bootstrap: &[Multiaddr]) -> (Amino, Multiaddr
         .authenticate(libp2p::noise::Config::new(&key).expect("noise"))
         .multiplex(libp2p::yamux::Config::default())
         .boxed();
-    let mut amino = Amino::new(transport, &key, catalog, bootstrap).expect("amino");
+    let mut amino = Amino::new(transport, &key, catalog, bootstrap);
     amino.listen(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
     amino.serve_dht();
     loop {

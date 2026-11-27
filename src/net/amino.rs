@@ -65,8 +65,17 @@ const IDLE: Duration = Duration::from_secs(20);
 const IDLE: Duration = Duration::from_secs(1);
 const LONGEST: Duration = Duration::from_mins(5);
 
+/// How long a fetch waits with nothing arriving before wanting what it
+/// still wants again, of whoever was asked: an answer may be lost, as
+/// when a peer's stream is reset, and Kubo's server doesn't send again.
+const REWANT: Duration = Duration::from_secs(3);
+
 /// How often what's to be announced is looked at again.
 const ANNOUNCE: Duration = Duration::from_mins(1);
+
+/// How soon it's looked at again once the catalog's changed: what's made
+/// public is announced in seconds, however busy the catalog.
+const ANNOUNCE_SOON: Duration = Duration::from_secs(5);
 
 /// The most providers of a root asked.
 const PROVIDERS: usize = 20;
@@ -123,6 +132,8 @@ struct Fetching {
     asked: HashSet<PeerId>,
     began: Instant,
     last: Instant,
+    /// When what's still wanted was last wanted again.
+    rewanted: Instant,
     reply: Option<tokio::sync::oneshot::Sender<Fetched>>,
 }
 
@@ -132,6 +143,7 @@ pub struct Behaviour {
     ping: ping::Behaviour,
     kad: kad::Behaviour<kad::store::MemoryStore>,
     streams: libp2p_stream::Behaviour,
+    inbound: inbound::Behaviour,
 }
 
 /// The swarm's key: generated, and kept, the first time it's asked for.
@@ -186,7 +198,9 @@ pub struct Amino {
     swarm: Swarm<Behaviour>,
     catalog: Catalog,
     control: libp2p_stream::Control,
-    incoming: libp2p_stream::IncomingStreams,
+    /// Bitswap's incoming streams, till the swarm runs and a task of
+    /// their own takes them.
+    incoming: Option<tokio::sync::mpsc::UnboundedReceiver<inbound::Incoming>>,
     read: tokio::sync::mpsc::UnboundedSender<Read>,
     reads: tokio::sync::mpsc::UnboundedReceiver<Read>,
     /// The ports it listens on, so an address it's seen at on one of them
@@ -201,6 +215,8 @@ pub struct Amino {
     /// looked at.
     providing: HashSet<Vec<u8>>,
     announced_at: Option<Instant>,
+    /// The catalog's generation when what's announced was looked at.
+    announced_of: Option<i64>,
     /// Whether it's a server of the DHT reached where it listens.
     serving: bool,
 }
@@ -208,12 +224,9 @@ pub struct Amino {
 impl Amino {
     /// A swarm over a transport, answering from the catalog, which knows
     /// these peers to start from.
-    ///
-    /// # Errors
-    ///
-    /// If Bitswap's protocol can't be taken.
-    pub fn new(transport: Boxed<(PeerId, StreamMuxerBox)>, key: &Keypair, catalog: Catalog, bootstrap: &[Multiaddr]) -> Result<Self> {
+    pub fn new(transport: Boxed<(PeerId, StreamMuxerBox)>, key: &Keypair, catalog: Catalog, bootstrap: &[Multiaddr]) -> Self {
         let peer = key.public().to_peer_id();
+        let (streams, incoming) = tokio::sync::mpsc::unbounded_channel();
         let mut kad = kad::Behaviour::with_config(peer, kad::store::MemoryStore::new(peer), kad::Config::new(KAD));
         for addr in bootstrap {
             if let Some(libp2p::multiaddr::Protocol::P2p(id)) = addr.iter().last() {
@@ -225,19 +238,19 @@ impl Amino {
             ping: ping::Behaviour::default(),
             kad,
             streams: libp2p_stream::Behaviour::new(),
+            inbound: inbound::Behaviour::new(StreamProtocol::new(bitswap::PROTOCOL), streams),
         };
         let swarm = Swarm::new(transport, behaviour, peer, libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(Duration::from_mins(1)));
-        let mut control = swarm.behaviour().streams.new_control();
-        let incoming = control.accept(StreamProtocol::new(bitswap::PROTOCOL)).map_err(|e| Error::Invalid(e.to_string()))?;
+        let control = swarm.behaviour().streams.new_control();
         let (read, reads) = tokio::sync::mpsc::unbounded_channel();
         let (ask, asks) = tokio::sync::mpsc::unbounded_channel();
         let handle = Handle { asks: ask };
-        let mut amino = Self { swarm, catalog, control, incoming, read, reads, ports: Vec::new(), asks, handle, fetches: Vec::new(), searches: HashMap::new(), providing: HashSet::new(), announced_at: None, serving: false };
+        let mut amino = Self { swarm, catalog, control, incoming: Some(incoming), read, reads, ports: Vec::new(), asks, handle, fetches: Vec::new(), searches: HashMap::new(), providing: HashSet::new(), announced_at: None, announced_of: None, serving: false };
         if !bootstrap.is_empty() {
             // Joining the DHT, which the behaviour does again now and then
             let _ = amino.swarm.behaviour_mut().kad.bootstrap();
         }
-        Ok(amino)
+        amino
     }
 
     pub fn peer_id(&self) -> PeerId {
@@ -322,14 +335,20 @@ impl Amino {
     /// The next thing that happens which the runner cares about; what else
     /// happens is dealt with on the way.
     pub async fn next(&mut self) -> Result<Event> {
+        if let Some(incoming) = self.incoming.take() {
+            tokio::spawn(accept(incoming, self.read.clone()));
+        }
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 Some(ask) = self.asks.recv() => self.begin(ask),
                 _ = tick.tick() => {
                     self.finish();
-                    if self.announced_at.is_none_or(|at| at.elapsed() >= ANNOUNCE) {
+                    let generation = self.catalog.generation().ok();
+                    let changed = generation != self.announced_of;
+                    if self.announced_at.is_none_or(|at| at.elapsed() >= ANNOUNCE || (changed && at.elapsed() >= ANNOUNCE_SOON)) {
                         self.announced_at = Some(Instant::now());
+                        self.announced_of = generation;
                         self.announce();
                     }
                 },
@@ -337,17 +356,6 @@ impl Amino {
                     if let Some(event) = self.handle(event) {
                         return Ok(event);
                     }
-                },
-                Some((peer, stream)) = self.incoming.next() => {
-                    let read = self.read.clone();
-                    tokio::spawn(async move {
-                        let mut stream = stream;
-                        while let Ok(Some(message)) = bitswap::read(&mut stream).await {
-                            if read.send((peer, message)).is_err() {
-                                break;
-                            }
-                        }
-                    });
                 },
                 Some((peer, message)) = self.reads.recv() => {
                     self.answer(peer, &message);
@@ -445,7 +453,7 @@ impl Amino {
         }
         let now = Instant::now();
         let fetch = self.fetches.len();
-        self.fetches.push(Fetching { wanted, dag: ask.dag, share: ask.share, fetched: 0, asked: HashSet::new(), began: now, last: now, reply: Some(ask.reply) });
+        self.fetches.push(Fetching { wanted, dag: ask.dag, share: ask.share, fetched: 0, asked: HashSet::new(), began: now, last: now, rewanted: now, reply: Some(ask.reply) });
         for root in &ask.roots {
             let search = self.swarm.behaviour_mut().kad.get_providers(kad::RecordKey::new(&root.multihash().to_bytes()));
             self.searches.insert(search, fetch);
@@ -521,6 +529,7 @@ impl Amino {
     fn finish(&mut self) {
         let now = Instant::now();
         let mut done = Vec::new();
+        let mut again = Vec::new();
         for (index, fetching) in self.fetches.iter_mut().enumerate() {
             // Not idle while providers are still being looked for
             let searching = self.searches.values().any(|fetch| *fetch == index);
@@ -529,7 +538,14 @@ impl Amino {
             if over && let Some(reply) = fetching.reply.take() {
                 let _ = reply.send(Fetched { fetched: fetching.fetched, missing: fetching.wanted.values().cloned().collect() });
                 done.push(index);
+            } else if fetching.reply.is_some() && now.duration_since(fetching.last.max(fetching.rewanted)) >= REWANT {
+                fetching.rewanted = now;
+                let wants: Vec<Entry> = fetching.wanted.values().map(|cid| Entry { cid: cid.clone(), priority: 1, cancel: false, want: WantType::Block, send_dont_have: true }).collect();
+                again.extend(fetching.asked.iter().map(|peer| (*peer, wants.clone())));
             }
+        }
+        for (peer, wants) in again {
+            self.send(peer, Message { wants, ..Message::default() });
         }
         // Done with, the searches for them go, and once none's under way the
         // list starts again
@@ -538,6 +554,20 @@ impl Amino {
             self.fetches.clear();
             self.searches.clear();
         }
+    }
+}
+
+/// Read each of Bitswap's incoming streams, every message on it.
+async fn accept(mut incoming: tokio::sync::mpsc::UnboundedReceiver<inbound::Incoming>, read: tokio::sync::mpsc::UnboundedSender<Read>) {
+    while let Some((peer, mut stream)) = incoming.recv().await {
+        let read = read.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(message)) = bitswap::read(&mut stream).await {
+                if read.send((peer, message)).is_err() {
+                    break;
+                }
+            }
+        });
     }
 }
 
@@ -612,7 +642,7 @@ pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multi
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
             runtime.block_on(async {
                 let bootstrap = bootstrap.unwrap_or_else(|| BOOTSTRAP.iter().filter_map(|addr| addr.parse().ok()).collect());
-                let mut amino = Amino::new(transport(&key)?, &key, Catalog::open_repo(&repo)?, &bootstrap)?;
+                let mut amino = Amino::new(transport(&key)?, &key, Catalog::open_repo(&repo)?, &bootstrap);
                 amino.listen(addr)?;
                 if server {
                     amino.serve_dht();
@@ -632,6 +662,8 @@ pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multi
     })?;
     Ok(())
 }
+
+mod inbound;
 
 #[cfg(test)]
 mod tests;

@@ -481,6 +481,7 @@ Checklist:
   - [x] A swarm of its own for Amino, with a key of its own and no private network: its DHT (`/ipfs/kad/1.0.0`) and Bitswap 1.2.0, answering wants for what's public and what was fetched to be shared, and saying what's private or missing isn't had alike, after a floor of time (`hk node run --amino`)
   - [x] Bitswap fetching from Amino, for what the mesh hasn't got, of a CID nothing here links to so asking says nothing of what's private: providers looked for in the DHT, shared back on request, never announced, unless fetched to be kept to oneself (`hk dag fetch [--amino] [--private]`)
   - [x] Providing announced roots on Amino, and reproviding them: an anchor as what it is now, a tag as its members; withdrawn once private again (`amino-server` for a DHT server on a LAN)
+  - [x] Checked against Kubo 0.42 both ways: each fetching what the other announced, found through the DHT, and what's only served got by a Kubo node peering hk (`tests/mesh/kubo.sh`)
 - [ ] BitTorrent bridging
 - [ ] User ownership model
   - [x] A user's root key certifies its devices; claims count only when an authorized device signs them; revoking a device signs again what it said before it was lost (`hk device list/revoke`, certificates in `hk node invite` tickets)
@@ -624,6 +625,7 @@ LARGE=1 scripts/kubo-compare.sh     # adds >1 GiB files
 scripts/git-compare.sh              # git objects vs git and Kubo, loose and packed; needs `ipfs`, `gpg`, `sqlite3`
 scripts/mount-stress.sh [seconds]   # writers and readers at once through a real mount, beside compacts and a held lock
 tests/mesh/run.sh                   # a mesh of real nodes, daemons and mounts, in containers
+tests/mesh/kubo.sh                  # Amino against Kubo's DHT and Bitswap, in containers; needs `ipfs`
 ```
 
 The mesh tests run each node in a rootless [Podman](https://podman.io) container on a network of its own, with the `hk` just built bind-mounted in: joining, writing on one node and reading on another, a node joining late, and a node cut off from the network, so both sides change the wiki, then put back, so they merge. Nothing runs as root on the host. Podman needs subordinate IDs for your account, once: `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER && podman system migrate`. `KEEP=1` leaves the containers to look at; `tests/mesh/run.sh write_read late_joiner` runs scenarios by name, in order.
