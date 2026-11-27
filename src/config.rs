@@ -114,7 +114,11 @@ pub struct Node {
     pub ping: Option<Duration>,
     /// How long a connection with nothing going on is kept open.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "duration", serialize_with = "show_duration")]
-    pub idle: Option<Duration>,    /// Whether to relay between members which can't reach each other:
+    pub idle: Option<Duration>,    /// Whether to serve what's public over HTTP, as a trustless gateway,
+    /// and where: `true` where `--gateway` alone would.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<Listen>,
+    /// Whether to relay between members which can't reach each other:
     /// for a member others reach where they can't reach each other, as a
     /// server with a public address.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,7 +209,7 @@ impl Config {
         if mesh == "main" {
             return self.node.clone();
         }
-        let base = Node { listen: None, clients: None, door: None, ..self.node.clone() };
+        let base = Node { listen: None, clients: None, door: None, gateway: None, ..self.node.clone() };
         self.mesh.get(mesh).map_or_else(|| base.clone(), |own| own.over(&base))
     }
 }
@@ -232,6 +236,7 @@ impl Node {
             ping: self.ping.or(base.ping),
             idle: self.idle.or(base.idle),
             relay: self.relay.or(base.relay),
+            gateway: self.gateway.clone().or_else(|| base.gateway.clone()),
         }
     }
 }

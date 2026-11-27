@@ -467,6 +467,7 @@ Checklist:
   - [x] Relays: members which can't reach each other connect through a member that relays, and punch through to each other where they can (`relay = true`, `hk node status`)
   - [x] Device names: each device names itself by its hostname, and any may name another, shown by every member (`hk node name`, `hk node peers`)
   - [x] Looking over the mount's work directories, and letting one go (`hk overlay ls/rm`), with what may not need to be there said when the mount starts
+  - [x] A trustless gateway: what's public over HTTP, raw blocks and CARs, fetched through the node if need be, what's private as missing (`hk node run --gateway`); every member hears what's public
   - [ ] A relay that isn't a member: relaying without the swarm key or the mesh's blocks
   - [ ] Kademlia provider records, once broadcast wants don't scale
   - [x] Measuring how far apart members' clocks are, advisorily (`hk node clocks`)

@@ -275,6 +275,28 @@ scenario_lost() {
     [ "$(on one hk cat "$cid")" = "only here" ] || fail "it isn't what it was"
 }
 
+# What's public on one is served over HTTP by two's gateway, which hears
+# it's public and fetches it; what's private there is as missing
+scenario_gateway() {
+    local note private
+    note=$(sh_on one 'echo "anyone may read this" | hk add -q -')
+    private=$(sh_on one 'echo "only mine" | hk add -q -')
+    on one hk public add --serve "$note" >/dev/null
+    node_down two
+    node_up two --gateway
+    # A raw block over plain HTTP, as any trustless client asks
+    http() { on two bash -c "exec 3<>/dev/tcp/127.0.0.1/4014; printf 'GET /ipfs/$1?format=raw HTTP/1.1\\r\\nHost: two\\r\\nConnection: close\\r\\n\\r\\n' >&3; cat <&3"; }
+    local deadline=$((SECONDS + timeout))
+    until http "$note" | grep -q 'anyone may read this'; do
+        [ $SECONDS -lt $deadline ] || fail "waited ${timeout}s for two's gateway to serve what one made public: $(http "$note" | head -1)"
+        sleep 0.5
+    done
+    http "$note" | head -1 | grep -q " 200 " || fail "not served as 200"
+    http "$private" | head -1 | grep -q " 404 " || fail "what's private wasn't answered as missing"
+    node_down two
+    node_up two
+}
+
 # A directory watched from empty: a download under way isn't imported till
 # it's renamed, a new subdirectory's noticed, and once it's not watched,
 # nothing more is
@@ -853,7 +875,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read names served edits copies whole late_joiner fork_merge lost watch forget car restore revoke shared client thin visitor expiry door several relayed)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read names served edits copies whole gateway late_joiner fork_merge lost watch forget car restore revoke shared client thin visitor expiry door several relayed)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

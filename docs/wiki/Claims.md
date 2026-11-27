@@ -181,8 +181,14 @@ anyone's to have, in a mode:
   new claim, `n`. Who's authorized changing, every unit's built again.
 - **A whole CID is public if its layout is**, as a `unixfs` same claim
   says (see [[#Same]]).
-- A mode not known is kept, and makes nothing public. Nothing serves or
-  announces yet: Bitswap and Amino will read this.
+- A mode not known is kept, and makes nothing public. Nothing announces
+  yet, and Bitswap doesn't serve yet: Amino will read this. The
+  [[#Gateway]] serves what's public over HTTP.
+- **Every member hears what's public**, holding it or not: a notice
+  marks public claims as wanted by all, so any member can serve what's
+  public, fetching it if need be. What's under a public root is known to
+  be once what links to it is here, so it's known block by block as a
+  reader walks it, or all at once with a CAR.
 
 ```
 hk public add [--serve] <cid>…   # anyone's to have; announced unless --serve
@@ -191,6 +197,28 @@ hk public ls                      # mode and root of each
 hk public check <cid>             # public or private, by whatever reaches it
 hk public rm <cid>                # private again
 ```
+
+## Gateway
+
+`hk node run --gateway [addr]` (or `gateway = true` in
+[[Configuration]]) serves what's public over HTTP as a trustless
+gateway, as the IPFS spec has it, for whatever can't reach the mesh: a
+browser, `curl`, any IPFS client, which checks each block against its
+CID, so nothing needs trusting.
+
+- `GET` or `HEAD /ipfs/<cid>?format=raw` (or `Accept:
+  application/vnd.ipld.raw`) is the block; a whole file's CID, which is
+  no block, is the file, read through its layout.
+- `?format=car` (or `Accept: application/vnd.ipld.car`) is a `CARv1` of
+  the DAG under it, depth first, each block once; `dag-scope=block`, of
+  it alone.
+- Only what's public is served, and what isn't here is fetched through
+  the node, only if it's public. What's private is answered exactly as
+  what's missing is, `404`.
+- Paths under a CID, and other formats, aren't served (`400`, `406`).
+- It's plain HTTP, on `127.0.0.1:4014` by default, for a reverse proxy
+  in front to give it HTTPS. A connection has a thread of its own, at
+  most 32 at once, idle ones closed after 15 s.
 
 ## Names
 

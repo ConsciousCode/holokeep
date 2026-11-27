@@ -52,6 +52,11 @@ pub struct Notice {
     /// claims shared with them: all wanted that aren't here.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     guest: bool,
+    /// Which of them every member wants, whatever it holds: claims of
+    /// what's public, so any member can serve it, fetching it if need be.
+    /// Left out by older builds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    everyone: Vec<ByteBuf>,
 }
 
 super::hosts::for_user!(Notice);
@@ -100,6 +105,10 @@ pub fn notices(catalog: &Catalog, structure: &[Link]) -> Result<Vec<Notice>> {
         // continues: those would draw every signature to any holder of one
         let links = match crate::claim::Claim::parse(block.data()) {
             Some(crate::claim::Claim::Sign(sign)) => sign.signs().to_vec(),
+            Some(crate::claim::Claim::Public(public)) => {
+                notice.everyone.push(ByteBuf::from(cid.to_bytes()));
+                public.target().to_vec()
+            },
             _ => crate::links::links(cid.codec(), block.data()).unwrap_or_default(),
         };
         if links.is_empty() {
@@ -181,6 +190,12 @@ pub fn answer(catalog: &Catalog, notice: &Notice) -> Result<Wants> {
     }
     let mut wanted = std::collections::BTreeSet::new();
     let mut want = Vec::new();
+    // What every member wants, whatever it holds
+    for (cid, key, _) in &candidates {
+        if notice.everyone.iter().any(|everyone| everyone.as_slice() == cid.as_slice()) && wanted.insert(key.clone()) {
+            want.push((*cid).clone());
+        }
+    }
     loop {
         let before = want.len();
         for (cid, key, targets) in &candidates {

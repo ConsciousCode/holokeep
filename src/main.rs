@@ -672,6 +672,12 @@ struct RunArgs {
     /// mesh's, which no one let in there reaches
     #[arg(long, num_args = 0..=1, default_missing_value = holokeep::net::daemon::LISTEN_DOOR)]
     door: Option<String>,
+    /// Serve what's public over HTTP too, here [default: 127.0.0.1:4014],
+    /// as a trustless gateway: `/ipfs/<cid>?format=raw` or `format=car`,
+    /// which whoever reads it checks. Plain HTTP, so on loopback by
+    /// default, for a reverse proxy in front to give it HTTPS
+    #[arg(long, num_args = 0..=1, default_missing_value = holokeep::gateway::LISTEN)]
+    gateway: Option<String>,
 }
 
 #[derive(Subcommand, Debug, Clone, Copy)]
@@ -2204,12 +2210,14 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
 #[cfg(feature = "net")]
 fn node_run(place: &holokeep::net::mesh::Place, args: RunArgs) -> anyhow::Result<()> {
     use holokeep::net::daemon;
-    let RunArgs { listen, copies, low_water, high_water, target, no_collect, no_lost_scan, shared, clients, door } = args;
+    let RunArgs { listen, copies, low_water, high_water, target, no_collect, no_lost_scan, shared, clients, door, gateway } = args;
     let config = holokeep::config::Config::load(&place.repo)?;
     let tuned = config.node(&place.mesh);
     let listen = listen.or(tuned.listen).unwrap_or_else(|| if place.is_main() { daemon::LISTEN } else { "/ip4/0.0.0.0/tcp/0" }.to_owned());
     let clients = clients.or_else(|| tuned.clients.and_then(|clients| clients.at(daemon::LISTEN_CLIENTS)));
     let door = door.or_else(|| tuned.door.and_then(|door| door.at(daemon::LISTEN_DOOR)));
+    let gateway = gateway.or_else(|| tuned.gateway.and_then(|gateway| gateway.at(holokeep::gateway::LISTEN)));
+    anyhow::ensure!(gateway.is_none() || place.is_main(), "the gateway is the main mesh's");
     anyhow::ensure!(clients.is_none() || place.is_main(), "clients are of the main mesh");
     let listen = daemon::Listen {
         members: listen.parse().context("not a multiaddr")?,
@@ -2217,6 +2225,15 @@ fn node_run(place: &holokeep::net::mesh::Place, args: RunArgs) -> anyhow::Result
     };
     if let Some(door) = door {
         holokeep::net::door::open(&place.repo, &holokeep::net::mesh::node_key(&place.repo)?, door.parse().context("not a multiaddr")?)?;
+    }
+    if let Some(gateway) = gateway {
+        let asking = holokeep::net::mesh::Place::main(&place.repo);
+        let fetch: holokeep::gateway::Fetcher = std::sync::Arc::new(move |cids: &[Link], dag: bool| match (dag, cids.first()) {
+            (true, Some(root)) => matches!(daemon::fetch(&asking, root), Ok(Some(_))),
+            _ => matches!(daemon::fetch_blocks(&asking, cids), Ok(Some(_))),
+        });
+        let at = holokeep::gateway::open(&place.repo, &gateway, Some(fetch)).with_context(|| format!("serving the gateway on {gateway}"))?;
+        eprintln!("the gateway serves what's public on http://{at}");
     }
     let copies = copies.or(tuned.copies).unwrap_or(2);
     let marks = holokeep::net::trim::Watermarks::new(low_water.or(tuned.low_water).unwrap_or(2 << 30), high_water.or(tuned.high_water).unwrap_or(4 << 30)).with_target(target.or(tuned.target));

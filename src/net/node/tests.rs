@@ -2491,3 +2491,22 @@ async fn names_reach_every_member() {
     a.announce().expect("announce");
     assert!(until(&mut [&mut a, &mut b], |n| names(n[1]).contains(&(theirs.clone(), "theseus-desk".to_owned()))).await, "{:?}", names(&b));
 }
+
+/// What's public is known to every member, holding it or not, so any can
+/// serve it, fetching it if need be.
+#[tokio::test]
+async fn every_member_hears_whats_public() {
+    let (mut a, mut b, blocks) = Box::pin(holding()).await;
+    one_user(&mut [&mut a, &mut b]);
+    let root = link(blocks.first().expect("root"));
+    let leaf = link(blocks.get(2).expect("leaf"));
+    assert!(!b.catalog().has(root.multihash()).expect("has"), "b holds none of it");
+    a.catalog().publish(&root, crate::claim::Public::SERVE).expect("publish");
+    a.announce().expect("announce");
+    assert!(until(&mut [&mut a, &mut b], |n| n[1].catalog().is_public(&root).unwrap_or(false)).await, "b knows it's public");
+    assert!(!b.catalog().has(root.multihash()).expect("has"), "and holds it no more for that");
+    // What's under it is known so as what links to it arrives
+    assert!(!b.catalog().is_public(&leaf).expect("public"), "nothing here links to it yet");
+    assert_eq!(fetch(&mut a, &mut b, root).await.0, 4);
+    assert!(b.catalog().is_public(&leaf).expect("public"));
+}
