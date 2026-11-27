@@ -1413,6 +1413,9 @@ fn amino_status_for(peers: bool, write: OwnedWriteHalf) -> std::result::Result<(
                 let _ = writeln!(out, "connected to {}", status.peers.len());
                 let _ = writeln!(out, "asked a router who has a block {} time{}", status.routed, if status.routed == 1 { "" } else { "s" });
                 let _ = writeln!(out, "reached {} through a relay, and punched through to {} of them", status.relayed, status.punched);
+                if status.private {
+                    let _ = writeln!(out, "behind a NAT, as AutoNAT finds, reached through {} relay{}", status.reserved.len(), if status.reserved.len() == 1 { "" } else { "s" });
+                }
                 if let Some(failed) = &status.failed {
                     let _ = writeln!(out, "last failed dial: {failed}");
                 }

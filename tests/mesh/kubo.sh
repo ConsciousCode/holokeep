@@ -27,7 +27,7 @@ cleanup() {
     for node in "${nodes[@]}"; do
         podman rm -f -t 0 "$node" >/dev/null 2>&1 || true
     done
-    podman network rm -f "$net" "$net-behind" >/dev/null 2>&1 || true
+    podman network rm -f "$net" "$net-behind" "$net-nat" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -56,8 +56,8 @@ wait_for() {
 }
 
 machine() {
-    local name=$1
-    podman run -d --name "$run-$name" --hostname "$name" --network "$net" \
+    local name=$1 network=${2:-$net}
+    podman run -d --name "$run-$name" --hostname "$name" --network "$network" \
         -v "$PWD/target/release/hk:/usr/local/bin/hk:ro" \
         -v "$ipfs_bin:/usr/local/bin/ipfs:ro" \
         -e HK_PASSPHRASE=kubo-test -e IPFS_PATH=/root/.ipfs -e IPFS_TELEMETRY=off \
@@ -98,6 +98,9 @@ podman network create --subnet 11.0.0.0/24 "$net" >/dev/null
 # A network hk isn't on, with no way out, reached only through the hub,
 # which is on both
 podman network create --internal --subnet 12.0.0.0/24 "$net-behind" >/dev/null
+# And one behind a NAT, which lets out what's dialled from it, through
+# the host, and lets nothing in
+podman network create --subnet 13.0.0.0/24 "$net-nat" >/dev/null
 say "$(ipfs version) against hk"
 
 # The hub's key is RSA, as Amino's bootstrap peers' are, and many of
@@ -158,6 +161,7 @@ sh_on hk "head -c 2500000 /dev/urandom > /tmp/announced"
 announced=$(on hk hk add -q /tmp/announced)
 on hk hk public add "$announced" >/dev/null
 seeker() { sh_on provider "timeout 10 ipfs routing findprovs -n 5 $1" | grep -q "$hk_id"; }
+seeker_of() { sh_on provider "timeout 10 ipfs routing findprovs -n 5 $2" | grep -q "$1"; }
 wait_for "Kubo to find hk providing what it announced" seeker "$announced"
 sh_on provider "timeout 60 ipfs cat $announced > /tmp/got" || fail "Kubo couldn't fetch $announced from hk"
 [ "$(sh_on provider 'sha256sum < /tmp/got')" = "$(sh_on hk 'sha256sum < /tmp/announced')" ] || fail "Kubo fetched something else"
@@ -174,6 +178,35 @@ wait_for "the hub to connect to hk" sh_on hub "ipfs swarm peers | grep -q $hk_id
 [ "$(sh_on hub "timeout 30 ipfs cat $served")" = "served, not announced" ] || fail "Kubo couldn't fetch what hk serves"
 ! sh_on hub "timeout 10 ipfs cat $private" >/dev/null 2>&1 || fail "Kubo fetched what's private"
 ! sh_on provider "timeout 10 ipfs routing findprovs -n 1 $served" | grep -q "$hk_id" || fail "what hk only serves was announced"
+
+say "an hk node behind a NAT reserves a slot on the hub, and Kubo fetches what it announced, punched through to"
+machine natted "$net-nat"
+on natted hk node id >/dev/null
+sh_on natted "printf '[node]\namino-bootstrap = [\"$hub\"]\namino-routers = []\n' > ~/.holokeep/config.toml"
+podman exec -d "$run-natted" sh -c "exec hk node run --amino >>/tmp/node.log 2>&1"
+wait_for "the natted node to join its Amino" sh_on natted "grep -q 'in Amino as' /tmp/node.log"
+natted_id=$(sh_on natted "grep 'in Amino as' /tmp/node.log | tail -1 | awk '{ print \$NF }'")
+timeout=120 wait_for "the natted node to find it's behind a NAT, and be reached through the hub" sh_on natted "hk node amino | grep -q 'reached through [1-9][0-9]* relay'"
+on natted hk node amino | grep -q "^reached at .*/p2p-circuit" || fail "the natted node isn't reached through the relay"
+on natted hk node amino | grep -q "client of the DHT" || fail "the natted node took itself for a server of the DHT"
+sh_on natted "head -c 400000 /dev/urandom > /tmp/natted"
+natted_file=$(on natted hk add -q /tmp/natted)
+on natted hk public add "$natted_file" >/dev/null
+# A record that times out, its query waiting out dials to where the
+# relays are reached from their other networks, is provided again a
+# minute on
+timeout=180 wait_for "Kubo to find the natted node providing it" seeker_of "$natted_id" "$natted_file"
+# A Kubo node it has no cause to dial, a client of the DHT relaying for
+# no one, so it reaches the natted node through a relay alone, and has
+# the file once the natted node has punched through to it. Podman routes
+# between its networks, so it's kept from dialling into the natted one,
+# as a NAT would keep it. It listens over QUIC too, as Kubo does unless
+# told otherwise, and as punching through mostly needs
+machine fetcher
+CONFIG='ipfs config Routing.Type dhtclient && ipfs config --json Swarm.RelayService.Enabled false && ipfs config --json Swarm.AddrFilters "[\"/ip4/13.0.0.0/ipcidr/24\"]"' SWARM='["/ip4/0.0.0.0/tcp/4001","/ip4/0.0.0.0/udp/4001/quic-v1"]' kubo_up fetcher ed25519 "$hub"
+sh_on fetcher "timeout 90 ipfs cat $natted_file > /tmp/natted" || fail "Kubo couldn't fetch $natted_file from behind the NAT"
+[ "$(sh_on fetcher 'sha256sum < /tmp/natted')" = "$(sh_on natted 'sha256sum < /tmp/natted')" ] || fail "Kubo fetched something else from behind the NAT"
+on natted hk node amino | grep -q "punched through to [1-9]" || fail "the natted node didn't punch through"
 
 # Kubo serves nothing over a relayed connection, which a relay cuts off
 # soon anyway: what's had of a node behind one is had once DCUtR has

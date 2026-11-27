@@ -20,6 +20,8 @@ use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::Boxed;
 use libp2p::identity::Keypair;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
+use libp2p::core::transport::ListenerId;
+use libp2p::multiaddr::Protocol;
 use libp2p::swarm::ConnectionId;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, autonat, dcutr, identify, kad, ping, relay};
@@ -107,6 +109,13 @@ pub const GATEWAY_REQUESTS: usize = 8;
 /// more: a gateway with none of it says so as quickly as one with all.
 const GATEWAY_FAILS: usize = 16;
 
+/// How many relays it's reached through, behind a NAT: more than one, so
+/// losing one doesn't leave it unreached till another's found.
+const RELAYS: usize = 2;
+
+/// How long a relay that refused or dropped its reservation is let be.
+const REFUSED_FOR: Duration = Duration::from_mins(10);
+
 /// How often it's sought again, of another block, while nothing arrives.
 #[cfg(not(test))]
 const SEEK_AGAIN: Duration = Duration::from_secs(5);
@@ -152,6 +161,10 @@ pub struct Status {
     /// to directly from there.
     pub relayed: usize,
     pub punched: usize,
+    /// Whether it's found to be behind a NAT, and the relays it's reached
+    /// through if so.
+    pub private: bool,
+    pub reserved: Vec<PeerId>,
 }
 
 /// A way to ask the running swarm to fetch, or how it is.
@@ -426,6 +439,15 @@ pub struct Amino {
     relayed: HashMap<PeerId, Vec<ConnectionId>>,
     relayed_to: usize,
     punched: usize,
+    /// Whether it's found to be behind a NAT, reached by no one dialling
+    /// it: then it's reached through relays, reserving a slot on each.
+    private: bool,
+    /// Who'd relay for it, where they listen; which relays it's reserved
+    /// on, by the listener reaching it there; and which refused or dropped
+    /// it, and when.
+    relays: HashMap<PeerId, Multiaddr>,
+    reserved: HashMap<ListenerId, PeerId>,
+    refused: HashMap<PeerId, Instant>,
     /// The peers a router found that are being dialled, and the fetches
     /// they're to be asked for once connected.
     dialling: HashMap<PeerId, Vec<u64>>,
@@ -496,6 +518,10 @@ impl Amino {
             relayed: HashMap::new(),
             relayed_to: 0,
             punched: 0,
+            private: false,
+            relays: HashMap::new(),
+            reserved: HashMap::new(),
+            refused: HashMap::new(),
             searches: HashMap::new(),
             providing: HashSet::new(),
             announced_at: None,
@@ -581,6 +607,8 @@ impl Amino {
             routed: self.routed,
             relayed: self.relayed_to,
             punched: self.punched,
+            private: self.private,
+            reserved: self.reserved.values().copied().collect(),
         }
     }
 
@@ -658,11 +686,40 @@ impl Amino {
     fn handle(&mut self, event: SwarmEvent<BehaviourEvent>) -> Option<Event> {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
-                let anywhere = address.iter().any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::Ip4(ip) if ip.is_unspecified() || ip.is_loopback()));
-                if self.serving && !anywhere {
+                let anywhere = address.iter().any(|protocol| matches!(protocol, Protocol::Ip4(ip) if ip.is_unspecified() || ip.is_loopback()));
+                // Reserved on a relay, it's reached there, as provider
+                // records and identify say
+                if (self.serving && !anywhere) || is_relayed(&address) {
                     self.swarm.add_external_address(address.clone());
                 }
                 Some(Event::Listening(address))
+            },
+            SwarmEvent::ExpiredListenAddr { address, .. } => {
+                if is_relayed(&address) {
+                    self.swarm.remove_external_address(&address);
+                }
+                None
+            },
+            // A relay that's dropped it, or refused it, is let be a while,
+            // and another found
+            SwarmEvent::ListenerClosed { listener_id, addresses, .. } => {
+                if let Some(relay) = self.reserved.remove(&listener_id) {
+                    for address in addresses {
+                        self.swarm.remove_external_address(&address);
+                    }
+                    self.refused.insert(relay, Instant::now());
+                    self.reserve();
+                }
+                None
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Autonat(autonat::Event::StatusChanged { new, .. })) => {
+                self.private = matches!(new, autonat::NatStatus::Private);
+                if self.private {
+                    self.reserve();
+                } else if matches!(new, autonat::NatStatus::Public(_)) {
+                    self.release();
+                }
+                None
             },
             SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, result: kad::QueryResult::GetProviders(result), step, .. })) => {
                 if let (Some(&Search { fetch, .. }), Ok(kad::GetProvidersOk::FoundProviders { providers, .. })) = (self.searches.get(&id), result) {
@@ -674,6 +731,12 @@ impl Amino {
                 if step.last {
                     self.searches.remove(&id);
                 }
+                None
+            },
+            // A record that didn't reach anyone in time, as when the closest
+            // peers can't be dialled, is provided again at the next look
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result: kad::QueryResult::StartProviding(Err(failed)), .. })) => {
+                self.providing.remove(failed.key().as_ref());
                 None
             },
             SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
@@ -697,6 +760,7 @@ impl Amino {
                 if num_established == 0 {
                     self.connected.remove(&peer_id);
                     self.relayed.remove(&peer_id);
+                    self.relays.remove(&peer_id);
                 }
                 None
             },
@@ -719,21 +783,74 @@ impl Amino {
                 None
             },
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
-                if let Some(known) = self.connected.get_mut(&peer_id) {
-                    known.1 = Some(info.agent_version);
-                }
-                // A server of the DHT, wherever it's connected from, joins
-                // the routing table where it says it listens: as one found
-                // by a router does, so the DHT finds more next time
-                if info.protocols.contains(&KAD) {
-                    let kad = &mut self.swarm.behaviour_mut().kad;
-                    for addr in info.listen_addrs.into_iter().filter(routers::dialable) {
-                        kad.add_address(&peer_id, addr);
-                    }
-                }
+                self.identified(peer_id, info);
                 None
             },
             _ => None,
+        }
+    }
+
+    /// What a peer says of itself: its agent; and where it listens, if it
+    /// serves the DHT or relays.
+    fn identified(&mut self, peer_id: PeerId, info: identify::Info) {
+        if let Some(known) = self.connected.get_mut(&peer_id) {
+            known.1 = Some(info.agent_version);
+        }
+        // One that relays may be reached through, where it listens, over
+        // TCP or QUIC
+        let direct = |addr: &&Multiaddr| routers::dialable(addr) && !is_relayed(addr) && (matches!(addr.iter().nth(1), Some(Protocol::Tcp(_))) || matches!(addr.iter().nth(2), Some(Protocol::QuicV1)));
+        if info.protocols.contains(&relay::HOP_PROTOCOL_NAME)
+            && let Some(at) = info.listen_addrs.iter().find(direct)
+        {
+            self.relays.insert(peer_id, at.clone());
+            self.reserve();
+        }
+        // A server of the DHT, wherever it's connected from, joins the
+        // routing table where it says it listens: as one found by a
+        // router does, so the DHT finds more next time
+        if info.protocols.contains(&KAD) {
+            let kad = &mut self.swarm.behaviour_mut().kad;
+            for addr in info.listen_addrs.into_iter().filter(routers::dialable) {
+                kad.add_address(&peer_id, addr);
+            }
+        }
+    }
+
+    /// Behind a NAT, reserve a slot on relays till it's reached through
+    /// enough of them: listening through each, as `/p2p-circuit`. A
+    /// relayed address doesn't make it a server of the DHT, which it would
+    /// be taken for with an address confirmed, so it's held a client.
+    fn reserve(&mut self) {
+        if !self.private || !self.swarm.behaviour().relayed.is_enabled() {
+            return;
+        }
+        let now = Instant::now();
+        self.refused.retain(|_, at| now.duration_since(*at) < REFUSED_FOR);
+        while self.reserved.len() < RELAYS {
+            let Some((relay, at)) = self.relays.iter().find(|(relay, _)| !self.refused.contains_key(*relay) && !self.reserved.values().any(|reserved| reserved == *relay)).map(|(relay, at)| (*relay, at.clone())) else {
+                break;
+            };
+            match self.swarm.listen_on(at.with(Protocol::P2p(relay)).with(Protocol::P2pCircuit)) {
+                Ok(listener) => {
+                    self.reserved.insert(listener, relay);
+                },
+                Err(_) => {
+                    self.refused.insert(relay, now);
+                },
+            }
+        }
+        if !self.serving && !self.reserved.is_empty() {
+            self.swarm.behaviour_mut().kad.set_mode(Some(kad::Mode::Client));
+        }
+    }
+
+    /// Reached directly, it's reached through relays no more.
+    fn release(&mut self) {
+        for listener in std::mem::take(&mut self.reserved).into_keys() {
+            self.swarm.remove_listener(listener);
+        }
+        if !self.serving {
+            self.swarm.behaviour_mut().kad.set_mode(None);
         }
     }
 
@@ -1097,6 +1214,11 @@ impl Amino {
             self.dialling.clear();
         }
     }
+}
+
+/// Whether an address is through a relay.
+fn is_relayed(addr: &Multiaddr) -> bool {
+    addr.iter().any(|protocol| protocol == Protocol::P2pCircuit)
 }
 
 /// Read each of Bitswap's incoming streams, every message on it.

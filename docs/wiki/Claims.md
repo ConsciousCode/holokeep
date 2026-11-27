@@ -214,6 +214,17 @@ closed once it has, since a relay cuts off what it carries within
 minutes and Kubo serves nothing over it. Punching through mostly takes
 QUIC: TCP seldom gets through a NAT.
 
+Behind a NAT itself, as AutoNAT finds when no peer dialling back
+reaches it, the node reserves a slot on two relays among its peers that
+offer one, listening through each, and is reached at those
+`/p2p-circuit` addresses, as its provider records say; whoever dials it
+there is punched through to from here. A relayed address doesn't make
+it a server of the DHT, so it's held a client meanwhile. A relay that
+refuses or drops it is let be for 10 minutes, and another found; once
+AutoNAT finds it reached directly, it gives the slots up. A provider
+record that reaches no one in time, as when the closest peers can't be
+dialled, is provided again at the next look, a minute on.
+
 - **What's served** to a peer who wants it is what's public, and what was
   fetched from Amino to be shared (all that's fetched, unless fetched to
   be kept to oneself). Bitswap holds nothing for anyone: a node gets only
@@ -292,7 +303,8 @@ where it listens and where it's taken to be reached, whether it's a
 server of the DHT and how many peers its routing table has, how many
 roots it provides, how many peers it's connected to, how many times a
 router's been asked who has a block, how many peers it's reached
-through a relay and punched through to, and the last dial that failed, which says why if it can't join; `--peers` lists each
+through a relay and punched through to, whether it's behind a NAT and
+through how many relays it's reached if so, and the last dial that failed, which says why if it can't join; `--peers` lists each
 connected peer, where, and its agent (`kubo/0.42.0`).
 
 ## Gateway
