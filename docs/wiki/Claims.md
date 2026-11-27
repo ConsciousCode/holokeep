@@ -204,7 +204,10 @@ hk public rm <cid>                # private again
 the public IPFS network: a swarm of its own, apart from the mesh, with a
 key of its own (`amino.key`), so nothing there links to the mesh, and no
 private network, so its peers reach its Kademlia DHT
-(`/ipfs/kad/1.0.0`) and Bitswap 1.2.0, and nothing else.
+(`/ipfs/kad/1.0.0`) and Bitswap 1.2.0, and nothing else. It listens
+over TCP where it's told (port 4015 by default) and over QUIC on the same
+port over UDP, so a firewall should let both in; it dials peers over
+either, as many list QUIC alone.
 
 - **What's served** to a peer who wants it is what's public, and what was
   fetched from Amino to be shared (all that's fetched, unless fetched to

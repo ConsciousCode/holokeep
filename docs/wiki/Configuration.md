@@ -45,7 +45,7 @@ port.
 | `door`       | boolean or multiaddr    | off                             | Open a door: `true` on port 4013, or where it says (`--door`); see [[Capabilities]].                       |
 | `ping`       | duration                | `"10s"`                         | How often a connection's pinged, and how long an answer's waited for, before it's closed and redialled.     |
 | `idle`       | duration                | `"1h"`                          | How long a connection with nothing going on is kept open.                                                  |
-| `amino`      | boolean or multiaddr    | off                             | Take part in Amino, the public IPFS network: `true` on port 4015, or where it says (`--amino`); see [[Claims#Amino]]. The main mesh's only. |
+| `amino`      | boolean or multiaddr    | off                             | Take part in Amino, the public IPFS network: `true` on port 4015, or where it says (`--amino`), over TCP, and over QUIC on the same port over UDP; see [[Claims#Amino]]. The main mesh's only. |
 | `amino-bootstrap` | list of multiaddrs | Amino's own                     | The peers Amino's joined by; empty for none, as for a test of its own. |
 | `amino-routers` | list of URLs        | `delegated-ipfs.dev`, unless `amino-bootstrap` is said | The routers (Routing V1 HTTP API) asked who has a block a fetch is stalled on; empty for none. A router learns what's sought of it; see [[Claims#Amino]]. |
 | `amino-gateway-requests` | number      | 8                               | The most blocks wanted at once of a trustless gateway a router finds, each a request of its own over HTTP; 0 for none to be had over HTTP. |
