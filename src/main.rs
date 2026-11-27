@@ -327,6 +327,14 @@ enum NodeCommand {
     /// the round trip it was measured over: advisory, as nothing's judged
     /// by it
     Clocks,
+    /// How the running node is in Amino: where it's reached, whether it's
+    /// a server of the DHT, how many peers it knows and is connected to,
+    /// and the last dial that failed
+    Amino {
+        /// Each connected peer too: where, and as what
+        #[arg(long)]
+        peers: bool,
+    },
     /// Have the running node audit every block now, not a few at a time:
     /// advertise those short of the copies it runs with, or of these, and
     /// copy them to other members
@@ -2214,6 +2222,14 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
         NodeCommand::Trim => {
             let report = daemon::trim(place)?.context("this node isn't running: start `hk node run`")?;
             out!("let go of {} of {} spare blocks, freeing {}", report.dropped, report.considered, health::bytes(report.freed));
+        },
+        NodeCommand::Amino { peers } => {
+            for line in &daemon::ask(place, if peers { "amino peers" } else { "amino" })?.context("this node isn't running: start `hk node run`")? {
+                if let Some(e) = line.strip_prefix("error: ") {
+                    anyhow::bail!("{e}");
+                }
+                out!("{line}");
+            }
         },
         NodeCommand::Clocks => {
             for line in &daemon::ask(place, "clocks")?.context("this node isn't running: start `hk node run`")? {

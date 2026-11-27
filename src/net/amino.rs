@@ -96,10 +96,30 @@ pub struct Fetched {
     pub missing: Vec<Link>,
 }
 
-/// A way to ask the running swarm to fetch.
+/// How the swarm is, for `hk node amino`.
+#[derive(Debug, Clone)]
+pub struct Status {
+    pub peer: PeerId,
+    pub listening: Vec<Multiaddr>,
+    /// Where it's taken to be reached, which a provider record says.
+    pub reached: Vec<Multiaddr>,
+    /// Whether it's a server of the DHT, answering others' queries.
+    pub server: bool,
+    /// The peers in its routing table.
+    pub routing: usize,
+    /// What it provides on the DHT.
+    pub providing: usize,
+    /// Who's connected, where, and as what, as identify says.
+    pub peers: Vec<(PeerId, Option<Multiaddr>, Option<String>)>,
+    /// The last dial that failed, and why.
+    pub failed: Option<String>,
+}
+
+/// A way to ask the running swarm to fetch, or how it is.
 #[derive(Clone)]
 pub struct Handle {
     asks: tokio::sync::mpsc::UnboundedSender<Ask>,
+    statuses: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<Status>>,
 }
 
 impl Handle {
@@ -109,6 +129,13 @@ impl Handle {
     pub fn fetch(&self, roots: Vec<Link>, dag: bool, share: bool) -> tokio::sync::oneshot::Receiver<Fetched> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         let _ = self.asks.send(Ask { roots, dag, share, reply });
+        answer
+    }
+
+    /// How the swarm is, or none if it's gone.
+    pub fn status(&self) -> tokio::sync::oneshot::Receiver<Status> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let _ = self.statuses.send(reply);
         answer
     }
 }
@@ -207,7 +234,11 @@ pub struct Amino {
     /// may be where it's reached.
     ports: Vec<u16>,
     asks: tokio::sync::mpsc::UnboundedReceiver<Ask>,
+    statuses: tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<Status>>,
     handle: Handle,
+    /// Each connected peer's address and agent, as far as they're known.
+    connected: HashMap<PeerId, (Option<Multiaddr>, Option<String>)>,
+    failed: Option<String>,
     fetches: Vec<Fetching>,
     /// Which fetch each search for providers is for.
     searches: HashMap<kad::QueryId, usize>,
@@ -244,8 +275,9 @@ impl Amino {
         let control = swarm.behaviour().streams.new_control();
         let (read, reads) = tokio::sync::mpsc::unbounded_channel();
         let (ask, asks) = tokio::sync::mpsc::unbounded_channel();
-        let handle = Handle { asks: ask };
-        let mut amino = Self { swarm, catalog, control, incoming: Some(incoming), read, reads, ports: Vec::new(), asks, handle, fetches: Vec::new(), searches: HashMap::new(), providing: HashSet::new(), announced_at: None, announced_of: None, serving: false };
+        let (status, statuses) = tokio::sync::mpsc::unbounded_channel();
+        let handle = Handle { asks: ask, statuses: status };
+        let mut amino = Self { swarm, catalog, control, incoming: Some(incoming), read, reads, ports: Vec::new(), asks, statuses, handle, connected: HashMap::new(), failed: None, fetches: Vec::new(), searches: HashMap::new(), providing: HashSet::new(), announced_at: None, announced_of: None, serving: false };
         if !bootstrap.is_empty() {
             // Joining the DHT, which the behaviour does again now and then
             let _ = amino.swarm.behaviour_mut().kad.bootstrap();
@@ -292,6 +324,25 @@ impl Amino {
         }
         self.providing = now;
         changed
+    }
+
+    /// How it is now.
+    fn status(&mut self) -> Status {
+        let kad = &mut self.swarm.behaviour_mut().kad;
+        let server = kad.mode() == kad::Mode::Server;
+        let routing = kad.kbuckets().map(|bucket| bucket.num_entries()).sum();
+        let mut peers: Vec<_> = self.connected.iter().map(|(peer, (addr, agent))| (*peer, addr.clone(), agent.clone())).collect();
+        peers.sort_by_key(|(peer, ..)| *peer);
+        Status {
+            peer: *self.swarm.local_peer_id(),
+            listening: self.swarm.listeners().cloned().collect(),
+            reached: self.swarm.external_addresses().cloned().collect(),
+            server,
+            routing,
+            providing: self.providing.len(),
+            peers,
+            failed: self.failed.clone(),
+        }
     }
 
     /// A way to ask it to fetch, from outside.
@@ -342,6 +393,9 @@ impl Amino {
         loop {
             tokio::select! {
                 Some(ask) = self.asks.recv() => self.begin(ask),
+                Some(reply) = self.statuses.recv() => {
+                    let _ = reply.send(self.status());
+                },
                 _ = tick.tick() => {
                     self.finish();
                     let generation = self.catalog.generation().ok();
@@ -389,7 +443,22 @@ impl Amino {
             },
             // Seen at a port it listens on, it's reached there: so the DHT
             // takes it for a server, as it should for a public address
-            SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                self.connected.entry(peer_id).or_default().0 = Some(endpoint.get_remote_address().clone());
+                None
+            },
+            SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                self.connected.remove(&peer_id);
+                None
+            },
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                self.failed = Some(format!("{}: {error}", peer_id.map_or_else(|| "a peer".to_owned(), |peer| peer.to_string())));
+                None
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                if let Some(known) = self.connected.get_mut(&peer_id) {
+                    known.1 = Some(info.agent_version.clone());
+                }
                 let observed = &info.observed_addr;
                 let port = observed.iter().find_map(|protocol| match protocol {
                     libp2p::multiaddr::Protocol::Tcp(port) => Some(port),

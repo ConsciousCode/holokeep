@@ -109,6 +109,8 @@ podman exec -d "$run-hk" sh -c "exec hk node run --amino >>/tmp/node.log 2>&1"
 wait_for "hk to join its Amino" sh_on hk "grep -q 'in Amino as' /tmp/node.log"
 hk_id=$(sh_on hk "grep 'in Amino as' /tmp/node.log | tail -1 | awk '{ print \$NF }'")
 wait_for "the hub to have hk in its DHT" sh_on hub "ipfs stats dht wan | grep -q $hk_id"
+wait_for "hk to have the hub in its routing table" sh_on hk "hk node amino | grep -q 'with [1-9][0-9]* peers in its routing table'"
+on hk hk node amino --peers | grep -q "kubo/" || fail "hk node amino --peers didn't show Kubo"
 
 say "hk fetches a file of many blocks the Kubo provider announced, through the DHT"
 sh_on provider "head -c 3000017 /dev/urandom > /tmp/big"

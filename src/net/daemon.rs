@@ -1377,6 +1377,56 @@ fn amino_fetch_for(words: &str, write: OwnedWriteHalf) -> std::result::Result<()
     Ok(())
 }
 
+/// What's asked of Amino's swarm: a fetch, or how it is.
+fn amino_for(command: &str, write: OwnedWriteHalf) -> std::result::Result<(), (OwnedWriteHalf, String)> {
+    match command.strip_prefix("amino-fetch ") {
+        Some(words) => amino_fetch_for(words, write),
+        None => amino_status_for(command == "amino peers", write),
+    }
+}
+
+/// What `amino [peers]` asks: how Amino's swarm is, answered on `write`
+/// once it says, the node going on meanwhile; or why not, with `write`
+/// back.
+fn amino_status_for(peers: bool, write: OwnedWriteHalf) -> std::result::Result<(), (OwnedWriteHalf, String)> {
+    let Some(amino) = super::amino::handle() else {
+        return Err((write, "this node isn't in Amino: run it with --amino".to_owned()));
+    };
+    let answer = amino.status();
+    let mut write = write;
+    tokio::spawn(async move {
+        let mut out = String::new();
+        match answer.await {
+            Ok(status) => {
+                let _ = writeln!(out, "in Amino as {}", status.peer);
+                for addr in &status.listening {
+                    let _ = writeln!(out, "listening at {addr}");
+                }
+                if status.reached.is_empty() {
+                    out.push_str("reached nowhere confirmed: no peer has seen it at a port it listens on\n");
+                }
+                for addr in &status.reached {
+                    let _ = writeln!(out, "reached at {addr}");
+                }
+                let _ = writeln!(out, "a {} of the DHT, with {} peers in its routing table", if status.server { "server" } else { "client" }, status.routing);
+                let _ = writeln!(out, "providing {}", status.providing);
+                let _ = writeln!(out, "connected to {}", status.peers.len());
+                if let Some(failed) = &status.failed {
+                    let _ = writeln!(out, "last failed dial: {failed}");
+                }
+                if peers {
+                    for (peer, addr, agent) in &status.peers {
+                        let _ = writeln!(out, "{peer}\t{}\t{}", addr.as_ref().map_or_else(|| "?".to_owned(), ToString::to_string), agent.as_deref().unwrap_or("?"));
+                    }
+                }
+            },
+            Err(_) => out.push_str("error: Amino's swarm stopped\n"),
+        }
+        let _ = write.write_all(out.as_bytes()).await;
+    });
+    Ok(())
+}
+
 /// What `reach <peer> <addr>...` asks: that a member be reached there.
 fn reach_member(node: &mut Node, words: &str) -> Result<()> {
     let mut words = words.split_whitespace();
@@ -1437,7 +1487,7 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
             }
         },
         command if command.starts_with("clients-at ") => out.push_str(&clients_at(node, command.trim_start_matches("clients-at "))?),
-        command if command.starts_with("amino-fetch ") => match amino_fetch_for(command.trim_start_matches("amino-fetch "), write) {
+        command if command == "amino" || command.starts_with("amino ") || command.starts_with("amino-fetch ") => match amino_for(command, write) {
             Ok(()) => return Ok(None),
             Err((back, e)) => {
                 write = back;

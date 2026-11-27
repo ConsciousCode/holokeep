@@ -242,6 +242,13 @@ private network, so its peers reach its Kademlia DHT
   the DHT takes it for a server. `amino-server = true` makes it one
   regardless, reached where it listens, as on a LAN.
 
+`hk node amino` says how the running node is in Amino: its peer id,
+where it listens and where it's taken to be reached, whether it's a
+server of the DHT and how many peers its routing table has, how many
+roots it provides, how many peers it's connected to, and the last dial
+that failed, which says why if it can't join; `--peers` lists each
+connected peer, where, and its agent (`kubo/0.42.0`).
+
 ## Gateway
 
 `hk node run --gateway [addr]` (or `gateway = true` in
