@@ -310,15 +310,34 @@ pub fn key(dir: &std::path::Path) -> Result<Keypair> {
 ///
 /// If the system's DNS configuration can't be read.
 pub fn transport(key: &Keypair) -> Result<Boxed<(PeerId, StreamMuxerBox)>> {
+    use futures::future::Either;
     use libp2p::Transport as _;
-    let tcp = libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default().nodelay(true));
     let noise = libp2p::noise::Config::new(key).map_err(|e| Error::Invalid(format!("noise: {e}")))?;
-    Ok(libp2p::dns::tokio::Transport::system(tcp)?
+    let tcp = libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default().nodelay(true))
         .upgrade(libp2p::core::upgrade::Version::V1)
         .authenticate(noise)
         .multiplex(libp2p::yamux::Config::default())
-        .timeout(Duration::from_secs(20))
-        .boxed())
+        .timeout(Duration::from_secs(20));
+    // QUIC, which many peers list alone, and which punches through NATs
+    // where TCP seldom does
+    let quic = libp2p::quic::tokio::Transport::new(libp2p::quic::Config::new(key));
+    let either = quic.or_transport(tcp).map(|either, _| match either {
+        Either::Left((peer, muxer)) => (peer, StreamMuxerBox::new(muxer)),
+        Either::Right((peer, muxer)) => (peer, StreamMuxerBox::new(muxer)),
+    });
+    Ok(libp2p::dns::tokio::Transport::system(either)?.boxed())
+}
+
+/// Where QUIC listens beside TCP: the same address and port, over UDP.
+/// None if it isn't TCP over IP.
+pub fn quic_beside(addr: &Multiaddr) -> Option<Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+    let mut protocols = addr.iter();
+    let ip = protocols.next().filter(|ip| matches!(ip, Protocol::Ip4(_) | Protocol::Ip6(_)))?;
+    let Some(Protocol::Tcp(port)) = protocols.next() else {
+        return None;
+    };
+    protocols.next().is_none().then(|| Multiaddr::empty().with(ip).with(Protocol::Udp(port)).with(Protocol::QuicV1))
 }
 
 /// What happens that whoever runs the swarm may care about.
@@ -1104,7 +1123,7 @@ pub fn answers(catalog: &Catalog, message: &Message) -> (Vec<Message>, Message) 
 
 /// Run the swarm for the repo, on a thread of its own.
 ///
-/// It listens on `addr`, joining Amino by these peers, or its own
+/// It listens on `addr`, and over QUIC on the same port too, joining Amino by these peers, or its own
 /// bootstrap peers if none are said; asking these routers who provides
 /// what a fetch gets nothing of, or its own if none are said and it's
 /// joined by its own peers; wanting at most `gateway_requests` blocks of
@@ -1129,6 +1148,9 @@ pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multi
                 let mut amino = Amino::new(transport(&key)?, &key, Catalog::open_repo(&repo)?, &bootstrap);
                 amino.route_by(routers);
                 amino.gateway_requests(gateway_requests);
+                if let Some(quic) = quic_beside(&addr) {
+                    amino.listen(quic)?;
+                }
                 amino.listen(addr)?;
                 if server {
                     amino.serve_dht();

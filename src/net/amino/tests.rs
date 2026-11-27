@@ -295,7 +295,7 @@ async fn a_router_finds_what_nothing_else_does_and_isnt_asked_once_its_found() {
     // Known to no one, the fetcher finds the provider by the router alone
     let done = fetched(&mut a, &mut b, fetcher.fetch(vec![link(&first)], false, true)).await;
     assert_eq!(done, Fetched { fetched: 1, missing: Vec::new() });
-    assert_eq!(*asked.lock().expect("asked"), [format!("/routing/v1/providers/{}?filter-protocols=transport-bitswap,transport-ipfs-gateway-http,unknown&filter-addrs=tcp,!p2p-circuit", link(&first))]);
+    assert_eq!(*asked.lock().expect("asked"), [format!("/routing/v1/providers/{}?filter-protocols=transport-bitswap,transport-ipfs-gateway-http,unknown&filter-addrs=tcp,quic-v1,!p2p-circuit", link(&first))]);
     // Connected to it now, it's found of whoever's connected, and the
     // router's asked nothing more
     let done = fetched(&mut a, &mut b, fetcher.fetch(vec![link(&second)], false, true)).await;
@@ -335,4 +335,13 @@ async fn a_dag_is_had_of_a_gateway_a_router_finds_each_block_checked() {
     let done = fetched(&mut a, &mut b, fetcher.fetch(vec![link(&lied), link(&missing)], false, true)).await;
     assert_eq!(done.fetched, 0);
     assert!(!b.catalog().has(lied.cid().multihash()).expect("has"), "not kept as what it isn't");
+}
+
+#[test]
+fn quic_listens_beside_tcp_on_the_same_port() {
+    let at = |addr: &str| quic_beside(&addr.parse().expect("multiaddr")).map(|quic| quic.to_string());
+    assert_eq!(at("/ip4/0.0.0.0/tcp/4015").as_deref(), Some("/ip4/0.0.0.0/udp/4015/quic-v1"));
+    assert_eq!(at("/ip6/::/tcp/4001").as_deref(), Some("/ip6/::/udp/4001/quic-v1"));
+    assert_eq!(at("/ip4/0.0.0.0/udp/4015/quic-v1"), None);
+    assert_eq!(at("/memory/1"), None);
 }

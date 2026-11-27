@@ -67,10 +67,11 @@ machine() {
 ip_of() { sh_on "$1" "hostname -I | awk '{ print \$1 }'"; }
 
 # A Kubo node, a server of the DHT, with a key of this algorithm, joined
-# by these peers, and a router (/routing/v1) on its gateway
+# by these peers, and a router (/routing/v1) on its gateway; listening
+# where $SWARM says, over TCP if unsaid
 kubo_up() {
     local name=$1 algorithm=$2; shift 2
-    local bootstrap=
+    local bootstrap= swarm=${SWARM:-'["/ip4/0.0.0.0/tcp/4001"]'}
     [ $# -eq 0 ] || bootstrap=$(printf '"%s",' "$@")
     on "$name" ipfs init --empty-repo --algorithm "$algorithm" >/dev/null
     sh_on "$name" "ipfs config --json Bootstrap '[${bootstrap%,}]' \
@@ -80,7 +81,7 @@ kubo_up() {
         && ipfs config --json Ipns.DelegatedPublishers '[]' \
         && ipfs config --json Discovery.MDNS.Enabled false \
         && ipfs config Routing.Type dhtserver \
-        && ipfs config --json Addresses.Swarm '[\"/ip4/0.0.0.0/tcp/4001\"]' \
+        && ipfs config --json Addresses.Swarm '$swarm' \
         && ipfs config Addresses.API /ip4/127.0.0.1/tcp/5001 \
         && ipfs config Addresses.Gateway /ip4/0.0.0.0/tcp/8080 \
         && ipfs config --json Gateway.ExposeRoutingAPI true"
@@ -97,12 +98,14 @@ say "$(ipfs version) against hk"
 
 # The hub's key is RSA, as Amino's bootstrap peers' are, and many of
 # its older peers'
-say "a Kubo hub with an RSA key, and a Kubo provider joined by it"
+# The provider listens over QUIC alone, so what hk has of it, through
+# the DHT or a router, it has over QUIC
+say "a Kubo hub with an RSA key, and a Kubo provider joined by it, over QUIC alone"
 machine hub
-kubo_up hub rsa
+SWARM='["/ip4/0.0.0.0/tcp/4001","/ip4/0.0.0.0/udp/4001/quic-v1"]' kubo_up hub rsa
 hub=$(kubo_addr hub)
 machine provider
-kubo_up provider ed25519 "$hub"
+SWARM='["/ip4/0.0.0.0/udp/4001/quic-v1"]' kubo_up provider ed25519 "$hub"
 provider_id=$(on provider ipfs id -f '<id>')
 
 say "an hk node in Amino, joined by the hub alone"
@@ -122,6 +125,7 @@ big=$(on provider ipfs add -Q /tmp/big)
 wait_for "the provider's record to be on the hub" sh_on hub "timeout 5 ipfs routing findprovs -n 1 $big | grep -q $provider_id"
 on hk hk dag fetch "$big" >/dev/null || fail "hk couldn't fetch $big from Kubo"
 [ "$(on hk hk cat "$big" | sha256sum)" = "$(on provider ipfs cat "$big" | sha256sum)" ] || fail "hk fetched something else"
+on hk hk node amino --peers | grep "^$provider_id" | grep -q "/quic-v1" || fail "hk isn't connected to the provider over QUIC"
 
 say "and a directory, whole"
 sh_on provider "mkdir -p /tmp/dir/sub && echo one > /tmp/dir/one && echo two > /tmp/dir/sub/two && head -c 300000 /dev/urandom > /tmp/dir/sub/three"
