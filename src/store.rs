@@ -3745,6 +3745,36 @@ impl Catalog {
         self.claims.as_ref().map_or(Ok(Vec::new()), |claims| claims.public_roots())
     }
 
+    /// What's to be announced as here, as Kubo's `roots` strategy does: what
+    /// each public claim in `announce` mode names, an anchor as what it is
+    /// now, every head if it's forked, and a group, such as a tag, as its
+    /// members; never an identity block, which needs no announcing.
+    pub fn announced(&self) -> Result<Vec<Link>> {
+        let Some(claims) = &self.claims else {
+            return Ok(Vec::new());
+        };
+        let mut announced = Vec::new();
+        for (mode, target) in self.public_roots()? {
+            if mode != crate::claim::Public::ANNOUNCE {
+                continue;
+            }
+            if crate::claim::is_anchor(&target) {
+                announced.extend(self.anchor_heads(&target)?.into_iter().map(|(_, value, _)| value));
+                continue;
+            }
+            let members = claims.tagged(target.multihash())?;
+            if members.is_empty() {
+                announced.push(target);
+            } else {
+                announced.extend(members);
+            }
+        }
+        announced.retain(|cid| cid.hashcode() != crate::block::IDENTITY);
+        announced.sort_by_key(Link::to_bytes);
+        announced.dedup();
+        Ok(announced)
+    }
+
     /// Whether a block's anyone's to have, as a public claim that counts
     /// for any account here says of it or what links to it: a whole file's
     /// CID, which is no block, if a layout it's said to be the same as is.

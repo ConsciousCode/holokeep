@@ -2273,7 +2273,7 @@ fn node_run(place: &holokeep::net::mesh::Place, args: RunArgs) -> anyhow::Result
     }
     if let Some(amino) = amino {
         let bootstrap = tuned.amino_bootstrap.map(|peers| peers.iter().map(|addr| addr.parse()).collect::<Result<Vec<_>, _>>()).transpose().context("amino-bootstrap: not a multiaddr")?;
-        holokeep::net::amino::open(&place.repo, amino.parse().context("not a multiaddr")?, bootstrap)?;
+        holokeep::net::amino::open(&place.repo, amino.parse().context("not a multiaddr")?, bootstrap, tuned.amino_server.unwrap_or(false))?;
     }
     let copies = copies.or(tuned.copies).unwrap_or(2);
     let marks = holokeep::net::trim::Watermarks::new(low_water.or(tuned.low_water).unwrap_or(2 << 30), high_water.or(tuned.high_water).unwrap_or(4 << 30)).with_target(target.or(tuned.target));
@@ -3602,8 +3602,12 @@ fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {
             // here links to, so asking tells nothing of what's private here
             let mut asked = false;
             if !missing.is_empty() && (amino || may_ask_amino(&open_repo(Some(dir))?, &cid)) {
-                let (more, still) = holokeep::net::daemon::amino_fetch(&place, std::slice::from_ref(&cid), true, !private)?.context("this node isn't running: start `hk node run`")?;
-                (fetched, missing, asked) = (fetched.saturating_add(more), still, true);
+                match holokeep::net::daemon::amino_fetch(&place, std::slice::from_ref(&cid), true, !private) {
+                    Ok(Some((more, still))) => (fetched, missing, asked) = (fetched.saturating_add(more), still, true),
+                    Ok(None) => anyhow::bail!("this node isn't running: start `hk node run`"),
+                    // Not in Amino, it's what the mesh had
+                    Err(e) => eprintln!("not asked of Amino: {e}"),
+                }
             }
             out!("fetched {fetched}");
             for cid in &missing {

@@ -480,7 +480,7 @@ Checklist:
   - [x] Public anchors and groups: what an anchor is now, with what it mounts, or a group's members, kept by unit as they change (`hk public add --tag`)
   - [x] A swarm of its own for Amino, with a key of its own and no private network: its DHT (`/ipfs/kad/1.0.0`) and Bitswap 1.2.0, answering wants for what's public and what was fetched to be shared, and saying what's private or missing isn't had alike, after a floor of time (`hk node run --amino`)
   - [x] Bitswap fetching from Amino, for what the mesh hasn't got, of a CID nothing here links to so asking says nothing of what's private: providers looked for in the DHT, shared back on request, never announced, unless fetched to be kept to oneself (`hk dag fetch [--amino] [--private]`)
-  - [ ] Providing announced roots on Amino, and reproviding them
+  - [x] Providing announced roots on Amino, and reproviding them: an anchor as what it is now, a tag as its members; withdrawn once private again (`amino-server` for a DHT server on a LAN)
 - [ ] BitTorrent bridging
 - [ ] User ownership model
   - [x] A user's root key certifies its devices; claims count only when an authorized device signs them; revoking a device signs again what it said before it was lost (`hk device list/revoke`, certificates in `hk node invite` tickets)

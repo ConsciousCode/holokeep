@@ -306,18 +306,28 @@ scenario_amino() {
     private=$(sh_on one 'echo "for no one on Amino" | hk add -q -')
     on one hk public add --serve "$note" >/dev/null
     node_down one
-    sh_on one 'printf "[node]\namino-bootstrap = []\n" >> ~/.holokeep/config.toml'
+    sh_on one 'printf "[node]\namino-server = true\namino-bootstrap = []\n" >> ~/.holokeep/config.toml'
     node_up one --clients --door --amino
     wait_for "one to join its Amino" sh_on one "grep -q 'in Amino as' /tmp/node.log"
     one_amino=$(sh_on one "grep 'in Amino as' /tmp/node.log | tail -1 | awk '{ print \$NF }'")
     one_ip=$(sh_on one "hostname -I | awk '{ print \$1 }'")
     machine browser
     on browser hk node id >/dev/null
-    sh_on browser "printf '[node]\namino-bootstrap = [\"/ip4/$one_ip/tcp/4015/p2p/$one_amino\"]\n' > ~/.holokeep/config.toml"
+    sh_on browser "printf '[node]\namino-server = true\namino-bootstrap = [\"/ip4/$one_ip/tcp/4015/p2p/$one_amino\"]\n' > ~/.holokeep/config.toml"
     node_up browser --amino
     wait_for "the browser to fetch what one made public, from Amino" on browser hk dag fetch "$note"
     [ "$(on browser hk cat "$note")" = "for anyone on Amino" ] || fail "fetched something else"
     ! on browser hk dag fetch "$private" >/dev/null 2>&1 || fail "fetched what's private"
+    # What the browser announces, a seeker that knows only one finds
+    local announced
+    announced=$(sh_on browser 'echo "announced by the browser" | hk add -q -')
+    on browser hk public add "$announced" >/dev/null
+    machine seeker
+    on seeker hk node id >/dev/null
+    sh_on seeker "printf '[node]\namino-server = true\namino-bootstrap = [\"/ip4/$one_ip/tcp/4015/p2p/$one_amino\"]\n' > ~/.holokeep/config.toml"
+    node_up seeker --amino
+    wait_for "the seeker to find and fetch what the browser announced" on seeker hk dag fetch "$announced"
+    [ "$(on seeker hk cat "$announced")" = "announced by the browser" ] || fail "fetched something else"
 }
 
 # A directory watched from empty: a download under way isn't imported till

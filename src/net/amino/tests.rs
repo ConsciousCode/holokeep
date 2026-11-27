@@ -173,3 +173,72 @@ async fn a_dag_is_fetched_from_amino_and_shared_back_unless_not_to_be() {
     assert_eq!(fetched(&mut a, &mut b, fetcher.fetch(vec![link(&other)], false, false)).await.fetched, 1);
     assert!(!b.catalog().shared_fetch(&link(&other)).expect("shared"));
 }
+
+/// A swarm as `swarm` makes, joining the DHT by these peers, a server of it.
+async fn joining(catalog: Catalog, bootstrap: &[Multiaddr]) -> (Amino, Multiaddr) {
+    use libp2p::Transport as _;
+    let key = Keypair::generate_ed25519();
+    let transport = MemoryTransport::default()
+        .upgrade(libp2p::core::upgrade::Version::V1)
+        .authenticate(libp2p::noise::Config::new(&key).expect("noise"))
+        .multiplex(libp2p::yamux::Config::default())
+        .boxed();
+    let mut amino = Amino::new(transport, &key, catalog, bootstrap).expect("amino");
+    amino.listen(Multiaddr::empty().with(Protocol::Memory(0))).expect("listen");
+    amino.serve_dht();
+    loop {
+        if let Event::Listening(at) = amino.next().await.expect("event") {
+            let peer = amino.peer_id();
+            return (amino, at.with(Protocol::P2p(peer)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn whats_announced_is_found_through_the_dht_by_whoever_wants_it() {
+    let scratch = Scratch::new("amino-provide");
+    let (mut server, at) = joining(Catalog::open_repo(&scratch.path().join("server")).expect("catalog"), &[]).await;
+    let providing = Catalog::open_repo(&scratch.path().join("providing")).expect("catalog");
+    let (announced, unannounced) = (raw(b"announced on Amino"), raw(b"served, not announced"));
+    for block in [&announced, &unannounced] {
+        providing.put_block(block, CidVersion::V1).expect("put");
+    }
+    providing.publish(&link(&announced), crate::claim::Public::ANNOUNCE).expect("publish");
+    providing.publish(&link(&unannounced), crate::claim::Public::SERVE).expect("publish");
+    assert_eq!(providing.announced().expect("announced"), [link(&announced)], "what's served alone isn't announced");
+    let (mut provider, _) = joining(providing, std::slice::from_ref(&at)).await;
+    let (mut fetcher, _) = joining(Catalog::open_repo(&scratch.path().join("fetching")).expect("catalog"), std::slice::from_ref(&at)).await;
+    let fetch = fetcher.fetcher();
+    // A moment for its record to reach the server
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! { _ = server.next() => {}, _ = provider.next() => {}, _ = fetcher.next() => {} }
+        }
+    }).await;
+
+    // Its record reaches the server, and the fetcher, which knows only the
+    // server, finds the provider by it
+    let mut answer = fetch.fetch(vec![link(&announced)], false, true);
+    let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(20)).expect("deadline");
+    let done = loop {
+        let step = tokio::time::timeout_at(deadline, async {
+            tokio::select! {
+                done = &mut answer => Some(done.expect("answered")),
+                _ = server.next() => None,
+                _ = provider.next() => None,
+                _ = fetcher.next() => None,
+            }
+        });
+        if let Some(done) = step.await.expect("in time") {
+            break done;
+        }
+    };
+    assert_eq!(done.fetched, 1, "{done:?}");
+    assert!(fetcher.catalog().has(announced.cid().multihash()).expect("has"));
+    assert!(fetcher.is_connected(&provider.peer_id()), "found, and connected to");
+    // Private again, it's announced no more
+    provider.catalog().unpublish(&link(&announced)).expect("unpublish");
+    assert!(provider.announce(), "what's announced changed");
+    assert!(provider.providing.is_empty());
+    assert!(!provider.announce(), "and stays so");
+}

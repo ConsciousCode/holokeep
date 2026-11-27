@@ -65,6 +65,9 @@ const IDLE: Duration = Duration::from_secs(20);
 const IDLE: Duration = Duration::from_secs(1);
 const LONGEST: Duration = Duration::from_mins(5);
 
+/// How often what's to be announced is looked at again.
+const ANNOUNCE: Duration = Duration::from_mins(1);
+
 /// The most providers of a root asked.
 const PROVIDERS: usize = 20;
 
@@ -194,6 +197,12 @@ pub struct Amino {
     fetches: Vec<Fetching>,
     /// Which fetch each search for providers is for.
     searches: HashMap<kad::QueryId, usize>,
+    /// What's announced as here, by multihash, and when that was last
+    /// looked at.
+    providing: HashSet<Vec<u8>>,
+    announced_at: Option<Instant>,
+    /// Whether it's a server of the DHT reached where it listens.
+    serving: bool,
 }
 
 impl Amino {
@@ -223,7 +232,7 @@ impl Amino {
         let (read, reads) = tokio::sync::mpsc::unbounded_channel();
         let (ask, asks) = tokio::sync::mpsc::unbounded_channel();
         let handle = Handle { asks: ask };
-        let mut amino = Self { swarm, catalog, control, incoming, read, reads, ports: Vec::new(), asks, handle, fetches: Vec::new(), searches: HashMap::new() };
+        let mut amino = Self { swarm, catalog, control, incoming, read, reads, ports: Vec::new(), asks, handle, fetches: Vec::new(), searches: HashMap::new(), providing: HashSet::new(), announced_at: None, serving: false };
         if !bootstrap.is_empty() {
             // Joining the DHT, which the behaviour does again now and then
             let _ = amino.swarm.behaviour_mut().kad.bootstrap();
@@ -237,6 +246,39 @@ impl Amino {
 
     pub const fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// Be a server of the DHT whatever it's seen as, reached where it
+    /// listens, which is what's announced with what's provided: as on a LAN,
+    /// where what's reached isn't a public address.
+    pub fn serve_dht(&mut self) {
+        self.serving = true;
+        self.swarm.behaviour_mut().kad.set_mode(Some(kad::Mode::Server));
+        let listening: Vec<Multiaddr> = self.swarm.listeners().cloned().collect();
+        for addr in listening {
+            self.swarm.add_external_address(addr);
+        }
+    }
+
+    /// Announce what's to be as here, and stop announcing what's no longer
+    /// to be: the DHT republishes what's announced as it goes. Returns
+    /// whether anything changed.
+    pub fn announce(&mut self) -> bool {
+        let Ok(announced) = self.catalog.announced() else {
+            return false;
+        };
+        let now: HashSet<Vec<u8>> = announced.iter().map(|cid| cid.multihash().to_bytes()).collect();
+        let mut changed = false;
+        for key in now.difference(&self.providing) {
+            let _ = self.swarm.behaviour_mut().kad.start_providing(kad::RecordKey::new(key));
+            changed = true;
+        }
+        for key in self.providing.difference(&now) {
+            self.swarm.behaviour_mut().kad.stop_providing(&kad::RecordKey::new(key));
+            changed = true;
+        }
+        self.providing = now;
+        changed
     }
 
     /// A way to ask it to fetch, from outside.
@@ -284,7 +326,13 @@ impl Amino {
         loop {
             tokio::select! {
                 Some(ask) = self.asks.recv() => self.begin(ask),
-                _ = tick.tick() => self.finish(),
+                _ = tick.tick() => {
+                    self.finish();
+                    if self.announced_at.is_none_or(|at| at.elapsed() >= ANNOUNCE) {
+                        self.announced_at = Some(Instant::now());
+                        self.announce();
+                    }
+                },
                 event = self.swarm.select_next_some() => {
                     if let Some(event) = self.handle(event) {
                         return Ok(event);
@@ -312,12 +360,22 @@ impl Amino {
 
     fn handle(&mut self, event: SwarmEvent<BehaviourEvent>) -> Option<Event> {
         match event {
-            SwarmEvent::NewListenAddr { address, .. } => Some(Event::Listening(address)),
-            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, result: kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders { providers, .. })), .. })) => {
-                if let Some(&fetch) = self.searches.get(&id) {
+            SwarmEvent::NewListenAddr { address, .. } => {
+                let anywhere = address.iter().any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::Ip4(ip) if ip.is_unspecified() || ip.is_loopback()));
+                if self.serving && !anywhere {
+                    self.swarm.add_external_address(address.clone());
+                }
+                Some(Event::Listening(address))
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { id, result: kad::QueryResult::GetProviders(result), step, .. })) => {
+                if let (Some(&fetch), Ok(kad::GetProvidersOk::FoundProviders { providers, .. })) = (self.searches.get(&id), result) {
                     for provider in providers.into_iter().take(PROVIDERS) {
                         self.ask(fetch, provider);
                     }
+                }
+                // Over, the fetch may be found to have waited long enough
+                if step.last {
+                    self.searches.remove(&id);
                 }
                 None
             },
@@ -464,7 +522,10 @@ impl Amino {
         let now = Instant::now();
         let mut done = Vec::new();
         for (index, fetching) in self.fetches.iter_mut().enumerate() {
-            let over = fetching.wanted.is_empty() || now.duration_since(fetching.last) > IDLE || now.duration_since(fetching.began) > LONGEST;
+            // Not idle while providers are still being looked for
+            let searching = self.searches.values().any(|fetch| *fetch == index);
+            let idle = !searching && now.duration_since(fetching.last) > IDLE;
+            let over = fetching.wanted.is_empty() || idle || now.duration_since(fetching.began) > LONGEST;
             if over && let Some(reply) = fetching.reply.take() {
                 let _ = reply.send(Fetched { fetched: fetching.fetched, missing: fetching.wanted.values().cloned().collect() });
                 done.push(index);
@@ -533,14 +594,16 @@ pub fn answers(catalog: &Catalog, message: &Message) -> (Vec<Message>, Message) 
     (now, later)
 }
 
-/// Run the swarm for the repo, listening on `addr`, on a thread of its own,
-/// joining Amino by these peers, or its own bootstrap peers if none are
-/// said.
+/// Run the swarm for the repo, on a thread of its own.
+///
+/// It listens on `addr`, joining Amino by these peers, or its own
+/// bootstrap peers if none are said; a server of its DHT, reached where it
+/// listens, if `server`.
 ///
 /// # Errors
 ///
 /// If the repo won't open, or the key can't be had.
-pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multiaddr>>) -> Result<()> {
+pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multiaddr>>, server: bool) -> Result<()> {
     drop(Catalog::open_repo(repo)?);
     let key = key(repo)?;
     let repo = repo.to_path_buf();
@@ -551,6 +614,9 @@ pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multi
                 let bootstrap = bootstrap.unwrap_or_else(|| BOOTSTRAP.iter().filter_map(|addr| addr.parse().ok()).collect());
                 let mut amino = Amino::new(transport(&key)?, &key, Catalog::open_repo(&repo)?, &bootstrap)?;
                 amino.listen(addr)?;
+                if server {
+                    amino.serve_dht();
+                }
                 let _ = HANDLE.set(amino.fetcher());
                 eprintln!("in Amino as {}", amino.peer_id());
                 loop {

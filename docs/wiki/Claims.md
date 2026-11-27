@@ -181,9 +181,9 @@ anyone's to have, in a mode:
   new claim, `n`. Who's authorized changing, every unit's built again.
 - **A whole CID is public if its layout is**, as a `unixfs` same claim
   says (see [[#Same]]).
-- A mode not known is kept, and makes nothing public. Nothing announces
-  yet. [[#Amino]] serves what's public over Bitswap, and the
-  [[#Gateway]] over HTTP.
+- A mode not known is kept, and makes nothing public. [[#Amino]] serves
+  what's public over Bitswap and announces what's in `announce` mode,
+  and the [[#Gateway]] serves it over HTTP.
 - **Every member hears what's public**, holding it or not: a notice
   marks public claims as wanted by all, so any member can serve what's
   public, fetching it if need be. What's under a public root is known to
@@ -224,10 +224,18 @@ private network, so its peers reach its Kademlia DHT
   DHT and asked, with whoever's connected, and what they send is kept,
   each block checked against its CID, and what it links to wanted too.
   `--private` keeps what's fetched to oneself, answered as missing.
+- **Announcing**: what each `announce` claim names is provided on the
+  DHT, an anchor as what it is now and a group, such as a tag, as its
+  members, as Kubo's `roots` strategy does; looked at again every minute,
+  what's no longer to be is no longer provided, and the DHT republishes
+  the rest. Nothing fetched is ever announced. A provider record says
+  where the node's reached, which takes a public address, or
+  `amino-server`.
 - **Joining**: Amino's bootstrap peers, unless `amino-bootstrap` says
   others (empty for none). Seen by its peers at a port it listens on, as
   on a server with a public address, it's taken to be reached there, so
-  the DHT takes it for a server.
+  the DHT takes it for a server. `amino-server = true` makes it one
+  regardless, reached where it listens, as on a LAN.
 
 ## Gateway
 

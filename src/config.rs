@@ -122,6 +122,11 @@ pub struct Node {
     /// peers if unsaid, none if empty, as for a test of its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amino_bootstrap: Option<Vec<String>>,
+    /// Whether to be a server of Amino's DHT, reached where it listens,
+    /// whatever it's seen as: for a LAN, or a test, where that's no public
+    /// address. One with a public address is taken for a server anyway.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amino_server: Option<bool>,
     /// Whether to serve what's public over HTTP, as a trustless gateway,
     /// and where: `true` where `--gateway` alone would.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -247,6 +252,7 @@ impl Node {
             gateway: self.gateway.clone().or_else(|| base.gateway.clone()),
             amino: self.amino.clone().or_else(|| base.amino.clone()),
             amino_bootstrap: self.amino_bootstrap.clone().or_else(|| base.amino_bootstrap.clone()),
+            amino_server: self.amino_server.or(base.amino_server),
         }
     }
 }

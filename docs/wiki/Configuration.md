@@ -47,6 +47,7 @@ port.
 | `idle`       | duration                | `"1h"`                          | How long a connection with nothing going on is kept open.                                                  |
 | `amino`      | boolean or multiaddr    | off                             | Take part in Amino, the public IPFS network: `true` on port 4015, or where it says (`--amino`); see [[Claims#Amino]]. The main mesh's only. |
 | `amino-bootstrap` | list of multiaddrs | Amino's own                     | The peers Amino's joined by; empty for none, as for a test of its own. |
+| `amino-server` | boolean              | false                           | Be a server of Amino's DHT, reached where it listens, whatever it's seen as: for a LAN or a test. A public address makes it one anyway. |
 | `gateway`    | boolean or address      | off                             | Serve what's public over HTTP: `true` on `127.0.0.1:4014`, or where it says, as `host:port` (`--gateway`); see [[Claims#Gateway]]. The main mesh's only. |
 | `relay`      | boolean                 | false                           | Relay between members which can't reach each other, for a member they all can; see [[Mesh#Relays]].         |
 
