@@ -326,6 +326,20 @@ fn fetched_of(lines: Vec<String>) -> Result<(usize, Vec<String>)> {
     Ok((fetched, missing))
 }
 
+/// Have the running daemon fetch these from Amino: how many it fetched, and
+/// what it couldn't, or None if it isn't running.
+///
+/// With `dag`, the whole DAGs under them; what's fetched is shared back
+/// unless not to be.
+pub fn amino_fetch(place: &Place, roots: &[crate::model::Link], dag: bool, share: bool) -> Result<Option<(usize, Vec<String>)>> {
+    let words: Vec<String> = roots.iter().map(ToString::to_string).collect();
+    let command = format!("amino-fetch {} {} {}", if dag { "dag" } else { "blocks" }, if share { "share" } else { "private" }, words.join(" "));
+    let Some(lines) = ask_patiently(place, &command)? else {
+        return Ok(None);
+    };
+    fetched_of(lines).map(Some)
+}
+
 /// Have the running daemon audit now, as many failures to lose a block as
 /// it's run with unless said: what it reported, or None if it isn't
 /// running.
@@ -1333,6 +1347,36 @@ fn answered(out: &mut String, result: Result<()>, done: &str) {
     }
 }
 
+/// What `amino-fetch <dag|blocks> <share|private> <cid>...` asks: the
+/// fetch begun, and answered on `write` once it's done, the node going on
+/// meanwhile; or why not, with `write` back.
+fn amino_fetch_for(words: &str, write: OwnedWriteHalf) -> std::result::Result<(), (OwnedWriteHalf, String)> {
+    let mut words = words.split_whitespace();
+    let (dag, share) = (words.next() == Some("dag"), words.next() == Some("share"));
+    let Ok(roots) = words.map(str::parse).collect::<std::result::Result<Vec<crate::model::Link>, _>>() else {
+        return Err((write, "not a list of CIDs".to_owned()));
+    };
+    let Some(amino) = super::amino::handle() else {
+        return Err((write, "this node isn't in Amino: run it with --amino".to_owned()));
+    };
+    let answer = amino.fetch(roots, dag, share);
+    let mut write = write;
+    tokio::spawn(async move {
+        let mut out = String::new();
+        match answer.await {
+            Ok(fetched) => {
+                let _ = writeln!(out, "fetched {}", fetched.fetched);
+                for cid in fetched.missing {
+                    let _ = writeln!(out, "missing {cid}");
+                }
+            },
+            Err(_) => out.push_str("error: Amino's swarm stopped\n"),
+        }
+        let _ = write.write_all(out.as_bytes()).await;
+    });
+    Ok(())
+}
+
 /// What `reach <peer> <addr>...` asks: that a member be reached there.
 fn reach_member(node: &mut Node, words: &str) -> Result<()> {
     let mut words = words.split_whitespace();
@@ -1375,13 +1419,8 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
             node.scan_lost()?;
             out.push_str("scanning\n");
         },
-        "listeners" => {
-            for addr in node.listeners() {
-                let _ = writeln!(out, "{addr}");
-            }
-        },
-        "client-listeners" => {
-            for addr in node.client_listeners() {
+        which @ ("listeners" | "client-listeners") => {
+            for addr in if which == "listeners" { node.listeners() } else { node.client_listeners() } {
                 let _ = writeln!(out, "{addr}");
             }
         },
@@ -1398,6 +1437,13 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
             }
         },
         command if command.starts_with("clients-at ") => out.push_str(&clients_at(node, command.trim_start_matches("clients-at "))?),
+        command if command.starts_with("amino-fetch ") => match amino_fetch_for(command.trim_start_matches("amino-fetch "), write) {
+            Ok(()) => return Ok(None),
+            Err((back, e)) => {
+                write = back;
+                let _ = writeln!(out, "error: {e}");
+            },
+        },
         command if command.starts_with("reach ") => answered(&mut out, reach_member(node, command.trim_start_matches("reach ")), "noted"),
         command if command.starts_with("forget ") => {
             let forgotten = command.trim_start_matches("forget ").trim().parse().map_err(|e| Error::Invalid(format!("not a peer: {e}"))).and_then(|peer| node.forget_member(&peer));

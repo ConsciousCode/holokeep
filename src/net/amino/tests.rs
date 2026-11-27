@@ -113,3 +113,63 @@ async fn a_peer_asking_over_bitswap_gets_whats_public_and_is_told_the_rest_isnt_
     assert_eq!((told.blocks.len(), told.presences), (0, vec![(private, Presence::DontHave)]));
     assert!(asked.elapsed() >= NOT_HAD, "not before the floor: {:?}", asked.elapsed());
 }
+
+/// Drive both till the fetch is done, and say what came of it.
+async fn fetched(a: &mut Amino, b: &mut Amino, mut answer: tokio::sync::oneshot::Receiver<Fetched>) -> Fetched {
+    let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(20)).expect("deadline");
+    loop {
+        let step = tokio::time::timeout_at(deadline, async {
+            tokio::select! {
+                done = &mut answer => Some(done.expect("answered")),
+                _ = a.next() => None,
+                _ = b.next() => None,
+            }
+        });
+        if let Some(done) = step.await.expect("in time") {
+            return done;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_dag_is_fetched_from_amino_and_shared_back_unless_not_to_be() {
+    let scratch = Scratch::new("amino-fetch");
+    let serving = Catalog::open_repo(&scratch.path().join("serving")).expect("catalog");
+    let (leaf, deep) = (raw(b"a leaf"), raw(b"a deeper leaf"));
+    let branch = crate::block::Block::hash(Cidv1Spec::new(crate::cid::DAG_CBOR_CODEC, crate::multihash::MultihashFunc::Sha2_256), crate::dagcbor::to_vec(&crate::model::Ipld::List(vec![crate::model::Ipld::Link(link(&deep))])).expect("cbor").into());
+    let root = crate::block::Block::hash(Cidv1Spec::new(crate::cid::DAG_CBOR_CODEC, crate::multihash::MultihashFunc::Sha2_256), crate::dagcbor::to_vec(&crate::model::Ipld::List(vec![crate::model::Ipld::Link(link(&branch)), crate::model::Ipld::Link(link(&leaf))])).expect("cbor").into());
+    let private = raw(b"not for Amino");
+    for block in [&root, &branch, &leaf, &deep, &private] {
+        serving.put_block(block, CidVersion::V1).expect("put");
+    }
+    serving.publish(&link(&root), crate::claim::Public::SERVE).expect("publish");
+    let (mut a, at) = swarm(serving).await;
+    let (mut b, _) = swarm(Catalog::open_repo(&scratch.path().join("fetching")).expect("catalog")).await;
+    b.dial(at).expect("dial");
+    let peer = a.peer_id();
+    // What connects isn't an event, so look again every so often
+    let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(10)).expect("deadline");
+    while !b.is_connected(&peer) {
+        assert!(tokio::time::Instant::now() < deadline, "connected in time");
+        let _ = tokio::time::timeout(Duration::from_millis(50), async { tokio::select! { _ = a.next() => {}, _ = b.next() => {} } }).await;
+    }
+    let fetcher = b.fetcher();
+
+    let done = fetched(&mut a, &mut b, fetcher.fetch(vec![link(&root)], true, true)).await;
+    assert_eq!(done, Fetched { fetched: 4, missing: Vec::new() });
+    for block in [&root, &branch, &leaf, &deep] {
+        assert!(b.catalog().has(block.cid().multihash()).expect("has"));
+        assert!(b.catalog().shared_fetch(&link(block)).expect("shared"), "shared back");
+    }
+    // Asked again, nothing's wanted
+    assert_eq!(fetched(&mut a, &mut b, fetcher.fetch(vec![link(&root)], true, true)).await, Fetched::default());
+    // What isn't served is missing, once nothing's come for a while
+    let done = fetched(&mut a, &mut b, fetcher.fetch(vec![link(&private)], false, true)).await;
+    assert_eq!(done, Fetched { fetched: 0, missing: vec![link(&private)] });
+    // Fetched to be kept to oneself, it isn't shared
+    let other = raw(b"public, fetched privately");
+    a.catalog().put_block(&other, CidVersion::V1).expect("put");
+    a.catalog().publish(&link(&other), crate::claim::Public::SERVE).expect("publish");
+    assert_eq!(fetched(&mut a, &mut b, fetcher.fetch(vec![link(&other)], false, false)).await.fetched, 1);
+    assert!(!b.catalog().shared_fetch(&link(&other)).expect("shared"));
+}

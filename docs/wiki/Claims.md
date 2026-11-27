@@ -215,6 +215,15 @@ private network, so its peers reach its Kademlia DHT
 - **What isn't served**, private or missing, is said not to be had alike,
   where the asker wants to be told, and only after 50 ms and up to 50 ms
   more at random: how long it takes says nothing of which.
+- **Fetching** from Amino is for what the mesh hasn't got: `hk dag fetch`
+  and `hk cat`, `get` and `dag export` ask it, through the running
+  node, once members haven't the DAG, but only of a CID nothing here
+  links to, or a public one. What's private here may be linked to by
+  what's lost, and asking for it would say it's wanted; `hk dag fetch
+  --amino` asks regardless. Providers of each root are looked for in the
+  DHT and asked, with whoever's connected, and what they send is kept,
+  each block checked against its CID, and what it links to wanted too.
+  `--private` keeps what's fetched to oneself, answered as missing.
 - **Joining**: Amino's bootstrap peers, unless `amino-bootstrap` says
   others (empty for none). Seen by its peers at a port it listens on, as
   on a server with a public address, it's taken to be reached there, so

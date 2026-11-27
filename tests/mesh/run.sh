@@ -297,6 +297,29 @@ scenario_gateway() {
     node_up two
 }
 
+# One takes part in an Amino of its own, none of the real one's; a machine
+# in no mesh, in that Amino too, fetches what one made public over Bitswap,
+# and is told what's private isn't had
+scenario_amino() {
+    local note private one_ip one_amino
+    note=$(sh_on one 'echo "for anyone on Amino" | hk add -q -')
+    private=$(sh_on one 'echo "for no one on Amino" | hk add -q -')
+    on one hk public add --serve "$note" >/dev/null
+    node_down one
+    sh_on one 'printf "[node]\namino-bootstrap = []\n" >> ~/.holokeep/config.toml'
+    node_up one --clients --door --amino
+    wait_for "one to join its Amino" sh_on one "grep -q 'in Amino as' /tmp/node.log"
+    one_amino=$(sh_on one "grep 'in Amino as' /tmp/node.log | tail -1 | awk '{ print \$NF }'")
+    one_ip=$(sh_on one "hostname -I | awk '{ print \$1 }'")
+    machine browser
+    on browser hk node id >/dev/null
+    sh_on browser "printf '[node]\namino-bootstrap = [\"/ip4/$one_ip/tcp/4015/p2p/$one_amino\"]\n' > ~/.holokeep/config.toml"
+    node_up browser --amino
+    wait_for "the browser to fetch what one made public, from Amino" on browser hk dag fetch "$note"
+    [ "$(on browser hk cat "$note")" = "for anyone on Amino" ] || fail "fetched something else"
+    ! on browser hk dag fetch "$private" >/dev/null 2>&1 || fail "fetched what's private"
+}
+
 # A directory watched from empty: a download under way isn't imported till
 # it's renamed, a new subdirectory's noticed, and once it's not watched,
 # nothing more is
@@ -875,7 +898,7 @@ mount_up one
 mount_up two
 
 scenarios=("$@")
-[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read names served edits copies whole gateway late_joiner fork_merge lost watch forget car restore revoke shared client thin visitor expiry door several relayed)
+[ ${#scenarios[@]} -gt 0 ] || scenarios=(write_read names served edits copies whole gateway amino late_joiner fork_merge lost watch forget car restore revoke shared client thin visitor expiry door several relayed)
 for scenario in "${scenarios[@]}"; do
     say "scenario: $scenario"
     "scenario_$scenario"

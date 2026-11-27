@@ -1069,10 +1069,21 @@ enum DagCommand {
         output: Option<PathBuf>,
     },
     /// Fetch whatever of the DAG under a CID isn't here from other members
-    /// of the mesh, through the running node
+    /// of the mesh, through the running node; and what they haven't got,
+    /// from Amino, if the node's in it (`hk node run --amino`) and nothing
+    /// here links to the CID, so asking says nothing of what's private
+    /// here. What's fetched from Amino is given back to whoever there asks,
+    /// and never announced
     #[cfg(feature = "net")]
     Fetch {
         cid: Link,
+        /// Ask Amino even though something here links to it
+        #[arg(long)]
+        amino: bool,
+        /// Keep what's fetched from Amino to oneself: answered there as
+        /// missing, as what's private is
+        #[arg(long)]
+        private: bool,
     },
     /// Say how safe the DAG under a CID is: of its blocks, how many failures
     /// it would take to lose the least safe, which are short of what their
@@ -1169,15 +1180,32 @@ fn fetch_first(repo: Option<&PathBuf>, cid: &Link) -> anyhow::Result<()> {
     #[cfg(feature = "net")]
     {
         let dir = repo_dir(repo.cloned())?;
-        if let Some((_, missing)) = holokeep::net::daemon::fetch(&holokeep::net::mesh::Place::main(&dir), cid)?
+        let place = holokeep::net::mesh::Place::main(&dir);
+        if let Some((_, missing)) = holokeep::net::daemon::fetch(&place, cid)?
             && !missing.is_empty()
         {
-            eprintln!("warning: {} blocks aren't here or on any connected member", missing.len());
+            // Amino's asked only for what nothing here links to: what it
+            // links to may be private, and asking would tell
+            let foreign = open_repo(Some(dir)).is_ok_and(|repo| may_ask_amino(&repo, cid));
+            match foreign.then(|| holokeep::net::daemon::amino_fetch(&place, std::slice::from_ref(cid), true, true)) {
+                Some(Ok(Some((_, missing)))) if missing.is_empty() => {},
+                Some(Ok(Some((_, missing)))) => eprintln!("warning: {} blocks aren't here, on any connected member, or on Amino", missing.len()),
+                _ => eprintln!("warning: {} blocks aren't here or on any connected member", missing.len()),
+            }
         }
     }
     #[cfg(not(feature = "net"))]
     let _ = (repo, cid);
     Ok(())
+}
+
+/// Whether Amino may be asked for a CID without being told it's asked: if
+/// it's public, or nothing here links to it, so it's no part of what's
+/// private here, as a CID from elsewhere isn't.
+#[cfg(feature = "net")]
+fn may_ask_amino(repo: &Catalog, cid: &Link) -> bool {
+    use holokeep::store::RefIndex as _;
+    repo.is_public(cid).unwrap_or(false) || repo.backrefs(cid.multihash()).is_ok_and(|backrefs| backrefs.is_empty())
 }
 
 /// Have a repo fetch blocks it wants through its running node, if there is one.
@@ -3566,14 +3594,22 @@ fn cap_import(repo: Option<PathBuf>, capability: &str, car: &[PathBuf], from: Ve
 fn dag(repo: Option<PathBuf>, command: DagCommand) -> anyhow::Result<()> {
     match command {
         #[cfg(feature = "net")]
-        DagCommand::Fetch { cid } => {
+        DagCommand::Fetch { cid, amino, private } => {
             let dir = repo_dir(repo)?;
-            let (fetched, missing) = holokeep::net::daemon::fetch(&holokeep::net::mesh::Place::main(&dir), &cid)?.context("this node isn't running: start `hk node run`")?;
+            let place = holokeep::net::mesh::Place::main(&dir);
+            let (mut fetched, mut missing) = holokeep::net::daemon::fetch(&place, &cid)?.context("this node isn't running: start `hk node run`")?;
+            // What the mesh hasn't got, from Amino: unasked, only what nothing
+            // here links to, so asking tells nothing of what's private here
+            let mut asked = false;
+            if !missing.is_empty() && (amino || may_ask_amino(&open_repo(Some(dir))?, &cid)) {
+                let (more, still) = holokeep::net::daemon::amino_fetch(&place, std::slice::from_ref(&cid), true, !private)?.context("this node isn't running: start `hk node run`")?;
+                (fetched, missing, asked) = (fetched.saturating_add(more), still, true);
+            }
             out!("fetched {fetched}");
             for cid in &missing {
                 out!("missing {cid}");
             }
-            anyhow::ensure!(missing.is_empty(), "{} blocks aren't here or on any connected member", missing.len());
+            anyhow::ensure!(missing.is_empty(), "{} blocks aren't here, or on any connected member{}", missing.len(), if asked { ", or on Amino" } else { "" });
             Ok(())
         },
         DagCommand::Health { cid, ask } => {

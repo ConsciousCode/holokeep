@@ -479,7 +479,7 @@ Checklist:
   - [x] `Public` claims, in `serve` or `announce` mode, and what each reaches kept as blocks arrive, so whether a block's public is one lookup; a kept file's whole CID is public if its layout is (`hk public add/rm/ls/check`)
   - [x] Public anchors and groups: what an anchor is now, with what it mounts, or a group's members, kept by unit as they change (`hk public add --tag`)
   - [x] A swarm of its own for Amino, with a key of its own and no private network: its DHT (`/ipfs/kad/1.0.0`) and Bitswap 1.2.0, answering wants for what's public and what was fetched to be shared, and saying what's private or missing isn't had alike, after a floor of time (`hk node run --amino`)
-  - [ ] Bitswap fetching from Amino, for what the mesh hasn't got: shared back on request, never announced, unless fetched to be kept to oneself
+  - [x] Bitswap fetching from Amino, for what the mesh hasn't got, of a CID nothing here links to so asking says nothing of what's private: providers looked for in the DHT, shared back on request, never announced, unless fetched to be kept to oneself (`hk dag fetch [--amino] [--private]`)
   - [ ] Providing announced roots on Amino, and reproviding them
 - [ ] BitTorrent bridging
 - [ ] User ownership model
