@@ -468,6 +468,7 @@ Checklist:
   - [x] Device names: each device names itself by its hostname, and any may name another, shown by every member (`hk node name`, `hk node peers`)
   - [x] Looking over the mount's work directories, and letting one go (`hk overlay ls/rm`), with what may not need to be there said when the mount starts
   - [x] A trustless gateway: what's public over HTTP, raw blocks and CARs, fetched through the node if need be, what's private as missing (`hk node run --gateway`); every member hears what's public
+  - [ ] *If someone asks for it:* reading from a browser, for a device that's none of the user's machines. A web reader the gateway serves, a static page holding a capability in the URL's fragment (never sent), fetching sealed blocks with block access token proofs and opening them in the browser; and requests signed with a key the page keeps, registered as a visitor, for what's private (HTTP Message Signatures, one request each, no handshake). Left out for now: the door already reads sealed anchors for `hk` anywhere, a user's own machines are members, and a browser is one more way in to guard
   - [ ] A relay that isn't a member: relaying without the swarm key or the mesh's blocks
   - [ ] Kademlia provider records, once broadcast wants don't scale
   - [x] Measuring how far apart members' clocks are, advisorily (`hk node clocks`)
