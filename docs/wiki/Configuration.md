@@ -48,6 +48,7 @@ port.
 | `amino`      | boolean or multiaddr    | off                             | Take part in Amino, the public IPFS network: `true` on port 4015, or where it says (`--amino`); see [[Claims#Amino]]. The main mesh's only. |
 | `amino-bootstrap` | list of multiaddrs | Amino's own                     | The peers Amino's joined by; empty for none, as for a test of its own. |
 | `amino-routers` | list of URLs        | `delegated-ipfs.dev`, unless `amino-bootstrap` is said | The routers (Routing V1 HTTP API) asked who has a block a fetch is stalled on; empty for none. A router learns what's sought of it; see [[Claims#Amino]]. |
+| `amino-gateway-requests` | number      | 8                               | The most blocks wanted at once of a trustless gateway a router finds, each a request of its own over HTTP; 0 for none to be had over HTTP. |
 | `amino-server` | boolean              | false                           | Be a server of Amino's DHT, reached where it listens, whatever it's seen as: for a LAN or a test. A public address makes it one anyway. |
 | `gateway`    | boolean or address      | off                             | Serve what's public over HTTP: `true` on `127.0.0.1:4014`, or where it says, as `host:port` (`--gateway`); see [[Claims#Gateway]]. The main mesh's only. |
 | `relay`      | boolean                 | false                           | Relay between members which can't reach each other, for a member they all can; see [[Mesh#Relays]].         |

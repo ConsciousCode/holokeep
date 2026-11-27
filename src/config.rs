@@ -129,6 +129,11 @@ pub struct Node {
     /// are said; none if empty. A router learns what's sought of it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amino_routers: Option<Vec<String>>,
+    /// The most blocks wanted at once of a trustless gateway a router
+    /// finds, each a request of its own over HTTP: 8 if unsaid, and 0 for
+    /// none to be had over HTTP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amino_gateway_requests: Option<usize>,
     /// Whether to be a server of Amino's DHT, reached where it listens,
     /// whatever it's seen as: for a LAN, or a test, where that's no public
     /// address. One with a public address is taken for a server anyway.
@@ -260,6 +265,7 @@ impl Node {
             amino: self.amino.clone().or_else(|| base.amino.clone()),
             amino_bootstrap: self.amino_bootstrap.clone().or_else(|| base.amino_bootstrap.clone()),
             amino_routers: self.amino_routers.clone().or_else(|| base.amino_routers.clone()),
+            amino_gateway_requests: self.amino_gateway_requests.or(base.amino_gateway_requests),
             amino_server: self.amino_server.or(base.amino_server),
         }
     }
@@ -363,6 +369,8 @@ mod tests {
             ping = "30s"
             door = true
             relay = true
+            amino-routers = []
+            amino-gateway-requests = 16
 
             [mesh.work]
             copies = 4
@@ -386,6 +394,7 @@ mod tests {
         assert_eq!((main.target, work.target), (None, Some(50 << 30)));
         assert_eq!(config.node("other").copies, Some(3), "a mesh unsaid is [node]'s");
         assert_eq!((main.relay, work.relay), (Some(true), Some(true)));
+        assert_eq!((main.amino_routers, main.amino_gateway_requests), (Some(Vec::new()), Some(16)));
         assert!(config.mount.first().is_some_and(|mount| !mount.read_only && !mount.dir().starts_with("~")));
         assert!(config.mount.get(1).is_some_and(|mount| mount.read_only && mount.dir() == Path::new("/mnt/soup")));
 

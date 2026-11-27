@@ -98,8 +98,8 @@ const STALLED: Duration = Duration::from_secs(2);
 const STALLED: Duration = Duration::from_millis(200);
 
 /// The most blocks wanted of a gateway at once, over HTTP, where each is
-/// a request of its own.
-const GATEWAY_WINDOW: usize = 8;
+/// a request of its own, unless said otherwise (`amino-gateway-requests`).
+pub const GATEWAY_REQUESTS: usize = 8;
 
 /// How many blocks running a gateway may not have before it's asked no
 /// more: a gateway with none of it says so as quickly as one with all.
@@ -379,6 +379,8 @@ pub struct Amino {
     next_fetch: u64,
     /// The routers asked who provides what a fetch gets nothing of.
     routers: Vec<String>,
+    /// The most blocks wanted of a gateway at once.
+    gateway_requests: usize,
     /// What they've found, for which fetch, as it's found.
     route: tokio::sync::mpsc::UnboundedSender<Route>,
     routes: tokio::sync::mpsc::UnboundedReceiver<Route>,
@@ -444,6 +446,7 @@ impl Amino {
             fetches: Vec::new(),
             next_fetch: 0,
             routers: Vec::new(),
+            gateway_requests: GATEWAY_REQUESTS,
             route,
             routes,
             http,
@@ -467,6 +470,12 @@ impl Amino {
     /// nothing of otherwise.
     pub fn route_by(&mut self, routers: Vec<String>) {
         self.routers = routers;
+    }
+
+    /// Want at most this many blocks of a gateway at once: none, for none
+    /// to be had over HTTP.
+    pub const fn gateway_requests(&mut self, most: usize) {
+        self.gateway_requests = most;
     }
 
     pub fn peer_id(&self) -> PeerId {
@@ -820,7 +829,7 @@ impl Amino {
             return;
         };
         for gateway in &mut fetching.gateways {
-            while gateway.asked < GATEWAY_WINDOW && gateway.failed < GATEWAY_FAILS {
+            while gateway.asked < self.gateway_requests && gateway.failed < GATEWAY_FAILS {
                 let Some((key, cid)) = fetching.wanted.iter().find(|(key, _)| !fetching.over_http.contains(*key) && !gateway.lacks.contains(*key)) else {
                     break;
                 };
@@ -1098,13 +1107,14 @@ pub fn answers(catalog: &Catalog, message: &Message) -> (Vec<Message>, Message) 
 /// It listens on `addr`, joining Amino by these peers, or its own
 /// bootstrap peers if none are said; asking these routers who provides
 /// what a fetch gets nothing of, or its own if none are said and it's
-/// joined by its own peers; a server of its DHT, reached where it
+/// joined by its own peers; wanting at most `gateway_requests` blocks of
+/// a gateway at once; a server of its DHT, reached where it
 /// listens, if `server`.
 ///
 /// # Errors
 ///
 /// If the repo won't open, or the key can't be had.
-pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multiaddr>>, routers: Option<Vec<String>>, server: bool) -> Result<()> {
+pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multiaddr>>, routers: Option<Vec<String>>, gateway_requests: usize, server: bool) -> Result<()> {
     drop(Catalog::open_repo(repo)?);
     let key = key(repo)?;
     let repo = repo.to_path_buf();
@@ -1118,6 +1128,7 @@ pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multi
                 let bootstrap = bootstrap.unwrap_or_else(|| BOOTSTRAP.iter().filter_map(|addr| addr.parse().ok()).collect());
                 let mut amino = Amino::new(transport(&key)?, &key, Catalog::open_repo(&repo)?, &bootstrap);
                 amino.route_by(routers);
+                amino.gateway_requests(gateway_requests);
                 amino.listen(addr)?;
                 if server {
                     amino.serve_dht();

@@ -2289,7 +2289,7 @@ fn node_run(place: &holokeep::net::mesh::Place, args: RunArgs) -> anyhow::Result
     }
     if let Some(amino) = amino {
         let bootstrap = tuned.amino_bootstrap.map(|peers| peers.iter().map(|addr| addr.parse()).collect::<Result<Vec<_>, _>>()).transpose().context("amino-bootstrap: not a multiaddr")?;
-        holokeep::net::amino::open(&place.repo, amino.parse().context("not a multiaddr")?, bootstrap, tuned.amino_routers, tuned.amino_server.unwrap_or(false))?;
+        holokeep::net::amino::open(&place.repo, amino.parse().context("not a multiaddr")?, bootstrap, tuned.amino_routers, tuned.amino_gateway_requests.unwrap_or(holokeep::net::amino::GATEWAY_REQUESTS), tuned.amino_server.unwrap_or(false))?;
     }
     let copies = copies.or(tuned.copies).unwrap_or(2);
     let marks = holokeep::net::trim::Watermarks::new(low_water.or(tuned.low_water).unwrap_or(2 << 30), high_water.or(tuned.high_water).unwrap_or(4 << 30)).with_target(target.or(tuned.target));
