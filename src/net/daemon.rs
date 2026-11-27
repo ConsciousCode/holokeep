@@ -1403,7 +1403,7 @@ fn amino_status_for(peers: bool, write: OwnedWriteHalf) -> std::result::Result<(
                     let _ = writeln!(out, "listening at {addr}");
                 }
                 if status.reached.is_empty() {
-                    out.push_str("reached nowhere confirmed: no peer has seen it at a port it listens on\n");
+                    out.push_str("reached nowhere confirmed: no peer dialling back has reached it where it's seen\n");
                 }
                 for addr in &status.reached {
                     let _ = writeln!(out, "reached at {addr}");

@@ -224,10 +224,16 @@ private network, so its peers reach its Kademlia DHT
   links to, or a public one. What's private here may be linked to by
   what's lost, and asking for it would say it's wanted; `hk dag fetch
   --amino` asks regardless. Providers of each root are looked for in the
-  DHT and asked, with whoever's connected, and what they send is kept,
-  each block checked against its CID, and what it links to wanted too.
-  With nothing arriving for 3 s, what's still wanted is wanted again,
-  since an answer lost isn't sent again.
+  DHT, and whoever's connected is asked whether they have some of what's
+  wanted; providers, and whoever says they have it or sends any of it,
+  are its sources. Blocks are wanted only of sources, at most 256 at a
+  time, each of one source in turn, as Kubo's sessions do: wanting every
+  block of everyone connected floods them, and Kubo keeps only a peer's
+  first 1024 wants. What's sent is kept, each block checked against its
+  CID, and what it links to wanted too. A block a source says it hasn't,
+  or hasn't sent in 3 s, is wanted of the next, since an answer lost
+  isn't sent again. A fetch goes on as long as blocks keep arriving, and
+  gives up after 20 s of nothing.
   `--private` keeps what's fetched to oneself, answered as missing.
 - **Announcing**: what each `announce` claim names is provided on the
   DHT, an anchor as what it is now and a group, such as a tag, as its
@@ -237,10 +243,13 @@ private network, so its peers reach its Kademlia DHT
   where the node's reached, which takes a public address, or
   `amino-server`.
 - **Joining**: Amino's bootstrap peers, unless `amino-bootstrap` says
-  others (empty for none). Seen by its peers at a port it listens on, as
-  on a server with a public address, it's taken to be reached there, so
-  the DHT takes it for a server. `amino-server = true` makes it one
-  regardless, reached where it listens, as on a LAN.
+  others (empty for none). Where it's reached is found by AutoNAT: peers
+  asked dial back where they see it, and only an address one reaches is
+  taken, so the DHT takes it for a server. Being seen at a port it
+  listens on isn't enough, since it dials out from that port, and a
+  firewall or NAT lets the answers back in but no one else.
+  `amino-server = true` makes it a server regardless, reached where it
+  listens, as on a LAN.
 
 `hk node amino` says how the running node is in Amino: its peer id,
 where it listens and where it's taken to be reached, whether it's a

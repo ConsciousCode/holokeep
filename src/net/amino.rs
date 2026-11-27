@@ -11,7 +11,7 @@
 //! answered alike: not had, and only after a floor of time each, so how
 //! long an answer takes says nothing of whether it's private either.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,7 @@ use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::Boxed;
 use libp2p::identity::Keypair;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, identify, kad, ping};
+use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, autonat, identify, kad, ping};
 
 use super::bitswap::{self, Entry, Message, Presence, WantType};
 use super::mesh::{Error, Result};
@@ -57,17 +57,25 @@ const WANTS: usize = 1024;
 /// The most block bytes in one message sent.
 const BUDGET: usize = 2 << 20;
 
-/// How long a fetch waits with nothing arriving, and at most in all,
-/// before it says what it couldn't fetch.
+/// How long a fetch waits with nothing arriving before it says what it
+/// couldn't fetch: however long it takes otherwise, a big DAG being many
+/// blocks.
 #[cfg(not(test))]
 const IDLE: Duration = Duration::from_secs(20);
 #[cfg(test)]
 const IDLE: Duration = Duration::from_secs(1);
-const LONGEST: Duration = Duration::from_mins(5);
 
-/// How long a fetch waits with nothing arriving before wanting what it
-/// still wants again, of whoever was asked: an answer may be lost, as
-/// when a peer's stream is reset, and Kubo's server doesn't send again.
+/// How many of what a fetch wants whoever's connected is asked whether
+/// they have, to find sources besides the providers.
+const PROBE: usize = 16;
+
+/// The most blocks a fetch wants of its sources and hasn't had at once:
+/// Kubo keeps the first 1024 of a peer's wants and drops the rest.
+const WINDOW: usize = 256;
+
+/// How long a block wanted of a source is waited for before it's wanted
+/// of the next: the source may be slow or gone, or its answer lost, as
+/// when a stream is reset, and Kubo's server doesn't send again.
 const REWANT: Duration = Duration::from_secs(3);
 
 /// How often what's to be announced is looked at again.
@@ -148,20 +156,82 @@ pub fn handle() -> Option<&'static Handle> {
     HANDLE.get()
 }
 
-/// A fetch under way.
+/// A fetch under way. Whoever's connected is asked whether they have the
+/// roots; the blocks are wanted only of its sources, a window at a time,
+/// each of one source in turn, as Kubo's sessions do: wanting every block
+/// of everyone connected floods them, and has each answer it isn't had.
 struct Fetching {
     /// What's wanted and not yet here, by multihash.
     wanted: BTreeMap<Vec<u8>, Link>,
+    /// Of those, what's wanted of a source now: of which, and since when.
+    window: BTreeMap<Vec<u8>, (PeerId, Instant)>,
+    /// Who has it, as far as is known: the roots' providers, and whoever's
+    /// sent any of it or said they have it.
+    sources: Vec<PeerId>,
+    /// Which source's next.
+    turn: usize,
+    /// Who's been asked whether they have the roots.
+    asked: HashSet<PeerId>,
     dag: bool,
     share: bool,
     fetched: usize,
-    /// Who's asked, providers and whoever sent any of it.
-    asked: HashSet<PeerId>,
-    began: Instant,
     last: Instant,
-    /// When what's still wanted was last wanted again.
-    rewanted: Instant,
+    /// When whoever's connected was last asked.
+    asked_at: Instant,
     reply: Option<tokio::sync::oneshot::Sender<Fetched>>,
+}
+
+impl Fetching {
+    /// Take a peer for a source: whether it's new.
+    fn source(&mut self, peer: PeerId) -> bool {
+        let new = !self.sources.contains(&peer);
+        if new {
+            self.sources.push(peer);
+        }
+        new
+    }
+
+    /// The source whose turn it is, other than this one if there's another.
+    fn next(&mut self, not: Option<PeerId>) -> Option<PeerId> {
+        for _ in 0..self.sources.len() {
+            let peer = *self.sources.get(self.turn.checked_rem(self.sources.len())?)?;
+            self.turn = self.turn.wrapping_add(1);
+            if Some(peer) != not || self.sources.len() == 1 {
+                return Some(peer);
+            }
+        }
+        None
+    }
+
+    /// The window filled from what's wanted: which source to want each of.
+    fn fill(&mut self, now: Instant) -> Vec<(PeerId, Link)> {
+        let room = WINDOW.saturating_sub(self.window.len());
+        let more: Vec<(Vec<u8>, Link)> = self.wanted.iter().filter(|(key, _)| !self.window.contains_key(*key)).take(room).map(|(key, cid)| (key.clone(), cid.clone())).collect();
+        let mut wants = Vec::new();
+        for (key, cid) in more {
+            let Some(peer) = self.next(None) else {
+                break;
+            };
+            self.window.insert(key, (peer, now));
+            wants.push((peer, cid));
+        }
+        wants
+    }
+
+    /// Want again of another source what's in the window, if its source
+    /// hasn't sent it in time, or says it hasn't it.
+    fn again(&mut self, now: Instant, which: impl Fn(&[u8], PeerId, Instant) -> bool) -> Vec<(PeerId, Link)> {
+        let stale: Vec<(Vec<u8>, PeerId)> = self.window.iter().filter(|(key, (peer, at))| which(key, *peer, *at)).map(|(key, (peer, _))| (key.clone(), *peer)).collect();
+        let mut wants = Vec::new();
+        for (key, was) in stale {
+            let (Some(cid), Some(peer)) = (self.wanted.get(&key).cloned(), self.next(Some(was))) else {
+                continue;
+            };
+            self.window.insert(key, (peer, now));
+            wants.push((peer, cid));
+        }
+        wants
+    }
 }
 
 #[derive(NetworkBehaviour)]
@@ -169,6 +239,11 @@ pub struct Behaviour {
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     kad: kad::Behaviour<kad::store::MemoryStore>,
+    /// Where it's reached, as peers dialling back find: so the DHT takes
+    /// it for a server only if it's reached where it's seen. Being seen
+    /// at a port it listens on isn't enough, as it dials from that port,
+    /// and a firewall or NAT lets the answers back in but no one else.
+    autonat: autonat::Behaviour,
     streams: libp2p_stream::Behaviour,
     inbound: inbound::Behaviour,
 }
@@ -230,9 +305,6 @@ pub struct Amino {
     incoming: Option<tokio::sync::mpsc::UnboundedReceiver<inbound::Incoming>>,
     read: tokio::sync::mpsc::UnboundedSender<Read>,
     reads: tokio::sync::mpsc::UnboundedReceiver<Read>,
-    /// The ports it listens on, so an address it's seen at on one of them
-    /// may be where it's reached.
-    ports: Vec<u16>,
     asks: tokio::sync::mpsc::UnboundedReceiver<Ask>,
     statuses: tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<Status>>,
     handle: Handle,
@@ -268,6 +340,7 @@ impl Amino {
             identify: identify::Behaviour::new(identify::Config::new("ipfs/0.1.0".to_owned(), key.public()).with_agent_version(format!("holokeep/{}", env!("CARGO_PKG_VERSION")))),
             ping: ping::Behaviour::default(),
             kad,
+            autonat: autonat::Behaviour::new(peer, autonat::Config::default()),
             streams: libp2p_stream::Behaviour::new(),
             inbound: inbound::Behaviour::new(StreamProtocol::new(bitswap::PROTOCOL), streams),
         };
@@ -277,7 +350,7 @@ impl Amino {
         let (ask, asks) = tokio::sync::mpsc::unbounded_channel();
         let (status, statuses) = tokio::sync::mpsc::unbounded_channel();
         let handle = Handle { asks: ask, statuses: status };
-        let mut amino = Self { swarm, catalog, control, incoming: Some(incoming), read, reads, ports: Vec::new(), asks, statuses, handle, connected: HashMap::new(), failed: None, fetches: Vec::new(), searches: HashMap::new(), providing: HashSet::new(), announced_at: None, announced_of: None, serving: false };
+        let mut amino = Self { swarm, catalog, control, incoming: Some(incoming), read, reads, asks, statuses, handle, connected: HashMap::new(), failed: None, fetches: Vec::new(), searches: HashMap::new(), providing: HashSet::new(), announced_at: None, announced_of: None, serving: false };
         if !bootstrap.is_empty() {
             // Joining the DHT, which the behaviour does again now and then
             let _ = amino.swarm.behaviour_mut().kad.bootstrap();
@@ -351,12 +424,6 @@ impl Amino {
     }
 
     pub fn listen(&mut self, addr: Multiaddr) -> Result<()> {
-        if let Some(port) = addr.iter().find_map(|protocol| match protocol {
-            libp2p::multiaddr::Protocol::Tcp(port) => Some(port),
-            _ => None,
-        }) {
-            self.ports.push(port);
-        }
         self.swarm.listen_on(addr).map(drop).map_err(|e| Error::Invalid(format!("listen: {e}")))
     }
 
@@ -441,8 +508,6 @@ impl Amino {
                 }
                 None
             },
-            // Seen at a port it listens on, it's reached there: so the DHT
-            // takes it for a server, as it should for a public address
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                 self.connected.entry(peer_id).or_default().0 = Some(endpoint.get_remote_address().clone());
                 None
@@ -457,20 +522,7 @@ impl Amino {
             },
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                 if let Some(known) = self.connected.get_mut(&peer_id) {
-                    known.1 = Some(info.agent_version.clone());
-                }
-                let observed = &info.observed_addr;
-                let port = observed.iter().find_map(|protocol| match protocol {
-                    libp2p::multiaddr::Protocol::Tcp(port) => Some(port),
-                    _ => None,
-                });
-                let local = observed.iter().any(|protocol| match protocol {
-                    libp2p::multiaddr::Protocol::Ip4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
-                    libp2p::multiaddr::Protocol::Ip6(ip) => ip.is_loopback(),
-                    _ => false,
-                });
-                if port.is_some_and(|port| self.ports.contains(&port)) && !local {
-                    self.swarm.add_external_address(observed.clone());
+                    known.1 = Some(info.agent_version);
                 }
                 None
             },
@@ -522,33 +574,86 @@ impl Amino {
         }
         let now = Instant::now();
         let fetch = self.fetches.len();
-        self.fetches.push(Fetching { wanted, dag: ask.dag, share: ask.share, fetched: 0, asked: HashSet::new(), began: now, last: now, rewanted: now, reply: Some(ask.reply) });
+        self.fetches.push(Fetching {
+            wanted,
+            window: BTreeMap::new(),
+            sources: Vec::new(),
+            turn: 0,
+            asked: HashSet::new(),
+            dag: ask.dag,
+            share: ask.share,
+            fetched: 0,
+            last: now,
+            asked_at: now,
+            reply: Some(ask.reply),
+        });
         for root in &ask.roots {
             let search = self.swarm.behaviour_mut().kad.get_providers(kad::RecordKey::new(&root.multihash().to_bytes()));
             self.searches.insert(search, fetch);
         }
-        let connected: Vec<PeerId> = self.swarm.connected_peers().copied().collect();
-        for peer in connected {
-            self.ask(fetch, peer);
+        self.ask_connected(fetch);
+    }
+
+    /// Ask whoever's connected and hasn't been whether they have some of
+    /// what a fetch wants, not to be told if they haven't: what's wanted,
+    /// rather than the roots, which may be here already.
+    fn ask_connected(&mut self, fetch: usize) {
+        let Some(fetching) = self.fetches.get_mut(fetch) else {
+            return;
+        };
+        let wants: Vec<Entry> = fetching.wanted.values().take(PROBE).map(|cid| Entry { cid: cid.clone(), priority: 1, cancel: false, want: WantType::Have, send_dont_have: false }).collect();
+        let peers: Vec<PeerId> = self.swarm.connected_peers().copied().filter(|peer| fetching.asked.insert(*peer)).collect();
+        for peer in peers {
+            self.send(peer, Message { wants: wants.clone(), ..Message::default() });
         }
     }
 
-    /// Want what a fetch still wants of a peer, if it hasn't been asked.
+    /// Take a peer for a source of a fetch, wanting of it what's its turn.
     fn ask(&mut self, fetch: usize, peer: PeerId) {
         let Some(fetching) = self.fetches.get_mut(fetch).filter(|fetching| fetching.reply.is_some()) else {
             return;
         };
-        if !fetching.asked.insert(peer) {
-            return;
+        if fetching.source(peer) {
+            let wants = fetching.fill(Instant::now());
+            self.want(wants);
         }
-        let wants = fetching.wanted.values().map(|cid| Entry { cid: cid.clone(), priority: 1, cancel: false, want: WantType::Block, send_dont_have: true }).collect();
-        self.send(peer, Message { wants, ..Message::default() });
+    }
+
+    /// Want each block of its peer, one message to each.
+    fn want(&self, wants: Vec<(PeerId, Link)>) {
+        let mut by_peer: HashMap<PeerId, Vec<Entry>> = HashMap::new();
+        for (peer, cid) in wants {
+            by_peer.entry(peer).or_default().push(Entry { cid, priority: 1, cancel: false, want: WantType::Block, send_dont_have: true });
+        }
+        for (peer, wants) in by_peer {
+            self.send(peer, Message { wants, ..Message::default() });
+        }
     }
 
     /// Take in what's arrived that's wanted: kept, shared if it's to be,
-    /// and for a DAG, what it links to that isn't here wanted too, of
-    /// whoever sent it and whoever else was asked.
+    /// and for a DAG, what it links to that isn't here wanted too; whoever
+    /// sent it, or says they have it, taken for a source; and the window
+    /// filled again.
     fn received(&mut self, peer: PeerId, message: &Message) {
+        let now = Instant::now();
+        let mut touched = BTreeSet::new();
+        let mut wants = Vec::new();
+        for (cid, presence) in &message.presences {
+            let key = cid.multihash().to_bytes();
+            for (fetch, fetching) in self.fetches.iter_mut().enumerate() {
+                if fetching.reply.is_none() || !fetching.wanted.contains_key(&key) {
+                    continue;
+                }
+                match presence {
+                    Presence::Have => {
+                        fetching.source(peer);
+                        touched.insert(fetch);
+                    },
+                    // Wanted of it and not had, it's wanted of another
+                    Presence::DontHave => wants.extend(fetching.again(now, |k, of, _| k == key.as_slice() && of == peer)),
+                }
+            }
+        }
         for (cid, data) in &message.blocks {
             let key = cid.multihash().to_bytes();
             let fetching: Vec<usize> = (0..self.fetches.len()).filter(|&fetch| self.fetches.get(fetch).is_some_and(|f| f.reply.is_some() && f.wanted.contains_key(&key))).collect();
@@ -568,29 +673,30 @@ impl Amino {
                     continue;
                 };
                 fetching.wanted.remove(&key);
+                fetching.window.remove(&key);
                 fetching.fetched = fetching.fetched.saturating_add(1);
-                fetching.last = Instant::now();
-                fetching.asked.insert(peer);
+                fetching.last = now;
+                fetching.source(peer);
+                touched.insert(fetch);
                 if fetching.share {
                     let _ = self.catalog.share_fetched(std::slice::from_ref(cid));
                 }
                 if !fetching.dag {
                     continue;
                 }
-                let mut more = Vec::new();
                 for link in &links {
-                    if !self.catalog.has(link.multihash()).unwrap_or(false) && fetching.wanted.insert(link.multihash().to_bytes(), link.clone()).is_none() {
-                        more.push(Entry { cid: link.clone(), priority: 1, cancel: false, want: WantType::Block, send_dont_have: true });
-                    }
-                }
-                if !more.is_empty() {
-                    let asked: Vec<PeerId> = fetching.asked.iter().copied().collect();
-                    for to in asked {
-                        self.send(to, Message { wants: more.clone(), ..Message::default() });
+                    if !self.catalog.has(link.multihash()).unwrap_or(false) {
+                        fetching.wanted.insert(link.multihash().to_bytes(), link.clone());
                     }
                 }
             }
         }
+        for fetch in touched {
+            if let Some(fetching) = self.fetches.get_mut(fetch).filter(|fetching| fetching.reply.is_some()) {
+                wants.extend(fetching.fill(now));
+            }
+        }
+        self.want(wants);
     }
 
     /// Say what came of each fetch that's done: nothing left to want, or
@@ -599,22 +705,28 @@ impl Amino {
         let now = Instant::now();
         let mut done = Vec::new();
         let mut again = Vec::new();
+        let mut unsourced = Vec::new();
         for (index, fetching) in self.fetches.iter_mut().enumerate() {
             // Not idle while providers are still being looked for
             let searching = self.searches.values().any(|fetch| *fetch == index);
             let idle = !searching && now.duration_since(fetching.last) > IDLE;
-            let over = fetching.wanted.is_empty() || idle || now.duration_since(fetching.began) > LONGEST;
+            let over = fetching.wanted.is_empty() || idle;
             if over && let Some(reply) = fetching.reply.take() {
                 let _ = reply.send(Fetched { fetched: fetching.fetched, missing: fetching.wanted.values().cloned().collect() });
                 done.push(index);
-            } else if fetching.reply.is_some() && now.duration_since(fetching.last.max(fetching.rewanted)) >= REWANT {
-                fetching.rewanted = now;
-                let wants: Vec<Entry> = fetching.wanted.values().map(|cid| Entry { cid: cid.clone(), priority: 1, cancel: false, want: WantType::Block, send_dont_have: true }).collect();
-                again.extend(fetching.asked.iter().map(|peer| (*peer, wants.clone())));
+            } else if fetching.reply.is_some() {
+                again.extend(fetching.again(now, |_, _, at| now.duration_since(at) >= REWANT));
+                again.extend(fetching.fill(now));
+                if fetching.sources.is_empty() && now.duration_since(fetching.asked_at) >= REWANT {
+                    fetching.asked_at = now;
+                    unsourced.push(index);
+                }
             }
         }
-        for (peer, wants) in again {
-            self.send(peer, Message { wants, ..Message::default() });
+        self.want(again);
+        // With no source yet, whoever's connected since is asked too
+        for fetch in unsourced {
+            self.ask_connected(fetch);
         }
         // Done with, the searches for them go, and once none's under way the
         // list starts again
@@ -720,7 +832,7 @@ pub fn open(repo: &std::path::Path, addr: Multiaddr, bootstrap: Option<Vec<Multi
                 eprintln!("in Amino as {}", amino.peer_id());
                 loop {
                     if let Event::Listening(at) = amino.next().await? {
-                        eprintln!("Amino reaches this at {at}");
+                        eprintln!("Amino listening at {at}");
                     }
                 }
             })
