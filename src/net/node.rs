@@ -1601,9 +1601,11 @@ impl Node {
     }
 
     /// Under pressure, let go of a sample of what's here, handing off what
-    /// isn't spare; or, when asked, of whatever's spare of everything.
+    /// isn't spare: the half least used lately of twice as many as a batch,
+    /// so what's held settles into what's wanted. Or, when asked, of
+    /// whatever's spare of everything.
     pub fn trim_some(&mut self, copies: usize, all: bool) -> Result<TrimId> {
-        let keys = if all { self.catalog.keys()? } else { self.catalog.sample(trim::BATCH)? };
+        let keys = if all { self.catalog.keys()? } else { super::recent::least_used(self.catalog.sample(trim::BATCH.saturating_mul(2))?, trim::BATCH) };
         self.trim(copies, &keys, !all)
     }
 

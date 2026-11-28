@@ -93,6 +93,26 @@ works. This is what neither says.
 
 ## Design decisions, and why
 
+- **Homeostasis over hyperparameters** (the user's founding principle,
+  2026-11-27): lean into homeostatic, organic, cybernetic dynamics
+  wherever possible, so the system settles by itself with as few knobs
+  to tune as can be. Config is different: it's an explicit statement of
+  the user's intent that can't be derived from what's actually wanted.
+  So prefer forces that balance (memory pressure against replication
+  pressure, say) over thresholds to set, and when adding a setting, ask
+  whether it states intent or merely tunes a process that could find
+  its own level.
+- **`copies` is what a node wants**, as the user designed it: how much
+  it wants a block kept, and so how willing it is to store it given its
+  space, rather than a mesh-wide count (a keep's own `copies` overrides
+  it for what the keep reaches). Ideally it becomes a returning
+  force, replication pressure against memory pressure; the specifics are
+  to be workshopped. As built, each node uses its own `copies` in audits
+  (only the top-ranked holder of a block audits it) and trims, so a
+  block's effective count is its top holder's; under space pressure,
+  mismatched settings churn until someone has room. Rendezvous hashing
+  doesn't involve `copies`.
+
 - **IPLD**: one canonical data model that codecs round-trip through;
   codecs hand-rolled on the serde harness in `src/serde/`, checked against
   `ipld/codec-fixtures`. `src/ipld.rs` is an abandoned experiment: don't

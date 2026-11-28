@@ -1127,6 +1127,7 @@ impl Amino {
             if self.catalog.put_block(&block, version).is_err() {
                 continue;
             }
+            super::recent::used(&key);
             let links = crate::links::links(cid.codec(), data).unwrap_or_default();
             for fetch in fetching {
                 let Some(fetching) = self.fetches.get_mut(fetch) else {
@@ -1276,6 +1277,7 @@ pub fn answers(catalog: &Catalog, message: &Message) -> (Vec<Message>, Message) 
                     size = 0;
                 }
                 size = size.saturating_add(block.len());
+                super::recent::used(&cid.multihash().to_bytes());
                 current.blocks.push((cid.clone(), block.data().to_vec()));
             },
             _ if *send_dont_have => later.presences.push((cid.clone(), Presence::DontHave)),

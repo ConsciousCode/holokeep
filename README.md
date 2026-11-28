@@ -453,6 +453,7 @@ Checklist:
   - [x] Auditing as a trickle: what's arrived and a random sample each tick, paced by what it finds; full audits only when asked (`hk node status`)
   - [x] Trimming surplus copies between free-space watermarks, confirmed with members first, lowest-ranked first (`hk node run --low-water/--high-water`, `hk node trim`)
   - [x] A target of what's kept here, and handing off copies that aren't surplus to members with room before letting go (`hk node run --target`)
+  - [x] Trimming what's used least lately first, so what a node holds under its target settles into what's wanted, as a cache's does; a member with no room isn't chosen to keep anything
   - [x] Advertising what's let go of, so sightings of members connected since needn't expire
   - [x] Trimming leaves of kept files: a file goes whole, or is split into blocks of its own once any leaf goes
   - [x] Holding what's kept: a keep is only added by a node holding all of what it keeps, fetching what isn't here first (`hk keep add`), so a keep added while what it keeps is being collected keeps a copy alive, and the trickle replicates it. Slippage then needs no timeout to be safe, only to be prompt

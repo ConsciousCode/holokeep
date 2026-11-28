@@ -105,11 +105,22 @@ asker ranks below it by the holders' rendezvous order, so the
 lowest-ranked goes first. What's let go is announced (`dropped`), and
 members forget their sightings and audit it soon.
 
+What's looked at first is what's been used least lately: each trim takes
+a random sample twice its size and looks at the half least used, by when
+each block was last served to a member or to Amino, or fetched. So what
+a node holds settles into what's wanted of it, as a cache's does, with
+no age to set. Uses are remembered in memory only, so after a restart
+everything's as unused as everything else till it's used again.
+
 A node can have a target too, the most it means to keep (`--target`, or
 `target` in [[Configuration]]): once what's stored here passes it, the
 node trims until it's a tenth under, and it offers others only what's
 under that. So a laptop needn't fill its disk for the mesh, and holds
-what it was given or wrote until there's somewhere else for it.
+what it was given or wrote until there's somewhere else for it. A
+member with no room at all, as one past its target, isn't chosen to
+keep anything. With `target = "4G"` a node such as a relay holds at most
+about that, keeping what's used most; `target = 0` has it hold only what
+no other member can take.
 
 ## Handing off
 

@@ -139,6 +139,7 @@ pub fn answer(catalog: &Catalog, want: &Want) -> Blocks {
             continue;
         }
         size = size.saturating_add(data.len());
+        super::recent::used(&multihash.to_bytes());
         let cid = catalog.cids(multihash.as_ref()).ok().and_then(|cids| cids.into_iter().next());
         answer.copies.push(catalog.replicas(multihash.as_ref()).unwrap_or_default());
         let cid = cid.unwrap_or_else(|| AnyCid::V1(Cidv1::new(RAW_CODEC, multihash)));

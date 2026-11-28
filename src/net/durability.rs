@@ -471,11 +471,15 @@ pub(crate) fn distinct<'a>(replicas: impl IntoIterator<Item = &'a Replica>) -> V
 
 /// Where to send a block to raise its tolerance: of the offers whose copy
 /// would raise it most, the one with the highest weighted rendezvous score.
+///
+/// One with no room at all, as a node past its target has, isn't sent
+/// anything: it would only refuse it.
 pub fn choose<'a>(key: &[u8], held: &[Replica], offers: impl IntoIterator<Item = (&'a PeerId, &'a Offer)>, copies: usize) -> Option<PeerId> {
     let have = distinct(held);
     let now = tolerance(&have, copies);
     let raised: Vec<(PeerId, usize, f64)> = offers
         .into_iter()
+        .filter(|(_, offer)| offer.free != Some(0))
         .map(|(peer, offer)| {
             let with = tolerance(&[have.as_slice(), std::slice::from_ref(&offer.risks)].concat(), copies);
             (*peer, with, weight(offer.free))
@@ -980,6 +984,11 @@ mod tests {
         }
         // Already enough
         assert_eq!(choose(&[0], &[held[0].clone(), replica(2, &["disk:y"])], &offers, 2), None);
+        // One with no room isn't sent anything, however much it would raise it
+        let full = BTreeMap::from([(a, Offer { free: Some(0), ..offer(&["volume:2", "disk:y"]) }), (b, offer(&["volume:3", "disk:x"]))]);
+        assert_eq!(choose(&[0], &held, &full, 2), None, "b on the same disk raises nothing");
+        let full = BTreeMap::from([(a, Offer { free: Some(0), ..offer(&["volume:2", "disk:y"]) }), (b, offer(&["volume:3", "disk:z"]))]);
+        assert_eq!(choose(&[0], &held, &full, 2), Some(b));
     }
 
     #[test]
