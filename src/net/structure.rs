@@ -83,10 +83,27 @@ impl Notice {
     }
 }
 
-/// The CIDs of what's wanted of a notice.
+/// The CIDs of what's wanted of a notice, or that it couldn't be placed.
+///
+/// A notice can't be placed when whose it is isn't known here yet, as
+/// when a notice for a guest comes before the grants that make them one:
+/// it's to be noticed again, not taken for wanting nothing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Wants {
     want: Vec<ByteBuf>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unplaced: bool,
+}
+
+impl Wants {
+    /// A notice couldn't be placed here.
+    pub const fn unplaced() -> Self {
+        Self { want: Vec::new(), unplaced: true }
+    }
+
+    pub const fn is_unplaced(&self) -> bool {
+        self.unplaced
+    }
 }
 
 /// Notices of structure, with what each links to, in batches. Structure
@@ -211,7 +228,7 @@ pub fn answer(catalog: &Catalog, notice: &Notice) -> Result<Wants> {
             }
         }
         if want.len() == before {
-            return Ok(Wants { want });
+            return Ok(Wants { want, unplaced: false });
         }
     }
 }
@@ -239,7 +256,7 @@ pub fn answer_guest(catalog: &Catalog, notice: &Notice) -> Result<Wants> {
             want.push(cid.clone());
         }
     }
-    Ok(Wants { want })
+    Ok(Wants { want, unplaced: false })
 }
 
 /// Pushes of what a guest's machine wants, of what they may see here.
@@ -330,5 +347,28 @@ impl Cursors {
             }
         }
         Ok(cursors)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An answer from an older build, which can't say it couldn't place a
+    /// notice, reads as placed; and what's placed is written as it was, so
+    /// an older build reads it too.
+    #[test]
+    fn whether_a_notice_was_placed_reads_and_writes_as_older_builds_do() {
+        #[derive(Serialize, Deserialize)]
+        struct Older {
+            want: Vec<ByteBuf>,
+        }
+        let older = serde_ipld_dagcbor::to_vec(&Older { want: vec![ByteBuf::from(vec![1])] }).expect("cbor");
+        let read: Wants = serde_ipld_dagcbor::from_slice(&older).expect("read");
+        assert!(!read.is_unplaced());
+        let placed = serde_ipld_dagcbor::to_vec(&Wants { want: Vec::new(), unplaced: false }).expect("cbor");
+        assert_eq!(placed, serde_ipld_dagcbor::to_vec(&Older { want: Vec::new() }).expect("cbor"));
+        let unplaced: Wants = serde_ipld_dagcbor::from_slice(&serde_ipld_dagcbor::to_vec(&Wants::unplaced()).expect("cbor")).expect("read");
+        assert!(unplaced.is_unplaced());
     }
 }

@@ -145,7 +145,10 @@ doesn't serve as for one it does, since every user's certificates and
 revocations go with the grants (see [[Grants#Sharing grants]]). So a
 machine can't claim to host a user without one of the user's device
 keys. Of a user it doesn't serve, only what's shared with them is the
-other's (see **Guests**).
+other's (see **Guests**). What a machine was told is kept, and judged
+again whenever the grants change, since the grants that make a user one
+of the mesh's travel on their own and may arrive after: a user told of
+before them is taken to be hosted once they come.
 
 **Serving.** Every request about blocks names, as `user`, the user's key
 CID whose blocks it's about. The answering machine works it out as its
@@ -179,7 +182,8 @@ withheld from the other's account. A guest is served nothing else.
 - **Noticing a guest.** Each machine notices every member of the claims
   shared with each guest it hosts, those it's not yet noticed and been
   answered, with `guest: true`; noticed again only once the grants change
-  or it reconnects. The member wants everything noticed that it lacks,
+  or it reconnects, or if the member couldn't place it (below). The
+  member wants everything noticed that it lacks,
   there being nothing there for it to link to, and takes only claims from
   a push marked `guest`. Whether they count is for the claims there to
   say, as anywhere.
@@ -400,7 +404,7 @@ them; omitted otherwise.
 | `/holokeep/blocks/1.0.0` | `{want: [key], user?}` | `{blocks: [[CID, data]], missing: [key], copies: [[replica]]}` | Fetch blocks. |
 | `/holokeep/adverts/1.0.0` | `{blocks: [[key, [replica]]], user?}` | `{held: [[key, [replica]]], offer: offer \| null}` | "These may be under-replicated." |
 | `/holokeep/push/1.0.0` | `{blocks: [[CID, data]], copies: [[replica]], user?, guest?}` | `{kept: [[key, [replica]]]}` | Send copies to keep, or claims shared with a guest. |
-| `/holokeep/notices/1.0.0` | `{blocks: [[CID, [key]]], user?, guest?}` | `{want: [CID]}` | Notice structure and what it links to, or claims shared with a guest. |
+| `/holokeep/notices/1.0.0` | `{blocks: [[CID, [key]]], user?, guest?}` | `{want: [CID], unplaced?}` | Notice structure and what it links to, or claims shared with a guest. |
 | `/holokeep/trim/1.0.0` | `{keys: [key], user?}` | `{held: [[key, [replica]]], refused: [key]}` | "I mean to let go of these." |
 | `/holokeep/dropped/1.0.0` | `{keys: [key]}` | `{}` | "I let go of these." |
 | `/holokeep/condemn/1.0.0` | `{blocks: [key]}` | `{kept: [key]}` | "Does a keep of yours reach these?" |
@@ -439,9 +443,16 @@ spreading everything everywhere:
 - An identity block counts as held only if it's a dissolved claim held
   here.
 
+A member that can't place a notice, not knowing yet whose it is, says
+so (`unplaced: true`) rather than wanting nothing: as when a notice for
+a guest comes before the grants that make them one, since grants travel
+on their own. The notice isn't taken as answered, and it's noticed
+again at the next announce. Older builds don't say so, and are read as
+placing everything.
+
 Each member has a cursor over the catalog's generations (see
 [[Storage]]) for each account served whose user it hosts, moved only once
-it answers, so a member that was away hears of what it missed. The
+it answers, and not for an unplaced answer, so a member that was away hears of what it missed. The
 daemon's own account's is named by the peer ID; another's adds `#` and
 the account's uid. A block sent to a member, by push, fetch
 or want, takes the structure linking to it along. It's one hop: what

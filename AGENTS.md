@@ -23,10 +23,10 @@ works. This is what neither says.
   - `tests/mesh/run.sh [scenario...]`: rootless Podman containers; the
     whole suite takes about 10 minutes, so name the scenarios a change
     touches (`amino` for Amino work).
-    The `shared` scenario is flaky (seen 2026-11-27, failing about a
-    third of runs on a commit that had passed): "ezra to see one's view",
-    or "ezra to fetch the later note from two", time out. Run it again
-    before suspecting a change, and look into it when there's time.
+    **A flaky scenario is a bug until shown otherwise**: every one so
+    far has been a real race with effects outside the test. Reproduce
+    with `KEEP=1` in a loop till it fails, then look at the kept
+    containers.
   - `tests/mesh/kubo.sh`: hk against real Kubo (needs `ipfs` on the
     PATH); for anything touching Amino.
   - `scripts/kubo-compare.sh`: for anything touching the importer.
@@ -169,6 +169,18 @@ works. This is what neither says.
     ledger, a cache quota and a denylist (badbits, IPIP-383), announcing
     relayed fetches only after 24 h ± jitter. The long-term aim is users
     of content indirectly funding its hosting.
+
+## Races to watch for in the mesh
+
+Grants travel on their own protocol, so anything a machine receives may
+come before the grants that make sense of it. Judging it against the
+grants as they are, once, and never again, loses it: a member told of a
+user it hosted before the grants recognized them took it to host no one,
+and a guest noticed of shared claims before its grants arrived wanted
+nothing and was never noticed again (both fixed 2026-11-27, found as the
+`shared` scenario's flakiness). When something's judged by grants, keep
+what was said and judge it again when they change, or have the other
+side say "can't tell yet" (`unplaced`) rather than "nothing".
 
 ## Amino, as learned against Kubo and the real network
 

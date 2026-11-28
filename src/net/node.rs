@@ -368,8 +368,11 @@ pub struct Node {
     /// Who this node last told members it hosts, by (user, device), and
     /// what it told them.
     told: (Hosted, Hosts),
-    /// What each connected member hosts, as it's said.
+    /// What each connected member hosts, as it's said, and what it said:
+    /// judged again whenever the grants change, as a user it said it hosts
+    /// may be recognized only once the grants making them one arrive.
     hosting: HashMap<PeerId, Hosting>,
+    hosts_said: HashMap<PeerId, Hosts>,
     /// Connected members which know what this node hosts as it now is, so
     /// may be asked things: until then, nothing's asked of one.
     heard: HashSet<PeerId>,
@@ -542,6 +545,7 @@ impl Node {
             others: Vec::new(),
             told: (Vec::new(), Hosts::default()),
             hosting: HashMap::new(),
+            hosts_said: HashMap::new(),
             heard: HashSet::new(),
             telling: HashMap::new(),
             condemned,
@@ -894,6 +898,12 @@ impl Node {
             self.catalog.set_access(state)?;
             // What's shared with whom may have changed
             self.guests_noticed.clear();
+            // And who hosts whom: a user a member said it hosts may be
+            // recognized now, as one of the mesh's, its grants come
+            let said: Vec<(PeerId, Hosts)> = self.hosts_said.iter().map(|(peer, hosts)| (*peer, hosts.clone())).collect();
+            for (peer, hosts) in said {
+                self.heard_hosts(peer, &hosts)?;
+            }
         }
         // A client's member is the one it was told, whoever the machines are
         let (Some(machines), None) = (self.machines(), self.client_of) else {
@@ -1155,6 +1165,7 @@ impl Node {
             }
         }
         self.hosting.insert(peer, Hosting::Users(users));
+        self.hosts_said.insert(peer, hosts.clone());
         Ok(())
     }
 
@@ -1298,15 +1309,18 @@ impl Node {
     fn on_notice(&mut self, event: request_response::Event<Notice, Wants>) -> Result<()> {
         match event {
             request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
+                // Whose it is not known here yet, as before the grants making
+                // the noticer's user a guest have come, it's to be noticed
+                // again, not taken for wanting nothing
                 let wants = if request.is_guest() {
                     match self.hosting_guest(&peer, request.user())? {
                         Some(local) => self.catalog.viewing(local.uid, |catalog| structure::answer_guest(catalog, &request))??,
-                        None => Wants::default(),
+                        None => Wants::unplaced(),
                     }
                 } else {
                     match self.serving(&peer, request.user())? {
                         Some(local) => self.catalog.viewing(local.uid, |catalog| structure::answer(catalog, &request))??,
-                        None => Wants::default(),
+                        None => Wants::unplaced(),
                     }
                 };
                 // The noticer may be gone already
@@ -1314,6 +1328,10 @@ impl Node {
             },
             request_response::Event::Message { message: request_response::Message::Response { request_id, response }, .. } => {
                 if let Some((peer, guest, cids)) = self.guest_notices.remove(&request_id) {
+                    // Noticed again at the next announce, by when it may be
+                    if response.is_unplaced() {
+                        return Ok(());
+                    }
                     for push in self.catalog.as_guest(&guest, |catalog| structure::guest_pushes(catalog, &response))?? {
                         let request = self.swarm.behaviour_mut().push.send_request(&peer, push.for_user(Some(&guest.to_bytes())));
                         self.guest_pushes.insert(request);
@@ -1324,6 +1342,12 @@ impl Node {
                 let Some((peer, uid, cursor)) = self.notices.remove(&request_id) else {
                     return Ok(());
                 };
+                // Not placed there, the cursor stays, and it's noticed again
+                // at the next announce
+                if response.is_unplaced() {
+                    self.noticing.remove(&(peer, uid));
+                    return Ok(());
+                }
                 let local = self.local(uid)?;
                 for push in self.catalog.viewing(uid, |catalog| structure::pushes(catalog, &response))?? {
                     let request = self.swarm.behaviour_mut().push.send_request(&peer, push.for_user(local.user_bytes().as_deref()));
@@ -2591,6 +2615,7 @@ impl Node {
         self.noticing.retain(|(noticed, _)| noticed != peer);
         self.guests_noticed.retain(|(noticed, _), _| noticed != peer);
         self.hosting.remove(peer);
+        self.hosts_said.remove(peer);
         self.heard.remove(peer);
         self.sightings.disconnected(peer);
         self.trickle.alarm();
