@@ -452,6 +452,12 @@ pub struct Node {
     /// Whether this machine's clock was last found far from the mesh's.
     skewed: bool,
     redial: Redial,
+    /// Dials to members made from the port this listens on, till they're
+    /// through or not, and where to: one failing is made again at once
+    /// from a port of its own. Two members dialling each other at once
+    /// from the ports they listen on make one TCP connection of the two,
+    /// in which both start the handshake as the dialler, and both fail.
+    reusing: HashMap<libp2p::swarm::ConnectionId, (PeerId, Vec<Multiaddr>)>,
     /// Where this listens through each relay, and the relayed connections
     /// open, to drop once their peers are connected directly.
     relays: HashMap<PeerId, (ListenerId, Multiaddr)>,
@@ -588,6 +594,7 @@ impl Node {
             forwarded: through::Forwarded::new(),
             skewed: false,
             redial: Redial::default(),
+            reusing: HashMap::new(),
             relays: HashMap::new(),
             dialled_at: HashMap::new(),
             circuits: HashMap::new(),
@@ -1089,6 +1096,12 @@ impl Node {
             }
         }
         Ok(())
+    }
+
+    /// Whether a connection's on its way, dialled or dialling in, not yet
+    /// made or failed: it may be to a member to ask.
+    fn connecting(&self) -> bool {
+        self.swarm.network_info().connection_counters().num_pending() > 0
     }
 
     /// The connected members which may be asked of an account's blocks,
@@ -2269,6 +2282,11 @@ impl Node {
         };
         let local = self.local(uid)?;
         let peers = self.fetch_peers(&local)?;
+        // With no member to ask yet, one still connecting may be one: as
+        // just after starting, before the dial to a member's gone through
+        if peers.is_empty() && self.connecting() {
+            return Ok(());
+        }
         let user = local.user_bytes();
         let Some((_, fetch)) = self.fetches.get_mut(&id) else {
             return Ok(());
@@ -2531,8 +2549,25 @@ impl Node {
         use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
         self.redial.dialled(peer, Instant::now());
         let condition = if self.relayed_only(&peer) { PeerCondition::Always } else { PeerCondition::Disconnected };
-        let opts = DialOpts::peer_id(peer).condition(condition).addresses(addrs).build();
+        let opts = DialOpts::peer_id(peer).condition(condition).addresses(addrs.clone()).build();
+        let id = opts.connection_id();
         // A failed dial is reported as an event
+        if self.swarm.dial(opts).is_ok() {
+            self.reusing.insert(id, (peer, addrs));
+        }
+    }
+
+    /// Dial a member again from a port of its own, if it was dialled from
+    /// the port this listens on and that failed: see `reusing`.
+    fn dial_apart(&mut self, id: libp2p::swarm::ConnectionId) {
+        use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+        let Some((peer, addrs)) = self.reusing.remove(&id) else {
+            return;
+        };
+        if self.swarm.is_connected(&peer) && !self.relayed_only(&peer) {
+            return;
+        }
+        let opts = DialOpts::peer_id(peer).condition(PeerCondition::Always).addresses(addrs).allocate_new_port().build();
         let _ = self.swarm.dial(opts);
     }
 
@@ -2792,10 +2827,12 @@ impl Node {
         }
     }
 
-    /// A connection's established: if through a relay, kept track of till
-    /// its peer's connected directly; if direct, its peer's circuits
-    /// dropped, as no longer needed, and where it was dialled noted.
+    /// A connection's established: a dial through, not to be made again
+    /// (see `reusing`); if through a relay, kept track of till its peer's
+    /// connected directly; if direct, its peer's circuits dropped, as no
+    /// longer needed, and where it was dialled noted.
     fn through_relay(&mut self, peer: PeerId, connection: libp2p::swarm::ConnectionId, endpoint: &libp2p::core::ConnectedPoint) {
+        self.reusing.remove(&connection);
         if endpoint.is_relayed() {
             self.circuits.insert(connection, peer);
             return;
@@ -2837,6 +2874,15 @@ impl Node {
         })
     }
 
+    /// A connection that was on its way failed: a member dialled from the
+    /// port this listens on is dialled again from another, and a fetch
+    /// waiting on it may have no one else to ask.
+    fn unconnected(&mut self, peer: Option<PeerId>, id: libp2p::swarm::ConnectionId, error: String) -> Result<Event> {
+        self.dial_apart(id);
+        unless_busy(self.redrive(), "going on with what waited on a connection")?;
+        Ok(Event::Failed(peer, error))
+    }
+
     fn handle(&mut self, event: SwarmEvent<BehaviourEvent>) -> Result<Option<Event>> {
         Ok(match event {
             SwarmEvent::Behaviour(event) if self.trespasses(&event) => None,
@@ -2874,8 +2920,8 @@ impl Node {
                 self.clocks.forget(&peer_id);
                 Some(Event::Disconnected(peer_id))
             },
-            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => Some(Event::Failed(peer_id, error.to_string())),
-            SwarmEvent::IncomingConnectionError { error, .. } => Some(Event::Failed(None, error.to_string())),
+            SwarmEvent::OutgoingConnectionError { peer_id, connection_id, error } => Some(self.unconnected(peer_id, connection_id, error.to_string())?),
+            SwarmEvent::IncomingConnectionError { connection_id, error, .. } => Some(self.unconnected(None, connection_id, error.to_string())?),
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                 self.on_identified(peer_id, &info.listen_addrs)?;
                 self.reserve(peer_id, &info);

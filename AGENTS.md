@@ -195,6 +195,16 @@ nothing and was never noticed again (both fixed 2026-11-27, found as the
 what was said and judge it again when they change, or have the other
 side say "can't tell yet" (`unplaced`) rather than "nothing".
 
+Members dial from the port they listen on, so two dialling each other
+at once make one TCP connection (simultaneous open) where both are the
+noise initiator, and both handshakes fail with "input error". That made
+the `copies` scenario fail a third of the time, its fetch landing in
+the 2 s before the redial (fixed 2026-11-28: a failed dial from the
+listening port is made again at once from a fresh port, and a fetch
+with no one to ask waits on pending connections). Two wrong guesses
+came first; the cause showed only once dials and their failures were
+logged.
+
 ## Amino, as learned against Kubo and the real network
 
 - **Kubo sends each Bitswap reply on a stream of its own** and never

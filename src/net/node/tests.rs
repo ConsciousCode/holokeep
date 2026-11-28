@@ -347,6 +347,22 @@ async fn members_fetch_dags_from_each_other() {
     assert_eq!(fetch(&mut a, &mut b, root).await, (0, vec![]));
 }
 
+/// A fetch begun as a member's still being dialled, as just after a node
+/// starts, waits for it rather than finding no one to ask.
+#[tokio::test]
+async fn a_fetch_waits_for_a_member_being_dialled() {
+    let swarm_key = mesh::fresh_swarm_key().expect("key");
+    let (mut a, mut b) = (node(swarm_key).await, node(swarm_key).await);
+    invite(&a, &b, swarm_key);
+    a.reload().expect("reload");
+    b.reload().expect("reload");
+    let block = raw(b"wanted at once");
+    a.catalog().put_block(&block, CidVersion::V1).expect("put");
+    b.dial_members().expect("dial");
+    let id = b.fetch(link(&block)).expect("fetch");
+    assert_eq!(fetched(&mut a, &mut b, id).await, (1, vec![]));
+}
+
 /// A block reported lost by one member, which another has, is lost no more.
 #[tokio::test]
 async fn what_one_reports_lost_another_makes_good() {

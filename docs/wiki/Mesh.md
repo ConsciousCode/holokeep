@@ -373,7 +373,14 @@ Members are dialled on start. One that isn't reached is dialled again
 2 s later, then after twice as long each time, to at most a minute, so
 a member that was restarting, as an inviter does on joining a mesh, is
 reached within seconds, and one that's offline is tried once a minute.
-Connecting, or a connection dropping, starts it from 2 s again. Every connection is pinged
+Connecting, or a connection dropping, starts it from 2 s again.
+A member's dialled from the port this listens on, so what it sees of
+where this is can be dialled back. Two members dialling each other at
+once that way make one TCP connection of the two, in which both start
+the handshake as the dialler and both fail; so a dial from that port
+that fails is made again at once from a port of its own. A fetch with
+no member to ask waits while a connection's on its way, rather than
+finding no one, as just after starting. Every connection is pinged
 every 10 s, and one whose ping fails is closed, so a peer that slept or
 changed networks isn't left as connected over a dead link: it's
 redialled instead.
@@ -390,7 +397,9 @@ below are CBOR byte strings. A "key" is a multihash's bytes; a "CID" is a
 CID's binary form. A **replica** is `{label: bytes, risks: [string]}`,
 one copy of a block: the volume it's on, by its random label, and what
 that volume risks (see [[Replication and Retention]]).
-An **offer** is `{risks: [string], free: uint | null}`. `user?` is
+An **offer** is `{risks: [string], free: uint | null, fill?: {stored:
+uint, capacity: uint}}`: `fill` how full the member is, what space costs
+it (see [[Replication as a Balance]]), omitted by older builds. `user?` is
 `user: CID`, the key of the user whose blocks a request is about, omitted
 by older builds (see [[#Users sharing a mesh]]). `guest?` is `guest:
 true`, from a machine that doesn't host the user, of what's shared with

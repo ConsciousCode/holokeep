@@ -200,7 +200,7 @@ scenario_copies() {
     two_peer=$(on two hk node id)
     sh_on one 'echo "kept twice" > /tmp/twice'
     cid=$(sh_on one 'hk add -q /tmp/twice | tail -1')
-    on two hk dag fetch "$cid" >/dev/null
+    on two hk dag fetch "$cid" >/dev/null || fail "two couldn't fetch what one added"
     health=$(on one hk dag health --ask-all "$cid") || fail "dag health failed"
     grep -q "^blocks	1 block" <<<"$health" || fail "it's not one block: $health"
     grep -q "^asked	.*$two_peer" <<<"$health" || fail "two wasn't asked: $health"
