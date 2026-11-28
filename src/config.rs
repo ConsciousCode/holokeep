@@ -7,7 +7,7 @@
 //! ```toml
 //! [node]              # the main mesh's node, and every other's defaults
 //! copies = 3
-//! low-water = "10G"
+//! copy-loss = 0.05   # the chance of a copy being lost
 //! target = "50G"      # the most to keep here
 //! ping = "30s"
 //! relay = true        # relay between members which can't reach each other
@@ -32,7 +32,7 @@ use ::serde::{Deserialize, Deserializer, Serialize};
 /// The file's name in the repo's directory.
 pub const FILE: &str = "config.toml";
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// The main mesh's node, and the defaults of every other's.
@@ -76,7 +76,7 @@ fn home(path: &Path) -> PathBuf {
 
 /// A node's tunables, each as its flag of `hk node run` says, and those
 /// with no flag. Unsaid, a flag or the default says.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Node {
     /// Where to listen: in `[node]`, the main mesh's alone, as with
@@ -85,10 +85,17 @@ pub struct Node {
     pub listen: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub copies: Option<usize>,
+    /// No longer anything: what's kept is weighed against what space
+    /// costs. Still read, so a file saying it opens.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "size", serialize_with = "show_size")]
     pub low_water: Option<u64>,
+    /// As `low_water`.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "size", serialize_with = "show_size")]
     pub high_water: Option<u64>,
+    /// The chance of a copy being lost, which weighs what copies are
+    /// worth: 0.1 if unsaid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy_loss: Option<f64>,
     /// The most to keep here.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "size", serialize_with = "show_size")]
     pub target: Option<u64>,
@@ -252,6 +259,7 @@ impl Node {
             copies: self.copies.or(base.copies),
             low_water: self.low_water.or(base.low_water),
             high_water: self.high_water.or(base.high_water),
+            copy_loss: self.copy_loss.or(base.copy_loss),
             target: self.target.or(base.target),
             collect: self.collect.or(base.collect),
             lost_scan: self.lost_scan.or(base.lost_scan),
@@ -371,6 +379,7 @@ mod tests {
             relay = true
             amino-routers = []
             amino-gateway-requests = 16
+            copy-loss = 0.05
 
             [mesh.work]
             copies = 4
@@ -395,6 +404,7 @@ mod tests {
         assert_eq!(config.node("other").copies, Some(3), "a mesh unsaid is [node]'s");
         assert_eq!((main.relay, work.relay), (Some(true), Some(true)));
         assert_eq!((main.amino_routers, main.amino_gateway_requests), (Some(Vec::new()), Some(16)));
+        assert_eq!((main.copy_loss, work.copy_loss), (Some(0.05), Some(0.05)));
         assert!(config.mount.first().is_some_and(|mount| !mount.read_only && !mount.dir().starts_with("~")));
         assert!(config.mount.get(1).is_some_and(|mount| mount.read_only && mount.dir() == Path::new("/mnt/soup")));
 

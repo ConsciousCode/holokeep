@@ -63,7 +63,7 @@ use crate::multihash::Multihash;
 use crate::store::BlockIndex;
 use super::mesh::{Error, Members, Result, unless_busy};
 use super::structure::{self, Cursors, Notice, Wants};
-use super::trim::{self, Ack, Dropped, Grant, Intent, Trim, Watermarks};
+use super::trim::{self, Ack, Dropped, Grant, Intent, Space, Trim};
 use crate::cid::{Cid as _, CidRef};
 use crate::model::Link;
 use crate::store::{Catalog, ExternalFile};
@@ -322,6 +322,21 @@ struct Group<R> {
     report: R,
 }
 
+/// How copies here are weighed against the space they take: what space
+/// there is, the chance of a copy being lost, and what space costs each
+/// member, as it last said.
+struct Weighing {
+    space: Space,
+    copy_loss: f64,
+    costs: HashMap<PeerId, f64>,
+}
+
+impl Default for Weighing {
+    fn default() -> Self {
+        Self { space: Space::default(), copy_loss: crate::balance::PRIOR, costs: HashMap::new() }
+    }
+}
+
 pub struct Node {
     swarm: Swarm<Behaviour>,
     members: Members,
@@ -343,7 +358,7 @@ pub struct Node {
     trims: BTreeMap<TrimId, (u32, Trim)>,
     trim_groups: BTreeMap<TrimId, Group<trim::Report>>,
     next_trim: TrimId,
-    marks: Watermarks,
+    weighing: Weighing,
     /// Blocks members let go of which this node holds, to audit soon.
     suspects: Vec<Multihash>,
     /// The fetch asking members for what a scan found gone, if it's underway.
@@ -533,7 +548,7 @@ impl Node {
             trims: BTreeMap::new(),
             trim_groups: BTreeMap::new(),
             next_trim: 0,
-            marks: Watermarks::default(),
+            weighing: Weighing::default(),
             suspects: Vec::new(),
             lost_scan: None,
             lost_cursor: 0,
@@ -1546,23 +1561,53 @@ impl Node {
         Ok(arrived)
     }
 
-    /// Keep the repo's space as the watermarks say: free space between
-    /// them, and what's stored under the target, if there is one.
-    pub const fn set_watermarks(&mut self, marks: Watermarks) {
-        self.marks = marks;
+    /// Weigh the repo's space as this says: under its target, if it has
+    /// one, else what's stored and free together.
+    pub const fn set_space(&mut self, space: Space) {
+        self.weighing.space = space;
     }
 
-    /// Whether the repo's short of space and should trim, by the
-    /// watermarks: from below the low until above the high, or from past
-    /// the target until a tenth under it.
-    pub fn pressed(&mut self) -> Result<bool> {
-        let free = self.catalog.offer()?.free;
-        let used = if self.marks.target.is_some() { self.catalog.stored()? } else { 0 };
-        Ok(self.marks.update(free, used))
+    /// Weigh copies by this chance of losing one.
+    pub const fn set_copy_loss(&mut self, q: f64) {
+        self.weighing.copy_loss = q;
     }
 
-    pub const fn watermarks(&self) -> Watermarks {
-        self.marks
+    pub const fn copy_loss(&self) -> f64 {
+        self.weighing.copy_loss
+    }
+
+    /// Measure what's stored here again.
+    pub fn measure(&mut self) -> Result<()> {
+        self.weighing.space.update(self.catalog.stored()?);
+        Ok(())
+    }
+
+    pub const fn space(&self) -> Space {
+        self.weighing.space
+    }
+
+    /// How full this node is, if that's known.
+    pub fn fill(&self) -> Result<Option<crate::balance::Fill>> {
+        Ok(self.weighing.space.fill(self.catalog.offer()?.free))
+    }
+
+    /// What space costs here.
+    pub fn cost(&self) -> Result<f64> {
+        Ok(crate::balance::cost(self.fill()?, 0))
+    }
+
+    /// What space costs the member it costs least of these, as each last
+    /// said, or as at half full for one that hasn't; with none, as at half
+    /// full, so what's short is said to be.
+    fn cheapest(&self, peers: &[PeerId]) -> f64 {
+        peers.iter().map(|peer| self.weighing.costs.get(peer).copied().unwrap_or(crate::balance::UNKNOWN)).reduce(f64::min).unwrap_or(crate::balance::UNKNOWN)
+    }
+
+    /// Note what space costs a member, by its offer.
+    fn offered(&mut self, peer: PeerId, offer: Option<&crate::store::Offer>) {
+        if let Some(offer) = offer {
+            self.weighing.costs.insert(peer, crate::balance::cost(offer.fill, 0));
+        }
     }
 
     pub fn trimming(&self) -> bool {
@@ -1583,7 +1628,8 @@ impl Node {
             let id = self.next_trim;
             self.next_trim = id.wrapping_add(1);
             let peers = self.machines_for(&local);
-            let (mut trim, intents) = self.catalog.viewing(local.uid, |catalog| Trim::start(catalog, &self.sightings, &peers, copies, hand_off, keys.iter().cloned()))??;
+            let scales = crate::balance::Scales { copies, q: self.weighing.copy_loss, cost: self.cost()? };
+            let (mut trim, intents) = self.catalog.viewing(local.uid, |catalog| Trim::start(catalog, &self.sightings, &peers, scales, hand_off, keys.iter().cloned()))??;
             for intent in intents {
                 let intent = intent.for_user(local.user_bytes().as_deref());
                 for peer in &peers {
@@ -1691,14 +1737,19 @@ impl Node {
             return Ok(());
         }
         let dropping = self.catalog.drop_all(keys)?;
+        // Members are told only of what's gone from here altogether: a copy
+        // let go of beside another here, on a volume that stays, leaves
+        // this node holding it as before
+        let mut gone = Vec::new();
         for key in &dropping.dropped {
             if !self.catalog.has(key.as_ref())? {
                 self.sightings.forget(key.as_ref())?;
+                gone.push(key.clone());
             }
         }
-        let gone = dropping.dropped;
         if let Some((_, trim)) = self.trims.get_mut(&id) {
-            trim.dropped(gone.len(), if handed { gone.len() } else { 0 }, dropping.freed);
+            let dropped = dropping.dropped.len();
+            trim.dropped(dropped, if handed { dropped } else { 0 }, dropping.freed);
         }
         if !gone.is_empty() {
             let dropped = trim::dropped(&gone);
@@ -1716,7 +1767,7 @@ impl Node {
                 let mut grant = match self.serving(&peer, request.user())? {
                     Some(local) => {
                         let mut trims: Vec<&mut Trim> = self.trims.values_mut().map(|(_, trim)| trim).collect();
-                        self.catalog.viewing(local.uid, |catalog| trim::answer(catalog, &me, &peer, &request, &mut trims, &self.marks))??
+                        self.catalog.viewing(local.uid, |catalog| trim::answer(catalog, &me, &peer, &request, &mut trims, &self.weighing.space))??
                     },
                     None => Grant::default(),
                 };
@@ -1726,6 +1777,7 @@ impl Node {
                 let _ = self.swarm.behaviour_mut().trim.send_response(channel, grant);
             },
             request_response::Event::Message { peer, message: request_response::Message::Response { request_id, response }, .. } => {
+                self.offered(peer, response.offer());
                 if let Some((&id, (_, trim))) = self.trims.iter_mut().find(|(_, (_, trim))| trim.asked(request_id)) {
                     trim.granted(request_id, peer, response);
                     self.drive_trim(id)?;
@@ -1906,7 +1958,8 @@ impl Node {
             let id = self.next_audit;
             self.next_audit = id.wrapping_add(1);
             let peers = self.machines_for(&local);
-            let (mut audit, adverts) = self.catalog.viewing(local.uid, |catalog| Audit::start(catalog, &self.sightings, (me, self.client_of.is_none()), &peers, copies, theirs))??;
+            let scales = crate::balance::Scales { copies, q: self.weighing.copy_loss, cost: self.cheapest(&peers) };
+            let (mut audit, adverts) = self.catalog.viewing(local.uid, |catalog| Audit::start(catalog, &self.sightings, (me, self.client_of.is_none()), &peers, scales, theirs))??;
             for advert in adverts {
                 let advert = advert.for_user(local.user_bytes().as_deref());
                 for &peer in &peers {
@@ -2006,14 +2059,15 @@ impl Node {
             },
             request_response::Event::Message { peer, message: request_response::Message::Request { request, channel, .. }, .. } => {
                 let haves = match self.serving(&peer, request.user())? {
-                    Some(local) => self.catalog.viewing(local.uid, |catalog| durability::answer_advert(catalog, &self.sightings, &peer, &request, &self.marks))??,
+                    Some(local) => self.catalog.viewing(local.uid, |catalog| durability::answer_advert(catalog, &self.sightings, &peer, &request, &self.weighing.space))??,
                     None => Haves::default(),
                 };
                 // The advertiser may be gone already
                 let _ = self.swarm.behaviour_mut().adverts.send_response(channel, haves);
                 return Ok(());
             },
-            request_response::Event::Message { message: request_response::Message::Response { request_id, response }, .. } => {
+            request_response::Event::Message { peer, message: request_response::Message::Response { request_id, response }, .. } => {
+                self.offered(peer, response.offer());
                 if let Some((_, audit)) = self.audit_of(request_id).and_then(|id| self.audits.get_mut(&id)) {
                     unless_busy(audit.haves(&self.sightings, request_id, response), "noting what a member has")?;
                 }
@@ -2045,12 +2099,12 @@ impl Node {
                 }
                 let size = request.size();
                 let kept = match self.serving(&peer, request.user())? {
-                    Some(local) => self.catalog.viewing(local.uid, |catalog| durability::answer_push(catalog, &self.sightings, &peer, request, &self.marks))??,
+                    Some(local) => self.catalog.viewing(local.uid, |catalog| durability::answer_push(catalog, &self.sightings, &peer, request, &self.weighing.space))??,
                     None => Kept::default(),
                 };
                 // Counted against the target till it's measured again
                 if !kept.is_empty() {
-                    self.marks.took(size);
+                    self.weighing.space.took(size);
                 }
                 let _ = self.swarm.behaviour_mut().push.send_response(channel, kept);
                 return Ok(());

@@ -1062,6 +1062,41 @@ async fn surplus_copies_are_let_go_of_once() {
 }
 
 #[tokio::test]
+async fn where_space_is_spare_blocks_have_more_copies_than_asked_till_its_dear() {
+    let (mut a, mut b, mut c) = Box::pin(three()).await;
+    let blocks = wide();
+    let (_, leaves) = blocks.split_last().expect("root");
+    for block in &blocks {
+        a.catalog().put_block(block, CidVersion::V1).expect("put");
+    }
+    // Each all but empty, so space costs next to nothing, and a third copy
+    // of two is worth having
+    for node in [&mut a, &mut b, &mut c] {
+        node.set_space(trim::Space::new(Some(1 << 30)));
+        node.measure().expect("measure");
+    }
+    let id = a.audit(2).expect("audit");
+    audited(&mut [&mut a, &mut b, &mut c], &[(0, id)]).await;
+    for leaf in leaves {
+        assert!(has(&a, leaf) && has(&b, leaf) && has(&c, leaf));
+    }
+    // A quarter full, a's space costs a third: more than a third copy's
+    // worth, less than a second's, so it lets go of the third
+    a.set_space(trim::Space::new(Some(a.space().stored().saturating_mul(4))));
+    a.measure().expect("measure");
+    let id = a.trim(2, &keys(&blocks), false).expect("trim");
+    let reports = trimmed(&mut [&mut a, &mut b, &mut c], &[(0, id)]).await;
+    assert_eq!(reports[0].dropped, 16, "{reports:?}");
+    for leaf in leaves {
+        assert!(!has(&a, leaf) && has(&b, leaf) && has(&c, leaf));
+    }
+    // And b, whose space costs as little as ever, keeps what's now one of two
+    let id = b.trim(2, &keys(&blocks), false).expect("trim");
+    let reports = trimmed(&mut [&mut a, &mut b, &mut c], &[(1, id)]).await;
+    assert_eq!(reports[0].dropped, 0, "{reports:?}");
+}
+
+#[tokio::test]
 async fn sightings_arent_trusted_with_the_last_copies() {
     let (mut a, mut b, blocks) = Box::pin(holding()).await;
     let leaf = blocks.get(2).expect("leaf");
@@ -1094,7 +1129,10 @@ async fn whats_needed_here_is_handed_to_a_member_with_room() {
     let id = a.trim(2, &keys(&blocks), false).expect("trim");
     let reports = trimmed(&mut [&mut a, &mut b, &mut c], &[(0, id)]).await;
     assert_eq!(reports[0].dropped, 0, "{reports:?}");
-    // Handing off, c takes a copy of each leaf first, and a lets go of its
+    // Short of space, handing off, c takes a copy of each leaf first, and
+    // a lets go of its
+    a.set_space(trim::Space::new(Some(1)));
+    a.measure().expect("measure");
     let id = a.trim(2, &keys(&blocks), true).expect("trim");
     let reports = trimmed(&mut [&mut a, &mut b, &mut c], &[(0, id)]).await;
     assert_eq!((reports[0].dropped, reports[0].handed), (16, 16), "{reports:?}");
@@ -1130,7 +1168,7 @@ async fn a_member_without_room_isnt_handed_anything() {
         }
     }
     // c keeps nothing more for others
-    c.set_watermarks(trim::Watermarks::new(0, 0).with_target(Some(0)));
+    c.set_space(trim::Space::new(Some(0)));
     let audits = [(0, a.audit(2).expect("audit")), (1, b.audit(2).expect("audit"))];
     audited(&mut [&mut a, &mut b, &mut c], &audits).await;
     let id = a.trim(2, &keys(&blocks), true).expect("trim");
@@ -1143,15 +1181,17 @@ async fn a_member_without_room_isnt_handed_anything() {
 async fn a_sole_copy_may_move_but_never_goes() {
     let (mut a, mut b, blocks) = Box::pin(holding()).await;
     let leaf = &blocks[2];
-    // Only a holds the leaf, and two copies are asked for: handed to b it's
-    // no shorter, so it moves
+    // Only a holds the leaf, and space there is all but gone: handed to b,
+    // whose fill isn't known, as at half full, it's no shorter, so it moves
+    a.set_space(trim::Space::new(Some(1)));
+    a.measure().expect("measure");
     let id = a.trim(2, &keys(std::slice::from_ref(leaf)), true).expect("trim");
     let reports = trimmed(&mut [&mut a, &mut b], &[(0, id)]).await;
     assert_eq!(reports[0].handed, 1, "{reports:?}");
     assert!(!has(&a, leaf) && has(&b, leaf));
     // And b, with no one to hand it to, a being as full as it means to be,
     // keeps it
-    a.set_watermarks(trim::Watermarks::new(0, 0).with_target(Some(0)));
+    a.set_space(trim::Space::new(Some(0)));
     let id = b.trim(2, &keys(std::slice::from_ref(leaf)), true).expect("trim");
     let reports = trimmed(&mut [&mut a, &mut b], &[(1, id)]).await;
     assert_eq!(reports[0].dropped, 0, "{reports:?}");

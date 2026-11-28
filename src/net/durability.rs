@@ -39,11 +39,12 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use sha2::Digest as _;
 
+use crate::balance::{self, Scales, Worth};
 use crate::block::{Block, IDENTITY};
 use crate::cid::{BaseCid, Cid, CidRef};
 use crate::model::Link;
 use crate::multihash::Multihash;
-use crate::store::{BlockIndex, Catalog, Db, Key, Offer, Replica, tolerance};
+use crate::store::{BlockIndex, Catalog, Db, Key, Offer, Replica};
 
 use super::mesh::Result;
 
@@ -59,9 +60,6 @@ const BUDGET: usize = 4 << 20;
 
 /// How long a copy sighted on another node is believed in.
 pub const TTL: Duration = Duration::from_hours(24 * 7);
-
-/// The space assumed free on a volume which doesn't say: a gigabyte.
-const UNKNOWN_FREE_MIB: u64 = 1024;
 
 /// Blocks a holder believes short, each with the copies it holds.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -96,6 +94,11 @@ pub struct Haves {
 }
 
 impl Haves {
+    /// Where the member would keep a block, and how full it is.
+    pub const fn offer(&self) -> Option<&Offer> {
+        self.offer.as_ref()
+    }
+
     /// The copies it holds, of each block it holds.
     pub(crate) fn into_held(self) -> Vec<(ByteBuf, Vec<Replica>)> {
         self.held
@@ -456,47 +459,45 @@ pub fn first_holder<'a>(key: &[u8], holders: impl IntoIterator<Item = &'a PeerId
     holders.into_iter().max_by(|a, b| score(key, a, 1.0).total_cmp(&score(key, b, 1.0))).copied()
 }
 
-/// What a volume's free space weighs, in mebibytes.
-fn weight(free: Option<u64>) -> f64 {
-    let mib = free.map_or(UNKNOWN_FREE_MIB, |free| free >> 20).max(1);
-    f64::from(u32::try_from(mib).unwrap_or(u32::MAX))
-}
-
-/// The risks of each distinct copy, by label: a volume two nodes share is
-/// one copy.
-pub(crate) fn distinct<'a>(replicas: impl IntoIterator<Item = &'a Replica>) -> Vec<Vec<String>> {
-    let by_label: BTreeMap<&[u8], &Vec<String>> = replicas.into_iter().map(|replica| (replica.label.as_slice(), &replica.risks)).collect();
-    by_label.into_values().cloned().collect()
-}
-
-/// Where to send a block to raise its tolerance: of the offers whose copy
-/// would raise it most, the one with the highest weighted rendezvous score.
+/// How many copies of a block these holders' make: one for each holder
+/// with a copy, but a volume two share, as a NAS both mount, only once.
 ///
-/// One with no room at all, as a node past its target has, isn't sent
-/// anything: it would only refuse it.
-pub fn choose<'a>(key: &[u8], held: &[Replica], offers: impl IntoIterator<Item = (&'a PeerId, &'a Offer)>, copies: usize) -> Option<PeerId> {
-    let have = distinct(held);
-    let now = tolerance(&have, copies);
-    let raised: Vec<(PeerId, usize, f64)> = offers
+/// What risks copies share isn't counted: which of a node's volumes a
+/// copy's on is for placement here, not for the balance, and a risk every
+/// member shares, a mount source say, would make every copy past the first
+/// worth nothing, though each guards against its own volume failing.
+pub(crate) fn holders<'a>(holdings: impl IntoIterator<Item = &'a [Replica]>) -> usize {
+    let mut seen: BTreeSet<&[u8]> = BTreeSet::new();
+    holdings.into_iter().filter(|replicas| replicas.iter().filter(|replica| seen.insert(replica.label.as_slice())).count() > 0).count()
+}
+
+/// Where to send a block of `size` bytes, of which `now` copies are held,
+/// none by these members.
+///
+/// Of the members whose copy would be worth more than space would cost
+/// them with it and what's been sent them already (`sent`), the one with
+/// the highest rendezvous score, weighted by `1 / cost`, so emptier
+/// members win in proportion. One without room for it isn't sent it: it
+/// would only refuse it.
+pub fn choose<'a>(key: &[u8], now: usize, offers: impl IntoIterator<Item = (&'a PeerId, &'a Offer)>, worth: Worth, size: u64, sent: &BTreeMap<PeerId, u64>) -> Option<PeerId> {
+    let with = now.saturating_add(1);
+    offers
         .into_iter()
-        .filter(|(_, offer)| offer.free != Some(0))
-        .map(|(peer, offer)| {
-            let with = tolerance(&[have.as_slice(), std::slice::from_ref(&offer.risks)].concat(), copies);
-            (*peer, with, weight(offer.free))
+        .filter_map(|(peer, offer)| {
+            let more = sent.get(peer).copied().unwrap_or_default().saturating_add(size);
+            if offer.free.is_some_and(|free| free < more) {
+                return None;
+            }
+            let cost = balance::cost(offer.fill, more);
+            worth.outweighs(with, cost).then(|| (*peer, balance::weight(cost)))
         })
-        .filter(|&(_, with, _)| with > now)
-        .collect();
-    let best = raised.iter().map(|&(_, with, _)| with).max()?;
-    raised
-        .into_iter()
-        .filter(|&(_, with, _)| with == best)
-        .max_by(|(a, _, wa), (b, _, wb)| score(key, a, *wa).total_cmp(&score(key, b, *wb)))
-        .map(|(peer, _, _)| peer)
+        .max_by(|(a, wa), (b, wb)| score(key, a, *wa).total_cmp(&score(key, b, *wb)))
+        .map(|(peer, _)| peer)
 }
 
 /// Answer an advert: the copies held here of what it names, noting the
 /// advertiser's copies of those, and where this node would keep a block.
-pub fn answer_advert(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, advert: &Advert, marks: &super::trim::Watermarks) -> Result<Haves> {
+pub fn answer_advert(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, advert: &Advert, space: &super::trim::Space) -> Result<Haves> {
     let mut held = Vec::new();
     for (key, theirs) in &advert.blocks {
         let Ok(multihash) = decode(key) else {
@@ -510,14 +511,16 @@ pub fn answer_advert(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, ad
         }
         held.push((key.clone(), catalog.replicas(multihash.as_ref())?));
     }
-    Ok(Haves { held, offer: Some(offered(catalog, marks)?) })
+    Ok(Haves { held, offer: Some(offered(catalog, space)?) })
 }
 
 /// Where this node would keep a block it's sent: its own volume, with
-/// the room the watermarks leave others, and the account's quota.
-pub fn offered(catalog: &Catalog, marks: &super::trim::Watermarks) -> Result<Offer> {
+/// the room under its target, if it has one, and the account's quota;
+/// and how full it is.
+pub fn offered(catalog: &Catalog, space: &super::trim::Space) -> Result<Offer> {
     let mut offer = catalog.offer()?;
-    offer.free = marks.room(offer.free);
+    offer.fill = space.fill(offer.free);
+    offer.free = space.room(offer.free);
     if let Some((_, left)) = catalog.quota_left()? {
         offer.free = Some(offer.free.map_or(left, |free| free.min(left)));
     }
@@ -526,9 +529,9 @@ pub fn offered(catalog: &Catalog, marks: &super::trim::Watermarks) -> Result<Off
 
 /// Keep what's pushed, if there's room and each block matches its CID,
 /// noting the sender's copies of what's kept.
-pub fn answer_push(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, push: Push, marks: &super::trim::Watermarks) -> Result<Kept> {
+pub fn answer_push(catalog: &Catalog, sightings: &Sightings, peer: &PeerId, push: Push, space: &super::trim::Space) -> Result<Kept> {
     let size = push.size();
-    if marks.room(catalog.offer()?.free).is_some_and(|room| size > room) {
+    if space.room(catalog.offer()?.free).is_some_and(|room| size > room) {
         return Ok(Kept::default());
     }
     // Nor past what the account's allowed
@@ -620,14 +623,27 @@ pub struct Report {
 }
 
 /// A block being audited: who holds copies, and who's been passed over.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Holding {
     holders: BTreeMap<PeerId, Vec<Replica>>,
     passed: BTreeSet<PeerId>,
     pushing: bool,
-    /// How many failures it should take to lose it, as its nearest keeps
-    /// say, or as the audit runs with.
-    copies: usize,
+    /// What its copies are worth, as its nearest keeps say or as the audit
+    /// runs with; None for a client's, which want only a member's copy.
+    worth: Option<Worth>,
+}
+
+impl Holding {
+    /// Whether a copy more, making it `k + 1` copies, is worth what
+    /// space costs a member.
+    fn wants(&self, k: usize, cost: f64) -> bool {
+        self.worth.map_or(k == 0, |worth| worth.outweighs(k.saturating_add(1), cost))
+    }
+
+    /// Whether it's short of the copies it wants, with `k`.
+    fn short(&self, k: usize) -> bool {
+        k < self.worth.map_or(1, |worth| worth.n)
+    }
 }
 
 /// Pushes to send: to whom, what, and the blocks' multihashes.
@@ -644,12 +660,15 @@ pub struct Audit {
     pushes: HashMap<OutboundRequestId, (PeerId, Vec<Vec<u8>>)>,
     /// Rounds of pushes decided.
     rounds: usize,
+    /// What's been sent each member, which its offer doesn't count.
+    sent: BTreeMap<PeerId, u64>,
     report: Report,
 }
 
 impl Audit {
-    /// Audit these blocks: find those short of `copies` failures to lose,
-    /// or whose copies elsewhere are due to be sighted again, and which
+    /// Audit these blocks: find those another copy of would be worth more
+    /// than space costs the member it costs least (`scales.cost`), or
+    /// whose copies elsewhere are due to be sighted again, and which
     /// this node is responsible for among the holders it knows of,
     /// connected or itself. Returns the audit and the adverts to send
     /// every peer. Unless `own` counts, what's here counts for nothing, as
@@ -661,7 +680,7 @@ impl Audit {
         sightings: &Sightings,
         (me, own): (PeerId, bool),
         peers: &[PeerId],
-        copies: usize,
+        scales: Scales,
         keys: impl IntoIterator<Item = Multihash>,
     ) -> Result<(Self, Vec<Advert>)> {
         sightings.expire()?;
@@ -672,6 +691,7 @@ impl Audit {
             adverts: HashMap::new(),
             pushes: HashMap::new(),
             rounds: 0,
+            sent: BTreeMap::new(),
             report: Report::default(),
         };
         let mut adverts = Vec::new();
@@ -683,15 +703,15 @@ impl Audit {
             let ours = if own { catalog.replicas(key.as_ref())? } else { Vec::new() };
             // A client's done once a member holds it, whose audits see to
             // the rest
-            let copies = if own { catalog.copies_wanted(key.as_ref(), copies)?.unwrap_or(copies) } else { 1 };
-            let mut holding = Holding { copies, ..Holding::default() };
+            let worth = if own { Some(scales.worth(catalog.copies_wanted(key.as_ref(), scales.copies)?.unwrap_or(scales.copies))) } else { None };
+            let mut holding = Holding { holders: BTreeMap::new(), passed: BTreeSet::new(), pushing: false, worth };
             for (peer, replica) in sightings.of(key.as_ref())? {
                 if peers.contains(&peer) {
                     holding.holders.entry(peer).or_default().push(replica);
                 }
             }
-            let have = distinct(ours.iter().chain(holding.holders.values().flatten()));
-            if tolerance(&have, copies) >= copies && !sightings.stale(key.as_ref())? {
+            let have = holders(std::iter::once(ours.as_slice()).chain(holding.holders.values().map(Vec::as_slice)));
+            if !holding.wants(have, scales.cost) && !sightings.stale(key.as_ref())? {
                 continue;
             }
             let bytes = key.to_bytes();
@@ -829,8 +849,8 @@ impl Audit {
         let mut targets: BTreeMap<PeerId, Vec<Vec<u8>>> = BTreeMap::new();
         let mut settled = Vec::new();
         for (key, holding) in &mut self.blocks {
-            let held: Vec<Replica> = holding.holders.values().flatten().cloned().collect();
-            if tolerance(&distinct(&held), holding.copies) >= holding.copies {
+            let now = holders(holding.holders.values().map(Vec::as_slice));
+            if !holding.wants(now, f64::NEG_INFINITY) {
                 settled.push(key.clone());
                 continue;
             }
@@ -841,12 +861,17 @@ impl Audit {
                 continue;
             }
             let offers = self.offers.iter().filter(|(peer, _)| !holding.holders.contains_key(peer) && !holding.passed.contains(peer));
-            let Some(target) = choose(key, &held, offers, holding.copies) else {
-                self.report.short = self.report.short.saturating_add(1);
+            let size = decode(key).ok().map(|key| catalog.held_size(key.as_ref())).transpose()?.flatten().unwrap_or_default();
+            let Some(target) = choose(key, now, offers, holding.worth.unwrap_or(Worth::EVERYTHING), size, &self.sent) else {
+                if holding.short(now) {
+                    self.report.short = self.report.short.saturating_add(1);
+                }
                 settled.push(key.clone());
                 continue;
             };
             holding.pushing = true;
+            let sent = self.sent.entry(target).or_default();
+            *sent = sent.saturating_add(size);
             targets.entry(target).or_default().push(key.clone());
         }
         for key in settled {
@@ -964,57 +989,80 @@ impl Trickle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::balance::Fill;
 
     fn offer(risks: &[&str]) -> Offer {
-        Offer { risks: risks.iter().map(|&risk| risk.to_owned()).collect(), free: None }
+        Offer { risks: risks.iter().map(|&risk| risk.to_owned()).collect(), free: None, fill: None }
     }
 
     fn replica(label: u8, risks: &[&str]) -> Replica {
         Replica { label: vec![label], risks: risks.iter().map(|&risk| risk.to_owned()).collect() }
     }
 
+    const TWO: Worth = Worth { n: 2, q: 0.1 };
+
+    fn pick<'a>(key: &[u8], now: usize, offers: impl IntoIterator<Item = (&'a PeerId, &'a Offer)>, worth: Worth) -> Option<PeerId> {
+        choose(key, now, offers, worth, 10, &BTreeMap::new())
+    }
+
     #[test]
-    fn the_target_is_whoever_raises_tolerance_most() {
+    fn a_member_without_room_isnt_chosen() {
         let (a, b) = (PeerId::random(), PeerId::random());
-        let held = [replica(1, &["volume:1", "disk:x"])];
-        // b's volume is on the same disk; a's isn't
-        let offers = BTreeMap::from([(a, offer(&["volume:2", "disk:y"])), (b, offer(&["volume:3", "disk:x"]))]);
+        let offers = BTreeMap::from([(a, offer(&["volume:2"])), (b, offer(&["volume:3"]))]);
+        assert!(pick(&[0], 1, &offers, TWO).is_some());
+        // Already enough, as members of unknown fill are at half full
+        assert_eq!(pick(&[0], 2, &offers, TWO), None);
+        let full = BTreeMap::from([(a, Offer { free: Some(0), ..offer(&["volume:2"]) }), (b, offer(&["volume:3"]))]);
         for key in 0..32u8 {
-            assert_eq!(choose(&[key], &held, &offers, 2), Some(a));
+            assert_eq!(pick(&[key], 1, &full, TWO), Some(b));
         }
-        // Already enough
-        assert_eq!(choose(&[0], &[held[0].clone(), replica(2, &["disk:y"])], &offers, 2), None);
-        // One with no room isn't sent anything, however much it would raise it
-        let full = BTreeMap::from([(a, Offer { free: Some(0), ..offer(&["volume:2", "disk:y"]) }), (b, offer(&["volume:3", "disk:x"]))]);
-        assert_eq!(choose(&[0], &held, &full, 2), None, "b on the same disk raises nothing");
-        let full = BTreeMap::from([(a, Offer { free: Some(0), ..offer(&["volume:2", "disk:y"]) }), (b, offer(&["volume:3", "disk:z"]))]);
-        assert_eq!(choose(&[0], &held, &full, 2), Some(b));
+        let none = BTreeMap::from([(a, Offer { free: Some(5), ..offer(&["volume:2"]) })]);
+        assert_eq!(pick(&[0], 1, &none, TWO), None, "nor one with less room than the block");
     }
 
     #[test]
-    fn a_shared_volume_is_one_copy() {
-        let shared = [replica(1, &["volume:1"]), replica(1, &["volume:1"])];
-        assert_eq!(tolerance(&distinct(&shared), 2), 1);
+    fn a_copy_goes_where_its_worth_what_space_costs() {
+        let a = PeerId::random();
+        let at = |stored: u64| BTreeMap::from([(a, Offer { fill: Some(Fill { stored, capacity: 1000 }), ..offer(&["volume:3"]) })]);
+        // A third copy of two is worth 0.1: taken while space costs less
+        assert_eq!(pick(&[0], 2, &at(50), TWO), Some(a), "under 9% full");
+        assert_eq!(pick(&[0], 2, &at(100), TWO), None, "past it, counting the block");
+        // What's sent already counts
+        let sent = BTreeMap::from([(a, 40)]);
+        assert_eq!(choose(&[0], 2, &at(50), TWO, 10, &sent), None);
+        // A client's wants a member's copy wherever there's room
+        assert_eq!(pick(&[0], 0, &at(990), Worth::EVERYTHING), Some(a));
     }
 
     #[test]
-    fn targets_spread_by_free_space() {
+    fn copies_are_one_a_holder_and_a_shared_volume_one() {
+        let (one, two, three) = ([replica(1, &["volume:1"])], [replica(2, &["volume:2", "overlay:overlay"])], [replica(3, &["volume:3", "overlay:overlay"])]);
+        assert_eq!(holders([one.as_slice(), two.as_slice(), three.as_slice()]), 3, "a risk they share is no matter");
+        let shared = [replica(1, &["volume:1"])];
+        assert_eq!(holders([one.as_slice(), shared.as_slice()]), 1, "two nodes mounting one volume");
+        assert_eq!(holders([one.as_slice(), &[]]), 1, "one that says it holds none");
+        let both = [replica(1, &["volume:1"]), replica(4, &["volume:4"])];
+        assert_eq!(holders([both.as_slice(), two.as_slice()]), 2, "two volumes on one node are one copy");
+    }
+
+    #[test]
+    fn targets_spread_by_what_space_costs() {
         let peers: Vec<PeerId> = (0..3).map(|_| PeerId::random()).collect();
-        let roomy = |peer: usize| Offer { risks: vec![format!("volume:{peer}")], free: Some(if peer == 0 { 3 << 30 } else { 1 << 30 }) };
-        let offers: BTreeMap<PeerId, Offer> = peers.iter().enumerate().map(|(i, peer)| (*peer, roomy(i))).collect();
-        let held = [replica(9, &["volume:9"])];
+        // Space costs the first a third of what it costs the others
+        let fill = |peer: usize| Fill { stored: if peer == 0 { 1000 } else { 2500 }, capacity: 10_000 };
+        let offers: BTreeMap<PeerId, Offer> = peers.iter().enumerate().map(|(i, peer)| (*peer, Offer { fill: Some(fill(i)), ..offer(&[&format!("volume:{i}")]) })).collect();
         let mut wins = [0usize; 3];
         for key in 0..3000u16 {
-            let target = choose(&key.to_be_bytes(), &held, &offers, 2).expect("target");
+            let target = pick(&key.to_be_bytes(), 1, &offers, TWO).expect("target");
             if let Some(win) = peers.iter().position(|peer| *peer == target).and_then(|i| wins.get_mut(i)) {
                 *win = win.saturating_add(1);
             }
         }
-        // 3:1:1 by free space, give or take
+        // 3:1:1, give or take
         assert!(wins.iter().all(|&win| win > 300), "{wins:?}");
         assert!(wins[0] > 1500 && wins[0] < 2100, "{wins:?}");
         // Whatever order a node knows the offers in
-        assert_eq!(choose(&[7], &held, &offers, 2), choose(&[7], &held, offers.iter().rev(), 2));
+        assert_eq!(pick(&[7], 1, &offers, TWO), pick(&[7], 1, offers.iter().rev(), TWO));
     }
 
     #[test]
@@ -1071,7 +1119,7 @@ mod tests {
     fn a_push_past_the_accounts_quota_is_refused() {
         let (db, mut catalog, _) = catalog_of(0);
         let sightings = Sightings::open(db).expect("sightings");
-        let marks = super::super::trim::Watermarks::new(0, 0);
+        let marks = super::super::trim::Space::new(None);
         let peer = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
         let block = |data: &[u8]| Block::hash(crate::cid::Cidv1Spec::default(), data.into());
         let push = |block: &Block| Push {
@@ -1125,7 +1173,7 @@ mod tests {
         sightings.see(key.as_ref(), &peer, &replica(1, &["volume:01", "disk:elsewhere"])).expect("see");
         // Enough copies, freshly sighted: nothing to say
         let advertised = |sightings: &Sightings| {
-            Audit::start(&catalog, sightings, (me, true), &[peer], 2, [key.clone()]).expect("start").0.report.advertised
+            Audit::start(&catalog, sightings, (me, true), &[peer], Scales { copies: 2, q: 0.1, cost: 1.0 }, [key.clone()]).expect("start").0.report.advertised
         };
         assert_eq!(advertised(&sightings), 0);
         // Four days on, it's due

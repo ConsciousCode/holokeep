@@ -5,6 +5,7 @@
 // error types', and nothing's lost by ignoring a result it returns
 #![allow(clippy::missing_errors_doc, clippy::missing_panics_doc, clippy::must_use_candidate)]
 
+pub mod balance;
 pub mod cid;
 pub mod config;
 pub mod cap;

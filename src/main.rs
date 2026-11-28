@@ -635,24 +635,26 @@ struct RunArgs {
     /// other port for another]
     #[arg(long)]
     listen: Option<String>,
-    /// Copy blocks to other members until it would take this many
-    /// failures to lose each, counting risks, auditing a few at a time
-    /// [default: 2]
+    /// The copies each block settles at while members are half full:
+    /// more where space is spare, fewer where it's short, as each copy's
+    /// worth is weighed against the space it takes [default: 2]
     #[arg(short, long)]
     copies: Option<usize>,
-    /// When free space falls below this, let go of copies the mesh can
-    /// spare (bytes, or with K, M, G, T) [default: 2G]
-    #[arg(long, value_parser = holokeep::net::daemon::parse_size)]
+    /// No longer anything: space is weighed, not kept between marks
+    #[arg(long, hide = true, value_parser = holokeep::net::daemon::parse_size)]
     low_water: Option<u64>,
-    /// ...until it's back above this; nor take others' copies past it
-    /// [default: 4G]
-    #[arg(long, value_parser = holokeep::net::daemon::parse_size)]
+    /// As --low-water
+    #[arg(long, hide = true, value_parser = holokeep::net::daemon::parse_size)]
     high_water: Option<u64>,
-    /// The most to keep here: past it, let go of copies the mesh can spare
-    /// and hand others to members with room, until a tenth under it; nor
-    /// take others' copies past that [default: no most]
+    /// The most to keep here: space costs the odds of being full of it,
+    /// and copies worth less than their space are let go of (bytes, or
+    /// with K, M, G, T) [default: what's stored and free together]
     #[arg(long, value_parser = holokeep::net::daemon::parse_size)]
     target: Option<u64>,
+    /// The chance of a copy being lost, which weighs what each copy's
+    /// worth [default: 0.1]
+    #[arg(long)]
+    copy_loss: Option<f64>,
     /// Don't collect garbage. Otherwise leaves nothing keeps are let go
     /// of a week after they're condemned, once every member's said it
     /// doesn't keep them
@@ -2260,7 +2262,7 @@ fn node(place: &holokeep::net::mesh::Place, command: NodeCommand) -> anyhow::Res
 #[cfg(feature = "net")]
 fn node_run(place: &holokeep::net::mesh::Place, args: RunArgs) -> anyhow::Result<()> {
     use holokeep::net::daemon;
-    let RunArgs { listen, copies, low_water, high_water, target, no_collect, no_lost_scan, shared, clients, door, gateway, amino } = args;
+    let RunArgs { listen, copies, low_water, high_water, target, copy_loss, no_collect, no_lost_scan, shared, clients, door, gateway, amino } = args;
     let config = holokeep::config::Config::load(&place.repo)?;
     let tuned = config.node(&place.mesh);
     let listen = listen.or(tuned.listen).unwrap_or_else(|| if place.is_main() { daemon::LISTEN } else { "/ip4/0.0.0.0/tcp/0" }.to_owned());
@@ -2292,7 +2294,16 @@ fn node_run(place: &holokeep::net::mesh::Place, args: RunArgs) -> anyhow::Result
         holokeep::net::amino::open(&place.repo, amino.parse().context("not a multiaddr")?, bootstrap, tuned.amino_routers, tuned.amino_gateway_requests.unwrap_or(holokeep::net::amino::GATEWAY_REQUESTS), tuned.amino_server.unwrap_or(false))?;
     }
     let copies = copies.or(tuned.copies).unwrap_or(2);
-    let marks = holokeep::net::trim::Watermarks::new(low_water.or(tuned.low_water).unwrap_or(2 << 30), high_water.or(tuned.high_water).unwrap_or(4 << 30)).with_target(target.or(tuned.target));
+    if low_water.or(tuned.low_water).or(high_water).or(tuned.high_water).is_some() {
+        eprintln!("warning: low-water and high-water no longer do anything: copies are weighed against what space costs, under target if there is one");
+    }
+    let target = target.or(tuned.target);
+    if target.is_none() {
+        eprintln!("warning: no target set, so space is weighed against all the free space: other members' copies may fill it till it's dear. Set one with --target or `target` in config.toml");
+    }
+    let copy_loss = copy_loss.or(tuned.copy_loss).unwrap_or(holokeep::balance::PRIOR);
+    anyhow::ensure!(copy_loss > 0.0 && copy_loss < 1.0, "copy-loss is a chance, between 0 and 1");
+    let balance = daemon::Balance { space: holokeep::net::trim::Space::new(target), copy_loss };
     let collect = !no_collect && tuned.collect.unwrap_or(true);
     let lost_scan = !no_lost_scan && tuned.lost_scan.unwrap_or(true);
     let shared = shared || tuned.shared.unwrap_or(false);
@@ -2303,7 +2314,7 @@ fn node_run(place: &holokeep::net::mesh::Place, args: RunArgs) -> anyhow::Result
         eprintln!("this build has no mount, so the config's mounts aren't kept");
     }
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let ran = runtime.block_on(daemon::run(place, listen, copies, marks, collect, lost_scan, shared));
+    let ran = runtime.block_on(daemon::run(place, listen, copies, balance, collect, lost_scan, shared));
     #[cfg(feature = "fuse")]
     if let Some(mounts) = mounts {
         mounts.stop();

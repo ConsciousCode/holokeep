@@ -106,16 +106,29 @@ works. This is what neither says.
   pressure, say) over thresholds to set, and when adding a setting, ask
   whether it states intent or merely tunes a process that could find
   its own level.
-- **`copies` is what a node wants**, as the user designed it: how much
-  it wants a block kept, and so how willing it is to store it given its
-  space, rather than a mesh-wide count (a keep's own `copies` overrides
-  it for what the keep reaches). Ideally it becomes a returning
-  force, replication pressure against memory pressure; the specifics are
-  to be workshopped. As built, each node uses its own `copies` in audits
-  (only the top-ranked holder of a block audits it) and trims, so a
-  block's effective count is its top holder's; under space pressure,
-  mismatched settings churn until someone has room. Rendezvous hashing
-  doesn't involve `copies`.
+- **Copies are a balance, not a count** (built 2026-11-28; the wiki's
+  "Replication as a Balance"). Space costs a node `p/(1−p)`, `p` its
+  stored over its `target`, or over stored + free with no target (the
+  user chose this so a disk's other files don't cut default
+  durability). A block's `k`-th copy is worth `q^(k−n)`, `n` its
+  `copies`, `q` the chance of losing a copy (`copy-loss`, 0.1). Add
+  where worth ≥ the member's cost with the block, drop where worth <
+  cost here; both count the block as stored, which is what stops
+  flapping. `k` is how many members hold a copy (a shared volume label
+  once), not tolerance: with tolerance, a risk all members share (in
+  the Podman tests every copy has `overlay:overlay`) made every copy
+  past the first worth 0, so members dropped them and an offline member
+  couldn't edit. Which volume a copy goes on is a later, local
+  placement policy, and risk classes are out of the balance on
+  purpose. A node whose fill isn't known (no free space
+  reported, as in the in-memory node tests) costs 1, so `copies` acts
+  as a count there. Not built: estimating `q` from losses (Beta prior
+  `(lost+1)/(seen+10)` over the `TTL` window, `copy-loss` then fixing it
+  till removed, a reset), and local value `ℓ(node, store, block)`.
+  Pinned for their own debates: placement units (rendezvous on what a
+  block was placed as part of), a configurable `TTL`. The watermarks
+  (`low-water`, `high-water`) are gone; the keys still parse, with a
+  warning, since the config denies unknown keys.
 
 - **IPLD**: one canonical data model that codecs round-trip through;
   codecs hand-rolled on the serde harness in `src/serde/`, checked against

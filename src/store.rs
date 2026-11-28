@@ -642,11 +642,14 @@ pub struct Replica {
 }
 
 /// Where a node would keep a block it's sent: its own volume's risks, and
-/// the free space there, if it's known.
+/// the room there, if it's known; and how full it is, which says what
+/// space costs it (see `balance`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Offer {
     pub risks: Vec<String>,
     pub free: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<crate::balance::Fill>,
 }
 
 /// The risk every volume runs of itself, by its label, so it means the
@@ -2618,9 +2621,9 @@ impl Catalog {
     pub fn offer(&self) -> Result<Offer> {
         let v = self.own().unwrap_or_default();
         let (Some(&id), Some(volume)) = (self.ids.get(v), self.volumes.get(v)) else {
-            return Ok(Offer { risks: Vec::new(), free: None });
+            return Ok(Offer { risks: Vec::new(), free: None, fill: None });
         };
-        Ok(Offer { risks: self.risks(id)?, free: volume.path().and_then(free_space) })
+        Ok(Offer { risks: self.risks(id)?, free: volume.path().and_then(free_space), fill: None })
     }
 
     /// A block as it can be read now, verified, under the first CID it was

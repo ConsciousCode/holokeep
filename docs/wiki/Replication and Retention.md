@@ -2,6 +2,11 @@ Replication and collection pull in opposite directions: one makes copies
 until every block is safe, the other lets go of what's surplus or
 unwanted. Both run as slow trickles rather than schedules.
 
+How many copies are made and kept settles by a balance of each copy's
+value against the cost of the space it takes, rather than at a count:
+see [[Replication as a Balance]]. `copies` is what a block settles at
+while members are half full.
+
 ## Risks
 
 Each volume has a set of **risks**, things whose failure would take every
@@ -21,8 +26,9 @@ one disk, or in one house, count as one.
 
 ## Durability
 
-Each node audits what it holds and advertises (see [[Mesh#Protocols|protocols]]) the blocks whose tolerance
-is below their target, with the replicas it knows of.
+Each node audits what it holds and advertises (see [[Mesh#Protocols|protocols]]) the blocks another
+copy of would be worth more than space costs the member it costs least,
+as members last said, with the replicas it knows of.
 
 A block's **target** is what its keeps say. Walking up from it, by links
 and from anchors' values to the anchors, each path stops at the first
@@ -33,15 +39,17 @@ farther one for what's under it (`hk keep add --copies 1` on what's
 made again easily), and a block shared with something more precious is
 as safe as that. What no keep reaches has the mesh's. Every member answers with what it holds of those
 (correcting the advertiser's belief, both ways) and an offer: its
-volume's risks and free space.
+volume's risks, its room and how full it is.
 
-If a block is still short, a target is chosen by **weighted rendezvous
-hashing** over the members whose copy would raise tolerance most:
+If another copy is still worth having, a member is chosen by **weighted
+rendezvous hashing** over those holding none whose copy would be worth
+more than space would cost them with it, a block's copies counted one
+for each member holding one:
 
 ```
 draw(key, peer)  = (u32_be(sha256(key || peer_id_bytes)[0..4]) + 1) / (2^32 + 1)
 score(key, peer) = -weight / ln(draw)
-weight           = max(1, free space in MiB)
+weight           = 1 / cost, with the block and what's been sent it this audit
 ```
 
 The highest score wins, and the block is pushed there. The same hashing,
@@ -94,16 +102,19 @@ A copy's being held is all this says. Whether its bytes are still whole
 depends on the storage: a mirror looks after itself, and the audits'
 sampling catches the rest in time.
 
-## Trimming surplus
+## Trimming
 
-When free space falls below `--low-water` (2G), a node lets go of copies
-the mesh can spare, by each block's target until it's above `--high-water` (4G). Only leaves in
-its own stores go, never structure, never ranges of files imported in
-place. Before letting go it asks every member what it holds *now*
-(`trim`). A member about to let go of the same block refuses unless the
-asker ranks below it by the holders' rendezvous order, so the
-lowest-ranked goes first. What's let go is announced (`dropped`), and
-members forget their sightings and audit it soon.
+A node lets go of a copy here once it's worth less than the space it
+takes, as [[Replication as a Balance]] weighs them: every 30 s, of a
+sample, and again at once after a trim that let go of anything. Only
+leaves in its own stores go, never structure, never ranges of files
+imported in place, and never the last copy of anything. Before letting
+go it asks every member what it holds *now* (`trim`), and only what's
+still worth less by the answers goes. A member about to let go of the
+same block refuses unless the asker ranks below it by the holders'
+rendezvous order, so the lowest-ranked goes first. What's let go is
+announced (`dropped`), and members forget their sightings and audit it
+soon.
 
 What's looked at first is what's been used least lately: each trim takes
 a random sample twice its size and looks at the half least used, by when
@@ -112,28 +123,26 @@ a node holds settles into what's wanted of it, as a cache's does, with
 no age to set. Uses are remembered in memory only, so after a restart
 everything's as unused as everything else till it's used again.
 
-A node can have a target too, the most it means to keep (`--target`, or
-`target` in [[Configuration]]): once what's stored here passes it, the
-node trims until it's a tenth under, and it offers others only what's
-under that. So a laptop needn't fill its disk for the mesh, and holds
-what it was given or wrote until there's somewhere else for it. A
-member with no room at all, as one past its target, isn't chosen to
-keep anything. With `target = "4G"` a node such as a relay holds at most
-about that, keeping what's used most; `target = 0` has it hold only what
-no other member can take.
+A node's `target` (`--target`, or `target` in [[Configuration]]) is the
+most it means to keep: how full it is is what's stored over that, and
+nothing's taken past it. With none, it's what's stored over what's
+stored and free together, so a disk's other uses count only as they
+take free space, and `hk node run` warns of it. So a laptop needn't fill
+its disk for the mesh. With `target = "4G"` a node such as a relay holds
+about as much as that makes worth it, keeping what's used most;
+`target = 0` has it hold only what no other member can take.
 
 ## Handing off
 
-Under pressure, by either mark, what isn't surplus can go too, if
-another member takes it first. A member's answer to an intent says where
-it would keep a block and how much room it has, as an advert's answer
-does; a copy here that's needed is pushed to the member whose copy would
-make up for it, and goes once that member says it kept it. A copy goes
-only if what's left takes as many failures to lose as with it, so a
-block short of copies may still move but never gets shorter, and a last
-copy no member has room for stays. Each trim hands off about 64 MiB, and
-one that freed space is followed by another at once, till the pressure's
-off. `hk node trim`, run by hand, lets go only of what's spare.
+What a trim would let go of, a member it's worth more to can take
+first. A member's answer to an intent says where it would keep a block,
+how much room it has and how full it is, as an advert's answer does; a
+copy here is pushed to the member chosen as an audit chooses, one
+holding none, and goes once that member says it kept it, so there are as
+many copies as before: blocks move to emptier members whole, and a last copy moves to
+one rather than staying where space is dear, or stays if none will take
+it. Each trim hands off about 64 MiB. `hk node trim`, run by hand,
+hands nothing off, letting go only of what can go now.
 
 ## Lost blocks
 

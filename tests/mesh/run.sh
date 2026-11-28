@@ -93,6 +93,11 @@ node_down() {
     wait_for "$1's node to stop" sh_on "$1" '! hk node status'
 }
 
+# The flags a node's daemon was started with, to start it again with
+node_args() {
+    sh_on "$1" 'for p in /proc/[0-9]*; do c=$(tr "\0" " " < "$p/cmdline" 2>/dev/null); case $c in "hk node run "*) echo "${c#hk node run }";; esac; done'
+}
+
 # Mount a node's soup at /soup, and wait till it's there
 mount_up() {
     podman exec -d "$run-$1" sh -c 'exec hk mount /soup >>/tmp/mount.log 2>&1'
@@ -238,6 +243,15 @@ scenario_late_joiner() {
 # A file imported in place changes, with no copy anywhere: it's found, and only
 # reported once every member's been asked. The same bytes made again end it.
 scenario_lost() {
+    # A copy elsewhere of what one keeps once is worth next to nothing, so
+    # what one has alone stays that way: with space spare, two would take
+    # a second copy
+    local args
+    args=$(node_args one)
+    node_down one
+    # shellcheck disable=SC2086
+    node_up one $args --copy-loss 0.000000001
+    wait_for "one and two to reconnect" sh_on one '! hk node peers | grep -q -- "	-	"'
     sh_on one 'echo "only here" > /tmp/only'
     local cid
     cid=$(sh_on one 'hk add -q --nocopy --no-keep /tmp/only | tail -1')
@@ -273,6 +287,9 @@ scenario_lost() {
     on one hk dag fetch "$cid" >/dev/null
     ! on one hk lost ls | grep "$cid" >/dev/null || fail "one still says it's lost, having it"
     [ "$(on one hk cat "$cid")" = "only here" ] || fail "it isn't what it was"
+    node_down one
+    # shellcheck disable=SC2086
+    node_up one $args
 }
 
 # What's public on one is served over HTTP by two's gateway, which hears

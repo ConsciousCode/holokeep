@@ -30,7 +30,7 @@ use tokio::net::unix::OwnedWriteHalf;
 use super::mesh::{self, Error, Members, Place, Result, unless_busy};
 use super::durability::Report;
 use super::node::{AuditId, Event, FetchId, Node, TrimId};
-use super::trim::Watermarks;
+use super::trim::Space;
 use crate::cid::CidRef as _;
 use crate::store::{Db, ExternalFile, Mount};
 
@@ -71,7 +71,7 @@ const ANNOUNCE: Duration = Duration::from_secs(10);
 /// connected.
 const SETTLE: Duration = Duration::from_secs(5);
 
-/// How often to look at free space, to trim between the watermarks.
+/// How often to weigh what's here against the space it takes, and trim.
 const PRESSURE: Duration = Duration::from_secs(30);
 
 /// How often to collect garbage from a sample of what's here, when
@@ -678,12 +678,12 @@ fn control_socket(place: &Place, shared: bool) -> Result<UnixListener> {
 
 /// A node alone, its swarm's key no member's, made a member of a mesh:
 /// started again, as that mesh's node, if it's in one now.
-fn join_mesh(place: &Place, listen: &Listen, marks: Watermarks) -> Result<Option<Node>> {
+fn join_mesh(place: &Place, listen: &Listen, balance: Balance) -> Result<Option<Node>> {
     let (mut joined, alone) = open_node(place)?;
     if alone {
         return Ok(None);
     }
-    joined.set_watermarks(marks);
+    balance.set(&mut joined)?;
     start(&mut joined, place, listen, false)?;
     Ok(Some(joined))
 }
@@ -726,8 +726,8 @@ fn notice_change(node: &mut Node, remounts: &mut Remounts, path: PathBuf, again:
 
 /// Join the mesh this node's been made a member of, if it can now. Returns
 /// whether that's been dealt with.
-fn join_now(node: &mut Node, alone: &mut bool, place: &Place, listen: &Listen, marks: Watermarks) -> Result<bool> {
-    match join_mesh(place, listen, marks) {
+fn join_now(node: &mut Node, alone: &mut bool, place: &Place, listen: &Listen, balance: Balance) -> Result<bool> {
+    match join_mesh(place, listen, balance) {
         Ok(joined) => {
             if let Some(joined) = joined {
                 *node = joined;
@@ -743,13 +743,29 @@ fn join_now(node: &mut Node, alone: &mut bool, place: &Place, listen: &Listen, m
     }
 }
 
+/// How the daemon weighs copies against space: what it means to keep at
+/// most, and the chance of a copy being lost.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Balance {
+    pub space: Space,
+    pub copy_loss: f64,
+}
+
+impl Balance {
+    fn set(self, node: &mut Node) -> Result<()> {
+        node.set_space(self.space);
+        node.set_copy_loss(self.copy_loss);
+        node.measure()
+    }
+}
+
 /// Run the node until interrupted, auditing as a trickle that it would
 /// take `copies` failures to lose each block it holds.
 ///
-/// Space is kept as the watermarks say: below the low mark of free space,
-/// or past the target of what's stored, the node lets go of copies the
-/// mesh can spare, and hands off others to members with room, until it's
-/// back above the high mark and a tenth under the target. If `collecting`, garbage is collected too, a sample at a time.
+/// Space is weighed as `balance` says: copies here worth less than the
+/// space they take are let go of, or handed to members they're worth more
+/// to, and copies are sent to members they're worth more to than the
+/// space they'd take. If `collecting`, garbage is collected too, a sample at a time.
 /// Once interrupted, or terminated, as a service is stopped.
 async fn stopped(terminate: &mut tokio::signal::unix::Signal) {
     tokio::select! {
@@ -759,9 +775,9 @@ async fn stopped(terminate: &mut tokio::signal::unix::Signal) {
 }
 
 #[allow(clippy::too_many_lines, reason = "the daemon's one loop, an arm for each thing it waits on")]
-pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks, collecting: bool, scanning: bool, shared: bool) -> Result<()> {
+pub async fn run(place: &Place, listen: Listen, copies: usize, balance: Balance, collecting: bool, scanning: bool, shared: bool) -> Result<()> {
     let (mut node, mut alone) = open_node(place)?;
-    node.set_watermarks(marks);
+    balance.set(&mut node)?;
     node.set_repo(place.repo.clone());
     // Mounts reach anchors other nodes serve through the main mesh's node
     let (relayed, mut relays_heard) = tokio::sync::mpsc::unbounded_channel();
@@ -810,7 +826,7 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks
             event = node.next() => match event {
                 Ok(Event::Served { session, message }) => relays.answered(session, message),
                 Ok(event) => {
-                    // Still pressed, and a trim helped: again, at once
+                    // A trim let go of something: perhaps more's to go, at once
                     if let Event::Trimmed { report, .. } = &event
                         && report.dropped > 0
                     {
@@ -828,7 +844,7 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks
                 answer_patiently(&mut node, place, stream, copies, collecting, alone, &mut join, &mut waiting).await?;
                 joining |= join;
                 if joining {
-                    joining = !join_now(&mut node, &mut alone, place, &listen, marks)?;
+                    joining = !join_now(&mut node, &mut alone, place, &listen, balance)?;
                 }
             },
             _ = redial.tick() => {
@@ -846,7 +862,7 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks
                 }
                 // Anything that was busy before, tried again
                 if joining {
-                    joining = !join_now(&mut node, &mut alone, place, &listen, marks)?;
+                    joining = !join_now(&mut node, &mut alone, place, &listen, balance)?;
                 }
                 for path in std::mem::take(&mut changed_again) {
                     notice_change(&mut node, &mut remounts, path, &mut changed_again)?;
@@ -878,7 +894,8 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks
                 trickle = later(node.trickle_delay());
             },
             () = tokio::time::sleep_until(pressure) => {
-                if !node.trimming() && node.pressed()? && !node.connected().is_empty() {
+                if !node.trimming() && !node.connected().is_empty() {
+                    node.measure()?;
                     unless_busy(node.trim_some(copies, false).map(drop), "trimming")?;
                 }
                 pressure = later(PRESSURE);
@@ -1270,12 +1287,13 @@ fn status(node: &Node, copies: usize, collecting: bool, alone: bool) -> Result<S
     let _ = writeln!(out, "trickle\t{:.1}s", node.trickle_interval().as_secs_f64());
     let free = node.catalog().offer()?.free;
     let _ = writeln!(out, "free\t{}", free.map_or_else(|| "unknown".to_owned(), crate::health::bytes));
-    let marks = node.watermarks();
-    let _ = writeln!(out, "watermarks\t{} to {}", crate::health::bytes(marks.low), crate::health::bytes(marks.high));
-    if let (Some(target), Some(calm)) = (marks.target, marks.calm()) {
-        let _ = writeln!(out, "target\t{}, trimming down to {}, {} stored", crate::health::bytes(target), crate::health::bytes(calm), crate::health::bytes(marks.used()));
+    let space = node.space();
+    let _ = writeln!(out, "target\t{}", space.target.map_or_else(|| "none".to_owned(), crate::health::bytes));
+    let _ = writeln!(out, "stored\t{}", crate::health::bytes(space.stored()));
+    if let Some(fill) = node.fill()? {
+        let _ = writeln!(out, "full\t{:.1}%, space costing {:.3}", fill.share() * 100.0, fill.cost());
     }
-    let _ = writeln!(out, "pressed\t{}", if marks.pressed() { "yes" } else { "no" });
+    let _ = writeln!(out, "copy loss\t{}", node.copy_loss());
     let _ = writeln!(out, "collecting\t{}", if collecting { "yes" } else { "no" });
     let _ = writeln!(out, "condemned\t{}", node.condemned().count()?);
     let _ = writeln!(out, "account\t{}", node.catalog().uid());

@@ -1,40 +1,37 @@
-//! Letting go of copies here when space runs short, without the mesh
-//! being any easier to lose for it: `/holokeep/trim/1.0.0` and
-//! `/holokeep/dropped/1.0.0`.
+//! Letting go of copies here once they're worth less than the space
+//! they take, without the mesh losing anything for it:
+//! `/holokeep/trim/1.0.0` and `/holokeep/dropped/1.0.0`.
 //!
 //! This is collecting surplus, not garbage: nothing is deleted from the
-//! mesh, only copies here, beyond what durability asks for or handed to a
-//! member with room. Which blocks should live at all is for claims to say
-//! (keeps and tombs).
+//! mesh, only copies here, or handed to a member they're worth more to.
+//! Which blocks should live at all is for claims to say (keeps and
+//! tombs).
 //!
-//! Space is kept between watermarks. When the repo's free space falls
-//! below the low one, the node trims until it's back above the high one,
-//! and between them it neither trims nor takes copies from others, so it
-//! doesn't flap at a threshold. Its offers count only the space above the
-//! high mark. A node may have a target too, the most it means to keep: it
-//! trims once what's stored here passes the target until it's a tenth
-//! under, and offers only what's under that, so a machine with a small
-//! disk, or other uses for it, needn't fill it for the mesh.
+//! A copy here is worth what it adds to its block's copies, one for each
+//! member holding one, weighed as `balance` says, and space costs the odds of this node's being
+//! full, the copy included; one worth less than its space is let go of.
+//! So there's no line at which trimming starts: as a node fills, the
+//! copies past what blocks want go first, then more, but never the last
+//! copy of anything.
 //!
-//! A leaf (structure stays, being small and what's queried) whose copies
-//! here could go is a candidate when its copies elsewhere, as sighted,
-//! would still take `copies` failures to lose. Sightings may be wrong, so
-//! before letting go the node asks every connected member what it holds
-//! of the candidates, now: an *intent*. Each answers with its copies, a
-//! *grant*, and only what's still enough by those answers goes. Two nodes
-//! may mean to let go of the same block at once; a member which is itself
-//! about to let go of a block refuses an intent for it unless the asker is
-//! ranked below it, by the same rendezvous hashing which ranks holders,
-//! and if so gives way: the lowest-ranked lets go first, so both never do.
+//! A leaf (structure stays, being small and what's queried) whose copy
+//! here is worth less than its space, by the copies elsewhere as
+//! sighted, is a candidate. Sightings may be wrong, so before letting go
+//! the node asks every connected member what it holds of the candidates,
+//! now: an *intent*. Each answers with its copies, a *grant*, and only
+//! what's still worth less by those answers goes. Two nodes may mean to
+//! let go of the same block at once; a member which is itself about to
+//! let go of a block refuses an intent for it unless the asker is ranked
+//! below it, by the same rendezvous hashing which ranks holders, and if
+//! so gives way: the lowest-ranked lets go first, so both never do.
 //!
-//! Under pressure, what isn't surplus is a candidate too, and is *handed
-//! off*: a grant says where its member would keep a block, as an advert's
-//! answer does, and a block whose copies here are needed is pushed to the
-//! member whose copy would make up for them, chosen as an audit chooses,
-//! and goes once that member's said it kept it. A copy here goes only if
-//! what's left takes as many failures to lose as with it, so a block
-//! short of its copies may still move, but never gets shorter, and the
-//! last copy of anything never goes: what no member has room for stays.
+//! When trimming of itself, a candidate a member would value more than
+//! its space costs it is *handed off* rather than dropped: a grant says
+//! where its member would keep a block and how full it is, as an
+//! advert's answer does, and the block is pushed to the member chosen as
+//! an audit chooses, one holding none, and goes once that member's said
+//! it kept it, so there are as many copies as before: blocks move to
+//! emptier members whole, and a last copy moves rather than going.
 //!
 //! What's let go of is told to every member, which forget their sightings
 //! of it, and audit it soon if they hold it: while who's connected doesn't
@@ -49,9 +46,10 @@ use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
 use crate::multihash::Multihash;
-use crate::store::{BlockIndex as _, Catalog, Offer, Replica, tolerance};
+use crate::balance::{Fill, Scales, Worth};
+use crate::store::{BlockIndex as _, Catalog, Offer, Replica};
 
-use super::durability::{Kept, Sightings, choose, distinct, offered, score};
+use super::durability::{Kept, Sightings, choose, holders, offered, score};
 use super::mesh::Result;
 
 pub const PROTOCOL: StreamProtocol = StreamProtocol::new("/holokeep/trim/1.0.0");
@@ -87,6 +85,11 @@ pub struct Grant {
 }
 
 impl Grant {
+    /// Where the member would keep a block, and how full it is.
+    pub const fn offer(&self) -> Option<&Offer> {
+        self.offer.as_ref()
+    }
+
     /// Say nothing of holding whichever blocks these are.
     pub fn withhold(&mut self, mut withheld: impl FnMut(&[u8]) -> bool) {
         self.held.retain(|(key, _)| !withheld(key));
@@ -114,91 +117,44 @@ pub fn drops_before(key: &[u8], a: &PeerId, b: &PeerId) -> bool {
     score(key, a, 1.0) < score(key, b, 1.0)
 }
 
-/// Where the repo's space is kept.
-///
-/// Trimming starts when free space falls below `low`, or what's stored
-/// here passes `target`, if there is one, and stops once free space is
-/// back above `high` and what's stored is back under the target's calm
-/// mark.
+/// Where the repo's space stands: the most to keep here, if there's a
+/// most, and what's stored, as last measured and taken in since.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Watermarks {
-    pub low: u64,
-    pub high: u64,
-    /// The most to keep here, if there's a most.
+pub struct Space {
     pub target: Option<u64>,
-    /// What's stored here, as last measured, and taken in since.
-    used: u64,
-    /// Trimming for free space.
-    short: bool,
-    /// Trimming for the target.
-    over: bool,
+    stored: u64,
 }
 
-impl Watermarks {
-    pub const fn new(low: u64, high: u64) -> Self {
-        Self { low, high: if high < low { low } else { high }, target: None, used: 0, short: false, over: false }
+impl Space {
+    pub const fn new(target: Option<u64>) -> Self {
+        Self { target, stored: 0 }
     }
 
-    /// With the most to keep here.
-    #[must_use]
-    pub const fn with_target(mut self, target: Option<u64>) -> Self {
-        self.target = target;
-        self
-    }
-
-    /// Where trimming for the target stops, and what others may fill up
-    /// to: a tenth under it.
-    pub const fn calm(&self) -> Option<u64> {
-        match self.target {
-            Some(target) => Some(target.saturating_sub(target / 10)),
-            None => None,
-        }
-    }
-
-    /// Take in the free space now, if it's known, and what's stored here,
-    /// and say whether to trim.
-    pub const fn update(&mut self, free: Option<u64>, used: u64) -> bool {
-        self.used = used;
-        if let Some(free) = free {
-            if free < self.low {
-                self.short = true;
-            } else if free >= self.high {
-                self.short = false;
-            }
-        }
-        match (self.target, self.calm()) {
-            (Some(target), _) if used > target => self.over = true,
-            (Some(_), Some(calm)) if used > calm => {},
-            _ => self.over = false,
-        }
-        self.pressed()
-    }
-
-    /// Whether it's between trimming down and coming back up.
-    pub const fn pressed(&self) -> bool {
-        self.short || self.over
+    /// Take in what's stored here, as measured.
+    pub const fn update(&mut self, stored: u64) {
+        self.stored = stored;
     }
 
     /// Note what's been taken in since what's stored was measured.
     pub const fn took(&mut self, bytes: u64) {
-        self.used = self.used.saturating_add(bytes);
+        self.stored = self.stored.saturating_add(bytes);
     }
 
     /// What's stored here, as last measured, and taken in since.
-    pub const fn used(&self) -> u64 {
-        self.used
+    pub const fn stored(&self) -> u64 {
+        self.stored
     }
 
-    /// The space others may fill: what's above the high mark of free
-    /// space, if that's known, and under the calm mark, if there's a
-    /// target; None if neither.
+    /// How full it is, with this much free, if that's known.
+    pub fn fill(&self, free: Option<u64>) -> Option<Fill> {
+        Fill::of(self.stored, self.target, free)
+    }
+
+    /// The space others may fill: what's free, if that's known, and under
+    /// the target, if there is one; None if neither.
     pub const fn room(&self, free: Option<u64>) -> Option<u64> {
-        let free = match free {
-            Some(free) => Some(free.saturating_sub(self.high)),
-            None => None,
-        };
-        let under = match self.calm() {
-            Some(calm) => Some(calm.saturating_sub(self.used)),
+        let under = match self.target {
+            Some(target) => Some(target.saturating_sub(self.stored)),
             None => None,
         };
         match (free, under) {
@@ -223,7 +179,7 @@ pub struct Report {
 }
 
 /// A block this node means to let go of.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Candidate {
     /// Its copies in the repo's own volumes, which would go.
     mine: Vec<Replica>,
@@ -233,36 +189,46 @@ struct Candidate {
     granted: BTreeMap<PeerId, Vec<Replica>>,
     /// A member lets go of it first.
     refused: bool,
-    /// How many failures it should take to lose it, as its nearest keeps
-    /// say, or as the trim runs with.
-    copies: usize,
-    /// The member it's handed to, and how many failures it took to lose
-    /// it before, which what's left once that member's kept it must too.
+    /// What its copies are worth.
+    worth: Worth,
+    /// The member it's handed to, and how many copies there were before,
+    /// which there must be once that member's kept it.
     to: Option<(PeerId, usize)>,
 }
 
 impl Candidate {
-    /// The copies which stay if those here go: on other volumes here, and
+    const fn new(mine: Vec<Replica>, staying: Vec<Replica>, worth: Worth) -> Self {
+        Self { mine, staying, granted: BTreeMap::new(), refused: false, worth, to: None }
+    }
+
+    /// How many copies there are with those here: this node's one, and
     /// members' as they've said.
-    fn left(&self) -> Vec<Replica> {
-        self.staying.iter().chain(self.granted.values().flatten()).cloned().collect()
-    }
-
-    /// How many failures it takes to lose it with the copies here.
     fn now(&self) -> usize {
-        tolerance(&distinct(self.left().iter().chain(&self.mine)), self.copies)
+        let here: Vec<Replica> = self.mine.iter().chain(&self.staying).cloned().collect();
+        holders(std::iter::once(here.as_slice()).chain(self.granted.values().map(Vec::as_slice)))
     }
 
-    /// Whether the copies here can go without it being any easier to lose,
-    /// as far as `copies` counts.
-    fn spare(&self) -> bool {
-        self.enough(self.now())
+    /// How many there would be without them: this node's still, if it
+    /// holds one on a volume that stays.
+    fn without(&self) -> usize {
+        holders(std::iter::once(self.staying.as_slice()).chain(self.granted.values().map(Vec::as_slice)))
     }
 
-    /// Whether what's left would take `failures` to lose.
-    fn enough(&self, failures: usize) -> bool {
-        tolerance(&distinct(&self.left()), self.copies) >= failures
+    /// Whether the copies here are worth less than their space costs.
+    fn goes(&self, cost: f64) -> bool {
+        worth_here(self.worth, self.without(), self.now()) < cost
     }
+
+    /// Whether what's left would be `copies` copies.
+    fn enough(&self, copies: usize) -> bool {
+        self.without() >= copies
+    }
+}
+
+/// What the copies here are worth, taking a block from `without` copies
+/// to `with`: each one more, the copy that makes it so.
+fn worth_here(worth: Worth, without: usize, with: usize) -> f64 {
+    (without.saturating_add(1)..=with).map(|k| worth.of(k)).sum()
 }
 
 /// What a trim hands to each member before letting go of it.
@@ -272,8 +238,10 @@ pub type Handing = BTreeMap<PeerId, Vec<Multihash>>;
 pub struct Trim {
     candidates: BTreeMap<Vec<u8>, Candidate>,
     awaiting: HashSet<OutboundRequestId>,
-    /// Whether what isn't surplus is handed off.
+    /// Whether what a member would value more is handed off to it.
     hand_off: bool,
+    /// What space costs here.
+    cost: f64,
     /// Where each member which answered would keep a block.
     offers: BTreeMap<PeerId, Offer>,
     /// Pushes of what's handed off, unanswered.
@@ -283,16 +251,18 @@ pub struct Trim {
 }
 
 impl Trim {
-    /// Of these blocks, those whose copies here could go and whose copies
-    /// elsewhere, as sighted, would still take `copies` failures to lose;
-    /// or, `hand_off`, any whose copies here could go. Returns the trim
-    /// and the intents to send every peer.
-    pub fn start(catalog: &Catalog, sightings: &Sightings, peers: &[PeerId], copies: usize, hand_off: bool, keys: impl IntoIterator<Item = Multihash>) -> Result<(Self, Vec<Intent>)> {
+    /// Of these blocks, those whose copies here could go and are worth
+    /// less than their space costs here (`scales.cost`), by the copies
+    /// elsewhere as sighted; `hand_off`, handing them to members they'd
+    /// be worth more to. Returns the trim and the intents to send every
+    /// peer.
+    pub fn start(catalog: &Catalog, sightings: &Sightings, peers: &[PeerId], scales: Scales, hand_off: bool, keys: impl IntoIterator<Item = Multihash>) -> Result<(Self, Vec<Intent>)> {
         let own = catalog.own_labels();
         let mut trim = Self {
             candidates: BTreeMap::new(),
             awaiting: HashSet::new(),
             hand_off,
+            cost: scales.cost,
             offers: BTreeMap::new(),
             pushing: HashSet::new(),
             decided: false,
@@ -311,11 +281,13 @@ impl Trim {
             }
             let (mine, staying): (Vec<Replica>, Vec<Replica>) = catalog.replicas(key.as_ref())?.into_iter().partition(|replica| own.contains(&replica.label));
             let sighted: Vec<Replica> = sightings.of(key.as_ref())?.into_iter().filter(|(peer, _)| peers.contains(peer)).map(|(_, replica)| replica).collect();
-            let copies = catalog.copies_wanted(key.as_ref(), copies)?.unwrap_or(copies);
-            if !hand_off && tolerance(&distinct(staying.iter().chain(&sighted)), copies) < copies {
-                continue;
+            let worth = scales.worth(catalog.copies_wanted(key.as_ref(), scales.copies)?.unwrap_or(scales.copies));
+            // As sightings have it, till members say
+            let mut seen = Candidate::new(mine, staying.iter().chain(&sighted).cloned().collect(), worth);
+            if seen.goes(scales.cost) && (hand_off || seen.enough(1)) {
+                seen.staying = staying;
+                trim.candidates.insert(bytes, seen);
             }
-            trim.candidates.insert(bytes, Candidate { mine, staying, copies, ..Candidate::default() });
         }
         trim.report.considered = trim.candidates.len();
         let keys: Vec<ByteBuf> = trim.candidates.keys().cloned().map(ByteBuf::from).collect();
@@ -376,51 +348,40 @@ impl Trim {
         self.decided
     }
 
-    /// Once every member's answered, what can go now, blocks still enough
-    /// without the copies here by what members said; and, handing off,
-    /// what to hand to whom first, a member whose copy would make up for
-    /// those here and with room for it, about `HANDING` at most.
+    /// Once every member's answered, what's to go: of what's still worth
+    /// less than its space here by what members said, handing off, what
+    /// to hand to whom first, a member it's worth more to whose copy would
+    /// make up for those here, about `HANDING` at most; and what can go
+    /// now, with another copy left.
     pub fn decide(&mut self, catalog: &Catalog) -> Result<(Vec<Multihash>, Handing)> {
         self.decided = true;
         let (mut now, mut hand) = (Vec::new(), Handing::new());
-        let mut room: BTreeMap<PeerId, Option<u64>> = self.offers.iter().map(|(peer, offer)| (*peer, offer.free)).collect();
+        let mut sent: BTreeMap<PeerId, u64> = BTreeMap::new();
         let mut handing = 0u64;
         for (key, candidate) in &mut self.candidates {
             let Ok(multihash) = <Multihash>::decode(key) else {
                 continue;
             };
-            if candidate.refused {
+            if candidate.refused || !candidate.goes(self.cost) {
                 continue;
             }
-            if candidate.spare() {
+            // One that holds none makes up for the copy here
+            let (before, without) = (candidate.now(), candidate.without());
+            if self.hand_off && handing < HANDING && without < before {
+                let size = catalog.held_size(multihash.as_ref())?.unwrap_or_default();
+                let offers = self.offers.iter().filter(|(peer, _)| !candidate.granted.contains_key(*peer));
+                if let Some(to) = choose(key, without, offers, candidate.worth, size, &sent) {
+                    let given = sent.entry(to).or_default();
+                    *given = given.saturating_add(size);
+                    handing = handing.saturating_add(size);
+                    candidate.to = Some((to, before));
+                    hand.entry(to).or_default().push(multihash);
+                    continue;
+                }
+            }
+            if candidate.enough(1) {
                 now.push(multihash);
-                continue;
             }
-            if !self.hand_off || handing >= HANDING {
-                continue;
-            }
-            let size = catalog.held_size(multihash.as_ref())?.unwrap_or_default();
-            let left = candidate.left();
-            let fits = |peer: &PeerId| room.get(peer).is_some_and(|room| room.is_none_or(|room| room >= size));
-            let offers = self.offers.iter().filter(|(peer, _)| fits(peer) && !candidate.granted.contains_key(*peer));
-            let Some(to) = choose(key, &left, offers, candidate.copies) else {
-                continue;
-            };
-            // Its copy must make up for those here
-            let Some(offer) = self.offers.get(&to) else {
-                continue;
-            };
-            let with = [distinct(&left), vec![offer.risks.clone()]].concat();
-            let before = candidate.now();
-            if tolerance(&with, candidate.copies) < before {
-                continue;
-            }
-            if let Some(Some(room)) = room.get_mut(&to) {
-                *room = room.saturating_sub(size);
-            }
-            handing = handing.saturating_add(size);
-            candidate.to = Some((to, before));
-            hand.entry(to).or_default().push(multihash);
         }
         Ok((now, hand))
     }
@@ -476,8 +437,8 @@ impl Trim {
 /// Answer an intent: the copies held here of what it names, refusing
 /// what a trim here lets go of first, and giving way where the asker
 /// does; and where this would keep a block handed to it.
-pub fn answer(catalog: &Catalog, me: &PeerId, peer: &PeerId, intent: &Intent, trims: &mut [&mut Trim], marks: &Watermarks) -> Result<Grant> {
-    let mut grant = Grant { offer: Some(offered(catalog, marks)?), ..Grant::default() };
+pub fn answer(catalog: &Catalog, me: &PeerId, peer: &PeerId, intent: &Intent, trims: &mut [&mut Trim], space: &Space) -> Result<Grant> {
+    let mut grant = Grant { offer: Some(offered(catalog, space)?), ..Grant::default() };
     for key in &intent.keys {
         let Ok(multihash) = <Multihash>::decode(key) else {
             continue;
@@ -508,37 +469,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn watermarks_keep_space_between_them() {
-        let mut marks = Watermarks::new(100, 200);
-        assert!(!marks.update(Some(150), 0), "between them, from calm: calm");
-        assert!(marks.update(Some(99), 0), "below the low mark: trim");
-        assert!(marks.update(Some(150), 0), "between them, trimming: keep trimming");
-        assert!(marks.update(None, 0), "not knowing: as it was");
-        assert!(!marks.update(Some(200), 0), "at the high mark: stop");
-        assert!(!marks.update(Some(150), 0));
-        assert_eq!(marks.room(Some(250)), Some(50));
-        assert_eq!(marks.room(Some(150)), Some(0));
-        assert_eq!(marks.room(None), None);
-        assert_eq!(Watermarks::new(300, 200).high, 300, "the high mark's at least the low");
+    fn space_is_under_the_target_and_whats_free() {
+        let mut space = Space::new(Some(1000));
+        space.update(600);
+        assert_eq!(space.room(Some(5000)), Some(400), "what's under the target");
+        assert_eq!(space.room(Some(250)), Some(250), "or what's free, if less");
+        assert_eq!(space.room(None), Some(400));
+        space.took(100);
+        assert_eq!(space.room(None), Some(300), "less what's been taken since");
+        assert_eq!(space.fill(Some(5)), Some(Fill { stored: 700, capacity: 1000 }));
+        let mut untargeted = Space::new(None);
+        untargeted.update(100);
+        assert_eq!(untargeted.room(Some(50)), Some(50));
+        assert_eq!(untargeted.fill(Some(300)), Some(Fill { stored: 100, capacity: 400 }), "what's stored and free together");
+        assert_eq!(untargeted.fill(None), None);
     }
 
     #[test]
-    fn a_target_keeps_whats_stored_a_tenth_under_it() {
-        let mut marks = Watermarks::new(100, 200).with_target(Some(1000));
-        assert_eq!(marks.calm(), Some(900));
-        assert!(!marks.update(Some(5000), 950), "between calm and the target, from calm: calm");
-        assert_eq!(marks.room(Some(5000)), Some(0), "nor taking more");
-        assert!(marks.update(Some(5000), 1001), "past the target: trim");
-        assert!(marks.update(Some(5000), 950), "above calm, trimming: keep trimming");
-        assert!(!marks.update(Some(5000), 900), "at calm: stop");
-        assert_eq!(marks.room(Some(5000)), Some(0));
-        marks.update(Some(5000), 600);
-        assert_eq!(marks.room(Some(5000)), Some(300), "what's under calm");
-        assert_eq!(marks.room(Some(450)), Some(250), "or above the high mark, if less");
-        assert_eq!(marks.room(None), Some(300));
-        marks.took(100);
-        assert_eq!(marks.room(None), Some(200), "less what's been taken since");
-        assert!(marks.update(Some(50), 600), "short of free space, under the target: trim");
+    fn copies_here_are_worth_each_failure_they_add() {
+        let worth = Worth { n: 2, q: 0.1 };
+        assert!(worth_here(worth, 2, 2).abs() < f64::EPSILON, "adding nothing, worth nothing");
+        assert!((worth_here(worth, 1, 2) - 1.0).abs() < 1e-12);
+        assert!((worth_here(worth, 2, 3) - 0.1).abs() < 1e-12);
+        assert!((worth_here(worth, 0, 1) - 10.0).abs() < 1e-9, "the last copy");
+        assert!((worth_here(worth, 1, 3) - 1.1).abs() < 1e-12, "two volumes here, each a failure");
     }
 
     #[test]

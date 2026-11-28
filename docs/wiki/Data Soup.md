@@ -20,6 +20,7 @@ the holokeep repository; this wiki is the reference.
 - [[Keys and Users]]: devices, users, signatures, sealing, accounts.
 - [[Mesh]]: joining, transport, and every wire protocol.
 - [[Replication and Retention]]: copies, risks, trimming, garbage collection.
+- [[Replication as a Balance]]: copies settling where their value meets the cost of space.
 - [[Protected Meshes]]: vaults, encryption, recovery.
 - [[Grants]]: who may do what in a mesh, as a history of claims.
 - [[Sharing]]: users sharing machines and data (partly planned).
