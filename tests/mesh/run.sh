@@ -300,7 +300,7 @@ scenario_gateway() {
 # One takes part in an Amino of its own, none of the real one's; a machine
 # in no mesh, in that Amino too, fetches what one made public over Bitswap,
 # and is told what's private isn't had, and what two made public, which
-# one fetches from two for it
+# one fetches from two for it; and two, not in Amino, fetches through one
 scenario_amino() {
     local note private one_ip one_amino
     note=$(sh_on one 'echo "for anyone on Amino" | hk add -q -')
@@ -329,6 +329,14 @@ scenario_amino() {
     node_up seeker --amino
     wait_for "the seeker to find and fetch what the browser announced" on seeker hk dag fetch "$announced"
     [ "$(on seeker hk cat "$announced")" = "announced by the browser" ] || fail "fetched something else"
+    # Two, a member not in Amino, fetches through one what's on Amino
+    # alone: the browser's, which no member has
+    local outside
+    outside=$(sh_on browser 'echo "on Amino, for two through one" | hk add -q -')
+    on browser hk public add "$outside" >/dev/null
+    ! on two hk block get "$outside" >/dev/null 2>&1 || fail "two has the browser's already"
+    on two hk dag fetch --amino "$outside" >/dev/null || fail "two couldn't fetch through one what's on Amino"
+    [ "$(on two hk cat "$outside")" = "on Amino, for two through one" ] || fail "two fetched something else through one"
     # What two makes public and one hasn't, one serves on Amino all the
     # same, fetching it from two as it's wanted: as a member that keeps
     # little, past its target, does. Two keeps a copy alone meanwhile, so

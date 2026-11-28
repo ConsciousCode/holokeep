@@ -488,6 +488,7 @@ Checklist:
   - [x] Peers reached only through a relay (`/p2p-circuit`), and DCUtR punching through to them from there, the relayed connection closed once it has (checked against a Kubo node behind a Kubo relay)
   - [x] Behind a NAT, a slot reserved on two relays and the node reached through them, punched through to by whoever dials it there (checked with an hk node behind a NAT, fetched from by a Kubo node that can only reach it through a relay)
   - [x] Serving on Amino what the mesh makes public but isn't here, fetched from members as it's wanted, so a member keeping little, past its target, serves it all (checked in the mesh suite's `amino` scenario)
+  - [x] Fetching from Amino through a member that's in it, for one that isn't: the members hosting its user asked in turn, what one fetched then had of the mesh (`/holokeep/amino-fetch/1.0.0`)
   - [x] How the node is in Amino: where it's reached, server or client of the DHT, its routing table, who's connected and as what, and the last dial that failed (`hk node amino [--peers]`)
   - [x] Checked against Kubo 0.42 both ways: each fetching what the other announced, found through the DHT, and what's only served got by a Kubo node peering hk (`tests/mesh/kubo.sh`)
 - [ ] BitTorrent bridging

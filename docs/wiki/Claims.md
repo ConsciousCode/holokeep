@@ -286,6 +286,15 @@ dialled, is provided again at the next look, a minute on.
   that block, and one that's had none of 16 running is asked no more.
   A gateway sees what's wanted of it as a Bitswap peer does.
   `--private` keeps what's fetched to oneself, answered as missing.
+- **Through a member**: a node of the main mesh not in Amino itself asks
+  the members hosting its user, one at a time
+  (`/holokeep/amino-fetch/1.0.0`), to fetch from Amino for it; one in
+  Amino fetches as for itself, shared back or kept to itself as asked,
+  and says what came of it, and the asker has it from the mesh then as
+  anything else. One that isn't in Amino says so, and the next is asked.
+  So a household's machines needn't each be in Amino: one with its ports
+  open, a relay say, is their way in, and what's wanted goes no further
+  than the user's own machines before Amino.
 - **Announcing**: what each `announce` claim names is provided on the
   DHT, an anchor as what it is now and a group, such as a tag, as its
   members, as Kubo's `roots` strategy does; looked at again within 5 s

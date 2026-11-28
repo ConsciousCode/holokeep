@@ -192,6 +192,7 @@ pub struct Behaviour {
     asks: request_response::cbor::Behaviour<super::thin::Ask, super::thin::Answer>,
     clock: request_response::cbor::Behaviour<clock::Asked, Told>,
     serve: request_response::cbor::Behaviour<super::serve::Asked, super::serve::Answered>,
+    through: request_response::cbor::Behaviour<through::Asked, through::Answered>,
 }
 
 /// The least and most time between dials of a member that isn't
@@ -428,6 +429,8 @@ pub struct Node {
     asking_served: HashMap<request_response::OutboundRequestId, (u64, Vec<u8>)>,
     /// The repo's directory, whose config says what this node serves.
     repo: Option<PathBuf>,
+    /// Fetches from Amino through members, and members' through this.
+    forwarded: through::Forwarded,
     /// Whether this machine's clock was last found far from the mesh's.
     skewed: bool,
     redial: Redial,
@@ -503,6 +506,7 @@ impl Node {
             clock: exchange(clock::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_secs(10))),
             // Longer than a mount waits, so it's the mount that gives up
             serve: exchange(super::serve::PROTOCOL, request_response::Config::default().with_request_timeout(Duration::from_secs(30))),
+            through: exchange(through::PROTOCOL, request_response::Config::default().with_request_timeout(through::ANSWER)),
         };
         let (heard_from, heard) = tokio::sync::mpsc::unbounded_channel();
         let config = libp2p::swarm::Config::with_tokio_executor().with_idle_connection_timeout(tunables.idle);
@@ -562,6 +566,7 @@ impl Node {
             services_heard: heard,
             asking_served: HashMap::new(),
             repo: None,
+            forwarded: through::Forwarded::new(),
             skewed: false,
             redial: Redial::default(),
             relays: HashMap::new(),
@@ -713,6 +718,7 @@ impl Node {
             BehaviourEvent::Grants(event) => from(event),
             BehaviourEvent::Clock(event) => from(event),
             BehaviourEvent::Serve(event) => from(event),
+            BehaviourEvent::Through(event) => from(event),
             _ => None,
         };
         peer.is_some_and(|peer| self.visitors.contains_key(&peer))
@@ -2207,6 +2213,8 @@ impl Node {
             }
             // What a client asked waits on it, which isn't the daemon's
             if !self.fetched_for_ask(id)? {
+                // Finishing one from Amino through a member, it's under that id
+                let id = self.forwarded.renamed.remove(&id).unwrap_or(id);
                 self.ready.push_back(Event::Fetched { id, fetched, missing });
             }
         }
@@ -2491,11 +2499,16 @@ impl Node {
             if let Some(event) = self.ready.pop_front() {
                 return Ok(event);
             }
-            let (swarm, heard) = (&mut self.swarm, &mut self.services_heard);
+            let (swarm, heard, through) = (&mut self.swarm, &mut self.services_heard, &mut self.forwarded.answers);
             let event = tokio::select! {
                 event = swarm.next() => event,
                 Some((peer, session, message)) = heard.recv() => {
                     self.on_heard(peer, session, message);
+                    continue;
+                },
+                // A member's fetch from Amino, done
+                Some((channel, answered)) = through.recv() => {
+                    let _ = self.swarm.behaviour_mut().through.send_response(channel, answered);
                     continue;
                 },
             };
@@ -2844,12 +2857,14 @@ impl Node {
             },
             SwarmEvent::Behaviour(BehaviourEvent::Clock(event)) => self.on_clock(event),
             SwarmEvent::Behaviour(BehaviourEvent::Serve(event)) => self.on_serve(event)?,
+            SwarmEvent::Behaviour(BehaviourEvent::Through(event)) => self.on_through(event)?,
             _ => None,
         })
     }
 }
 
 mod serving;
+mod through;
 
 mod asks;
 

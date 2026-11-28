@@ -1397,6 +1397,27 @@ fn amino_fetch_for(words: &str, write: OwnedWriteHalf) -> std::result::Result<()
     Ok(())
 }
 
+/// What's asked of Amino: of its swarm, or, by a node of the main mesh
+/// not in Amino itself, a fetch through a member that is, waited on.
+fn amino_command(node: &mut Node, place: &Place, command: &str, write: OwnedWriteHalf) -> std::result::Result<Option<(Waiter, OwnedWriteHalf)>, (OwnedWriteHalf, String)> {
+    match command.strip_prefix("amino-fetch ") {
+        Some(words) if super::amino::handle().is_none() && place.is_main() => match through_for(node, words) {
+            Ok(id) => Ok(Some((Waiter::Fetch(id), write))),
+            Err(e) => Err((write, e.to_string())),
+        },
+        _ => amino_for(command, write).map(|()| None),
+    }
+}
+
+/// What `amino-fetch` asks of a node not in Amino: a fetch through a
+/// member that is.
+fn through_for(node: &mut Node, words: &str) -> Result<FetchId> {
+    let mut words = words.split_whitespace();
+    let (dag, share) = (words.next() == Some("dag"), words.next() == Some("share"));
+    let roots = words.map(str::parse).collect::<std::result::Result<Vec<crate::model::Link>, _>>().map_err(|_| Error::Invalid("not a list of CIDs".into()))?;
+    node.fetch_through_amino(roots, dag, share)
+}
+
 /// What's asked of Amino's swarm: a fetch, or how it is.
 fn amino_for(command: &str, write: OwnedWriteHalf) -> std::result::Result<(), (OwnedWriteHalf, String)> {
     match command.strip_prefix("amino-fetch ") {
@@ -1512,8 +1533,8 @@ async fn answer(node: &mut Node, place: &Place, stream: tokio::net::UnixStream, 
             }
         },
         command if command.starts_with("clients-at ") => out.push_str(&clients_at(node, command.trim_start_matches("clients-at "))?),
-        command if command == "amino" || command.starts_with("amino ") || command.starts_with("amino-fetch ") => match amino_for(command, write) {
-            Ok(()) => return Ok(None),
+        command if command == "amino" || command.starts_with("amino ") || command.starts_with("amino-fetch ") => match amino_command(node, place, command, write) {
+            Ok(waiter) => return Ok(waiter),
             Err((back, e)) => {
                 write = back;
                 let _ = writeln!(out, "error: {e}");
