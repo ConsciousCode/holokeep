@@ -23,6 +23,10 @@ works. This is what neither says.
   - `tests/mesh/run.sh [scenario...]`: rootless Podman containers; the
     whole suite takes about 10 minutes, so name the scenarios a change
     touches (`amino` for Amino work).
+    The `shared` scenario is flaky (seen 2026-11-27, failing about a
+    third of runs on a commit that had passed): "ezra to see one's view",
+    or "ezra to fetch the later note from two", time out. Run it again
+    before suspecting a change, and look into it when there's time.
   - `tests/mesh/kubo.sh`: hk against real Kubo (needs `ipfs` on the
     PATH); for anything touching Amino.
   - `scripts/kubo-compare.sh`: for anything touching the importer.

@@ -234,6 +234,13 @@ dialled, is provided again at the next look, a minute on.
   peers it's had blocks from, on its LAN or peered (`Peering.Peers`),
   and a few at random, so what's only served reaches a Kubo node that
   peers this one, or has had blocks of it before.
+- **What the mesh holds**: what's public but not here, as on a member
+  past its target that's let go of it, is fetched from the mesh's
+  members as it's wanted, and served once it's come, or said not to be
+  had if it hasn't in 30 s. A block's known to be public while what
+  links to it is here, and structure is never trimmed, so a member
+  keeping little still serves all the mesh makes public, keeping what's
+  wanted most, by its target. Only the main mesh's members are asked.
 - **What isn't served**, private or missing, is said not to be had alike,
   where the asker wants to be told, and only after 50 ms and up to 50 ms
   more at random: how long it takes says nothing of which.

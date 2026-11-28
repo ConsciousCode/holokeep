@@ -195,6 +195,24 @@ impl Handle {
 /// The running swarm's handle, once there is one: there's one to a daemon.
 static HANDLE: OnceLock<Handle> = OnceLock::new();
 
+/// Blocks to fetch from the mesh's members, and who to tell once that's
+/// done, whatever came of it.
+pub type MeshFetch = (Vec<Link>, tokio::sync::oneshot::Sender<()>);
+
+static MESH: OnceLock<tokio::sync::mpsc::UnboundedSender<MeshFetch>> = OnceLock::new();
+
+/// Have what's public but not here, wanted by a peer, fetched from the
+/// mesh's members through this, to be served once it's here.
+///
+/// So a node that keeps little, past its target, still serves all the
+/// mesh makes public. The main mesh's daemon gives it.
+pub fn fetch_through(mesh: tokio::sync::mpsc::UnboundedSender<MeshFetch>) {
+    let _ = MESH.set(mesh);
+}
+
+/// How long what's fetched from the mesh for a peer is waited for.
+const MESH_WAIT: Duration = Duration::from_secs(30);
+
 /// The running swarm, to fetch from Amino, if this process takes part.
 pub fn handle() -> Option<&'static Handle> {
     HANDLE.get()
@@ -433,6 +451,10 @@ pub struct Amino {
     /// What gateways have sent, or not, as it comes.
     http: tokio::sync::mpsc::UnboundedSender<OverHttp>,
     https: tokio::sync::mpsc::UnboundedReceiver<OverHttp>,
+    /// What peers wanted that was fetched from the mesh for them, or
+    /// couldn't be, to answer now.
+    meshed: tokio::sync::mpsc::UnboundedSender<(PeerId, Message)>,
+    mesheds: tokio::sync::mpsc::UnboundedReceiver<(PeerId, Message)>,
     routed: usize,
     /// Each peer's connections through a relay, closed once there's a
     /// direct one; and how many it's reached so, and punched through to.
@@ -493,6 +515,7 @@ impl Amino {
         let handle = Handle { asks: ask, statuses: status };
         let (route, routes) = tokio::sync::mpsc::unbounded_channel();
         let (http, https) = tokio::sync::mpsc::unbounded_channel();
+        let (meshed, mesheds) = tokio::sync::mpsc::unbounded_channel();
         let mut amino = Self {
             swarm,
             catalog,
@@ -513,6 +536,8 @@ impl Amino {
             routes,
             http,
             https,
+            meshed,
+            mesheds,
             routed: 0,
             dialling: HashMap::new(),
             relayed: HashMap::new(),
@@ -674,6 +699,7 @@ impl Amino {
                 },
                 Some((fetch, found)) = self.routes.recv() => self.found(fetch, found),
                 Some((fetch, gateway, cid, data)) = self.https.recv() => self.over_http(fetch, &gateway, &cid, data),
+                Some((peer, wants)) = self.mesheds.recv() => self.answer_meshed(peer, &wants),
                 Some((peer, message)) = self.reads.recv() => {
                     self.answer(peer, &message);
                     self.received(Some(peer), &message);
@@ -857,10 +883,43 @@ impl Amino {
     /// Answer what a peer wants: what's served at once, and what isn't had
     /// after the floor.
     fn answer(&self, peer: PeerId, message: &Message) {
-        let (now, later) = answers(&self.catalog, message);
+        let (now, mut later, public) = answers(&self.catalog, message);
         for message in now {
             self.send(peer, message);
         }
+        // What's public but not here is fetched from the mesh first, if
+        // there's one to ask, and answered once it's come or hasn't
+        match MESH.get().filter(|_| !public.is_empty()) {
+            Some(mesh) => {
+                let (done, fetched) = tokio::sync::oneshot::channel();
+                let _ = mesh.send((public.iter().map(|want| want.cid.clone()).collect(), done));
+                let meshed = self.meshed.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(MESH_WAIT, fetched).await;
+                    let _ = meshed.send((peer, Message { wants: public, ..Message::default() }));
+                });
+            },
+            None => later.presences.extend(public.into_iter().filter(|want| want.send_dont_have).map(|want| (want.cid, Presence::DontHave))),
+        }
+        self.later(peer, later);
+    }
+
+    /// Answer what was fetched from the mesh for a peer: what's here now
+    /// is sent, and what still isn't is said not to be had, at once, as
+    /// it's public, so how long it took says nothing private.
+    fn answer_meshed(&self, peer: PeerId, wants: &Message) {
+        let (now, mut not_had, still) = answers(&self.catalog, wants);
+        for message in now {
+            self.send(peer, message);
+        }
+        not_had.presences.extend(still.into_iter().filter(|want| want.send_dont_have).map(|want| (want.cid, Presence::DontHave)));
+        if !not_had.is_empty() {
+            self.send(peer, not_had);
+        }
+    }
+
+    /// Say what isn't had, after the floor of time.
+    fn later(&self, peer: PeerId, later: Message) {
         if !later.is_empty() {
             let mut control = self.control.clone();
             let wait = NOT_HAD.saturating_add(Duration::from_millis(jitter(NOT_HAD_JITTER_MS)));
@@ -1251,14 +1310,15 @@ fn jitter(most: u64) -> u64 {
     u64::from_le_bytes(bytes).checked_rem(most).unwrap_or_default()
 }
 
-/// What to say to a peer's wants: what to send at once, and what after.
+/// What to say to a peer's wants: what to send at once, what after, and
+/// what's public but not here, to fetch from the mesh.
 ///
 /// At once, messages of blocks and what's had, each within the budget;
-/// after the floor, one of what isn't had. Whether something's servable is worked out the same
-/// way whatever it is, so what's private takes as long to judge as what's
-/// missing; only what's servable is read.
-pub fn answers(catalog: &Catalog, message: &Message) -> (Vec<Message>, Message) {
-    let (mut now, mut current, mut later) = (Vec::new(), Message::default(), Message::default());
+/// after the floor, one of what isn't had. Whether something's servable
+/// is worked out the same way whatever it is, so what's private takes as
+/// long to judge as what's missing; only what's servable is read.
+pub fn answers(catalog: &Catalog, message: &Message) -> (Vec<Message>, Message, Vec<Entry>) {
+    let (mut now, mut current, mut later, mut elsewhere) = (Vec::new(), Message::default(), Message::default(), Vec::new());
     let mut size = 0usize;
     for want in message.wants.iter().filter(|want| !want.cancel).take(WANTS) {
         let Entry { cid, want: kind, send_dont_have, .. } = want;
@@ -1280,6 +1340,7 @@ pub fn answers(catalog: &Catalog, message: &Message) -> (Vec<Message>, Message) 
                 super::recent::used(&cid.multihash().to_bytes());
                 current.blocks.push((cid.clone(), block.data().to_vec()));
             },
+            _ if public && !here => elsewhere.push(want.clone()),
             _ if *send_dont_have => later.presences.push((cid.clone(), Presence::DontHave)),
             _ => {},
         }
@@ -1287,7 +1348,7 @@ pub fn answers(catalog: &Catalog, message: &Message) -> (Vec<Message>, Message) 
     if !current.is_empty() {
         now.push(current);
     }
-    (now, later)
+    (now, later, elsewhere)
 }
 
 /// Run the swarm for the repo, on a thread of its own.

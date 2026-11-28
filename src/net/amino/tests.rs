@@ -48,7 +48,8 @@ fn whats_public_or_shared_is_served_and_the_rest_is_not_had_alike() {
         ],
         ..Message::default()
     };
-    let (now, later) = answers(&catalog, &asked);
+    let (now, later, elsewhere) = answers(&catalog, &asked);
+    assert!(elsewhere.is_empty(), "everything public is here");
     let blocks: Vec<Link> = now.iter().flat_map(|message| message.blocks.iter().map(|(cid, _)| cid.clone())).collect();
     let haves: Vec<_> = now.iter().flat_map(|message| message.presences.clone()).collect();
     assert_eq!(blocks, [public.clone(), fetched]);

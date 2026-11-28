@@ -299,7 +299,8 @@ scenario_gateway() {
 
 # One takes part in an Amino of its own, none of the real one's; a machine
 # in no mesh, in that Amino too, fetches what one made public over Bitswap,
-# and is told what's private isn't had
+# and is told what's private isn't had, and what two made public, which
+# one fetches from two for it
 scenario_amino() {
     local note private one_ip one_amino
     note=$(sh_on one 'echo "for anyone on Amino" | hk add -q -')
@@ -328,6 +329,22 @@ scenario_amino() {
     node_up seeker --amino
     wait_for "the seeker to find and fetch what the browser announced" on seeker hk dag fetch "$announced"
     [ "$(on seeker hk cat "$announced")" = "announced by the browser" ] || fail "fetched something else"
+    # What two makes public and one hasn't, one serves on Amino all the
+    # same, fetching it from two as it's wanted: as a member that keeps
+    # little, past its target, does. Two keeps a copy alone meanwhile, so
+    # none comes to one otherwise
+    local elsewhere
+    node_down two
+    node_up two --copies 1
+    sh_on two 'head -c 700000 /dev/urandom > /tmp/elsewhere'
+    elsewhere=$(sh_on two 'hk add -q /tmp/elsewhere | tail -1')
+    on two hk public add --serve "$elsewhere" >/dev/null
+    wait_for "one to know two made it public" sh_on one "hk public check $elsewhere | grep -q '^public'"
+    ! on one hk block get "$elsewhere" >/dev/null 2>&1 || fail "one holds what two made public already"
+    on browser hk dag fetch "$elsewhere" >/dev/null || fail "the browser couldn't fetch through one what two made public"
+    [ "$(on browser hk cat "$elsewhere" | sha256sum)" = "$(sh_on two 'sha256sum < /tmp/elsewhere')" ] || fail "the browser fetched something else through one"
+    node_down two
+    node_up two
 }
 
 # A directory watched from empty: a download under way isn't imported till

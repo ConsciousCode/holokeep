@@ -793,8 +793,20 @@ pub async fn run(place: &Place, listen: Listen, copies: usize, marks: Watermarks
     // What couldn't be done for something else writing, to try again
     let mut changed_again: Vec<PathBuf> = Vec::new();
     let mut joining = false;
+    // What Amino's peers want of what's public but not here, fetched from
+    // members to serve them
+    let (mesh, mut for_amino) = tokio::sync::mpsc::unbounded_channel();
+    if place.is_main() {
+        super::amino::fetch_through(mesh);
+    }
     let result = loop {
         tokio::select! {
+            Some((blocks, done)) = for_amino.recv() => {
+                // Busy, it's answered as not had
+                if let Ok(id) = node.fetch_blocks(blocks) {
+                    waiting.for_amino.insert(id, done);
+                }
+            },
             event = node.next() => match event {
                 Ok(Event::Served { session, message }) => relays.answered(session, message),
                 Ok(event) => {
@@ -1102,6 +1114,8 @@ struct Waiting {
     auditing: HashMap<AuditId, OwnedWriteHalf>,
     trimming: HashMap<TrimId, OwnedWriteHalf>,
     checking: HashMap<super::check::CheckId, OwnedWriteHalf>,
+    /// Fetches for Amino, of what's public that its peers want.
+    for_amino: HashMap<FetchId, tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Waiting {
@@ -1132,6 +1146,12 @@ impl Waiting {
                 (self.trimming.remove(&id), format!("trimmed {} {} {} {}\n", report.considered, report.dropped, report.freed, report.handed))
             },
             Event::Checked { id, known } => (self.checking.remove(&id), checked(&known)),
+            Event::Fetched { id, .. } if self.for_amino.contains_key(&id) => {
+                if let Some(done) = self.for_amino.remove(&id) {
+                    let _ = done.send(());
+                }
+                return;
+            },
             Event::Fetched { id, fetched, missing } => {
                 let mut out = format!("fetched {fetched}\n");
                 for cid in missing {
